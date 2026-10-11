@@ -14,7 +14,6 @@
       "aarch64-darwin"
       "x86_64-linux"
       "aarch64-linux"
-      "x86_64-darwin"
     ] (system: {
       default = nixpkgs.legacyPackages.${system}.mkShell {
         packages = [ zig-overlay.packages.${system}."0.16.0" ];
