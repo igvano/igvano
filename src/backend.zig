@@ -33,13 +33,18 @@ pub const Backend = struct {
         PermissionDenied,
         SystemResources,
         CreateFailed,
+        KillFailed,
+        LivenessFailed,
+        ProcessNotFound,
     } || std.mem.Allocator.Error;
 
     /// Backends receive parsed values only; the frontend loads config.json and resolves paths.
     pub const VTable = struct {
         create: *const fn (ptr: *anyopaque, options: CreateOptions) Error!Handle,
-        start: *const fn (ptr: *anyopaque, handle: Handle) Error!void,
-        /// A bare pid can be reused; implementations must check the container identity.
+        /// The FIFO ready exchange is runtime state machinery, not isolation.
+        /// A backend start hook can be added when an isolation mechanism needs it.
+        alive: *const fn (ptr: *anyopaque, handle: Handle) Error!bool,
+        /// Handles currently identify processes by host PID.
         kill: *const fn (ptr: *anyopaque, handle: Handle, signal: i32) Error!void,
         /// The id identifies resources after the container stops and its pid is gone.
         delete: *const fn (ptr: *anyopaque, handle: Handle) Error!void,
@@ -49,8 +54,8 @@ pub const Backend = struct {
         return self.vtable.create(self.ptr, options);
     }
 
-    pub fn start(self: Backend, handle: Handle) Error!void {
-        return self.vtable.start(self.ptr, handle);
+    pub fn alive(self: Backend, handle: Handle) Error!bool {
+        return self.vtable.alive(self.ptr, handle);
     }
 
     pub fn kill(self: Backend, handle: Handle, signal: i32) Error!void {
@@ -69,7 +74,7 @@ test {
 test "backend dispatches lifecycle operations through its vtable" {
     const TestBackend = struct {
         options: ?Backend.CreateOptions = null,
-        started: ?Backend.Handle = null,
+        checked: ?Backend.Handle = null,
         killed: ?Backend.Handle = null,
         signal: ?i32 = null,
         deleted: ?Backend.Handle = null,
@@ -77,7 +82,7 @@ test "backend dispatches lifecycle operations through its vtable" {
 
         const vtable: Backend.VTable = .{
             .create = create,
-            .start = start,
+            .alive = alive,
             .kill = kill,
             .delete = delete,
         };
@@ -89,9 +94,10 @@ test "backend dispatches lifecycle operations through its vtable" {
             return .{ .id = options.id, .pid = 1234 };
         }
 
-        fn start(ptr: *anyopaque, handle: Backend.Handle) Backend.Error!void {
+        fn alive(ptr: *anyopaque, handle: Backend.Handle) Backend.Error!bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.started = handle;
+            self.checked = handle;
+            return true;
         }
 
         fn kill(ptr: *anyopaque, handle: Backend.Handle, signal: i32) Backend.Error!void {
@@ -127,9 +133,9 @@ test "backend dispatches lifecycle operations through its vtable" {
     try std.testing.expectEqualStrings("/tmp/bundle/rootfs", implementation.options.?.rootfs);
     try std.testing.expectEqualStrings("/tmp/containers/example/exec.fifo", implementation.options.?.exec_fifo);
     try std.testing.expect(implementation.options.?.spec == &spec);
-    try backend.start(handle);
-    try std.testing.expectEqualStrings("example", implementation.started.?.id);
-    try std.testing.expectEqual(@as(i32, 1234), implementation.started.?.pid);
+    try std.testing.expect(try backend.alive(handle));
+    try std.testing.expectEqualStrings("example", implementation.checked.?.id);
+    try std.testing.expectEqual(@as(i32, 1234), implementation.checked.?.pid);
     try backend.kill(.{ .id = "other", .pid = 1235 }, 15);
     try std.testing.expectEqualStrings("other", implementation.killed.?.id);
     try std.testing.expectEqual(@as(i32, 1235), implementation.killed.?.pid);

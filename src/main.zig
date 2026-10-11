@@ -93,6 +93,30 @@ fn parseArgs(args: []const []const u8) !Config {
     };
 }
 
+fn parseSignal(value: ?[]const u8) !i32 {
+    const text = value orelse return 15;
+    if (text.len == 0) return error.InvalidSignal;
+    if (std.ascii.isDigit(text[0])) {
+        for (text) |byte| {
+            if (!std.ascii.isDigit(byte)) return error.InvalidSignal;
+        }
+        const signal = std.fmt.parseInt(i32, text, 10) catch return error.InvalidSignal;
+        if (signal >= std.os.linux.NSIG) return error.InvalidSignal;
+        return signal;
+    }
+    var buffer: [16]u8 = undefined;
+    if (text.len > buffer.len) return error.InvalidSignal;
+    for (text, 0..) |byte, i| buffer[i] = std.ascii.toUpper(byte);
+    var name: []const u8 = buffer[0..text.len];
+    if (std.mem.startsWith(u8, name, "SIG")) name = name[3..];
+    // Use Linux numbering even when compiling the frontend's tests on macOS.
+    if (std.mem.eql(u8, name, "IOT")) name = "ABRT";
+    if (std.mem.eql(u8, name, "POLL")) name = "IO";
+    if (std.mem.eql(u8, name, "CLD")) name = "CHLD";
+    const signal = std.meta.stringToEnum(std.os.linux.SIG, name) orelse return error.InvalidSignal;
+    return @intCast(@intFromEnum(signal));
+}
+
 fn createContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, config: Config) !void {
     const cwd = std.Io.Dir.cwd();
     const bundle = try cwd.realPathFileAlloc(io, config.bundle orelse ".", allocator);
@@ -115,8 +139,6 @@ fn createContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, c
 
     const fifo = try std.fs.path.join(allocator, &.{ state_dir, oci.exec_fifo_name });
     defer allocator.free(fifo);
-    const state_path = try std.fs.path.join(allocator, &.{ state_dir, oci.state_file_name });
-    defer allocator.free(state_path);
     try makeExecFifo(allocator, fifo);
     const handle = try backend.create(.{
         .allocator = allocator,
@@ -127,20 +149,72 @@ fn createContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, c
     });
     errdefer backend.kill(handle, 9) catch {};
 
-    const json = try std.json.Stringify.valueAlloc(allocator, oci.State{
-        .ociVersion = parsed.value.ociVersion,
+    try oci.saveState(allocator, io, root, .{
         .id = config.id,
         .status = .created,
         .pid = handle.pid,
         .bundle = bundle,
-    }, .{ .emit_null_optional_fields = false });
-    defer allocator.free(json);
-    try cwd.writeFile(io, .{ .sub_path = state_path, .data = json });
+        .annotations = parsed.value.annotations,
+    });
     if (config.pid_file) |path| {
         const pid = try std.fmt.allocPrint(allocator, "{d}", .{handle.pid});
         defer allocator.free(pid);
-        try cwd.writeFile(io, .{ .sub_path = path, .data = pid });
+        try oci.atomicWrite(io, path, pid);
     }
+}
+
+fn stateHandle(state: oci.State) !Backend.Handle {
+    const pid = state.pid orelse return error.InvalidState;
+    if (pid <= 0) return error.InvalidState;
+    return .{ .id = state.id, .pid = pid };
+}
+
+fn readLiveState(allocator: std.mem.Allocator, io: std.Io, backend: Backend, config: Config) !std.json.Parsed(oci.State) {
+    var parsed = try oci.loadState(allocator, io, config.root, config.id);
+    errdefer parsed.deinit();
+    if (!std.mem.eql(u8, parsed.value.id, config.id)) return error.InvalidState;
+    if (parsed.value.status == .created or parsed.value.status == .running) {
+        if (!try backend.alive(try stateHandle(parsed.value))) {
+            parsed.value.status = .stopped;
+            try oci.saveState(allocator, io, config.root, parsed.value);
+        }
+    }
+    return parsed;
+}
+
+fn startContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, config: Config) !void {
+    var state = try readLiveState(allocator, io, backend, config);
+    defer state.deinit();
+    try oci.requireStart(state.value.status, true);
+    const spec = try oci.loadSpec(allocator, io, state.value.bundle);
+    defer spec.deinit();
+    try oci.requireStart(state.value.status, spec.value.process != null);
+    const path = try std.fs.path.join(allocator, &.{ config.root, config.id, oci.exec_fifo_name });
+    defer allocator.free(path);
+    const fifo = try std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only });
+    defer fifo.close(io);
+    var byte: [1]u8 = undefined;
+    if (try fifo.readStreaming(io, &.{&byte}) != 1 or byte[0] != 1) return error.StartFailed;
+    state.value.status = .running;
+    try oci.saveState(allocator, io, config.root, state.value);
+}
+
+fn killContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, config: Config) !void {
+    const signal = try parseSignal(config.signal);
+    const state = try readLiveState(allocator, io, backend, config);
+    defer state.deinit();
+    try oci.requireKill(state.value.status);
+    try backend.kill(try stateHandle(state.value), signal);
+}
+
+fn deleteContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, config: Config) !void {
+    const state = try readLiveState(allocator, io, backend, config);
+    defer state.deinit();
+    try oci.requireDelete(state.value.status);
+    try backend.delete(.{ .id = state.value.id, .pid = state.value.pid orelse 0 });
+    const path = try std.fs.path.join(allocator, &.{ config.root, config.id });
+    defer allocator.free(path);
+    try std.Io.Dir.cwd().deleteTree(io, path);
 }
 
 fn makeExecFifo(allocator: std.mem.Allocator, path: []const u8) !void {
@@ -183,38 +257,54 @@ pub fn main(init: std.process.Init) !u8 {
         );
         return 1;
     };
+    var implementation: backend_module.LinuxBackend = .{};
+    const backend = implementation.backend();
     switch (config.subcommand) {
         .state => {
-            var buffer: [4096]u8 = undefined;
-            var stdout = std.Io.File.stdout().writerStreaming(init.io, &buffer);
-            oci.writeState(allocator, init.io, config.root, config.id, &stdout.interface) catch |err| {
-                if (err == error.FileNotFound) {
-                    std.debug.print("igvano: container '{s}' does not exist\n", .{config.id});
-                } else {
-                    std.debug.print("igvano: state for '{s}' failed: {s}\n", .{ config.id, @errorName(err) });
-                }
+            const state = readLiveState(allocator, init.io, backend, config) catch |err| {
+                reportError(config, err);
                 return 1;
             };
+            defer state.deinit();
+            var buffer: [4096]u8 = undefined;
+            var stdout = std.Io.File.stdout().writerStreaming(init.io, &buffer);
+            try std.json.Stringify.value(state.value, .{ .emit_null_optional_fields = false }, &stdout.interface);
+            try stdout.interface.writeByte('\n');
             try stdout.interface.flush();
             return 0;
         },
         .create => {
-            var implementation: backend_module.LinuxBackend = .{};
-            createContainer(allocator, init.io, implementation.backend(), config) catch |err| {
-                if (err == error.ContainerExists) {
-                    std.debug.print("igvano: container '{s}' already exists\n", .{config.id});
-                } else {
-                    std.debug.print("igvano: create for '{s}' failed: {s}\n", .{ config.id, @errorName(err) });
-                }
+            createContainer(allocator, init.io, backend, config) catch |err| {
+                reportError(config, err);
                 return 1;
             };
             return 0;
         },
-        .start, .kill, .delete => std.debug.print("not implemented\n", .{}),
+        .start, .kill, .delete => {
+            const result = switch (config.subcommand) {
+                .start => startContainer(allocator, init.io, backend, config),
+                .kill => killContainer(allocator, init.io, backend, config),
+                .delete => deleteContainer(allocator, init.io, backend, config),
+                else => unreachable,
+            };
+            result catch |err| {
+                reportError(config, err);
+                return 1;
+            };
+            return 0;
+        },
     }
-    return 1;
 }
 
+fn reportError(config: Config, err: anyerror) void {
+    if (err == error.FileNotFound) {
+        std.debug.print("igvano: container '{s}' or a required file does not exist\n", .{config.id});
+    } else if (err == error.ContainerExists) {
+        std.debug.print("igvano: container '{s}' already exists\n", .{config.id});
+    } else {
+        std.debug.print("igvano: {s} for '{s}' failed: {s}\n", .{ @tagName(config.subcommand), config.id, @errorName(err) });
+    }
+}
 test "dispatch recognizes lifecycle subcommands and rejects unknown commands" {
     try std.testing.expectEqual(@as(?Subcommand, .state), std.meta.stringToEnum(Subcommand, "state"));
     try std.testing.expectEqual(@as(?Subcommand, .create), std.meta.stringToEnum(Subcommand, "create"));
@@ -311,6 +401,29 @@ test "kill parsing preserves an optional positional signal" {
     try std.testing.expectError(error.UnexpectedArgument, parseArgs(&.{ "igvano", "kill", "example", "TERM", "extra" }));
 }
 
+test "signal parsing accepts Linux names, prefixes, aliases and numbers" {
+    const cases = [_]struct { value: []const u8, signal: i32 }{
+        .{ .value = "TERM", .signal = 15 },
+        .{ .value = "SIGTERM", .signal = 15 },
+        .{ .value = "sigterm", .signal = 15 },
+        .{ .value = "KILL", .signal = 9 },
+        .{ .value = "SIGINT", .signal = 2 },
+        .{ .value = "USR1", .signal = 10 },
+        .{ .value = "CHLD", .signal = 17 },
+        .{ .value = "IOT", .signal = 6 },
+        .{ .value = "POLL", .signal = 29 },
+        .{ .value = "CLD", .signal = 17 },
+        .{ .value = "0", .signal = 0 },
+        .{ .value = "15", .signal = 15 },
+        .{ .value = "64", .signal = 64 },
+    };
+    try std.testing.expectEqual(@as(i32, 15), try parseSignal(null));
+    for (cases) |case| try std.testing.expectEqual(case.signal, try parseSignal(case.value));
+    for ([_][]const u8{ "", "SIG", "unknown", "-1", "65", "999999999999999", "9x", " 9", "+9" }) |value| {
+        try std.testing.expectError(error.InvalidSignal, parseSignal(value));
+    }
+}
+
 test "create rejects a duplicate id without changing existing state" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -394,7 +507,7 @@ test "create persists backend pid and absolute paths and rolls back a failed pid
 
         const vtable: Backend.VTable = .{
             .create = create,
-            .start = unused,
+            .alive = alive,
             .kill = kill,
             .delete = unused,
         };
@@ -410,6 +523,9 @@ test "create persists backend pid and absolute paths and rolls back a failed pid
             return error.NotImplemented;
         }
 
+        fn alive(_: *anyopaque, _: Backend.Handle) Backend.Error!bool {
+            return true;
+        }
         fn kill(ptr: *anyopaque, handle: Backend.Handle, signal: i32) Backend.Error!void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (handle.pid != 1234 or signal != 9) return error.CreateFailed;
@@ -422,7 +538,7 @@ test "create persists backend pid and absolute paths and rolls back a failed pid
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "bundle/config.json",
         .data =
-        \\{"ociVersion":"1.0.2","root":{"path":"rootfs"}}
+        \\{"ociVersion":"9.9.9","root":{"path":"rootfs"},"annotations":{"org.example.description":"hello"}}
         ,
     });
     const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
@@ -444,6 +560,7 @@ test "create persists backend pid and absolute paths and rolls back a failed pid
     try std.testing.expectEqual(@as(?i32, 1234), state.value.pid);
     try std.testing.expectEqualStrings("example", state.value.id);
     try std.testing.expectEqualStrings("1.0.2", state.value.ociVersion);
+    try std.testing.expectEqualStrings("hello", state.value.annotations.?.map.get("org.example.description").?);
     const absolute_bundle = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, bundle, std.testing.allocator);
     defer std.testing.allocator.free(absolute_bundle);
     try std.testing.expectEqualStrings(absolute_bundle, state.value.bundle);
@@ -464,4 +581,168 @@ test "create persists backend pid and absolute paths and rolls back a failed pid
     try std.testing.expectError(error.FileNotFound, createContainer(std.testing.allocator, std.testing.io, backend, config));
     try std.testing.expect(implementation.killed);
     try std.testing.expectError(error.FileNotFound, tmp.dir.openDir(std.testing.io, "other", .{}));
+}
+
+test "linux lifecycle exchanges the FIFO byte and persists running then stopped" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const linux = std.os.linux;
+    const posix = std.posix;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "example", .default_dir);
+    try tmp.dir.createDir(std.testing.io, "bundle", .default_dir);
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "bundle/config.json",
+        .data =
+        \\{"ociVersion":"1.0.2","root":{"path":"/"},"process":{"args":["/bin/sh"],"cwd":"/","user":{"uid":0,"gid":0}}}
+        ,
+    });
+    const relative = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer std.testing.allocator.free(relative);
+    const root = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, relative, std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const bundle = try std.fs.path.join(std.testing.allocator, &.{ root, "bundle" });
+    defer std.testing.allocator.free(bundle);
+    const fifo = try std.fs.path.join(std.testing.allocator, &.{ root, "example", oci.exec_fifo_name });
+    defer std.testing.allocator.free(fifo);
+    const fifo_z = try std.testing.allocator.dupeZ(u8, fifo);
+    defer std.testing.allocator.free(fifo_z);
+    try makeExecFifo(std.testing.allocator, fifo);
+    const result = posix.system.fork();
+    if (posix.errno(result) != .SUCCESS) return error.ForkFailed;
+    const pid: i32 = @intCast(result);
+    if (pid == 0) {
+        // Model an init waiting for the frontend's start handshake, without chroot.
+        const opened = linux.open(fifo_z, .{ .ACCMODE = .WRONLY, .CLOEXEC = true }, 0);
+        if (linux.errno(opened) != .SUCCESS) linux.exit_group(1);
+        const fd: posix.fd_t = @intCast(opened);
+        if (posix.system.write(fd, &[_]u8{1}, 1) != 1) linux.exit_group(1);
+        _ = linux.close(fd);
+        while (true) _ = linux.pause();
+    }
+    var reaped = false;
+    defer if (!reaped) {
+        _ = linux.kill(pid, .KILL);
+        var status: if (builtin.link_libc) c_int else u32 = undefined;
+        _ = posix.system.waitpid(pid, &status, 0);
+    };
+    try oci.saveState(std.testing.allocator, std.testing.io, root, .{
+        .id = "example",
+        .status = .created,
+        .pid = pid,
+        .bundle = bundle,
+    });
+    var implementation: backend_module.LinuxBackend = .{};
+    const backend = implementation.backend();
+    const config: Config = .{ .root = root, .subcommand = .start, .id = "example" };
+    try std.testing.expectError(error.InvalidStatus, deleteContainer(std.testing.allocator, std.testing.io, backend, config));
+    try killContainer(std.testing.allocator, std.testing.io, backend, .{ .root = root, .subcommand = .kill, .id = "example", .signal = "0" });
+    try startContainer(std.testing.allocator, std.testing.io, backend, config);
+    const running = try oci.loadState(std.testing.allocator, std.testing.io, root, "example");
+    defer running.deinit();
+    try std.testing.expectEqual(oci.Status.running, running.value.status);
+    try std.testing.expectError(error.InvalidStatus, startContainer(std.testing.allocator, std.testing.io, backend, config));
+    try std.testing.expectError(error.InvalidStatus, deleteContainer(std.testing.allocator, std.testing.io, backend, config));
+    try killContainer(std.testing.allocator, std.testing.io, backend, .{ .root = root, .subcommand = .kill, .id = "example", .signal = "SIGKILL" });
+    var status: if (builtin.link_libc) c_int else u32 = undefined;
+    while (true) {
+        switch (posix.errno(posix.system.waitpid(pid, &status, 0))) {
+            .SUCCESS => break,
+            .INTR => continue,
+            else => return error.WaitFailed,
+        }
+    }
+    reaped = true;
+    const stopped = try readLiveState(std.testing.allocator, std.testing.io, backend, config);
+    defer stopped.deinit();
+    try std.testing.expectEqual(oci.Status.stopped, stopped.value.status);
+    const persisted = try oci.loadState(std.testing.allocator, std.testing.io, root, "example");
+    defer persisted.deinit();
+    try std.testing.expectEqual(oci.Status.stopped, persisted.value.status);
+    try std.testing.expectError(error.InvalidStatus, killContainer(std.testing.allocator, std.testing.io, backend, config));
+    try deleteContainer(std.testing.allocator, std.testing.io, backend, config);
+    try std.testing.expectError(error.FileNotFound, oci.loadState(std.testing.allocator, std.testing.io, root, "example"));
+}
+
+test "linux start rejects an absent process before opening the FIFO" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "example", .default_dir);
+    try tmp.dir.createDir(std.testing.io, "bundle", .default_dir);
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "bundle/config.json",
+        .data =
+        \\{"ociVersion":"1.0.2","root":{"path":"/"}}
+        ,
+    });
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer std.testing.allocator.free(root);
+    const bundle = try std.fs.path.join(std.testing.allocator, &.{ root, "bundle" });
+    defer std.testing.allocator.free(bundle);
+    try oci.saveState(std.testing.allocator, std.testing.io, root, .{
+        .id = "example",
+        .status = .created,
+        .pid = std.os.linux.getpid(),
+        .bundle = bundle,
+    });
+    var implementation: backend_module.LinuxBackend = .{};
+    try std.testing.expectError(error.MissingProcess, startContainer(std.testing.allocator, std.testing.io, implementation.backend(), .{
+        .root = root,
+        .subcommand = .start,
+        .id = "example",
+    }));
+}
+
+test "linux state kill and delete refresh stale created and running states" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const linux = std.os.linux;
+    const posix = std.posix;
+    const result = posix.system.fork();
+    if (posix.errno(result) != .SUCCESS) return error.ForkFailed;
+    const pid: i32 = @intCast(result);
+    if (pid == 0) linux.exit_group(0);
+    var child_status: if (builtin.link_libc) c_int else u32 = undefined;
+    while (true) {
+        switch (posix.errno(posix.system.waitpid(pid, &child_status, 0))) {
+            .SUCCESS => break,
+            .INTR => continue,
+            else => return error.WaitFailed,
+        }
+    }
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer std.testing.allocator.free(root);
+    var implementation: backend_module.LinuxBackend = .{};
+    const backend = implementation.backend();
+    for ([_]oci.Status{ .created, .running }) |status| {
+        for ([_]Subcommand{ .state, .kill, .delete }) |subcommand| {
+            try tmp.dir.createDirPath(std.testing.io, "example");
+            try oci.saveState(std.testing.allocator, std.testing.io, root, .{
+                .id = "example",
+                .status = status,
+                .pid = pid,
+                .bundle = "/bundle",
+            });
+            const config: Config = .{ .root = root, .subcommand = subcommand, .id = "example" };
+            switch (subcommand) {
+                .state => {
+                    const state = try readLiveState(std.testing.allocator, std.testing.io, backend, config);
+                    defer state.deinit();
+                    try std.testing.expectEqual(oci.Status.stopped, state.value.status);
+                },
+                .kill => try std.testing.expectError(error.InvalidStatus, killContainer(std.testing.allocator, std.testing.io, backend, config)),
+                .delete => {
+                    try deleteContainer(std.testing.allocator, std.testing.io, backend, config);
+                    try std.testing.expectError(error.FileNotFound, oci.loadState(std.testing.allocator, std.testing.io, root, "example"));
+                    continue;
+                },
+                else => unreachable,
+            }
+            const persisted = try oci.loadState(std.testing.allocator, std.testing.io, root, "example");
+            defer persisted.deinit();
+            try std.testing.expectEqual(oci.Status.stopped, persisted.value.status);
+        }
+    }
 }

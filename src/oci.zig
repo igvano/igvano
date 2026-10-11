@@ -2,6 +2,7 @@ const std = @import("std");
 
 pub const state_file_name = "state.json";
 pub const exec_fifo_name = "exec.fifo";
+pub const runtime_oci_version = "1.0.2";
 
 /// Parsed config.json values needed by a namespace backend.
 pub const Spec = struct {
@@ -11,6 +12,7 @@ pub const Spec = struct {
     hostname: ?[]const u8 = null,
     mounts: ?[]const Mount = null,
     linux: ?Linux = null,
+    annotations: ?std.json.ArrayHashMap([]const u8) = null,
 
     pub const Root = struct {
         path: []const u8,
@@ -22,6 +24,7 @@ pub const Spec = struct {
         env: ?[]const []const u8 = null,
         cwd: []const u8,
         terminal: ?bool = null,
+        noNewPrivileges: bool = false,
         user: User,
     };
 
@@ -82,14 +85,52 @@ pub const Status = enum {
     stopped,
 };
 
+pub fn requireStart(status: Status, has_process: bool) !void {
+    if (status != .created) return error.InvalidStatus;
+    if (!has_process) return error.MissingProcess;
+}
+
+pub fn requireKill(status: Status) !void {
+    if (status != .created and status != .running) return error.InvalidStatus;
+}
+
+pub fn requireDelete(status: Status) !void {
+    if (status != .stopped) return error.InvalidStatus;
+}
+
 pub const State = struct {
-    ociVersion: []const u8,
+    ociVersion: []const u8 = runtime_oci_version,
     id: []const u8,
     status: Status,
     pid: ?i32 = null,
     bundle: []const u8,
     annotations: ?std.json.ArrayHashMap([]const u8) = null,
 };
+
+/// A named temporary file in the destination directory is renamed after writing.
+pub fn atomicWrite(io: std.Io, path: []const u8, bytes: []const u8) !void {
+    var file = try std.Io.Dir.cwd().createFileAtomic(io, path, .{ .replace = true });
+    defer file.deinit(io);
+    try file.file.writeStreamingAll(io, bytes);
+    try file.replace(io);
+}
+
+pub fn saveState(allocator: std.mem.Allocator, io: std.Io, root: []const u8, state: State) !void {
+    const path = try std.fs.path.join(allocator, &.{ root, state.id, state_file_name });
+    defer allocator.free(path);
+    const json = try std.json.Stringify.valueAlloc(allocator, state, .{ .emit_null_optional_fields = false });
+    defer allocator.free(json);
+    try atomicWrite(io, path, json);
+}
+
+/// The caller owns the returned state and must call deinit().
+pub fn loadState(allocator: std.mem.Allocator, io: std.Io, root: []const u8, id: []const u8) !std.json.Parsed(State) {
+    const path = try std.fs.path.join(allocator, &.{ root, id, state_file_name });
+    defer allocator.free(path);
+    const json = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1 << 20));
+    defer allocator.free(json);
+    return std.json.parseFromSlice(State, allocator, json, .{ .allocate = .alloc_always });
+}
 
 pub fn writeState(
     allocator: std.mem.Allocator,
@@ -98,11 +139,7 @@ pub fn writeState(
     id: []const u8,
     writer: *std.Io.Writer,
 ) !void {
-    const path = try std.fs.path.join(allocator, &.{ root, id, state_file_name });
-    defer allocator.free(path);
-    const json = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1 << 20));
-    defer allocator.free(json);
-    const parsed = try std.json.parseFromSlice(State, allocator, json, .{});
+    const parsed = try loadState(allocator, io, root, id);
     defer parsed.deinit();
     try std.json.Stringify.value(parsed.value, .{ .emit_null_optional_fields = false }, writer);
     try writer.writeByte('\n');
@@ -272,6 +309,7 @@ test "loadSpec parses a runc-style config and tolerates unknown fields" {
     try std.testing.expectEqualStrings("TERM=xterm", process.env.?[1]);
     try std.testing.expectEqualStrings("/", process.cwd);
     try std.testing.expectEqual(@as(?bool, true), process.terminal);
+    try std.testing.expect(process.noNewPrivileges);
     try std.testing.expectEqual(@as(u32, 1000), process.user.uid);
     try std.testing.expectEqual(@as(u32, 1001), process.user.gid);
     try std.testing.expectEqualStrings("example", spec.hostname.?);
@@ -290,6 +328,7 @@ test "loadSpec parses a runc-style config and tolerates unknown fields" {
     try std.testing.expectEqual(.mount, namespaces[1].type);
     try std.testing.expectEqual(.uts, namespaces[2].type);
     try std.testing.expect(namespaces[0].path == null);
+    try std.testing.expectEqualStrings("hello", spec.annotations.?.map.get("org.example.description").?);
 }
 
 test "spec defaults omitted optional fields" {
@@ -301,10 +340,12 @@ test "spec defaults omitted optional fields" {
     try std.testing.expect(!parsed.value.root.readonly);
     try std.testing.expect(parsed.value.process.?.env == null);
     try std.testing.expect(parsed.value.process.?.terminal == null);
+    try std.testing.expect(!parsed.value.process.?.noNewPrivileges);
     try std.testing.expect(parsed.value.process.?.user.additionalGids == null);
     try std.testing.expect(parsed.value.hostname == null);
     try std.testing.expect(parsed.value.mounts == null);
     try std.testing.expect(parsed.value.linux == null);
+    try std.testing.expect(parsed.value.annotations == null);
 }
 
 test "process user retains supplementary groups from JSON" {
@@ -403,4 +444,60 @@ test "spec accepts an omitted process and a time namespace" {
 test "rootfs resolution rejects a relative bundle even for an absolute rootfs" {
     try std.testing.expectError(error.RelativeBundle, resolveRootfs(std.testing.allocator, "bundle", "rootfs"));
     try std.testing.expectError(error.RelativeBundle, resolveRootfs(std.testing.allocator, "bundle", "/rootfs"));
+}
+
+test "lifecycle operations enforce their legal statuses" {
+    for ([_]Status{ .creating, .created, .running, .stopped }) |status| {
+        if (status == .created) {
+            try requireStart(status, true);
+            try std.testing.expectError(error.MissingProcess, requireStart(status, false));
+        } else {
+            try std.testing.expectError(error.InvalidStatus, requireStart(status, true));
+        }
+        if (status == .created or status == .running) {
+            try requireKill(status);
+        } else {
+            try std.testing.expectError(error.InvalidStatus, requireKill(status));
+        }
+        if (status == .stopped) {
+            try requireDelete(status);
+        } else {
+            try std.testing.expectError(error.InvalidStatus, requireDelete(status));
+        }
+    }
+}
+
+test "atomic write replaces complete contents and cleans up after a failed rename" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer std.testing.allocator.free(root);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ root, "state.json" });
+    defer std.testing.allocator.free(path);
+    const original = "first, longer contents";
+    try atomicWrite(std.testing.io, path, original);
+    const old_file = try tmp.dir.openFile(std.testing.io, "state.json", .{});
+    defer old_file.close(std.testing.io);
+    try atomicWrite(std.testing.io, path, "second");
+    // Readers that already opened the old state keep seeing its complete contents.
+    var old_contents: [original.len]u8 = undefined;
+    try std.testing.expectEqual(original.len, try old_file.readPositionalAll(std.testing.io, &old_contents, 0));
+    try std.testing.expectEqualStrings(original, &old_contents);
+    const contents = try tmp.dir.readFileAlloc(std.testing.io, "state.json", std.testing.allocator, .limited(1024));
+    defer std.testing.allocator.free(contents);
+    try std.testing.expectEqualStrings("second", contents);
+
+    try tmp.dir.createDir(std.testing.io, "directory", .default_dir);
+    const directory = try std.fs.path.join(std.testing.allocator, &.{ root, "directory" });
+    defer std.testing.allocator.free(directory);
+    if (atomicWrite(std.testing.io, directory, "cannot replace a directory")) {
+        return error.TestUnexpectedResult;
+    } else |_| {}
+    var entries = tmp.dir.iterate();
+    var count: usize = 0;
+    while (try entries.next(std.testing.io)) |entry| {
+        try std.testing.expect(std.mem.eql(u8, entry.name, "state.json") or std.mem.eql(u8, entry.name, "directory"));
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), count);
 }

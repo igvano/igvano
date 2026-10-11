@@ -31,23 +31,24 @@ pub fn namespaceFlags(config: ?oci.Spec.Linux) Backend.Error!usize {
 }
 
 pub const LinuxBackend = struct {
-    created: ?Backend.Handle = null,
-
     pub fn backend(self: *LinuxBackend) Backend {
         return .{ .ptr = self, .vtable = &vtable };
     }
 
     const vtable: Backend.VTable = .{
         .create = create,
-        .start = start,
+        .alive = alive,
         .kill = kill,
         .delete = delete,
     };
 
-    fn create(ptr: *anyopaque, options: Backend.CreateOptions) Backend.Error!Backend.Handle {
+    fn create(_: *anyopaque, options: Backend.CreateOptions) Backend.Error!Backend.Handle {
         if (comptime builtin.os.tag == .linux) {
             const flags = try namespaceFlags(options.spec.linux);
+            if (options.spec.hostname != null and flags & linux.CLONE.NEWUTS == 0)
+                return error.InvalidConfig;
             if (options.spec.process) |process| {
+                if (process.terminal orelse false) return error.Unsupported;
                 if (process.args.len == 0) return error.InvalidProcess;
             }
             if (!std.fs.path.isAbsolute(options.exec_fifo) or
@@ -89,6 +90,8 @@ pub const LinuxBackend = struct {
                 // NEWPID affects the next fork, making child2 pid 1 inside the namespace.
                 const child2 = forkProcess() catch |err| failCreate(report[1], err);
                 if (child2 == 0) {
+                    // ponytail: a create that dies mid-flight can leak a blocked init.
+                    // PDEATHSIG races with child1's normal exit; fix with a parent pidfd watch.
                     closeFd(report[1]);
                     closeFd(ready[0]);
                     runInit(options.spec, flags, rootfs, cwd, fifo, argv.ptr, envp.ptr, ready[1]);
@@ -126,31 +129,34 @@ pub const LinuxBackend = struct {
                 if (response.pid > 0) _ = linux.kill(response.pid, .KILL);
                 return error.CreateFailed;
             }
-            const handle: Backend.Handle = .{ .id = options.id, .pid = response.pid };
-            const self: *LinuxBackend = @ptrCast(@alignCast(ptr));
-            self.created = handle;
-            return handle;
+            return .{ .id = options.id, .pid = response.pid };
         } else {
             return error.NotImplemented;
         }
     }
 
-    fn start(_: *anyopaque, _: Backend.Handle) Backend.Error!void {
-        return error.NotImplemented;
+    fn alive(_: *anyopaque, handle: Backend.Handle) Backend.Error!bool {
+        if (comptime builtin.os.tag == .linux) {
+            if (handle.pid <= 0) return error.InvalidProcess;
+            return switch (linux.errno(linux.kill(handle.pid, @enumFromInt(0)))) {
+                .SUCCESS, .PERM => true,
+                .SRCH => false,
+                else => error.LivenessFailed,
+            };
+        } else {
+            return error.NotImplemented;
+        }
     }
 
-    fn kill(ptr: *anyopaque, handle: Backend.Handle, signal: i32) Backend.Error!void {
+    fn kill(_: *anyopaque, handle: Backend.Handle, signal: i32) Backend.Error!void {
         if (comptime builtin.os.tag == .linux) {
-            // Roll back a create whose state could not be saved. Persisted identity
-            // checks and the kill subcommand belong to the next lifecycle milestone.
-            const self: *LinuxBackend = @ptrCast(@alignCast(ptr));
-            const created = self.created orelse return error.NotImplemented;
-            if (signal != 9 or created.pid != handle.pid or
-                !std.mem.eql(u8, created.id, handle.id)) return error.NotImplemented;
-            switch (linux.errno(linux.kill(handle.pid, .KILL))) {
-                .SUCCESS, .SRCH => self.created = null,
+            if (handle.pid <= 0) return error.InvalidProcess;
+            if (signal < 0 or signal >= linux.NSIG) return error.KillFailed;
+            switch (linux.errno(linux.kill(handle.pid, @enumFromInt(@as(u32, @intCast(signal)))))) {
+                .SUCCESS => {},
+                .SRCH => return error.ProcessNotFound,
                 .PERM => return error.PermissionDenied,
-                else => return error.CreateFailed,
+                else => return error.KillFailed,
             }
         } else {
             return error.NotImplemented;
@@ -158,7 +164,12 @@ pub const LinuxBackend = struct {
     }
 
     fn delete(_: *anyopaque, _: Backend.Handle) Backend.Error!void {
-        return error.NotImplemented;
+        if (comptime builtin.os.tag == .linux) {
+            // No backend resources to clean up until cgroups are implemented.
+            // The frontend owns and removes the runtime state directory.
+        } else {
+            return error.NotImplemented;
+        }
     }
 };
 
@@ -296,6 +307,11 @@ fn runInit(
     checkResult(linux.setgroups(groups.len, groups.ptr)) catch linux.exit_group(1);
     checkResult(linux.setgid(process.user.gid)) catch linux.exit_group(1);
     checkResult(linux.setuid(process.user.uid)) catch linux.exit_group(1);
+    if (process.noNewPrivileges) {
+        checkResult(linux.prctl(@intFromEnum(linux.PR.SET_NO_NEW_PRIVS), 1, 0, 0, 0)) catch linux.exit_group(1);
+    }
+    // Linux CLOSE_RANGE_CLOEXEC is 1 << 2; Zig 0.16's packed flags use 1 << 1.
+    checkResult(linux.syscall3(.close_range, 3, std.math.maxInt(u32), 1 << 2)) catch linux.exit_group(1);
     execProcess(argv, envp);
 }
 
@@ -328,7 +344,8 @@ fn execProcess(argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*:0]con
     linux.exit_group(1);
 }
 
-test "linux backend leaves other lifecycle operations unimplemented" {
+test "linux backend is unavailable on other platforms" {
+    if (comptime builtin.os.tag == .linux) return error.SkipZigTest;
     const spec: oci.Spec = .{
         .ociVersion = "1.0.2",
         .root = .{ .path = "rootfs" },
@@ -346,9 +363,64 @@ test "linux backend leaves other lifecycle operations unimplemented" {
             .spec = &spec,
         }));
     }
-    try std.testing.expectError(error.NotImplemented, backend.start(handle));
+    try std.testing.expectError(error.NotImplemented, backend.alive(handle));
     try std.testing.expectError(error.NotImplemented, backend.kill(handle, 15));
     try std.testing.expectError(error.NotImplemented, backend.delete(handle));
+}
+
+test "linux liveness and signaling work with a handle loaded by a new backend" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const pipe = try makePipe();
+    defer closeFd(pipe[0]);
+    defer closeFd(pipe[1]);
+    const pid = try forkProcess();
+    if (pid == 0) {
+        closeFd(pipe[1]);
+        var byte: [1]u8 = undefined;
+        _ = readAll(pipe[0], &byte);
+        linux.exit_group(0);
+    }
+    var reaped = false;
+    defer if (!reaped) {
+        _ = linux.kill(pid, .KILL);
+        _ = waitChild(pid) catch {};
+    };
+    var implementation: LinuxBackend = .{};
+    const backend = implementation.backend();
+    const handle: Backend.Handle = .{ .id = "persisted", .pid = pid };
+    try std.testing.expect(try backend.alive(handle));
+    try backend.kill(handle, 0);
+    try std.testing.expectError(error.InvalidProcess, backend.kill(.{ .id = "invalid", .pid = 0 }, 9));
+    try std.testing.expectError(error.InvalidProcess, backend.alive(.{ .id = "invalid", .pid = -1 }));
+    try std.testing.expectError(error.KillFailed, backend.kill(handle, 65));
+    try backend.kill(handle, 9);
+    _ = try waitChild(pid);
+    reaped = true;
+    try std.testing.expect(!try backend.alive(handle));
+    try std.testing.expectError(error.ProcessNotFound, backend.kill(handle, 15));
+    try backend.delete(handle);
+}
+
+test "linux create rejects hostname without UTS isolation and unsupported terminals" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var spec: oci.Spec = .{
+        .ociVersion = "1.0.2",
+        .root = .{ .path = "/" },
+        .hostname = "must-not-change-the-host",
+    };
+    var implementation: LinuxBackend = .{};
+    const backend = implementation.backend();
+    const options: Backend.CreateOptions = .{
+        .allocator = std.testing.allocator,
+        .id = "example",
+        .rootfs = "/",
+        .exec_fifo = "/dev/null",
+        .spec = &spec,
+    };
+    try std.testing.expectError(error.InvalidConfig, backend.create(options));
+    spec.hostname = null;
+    spec.process = .{ .args = &.{"/bin/sh"}, .cwd = "/", .terminal = true, .user = .{ .uid = 0, .gid = 0 } };
+    try std.testing.expectError(error.Unsupported, backend.create(options));
 }
 
 test "linux create rejects relative process cwd" {
@@ -383,7 +455,6 @@ test "linux create rejects relative process cwd" {
             if (builtin.os.tag == .linux) error.InvalidProcess else error.NotImplemented,
             result,
         );
-        try std.testing.expect(implementation.created == null);
     }
 }
 
@@ -409,7 +480,6 @@ test "linux create rejects empty process args" {
         if (builtin.os.tag == .linux) error.InvalidProcess else error.NotImplemented,
         result,
     );
-    try std.testing.expect(implementation.created == null);
 }
 
 test "linux create rejects a cwd missing from the resolved rootfs" {
@@ -443,7 +513,6 @@ test "linux create rejects a cwd missing from the resolved rootfs" {
         if (builtin.os.tag == .linux) error.CreateFailed else error.NotImplemented,
         result,
     );
-    try std.testing.expect(implementation.created == null);
 }
 
 test "namespace flags map each namespace and combine flags without system calls" {
@@ -603,6 +672,37 @@ test "linux init exits nonzero instead of exec when it cannot apply process user
     try std.testing.expectEqual(@as(u32, 1 << 8), try waitChild(pid));
 }
 
+test "linux init marks inherited descriptors CLOEXEC and sets noNewPrivileges" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (linux.geteuid() != 0) return error.SkipZigTest;
+    const command = "test ! -e /proc/self/fd/200 && grep -q '^NoNewPrivs:[[:space:]]*1$' /proc/self/status";
+    const spec: oci.Spec = .{
+        .ociVersion = "1.0.2",
+        .root = .{ .path = "/" },
+        .process = .{
+            .args = &.{ "/bin/sh", "-c", command },
+            .cwd = "/",
+            .user = .{ .uid = 0, .gid = 0 },
+            .noNewPrivileges = true,
+        },
+    };
+    const argv = [_:null]?[*:0]const u8{ "/bin/sh", "-c", command };
+    const envp = [_:null]?[*:0]const u8{};
+    const ready = try makePipe();
+    defer closeFd(ready[0]);
+    const pid = forkProcess() catch |err| {
+        closeFd(ready[1]);
+        return err;
+    };
+    if (pid == 0) {
+        closeFd(ready[0]);
+        checkResult(linux.dup2(ready[1], 200)) catch linux.exit_group(2);
+        runInit(&spec, 0, "/", "/", "/dev/null", &argv, &envp, ready[1]);
+    }
+    closeFd(ready[1]);
+    try std.testing.expectEqual(@as(u32, 0), try waitChild(pid));
+}
+
 test "linux create reports child setup failures without leaving an init" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
@@ -628,7 +728,6 @@ test "linux create reports child setup failures without leaving an init" {
         .exec_fifo = fifo,
         .spec = &spec,
     }));
-    try std.testing.expect(implementation.created == null);
 }
 
 test "linux create accepts an empty rootfs and returns a live blocked init" {
@@ -669,8 +768,6 @@ test "linux create accepts an empty rootfs and returns a live blocked init" {
         try std.testing.expect(handle.pid > 0);
         try std.testing.expectEqualStrings("example", handle.id);
         try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.kill(handle.pid, @enumFromInt(0))));
-        try std.testing.expectError(error.NotImplemented, backend.kill(.{ .id = "other", .pid = handle.pid }, 9));
         try backend.kill(handle, 9);
-        try std.testing.expect(implementation.created == null);
     }
 }
