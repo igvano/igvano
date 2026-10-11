@@ -1,10 +1,13 @@
 const std = @import("std");
 
+pub const state_file_name = "state.json";
+pub const exec_fifo_name = "exec.fifo";
+
 /// Parsed config.json values needed by a namespace backend.
 pub const Spec = struct {
     ociVersion: []const u8,
     root: Root,
-    process: Process,
+    process: ?Process = null,
     hostname: ?[]const u8 = null,
     mounts: ?[]const Mount = null,
     linux: ?Linux = null,
@@ -25,6 +28,7 @@ pub const Spec = struct {
     pub const User = struct {
         uid: u32,
         gid: u32,
+        additionalGids: ?[]const u32 = null,
     };
 
     pub const Mount = struct {
@@ -41,7 +45,7 @@ pub const Spec = struct {
     };
 
     pub const Namespace = struct {
-        type: enum { pid, network, mount, ipc, uts, user, cgroup },
+        type: enum { pid, network, mount, ipc, uts, user, cgroup, time },
         path: ?[]const u8 = null,
     };
 
@@ -53,12 +57,10 @@ pub const Spec = struct {
 };
 
 /// Loads <bundle>/config.json. The caller owns the result and must call deinit().
-pub fn loadSpec(allocator: std.mem.Allocator, bundle_dir: []const u8) !std.json.Parsed(Spec) {
-    var threaded: std.Io.Threaded = .init_single_threaded;
-    defer threaded.deinit();
+pub fn loadSpec(allocator: std.mem.Allocator, io: std.Io, bundle_dir: []const u8) !std.json.Parsed(Spec) {
     const path = try std.fs.path.join(allocator, &.{ bundle_dir, "config.json" });
     defer allocator.free(path);
-    const json = try std.Io.Dir.cwd().readFileAlloc(threaded.io(), path, allocator, .limited(1 << 20));
+    const json = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1 << 20));
     defer allocator.free(json);
     return std.json.parseFromSlice(Spec, allocator, json, .{
         .ignore_unknown_fields = true,
@@ -68,6 +70,7 @@ pub fn loadSpec(allocator: std.mem.Allocator, bundle_dir: []const u8) !std.json.
 
 /// Resolves root.path against an absolute bundle directory. The caller owns the path.
 pub fn resolveRootfs(allocator: std.mem.Allocator, bundle_dir: []const u8, root_path: []const u8) ![]u8 {
+    if (!std.fs.path.isAbsolute(bundle_dir)) return error.RelativeBundle;
     if (std.fs.path.isAbsolute(root_path)) return allocator.dupe(u8, root_path);
     return std.fs.path.join(allocator, &.{ bundle_dir, root_path });
 }
@@ -95,7 +98,7 @@ pub fn writeState(
     id: []const u8,
     writer: *std.Io.Writer,
 ) !void {
-    const path = try std.fs.path.join(allocator, &.{ root, id, "state.json" });
+    const path = try std.fs.path.join(allocator, &.{ root, id, state_file_name });
     defer allocator.free(path);
     const json = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1 << 20));
     defer allocator.free(json);
@@ -253,23 +256,24 @@ test "loadSpec parses a runc-style config and tolerates unknown fields" {
 
     const bundle = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
     defer std.testing.allocator.free(bundle);
-    const parsed = try loadSpec(std.testing.allocator, bundle);
+    const parsed = try loadSpec(std.testing.allocator, std.testing.io, bundle);
     defer parsed.deinit();
     const spec = parsed.value;
     try std.testing.expectEqualStrings("1.0.2", spec.ociVersion);
     try std.testing.expectEqualStrings("rootfs", spec.root.path);
     try std.testing.expect(spec.root.readonly);
-    try std.testing.expectEqual(@as(usize, 3), spec.process.args.len);
-    try std.testing.expectEqualStrings("/bin/sh", spec.process.args[0]);
-    try std.testing.expectEqualStrings("-c", spec.process.args[1]);
-    try std.testing.expectEqualStrings("echo hello", spec.process.args[2]);
-    try std.testing.expectEqual(@as(usize, 2), spec.process.env.?.len);
-    try std.testing.expectEqualStrings("PATH=/usr/bin:/bin", spec.process.env.?[0]);
-    try std.testing.expectEqualStrings("TERM=xterm", spec.process.env.?[1]);
-    try std.testing.expectEqualStrings("/", spec.process.cwd);
-    try std.testing.expectEqual(@as(?bool, true), spec.process.terminal);
-    try std.testing.expectEqual(@as(u32, 1000), spec.process.user.uid);
-    try std.testing.expectEqual(@as(u32, 1001), spec.process.user.gid);
+    const process = spec.process.?;
+    try std.testing.expectEqual(@as(usize, 3), process.args.len);
+    try std.testing.expectEqualStrings("/bin/sh", process.args[0]);
+    try std.testing.expectEqualStrings("-c", process.args[1]);
+    try std.testing.expectEqualStrings("echo hello", process.args[2]);
+    try std.testing.expectEqual(@as(usize, 2), process.env.?.len);
+    try std.testing.expectEqualStrings("PATH=/usr/bin:/bin", process.env.?[0]);
+    try std.testing.expectEqualStrings("TERM=xterm", process.env.?[1]);
+    try std.testing.expectEqualStrings("/", process.cwd);
+    try std.testing.expectEqual(@as(?bool, true), process.terminal);
+    try std.testing.expectEqual(@as(u32, 1000), process.user.uid);
+    try std.testing.expectEqual(@as(u32, 1001), process.user.gid);
     try std.testing.expectEqualStrings("example", spec.hostname.?);
     try std.testing.expectEqual(@as(usize, 1), spec.mounts.?.len);
     const mount = spec.mounts.?[0];
@@ -295,11 +299,25 @@ test "spec defaults omitted optional fields" {
     defer parsed.deinit();
 
     try std.testing.expect(!parsed.value.root.readonly);
-    try std.testing.expect(parsed.value.process.env == null);
-    try std.testing.expect(parsed.value.process.terminal == null);
+    try std.testing.expect(parsed.value.process.?.env == null);
+    try std.testing.expect(parsed.value.process.?.terminal == null);
+    try std.testing.expect(parsed.value.process.?.user.additionalGids == null);
     try std.testing.expect(parsed.value.hostname == null);
     try std.testing.expect(parsed.value.mounts == null);
     try std.testing.expect(parsed.value.linux == null);
+}
+
+test "process user retains supplementary groups from JSON" {
+    const json = "{\"uid\":1000,\"gid\":1000,\"additionalGids\":[1001,1002]}";
+    const parsed = try std.json.parseFromSlice(Spec.User, std.testing.allocator, json, .{
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+    const output = try std.json.Stringify.valueAlloc(std.testing.allocator, parsed.value, .{
+        .emit_null_optional_fields = false,
+    });
+    defer std.testing.allocator.free(output);
+    try std.testing.expectEqualStrings(json, output);
 }
 
 test "spec parses namespace paths and user id mappings" {
@@ -346,7 +364,7 @@ test "loadSpec reports a missing config" {
     defer tmp.cleanup();
     const bundle = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
     defer std.testing.allocator.free(bundle);
-    try std.testing.expectError(error.FileNotFound, loadSpec(std.testing.allocator, bundle));
+    try std.testing.expectError(error.FileNotFound, loadSpec(std.testing.allocator, std.testing.io, bundle));
 }
 
 test "loadSpec rejects files larger than one MiB" {
@@ -358,7 +376,7 @@ test "loadSpec rejects files larger than one MiB" {
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "config.json", .data = data });
     const bundle = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
     defer std.testing.allocator.free(bundle);
-    try std.testing.expectError(error.StreamTooLong, loadSpec(std.testing.allocator, bundle));
+    try std.testing.expectError(error.StreamTooLong, loadSpec(std.testing.allocator, std.testing.io, bundle));
 }
 
 test "rootfs resolution uses the bundle only for relative paths" {
@@ -371,4 +389,18 @@ test "rootfs resolution uses the bundle only for relative paths" {
         defer std.testing.allocator.free(rootfs);
         try std.testing.expectEqualStrings(case.expected, rootfs);
     }
+}
+
+test "spec accepts an omitted process and a time namespace" {
+    const parsed = try std.json.parseFromSlice(Spec, std.testing.allocator,
+        \\{"ociVersion":"1.0.2","root":{"path":"rootfs"},"linux":{"namespaces":[{"type":"time"}]}}
+    , .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.process == null);
+    try std.testing.expectEqual(.time, parsed.value.linux.?.namespaces.?[0].type);
+}
+
+test "rootfs resolution rejects a relative bundle even for an absolute rootfs" {
+    try std.testing.expectError(error.RelativeBundle, resolveRootfs(std.testing.allocator, "bundle", "rootfs"));
+    try std.testing.expectError(error.RelativeBundle, resolveRootfs(std.testing.allocator, "bundle", "/rootfs"));
 }

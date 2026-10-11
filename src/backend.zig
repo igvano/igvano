@@ -9,9 +9,12 @@ pub const Backend = struct {
 
     /// Strings and the parsed spec are borrowed; the frontend owns their memory.
     pub const CreateOptions = struct {
+        allocator: std.mem.Allocator,
         id: []const u8,
         /// Absolute rootfs path resolved by the frontend.
         rootfs: []const u8,
+        /// Absolute path to the FIFO created by the frontend.
+        exec_fifo: []const u8,
         spec: *const oci.Spec,
     };
 
@@ -21,7 +24,16 @@ pub const Backend = struct {
         pid: i32,
     };
 
-    pub const Error = error{NotImplemented};
+    pub const Error = error{
+        NotImplemented,
+        Unsupported,
+        InvalidConfig,
+        InvalidProcess,
+        InvalidPath,
+        PermissionDenied,
+        SystemResources,
+        CreateFailed,
+    } || std.mem.Allocator.Error;
 
     /// Backends receive parsed values only; the frontend loads config.json and resolves paths.
     pub const VTable = struct {
@@ -99,7 +111,13 @@ test "backend dispatches lifecycle operations through its vtable" {
         .root = .{ .path = "rootfs" },
         .process = .{ .args = &.{"/bin/sh"}, .cwd = "/", .user = .{ .uid = 0, .gid = 0 } },
     };
-    const options: Backend.CreateOptions = .{ .id = "example", .rootfs = "/tmp/bundle/rootfs", .spec = &spec };
+    const options: Backend.CreateOptions = .{
+        .allocator = std.testing.allocator,
+        .id = "example",
+        .rootfs = "/tmp/bundle/rootfs",
+        .exec_fifo = "/tmp/containers/example/exec.fifo",
+        .spec = &spec,
+    };
     var implementation: TestBackend = .{};
     const backend: Backend = .{ .ptr = &implementation, .vtable = &TestBackend.vtable };
     const handle = try backend.create(options);
@@ -107,6 +125,7 @@ test "backend dispatches lifecycle operations through its vtable" {
     try std.testing.expectEqual(@as(i32, 1234), handle.pid);
     try std.testing.expectEqualStrings("example", implementation.options.?.id);
     try std.testing.expectEqualStrings("/tmp/bundle/rootfs", implementation.options.?.rootfs);
+    try std.testing.expectEqualStrings("/tmp/containers/example/exec.fifo", implementation.options.?.exec_fifo);
     try std.testing.expect(implementation.options.?.spec == &spec);
     try backend.start(handle);
     try std.testing.expectEqualStrings("example", implementation.started.?.id);

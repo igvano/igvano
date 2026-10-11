@@ -1,5 +1,8 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const oci = @import("igvano").oci;
+const backend_module = @import("igvano").backend;
+const Backend = backend_module.Backend;
 
 pub const default_root = "/run/igvano";
 
@@ -15,6 +18,9 @@ const Config = struct {
     root: []const u8,
     subcommand: Subcommand,
     id: []const u8,
+    bundle: ?[]const u8 = null,
+    pid_file: ?[]const u8 = null,
+    signal: ?[]const u8 = null,
 };
 
 fn parseArgs(args: []const []const u8) !Config {
@@ -37,15 +43,120 @@ fn parseArgs(args: []const []const u8) !Config {
     const subcommand = std.meta.stringToEnum(Subcommand, args[index]) orelse
         return error.UnknownSubcommand;
     index += 1;
+
+    var bundle: ?[]const u8 = null;
+    var pid_file: ?[]const u8 = null;
+    if (subcommand == .create) {
+        while (index < args.len and std.mem.startsWith(u8, args[index], "-")) : (index += 1) {
+            if (std.mem.eql(u8, args[index], "--bundle")) {
+                index += 1;
+                if (index >= args.len or args[index].len == 0 or std.mem.startsWith(u8, args[index], "--"))
+                    return error.MissingBundle;
+                bundle = args[index];
+            } else if (std.mem.startsWith(u8, args[index], "--bundle=")) {
+                bundle = args[index]["--bundle=".len..];
+                if (bundle.?.len == 0) return error.MissingBundle;
+            } else if (std.mem.eql(u8, args[index], "--pid-file")) {
+                index += 1;
+                if (index >= args.len or args[index].len == 0 or std.mem.startsWith(u8, args[index], "--"))
+                    return error.MissingPidFile;
+                pid_file = args[index];
+            } else if (std.mem.startsWith(u8, args[index], "--pid-file=")) {
+                pid_file = args[index]["--pid-file=".len..];
+                if (pid_file.?.len == 0) return error.MissingPidFile;
+            } else {
+                return error.UnknownOption;
+            }
+        }
+        if (bundle == null) bundle = ".";
+    }
     if (index >= args.len) return error.MissingId;
-    if (args.len - index != 1) return error.UnexpectedArgument;
+    const remaining = args.len - index;
+    if (remaining != 1 and !(subcommand == .kill and remaining == 2)) return error.UnexpectedArgument;
     const id = args[index];
-    if (id.len == 0 or std.mem.eql(u8, id, ".") or std.mem.eql(u8, id, "..") or
+    if (id.len == 0 or std.mem.indexOfScalar(u8, id, 0) != null or std.mem.eql(u8, id, ".") or std.mem.eql(u8, id, "..") or
         std.mem.indexOfScalar(u8, id, '/') != null or std.mem.startsWith(u8, id, "-"))
     {
         return error.InvalidId;
     }
-    return .{ .root = root, .subcommand = subcommand, .id = id };
+    const signal = if (remaining == 2) args[index + 1] else null;
+    if (signal) |value| {
+        if (value.len == 0 or std.mem.startsWith(u8, value, "-")) return error.UnexpectedArgument;
+    }
+    return .{
+        .root = root,
+        .subcommand = subcommand,
+        .id = id,
+        .bundle = bundle,
+        .pid_file = pid_file,
+        .signal = signal,
+    };
+}
+
+fn createContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, config: Config) !void {
+    const cwd = std.Io.Dir.cwd();
+    const bundle = try cwd.realPathFileAlloc(io, config.bundle orelse ".", allocator);
+    defer allocator.free(bundle);
+    const parsed = try oci.loadSpec(allocator, io, bundle);
+    defer parsed.deinit();
+    const rootfs = try oci.resolveRootfs(allocator, bundle, parsed.value.root.path);
+    defer allocator.free(rootfs);
+
+    try cwd.createDirPath(io, config.root);
+    const root = try cwd.realPathFileAlloc(io, config.root, allocator);
+    defer allocator.free(root);
+    const state_dir = try std.fs.path.join(allocator, &.{ root, config.id });
+    defer allocator.free(state_dir);
+    cwd.createDir(io, state_dir, .default_dir) catch |err| switch (err) {
+        error.PathAlreadyExists => return error.ContainerExists,
+        else => return err,
+    };
+    errdefer cwd.deleteTree(io, state_dir) catch {};
+
+    const fifo = try std.fs.path.join(allocator, &.{ state_dir, oci.exec_fifo_name });
+    defer allocator.free(fifo);
+    const state_path = try std.fs.path.join(allocator, &.{ state_dir, oci.state_file_name });
+    defer allocator.free(state_path);
+    try makeExecFifo(allocator, fifo);
+    const handle = try backend.create(.{
+        .allocator = allocator,
+        .id = config.id,
+        .rootfs = rootfs,
+        .exec_fifo = fifo,
+        .spec = &parsed.value,
+    });
+    errdefer backend.kill(handle, 9) catch {};
+
+    const json = try std.json.Stringify.valueAlloc(allocator, oci.State{
+        .ociVersion = parsed.value.ociVersion,
+        .id = config.id,
+        .status = .created,
+        .pid = handle.pid,
+        .bundle = bundle,
+    }, .{ .emit_null_optional_fields = false });
+    defer allocator.free(json);
+    try cwd.writeFile(io, .{ .sub_path = state_path, .data = json });
+    if (config.pid_file) |path| {
+        const pid = try std.fmt.allocPrint(allocator, "{d}", .{handle.pid});
+        defer allocator.free(pid);
+        try cwd.writeFile(io, .{ .sub_path = path, .data = pid });
+    }
+}
+
+fn makeExecFifo(allocator: std.mem.Allocator, path: []const u8) !void {
+    if (comptime builtin.os.tag == .linux) {
+        const path_z = try allocator.dupeZ(u8, path);
+        defer allocator.free(path_z);
+        // mkfifo is mknod(S_IFIFO) on Linux; Zig 0.16 exposes the latter.
+        switch (std.os.linux.errno(std.os.linux.mknod(path_z, std.os.linux.S.IFIFO | 0o600, 0))) {
+            .SUCCESS => {},
+            .ACCES, .PERM => return error.PermissionDenied,
+            .NOSPC => return error.NoSpaceLeft,
+            else => return error.CreateFailed,
+        }
+    } else {
+        return error.NotImplemented;
+    }
 }
 
 pub fn main(init: std.process.Init) !u8 {
@@ -56,13 +167,20 @@ pub fn main(init: std.process.Init) !u8 {
         const message = switch (err) {
             error.MissingRoot => "missing value for --root",
             error.MissingSubcommand => "missing subcommand",
-            error.UnknownOption => "unknown global option",
+            error.UnknownOption => "unknown option",
             error.UnknownSubcommand => "unknown subcommand",
             error.MissingId => "missing container id",
+            error.MissingBundle => "missing value for --bundle",
+            error.MissingPidFile => "missing value for --pid-file",
             error.UnexpectedArgument => "unexpected argument; global flags must precede the subcommand",
             error.InvalidId => "invalid container id",
         };
-        std.debug.print("igvano: {s}\nUsage: igvano [--root <dir>] <state|create|start|kill|delete> <id>\n", .{message});
+        std.debug.print(
+            "igvano: {s}\nUsage: igvano [--root <dir>] <state|start|delete> <id>\n" ++
+                "       igvano [--root <dir>] kill <id> [signal]\n" ++
+                "       igvano [--root <dir>] create [--bundle <path>] [--pid-file <file>] <id>\n",
+            .{message},
+        );
         return 1;
     };
     switch (config.subcommand) {
@@ -80,7 +198,19 @@ pub fn main(init: std.process.Init) !u8 {
             try stdout.interface.flush();
             return 0;
         },
-        .create, .start, .kill, .delete => std.debug.print("not implemented\n", .{}),
+        .create => {
+            var implementation: backend_module.LinuxBackend = .{};
+            createContainer(allocator, init.io, implementation.backend(), config) catch |err| {
+                if (err == error.ContainerExists) {
+                    std.debug.print("igvano: container '{s}' already exists\n", .{config.id});
+                } else {
+                    std.debug.print("igvano: create for '{s}' failed: {s}\n", .{ config.id, @errorName(err) });
+                }
+                return 1;
+            };
+            return 0;
+        },
+        .start, .kill, .delete => std.debug.print("not implemented\n", .{}),
     }
     return 1;
 }
@@ -131,7 +261,207 @@ test "argument parsing rejects missing arguments and misplaced global flags" {
 }
 
 test "argument parsing rejects ids that escape the container directory" {
-    for ([_][]const u8{ "", ".", "..", "../example", "/example", "example/other" }) |id| {
+    for ([_][]const u8{ "", ".", "..", "../example", "/example", "example/other", "example\x00other", "-example" }) |id| {
         try std.testing.expectError(error.InvalidId, parseArgs(&.{ "igvano", "state", id }));
     }
+}
+
+test "create parsing accepts bundle and optional pid file after the subcommand" {
+    const config = try parseArgs(&.{ "igvano", "--root", "/tmp/containers", "create", "--bundle", "/tmp/bundle", "--pid-file", "/tmp/init.pid", "example" });
+    try std.testing.expectEqual(Subcommand.create, config.subcommand);
+    try std.testing.expectEqualStrings("/tmp/containers", config.root);
+    try std.testing.expectEqualStrings("example", config.id);
+    try std.testing.expectEqualStrings("/tmp/bundle", config.bundle.?);
+    try std.testing.expectEqualStrings("/tmp/init.pid", config.pid_file.?);
+
+    const no_pid = try parseArgs(&.{ "igvano", "create", "--bundle", "bundle", "example" });
+    try std.testing.expectEqualStrings("bundle", no_pid.bundle.?);
+    try std.testing.expect(no_pid.pid_file == null);
+    const equals = try parseArgs(&.{ "igvano", "create", "--pid-file=/tmp/init.pid", "--bundle=/tmp/bundle", "example" });
+    try std.testing.expectEqualStrings("/tmp/bundle", equals.bundle.?);
+    try std.testing.expectEqualStrings("/tmp/init.pid", equals.pid_file.?);
+}
+
+test "create parsing defaults the bundle to the current directory" {
+    const config = try parseArgs(&.{ "igvano", "create", "example" });
+    try std.testing.expectEqualStrings(".", config.bundle.?);
+    const with_pid = try parseArgs(&.{ "igvano", "create", "--pid-file", "init.pid", "example" });
+    try std.testing.expectEqualStrings(".", with_pid.bundle.?);
+    try std.testing.expectEqualStrings("init.pid", with_pid.pid_file.?);
+    try std.testing.expectError(error.MissingId, parseArgs(&.{ "igvano", "create" }));
+}
+
+test "create parsing rejects missing bundle and pid file values" {
+    try std.testing.expectError(error.MissingBundle, parseArgs(&.{ "igvano", "create", "--bundle" }));
+    try std.testing.expectError(error.MissingBundle, parseArgs(&.{ "igvano", "create", "--bundle", "", "example" }));
+    try std.testing.expectError(error.MissingBundle, parseArgs(&.{ "igvano", "create", "--bundle=" }));
+    try std.testing.expectError(error.MissingBundle, parseArgs(&.{ "igvano", "create", "--bundle", "--pid-file", "init.pid", "example" }));
+    try std.testing.expectError(error.MissingId, parseArgs(&.{ "igvano", "create", "--bundle", "/tmp/bundle" }));
+    try std.testing.expectError(error.MissingPidFile, parseArgs(&.{ "igvano", "create", "--bundle", "/tmp/bundle", "--pid-file" }));
+    try std.testing.expectError(error.MissingPidFile, parseArgs(&.{ "igvano", "create", "--bundle", "/tmp/bundle", "--pid-file=" }));
+    try std.testing.expectError(error.UnknownOption, parseArgs(&.{ "igvano", "create", "--root", "/tmp", "--bundle", "/tmp/bundle", "example" }));
+    try std.testing.expectError(error.UnexpectedArgument, parseArgs(&.{ "igvano", "create", "--bundle", "/tmp/bundle", "example", "--pid-file", "init.pid" }));
+}
+
+test "kill parsing preserves an optional positional signal" {
+    const default_signal = try parseArgs(&.{ "igvano", "kill", "example" });
+    try std.testing.expect(default_signal.signal == null);
+    const explicit_signal = try parseArgs(&.{ "igvano", "kill", "example", "TERM" });
+    try std.testing.expectEqualStrings("TERM", explicit_signal.signal.?);
+    try std.testing.expectError(error.UnexpectedArgument, parseArgs(&.{ "igvano", "kill", "example", "TERM", "extra" }));
+}
+
+test "create rejects a duplicate id without changing existing state" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "bundle", .default_dir);
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "bundle/config.json",
+        .data =
+        \\{"ociVersion":"1.0.2","root":{"path":"rootfs"}}
+        ,
+    });
+    try tmp.dir.createDirPath(std.testing.io, "containers/example");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "containers/example/state.json", .data = "existing state" });
+    const base = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer std.testing.allocator.free(base);
+    const root = try std.fs.path.join(std.testing.allocator, &.{ base, "containers" });
+    defer std.testing.allocator.free(root);
+    const bundle = try std.fs.path.join(std.testing.allocator, &.{ base, "bundle" });
+    defer std.testing.allocator.free(bundle);
+    var implementation: backend_module.LinuxBackend = .{};
+    try std.testing.expectError(error.ContainerExists, createContainer(std.testing.allocator, std.testing.io, implementation.backend(), .{
+        .root = root,
+        .subcommand = .create,
+        .id = "example",
+        .bundle = bundle,
+    }));
+    const state = try tmp.dir.readFileAlloc(std.testing.io, "containers/example/state.json", std.testing.allocator, .limited(1024));
+    defer std.testing.allocator.free(state);
+    try std.testing.expectEqualStrings("existing state", state);
+}
+
+test "create rejects a missing bundle before creating the state directory" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer std.testing.allocator.free(base);
+    const bundle = try std.fs.path.join(std.testing.allocator, &.{ base, "missing" });
+    defer std.testing.allocator.free(bundle);
+    var implementation: backend_module.LinuxBackend = .{};
+    try std.testing.expectError(error.FileNotFound, createContainer(std.testing.allocator, std.testing.io, implementation.backend(), .{
+        .root = base,
+        .subcommand = .create,
+        .id = "example",
+        .bundle = bundle,
+    }));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.openDir(std.testing.io, "example", .{}));
+}
+
+test "create removes its new state directory when setup fails" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "bundle", .default_dir);
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "bundle/config.json",
+        .data =
+        \\{"ociVersion":"1.0.2","root":{"path":"rootfs"},"linux":{"namespaces":[{"type":"network","path":"/proc/1/ns/net"}]}}
+        ,
+    });
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer std.testing.allocator.free(root);
+    const bundle = try std.fs.path.join(std.testing.allocator, &.{ root, "bundle" });
+    defer std.testing.allocator.free(bundle);
+    var implementation: backend_module.LinuxBackend = .{};
+    try std.testing.expectError(
+        if (builtin.os.tag == .linux) error.Unsupported else error.NotImplemented,
+        createContainer(std.testing.allocator, std.testing.io, implementation.backend(), .{
+            .root = root,
+            .subcommand = .create,
+            .id = "example",
+            .bundle = bundle,
+        }),
+    );
+    try std.testing.expectError(error.FileNotFound, tmp.dir.openDir(std.testing.io, "example", .{}));
+}
+
+test "create persists backend pid and absolute paths and rolls back a failed pid file" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const TestBackend = struct {
+        rootfs: [std.fs.max_path_bytes]u8 = undefined,
+        rootfs_len: usize = 0,
+        killed: bool = false,
+
+        const vtable: Backend.VTable = .{
+            .create = create,
+            .start = unused,
+            .kill = kill,
+            .delete = unused,
+        };
+
+        fn create(ptr: *anyopaque, options: Backend.CreateOptions) Backend.Error!Backend.Handle {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.rootfs_len = options.rootfs.len;
+            @memcpy(self.rootfs[0..self.rootfs_len], options.rootfs);
+            return .{ .id = options.id, .pid = 1234 };
+        }
+
+        fn unused(_: *anyopaque, _: Backend.Handle) Backend.Error!void {
+            return error.NotImplemented;
+        }
+
+        fn kill(ptr: *anyopaque, handle: Backend.Handle, signal: i32) Backend.Error!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (handle.pid != 1234 or signal != 9) return error.CreateFailed;
+            self.killed = true;
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "bundle", .default_dir);
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "bundle/config.json",
+        .data =
+        \\{"ociVersion":"1.0.2","root":{"path":"rootfs"}}
+        ,
+    });
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer std.testing.allocator.free(root);
+    const bundle = try std.fs.path.join(std.testing.allocator, &.{ root, "bundle" });
+    defer std.testing.allocator.free(bundle);
+    const pid_file = try std.fs.path.join(std.testing.allocator, &.{ root, "init.pid" });
+    defer std.testing.allocator.free(pid_file);
+    var implementation: TestBackend = .{};
+    const backend: Backend = .{ .ptr = &implementation, .vtable = &TestBackend.vtable };
+    var config: Config = .{ .root = root, .subcommand = .create, .id = "example", .bundle = bundle, .pid_file = pid_file };
+    try createContainer(std.testing.allocator, std.testing.io, backend, config);
+
+    const json = try tmp.dir.readFileAlloc(std.testing.io, "example/state.json", std.testing.allocator, .limited(1024));
+    defer std.testing.allocator.free(json);
+    const state = try std.json.parseFromSlice(oci.State, std.testing.allocator, json, .{});
+    defer state.deinit();
+    try std.testing.expectEqual(oci.Status.created, state.value.status);
+    try std.testing.expectEqual(@as(?i32, 1234), state.value.pid);
+    try std.testing.expectEqualStrings("example", state.value.id);
+    try std.testing.expectEqualStrings("1.0.2", state.value.ociVersion);
+    const absolute_bundle = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, bundle, std.testing.allocator);
+    defer std.testing.allocator.free(absolute_bundle);
+    try std.testing.expectEqualStrings(absolute_bundle, state.value.bundle);
+    const expected_rootfs = try std.fs.path.join(std.testing.allocator, &.{ absolute_bundle, "rootfs" });
+    defer std.testing.allocator.free(expected_rootfs);
+    try std.testing.expectEqualStrings(expected_rootfs, implementation.rootfs[0..implementation.rootfs_len]);
+    const pid = try tmp.dir.readFileAlloc(std.testing.io, "init.pid", std.testing.allocator, .limited(32));
+    defer std.testing.allocator.free(pid);
+    try std.testing.expectEqualStrings("1234", pid);
+    const fifo = try tmp.dir.statFile(std.testing.io, "example/exec.fifo", .{});
+    try std.testing.expectEqual(std.Io.File.Kind.named_pipe, fifo.kind);
+    try std.testing.expect(!implementation.killed);
+
+    const bad_pid_file = try std.fs.path.join(std.testing.allocator, &.{ root, "missing", "init.pid" });
+    defer std.testing.allocator.free(bad_pid_file);
+    config.id = "other";
+    config.pid_file = bad_pid_file;
+    try std.testing.expectError(error.FileNotFound, createContainer(std.testing.allocator, std.testing.io, backend, config));
+    try std.testing.expect(implementation.killed);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.openDir(std.testing.io, "other", .{}));
 }
