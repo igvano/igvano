@@ -1,6 +1,8 @@
 const std = @import("std");
 const oci = @import("igvano").oci;
 
+pub const default_root = "/run/igvano";
+
 const Subcommand = enum {
     state,
     create,
@@ -10,13 +12,13 @@ const Subcommand = enum {
 };
 
 const Config = struct {
-    root: []const u8 = "/run/igvano",
+    root: []const u8,
     subcommand: Subcommand,
     id: []const u8,
 };
 
 fn parseArgs(args: []const []const u8) !Config {
-    var root: []const u8 = "/run/igvano";
+    var root: []const u8 = default_root;
     var index: usize = 1;
     while (index < args.len and std.mem.startsWith(u8, args[index], "-")) {
         if (std.mem.eql(u8, args[index], "--root")) {
@@ -97,7 +99,7 @@ test "dispatch recognizes lifecycle subcommands and rejects unknown commands" {
 
 test "argument parsing uses the default root and positional container id" {
     const config = try parseArgs(&.{ "igvano", "state", "example" });
-    try std.testing.expectEqualStrings("/run/igvano", config.root);
+    try std.testing.expectEqualStrings(default_root, config.root);
     try std.testing.expectEqual(Subcommand.state, config.subcommand);
     try std.testing.expectEqualStrings("example", config.id);
 }
