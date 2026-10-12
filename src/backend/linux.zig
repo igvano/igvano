@@ -62,11 +62,21 @@ pub const LinuxBackend = struct {
             const fifo = try allocator.dupeZ(u8, options.exec_fifo);
             const rootfs = try processString(allocator, options.rootfs);
             const cwd = try processString(allocator, if (options.spec.process) |process| process.cwd else "/");
-            // chroot does not reset cwd; relative paths could retain a host cwd.
             if (!std.fs.path.isAbsolute(cwd)) return error.InvalidProcess;
-            // Validate the host path before create can report success.
-            const host_cwd = try std.fs.path.join(allocator, &.{ rootfs, cwd });
-            try checkResult(linux.access(try allocator.dupeZ(u8, host_cwd), linux.F_OK));
+            if (flags & linux.CLONE.NEWNS == 0) return error.InvalidConfig;
+            if (!std.fs.path.isAbsolute(rootfs)) return error.InvalidPath;
+            const mounts = try allocator.alloc(PreparedMount, options.mounts.len);
+            for (options.mounts, mounts) |mount, *prepared| {
+                if (!std.mem.startsWith(u8, mount.destination, "/")) return error.InvalidPath;
+                prepared.* = .{
+                    .destination = try pathString(allocator, mount.destination),
+                    .source = if (mount.source) |source| try pathString(allocator, source) else null,
+                    .type = if (mount.type) |mount_type| try pathString(allocator, mount_type) else null,
+                    .flags = mount.flags,
+                    .propagation = mount.propagation,
+                    .data = try pathString(allocator, mount.data),
+                };
+            }
             const args: []const []const u8 = if (options.spec.process) |process| process.args else &.{};
             const env: []const []const u8 = if (options.spec.process) |process| process.env orelse &.{} else &.{};
             const argv = try allocator.allocSentinel(?[*:0]const u8, args.len, null);
@@ -74,6 +84,10 @@ pub const LinuxBackend = struct {
             const envp = try allocator.allocSentinel(?[*:0]const u8, env.len, null);
             for (env, 0..) |entry, i| envp[i] = (try processString(allocator, entry)).ptr;
 
+            // pivot_root also changes child1's root while it waits in the same
+            // mount namespace. Pin host /proc so it can still capture identity.
+            const proc_dir = try openPath(linux.AT.FDCWD, "/proc", .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true });
+            defer closeFd(proc_dir);
             const report = try makePipe();
             const ready = makePipe() catch |err| {
                 for (report) |fd| closeFd(fd);
@@ -94,7 +108,8 @@ pub const LinuxBackend = struct {
                     // PDEATHSIG races with child1's normal exit; fix with a parent pidfd watch.
                     closeFd(report[1]);
                     closeFd(ready[0]);
-                    runInit(options.spec, flags, rootfs, cwd, fifo, argv.ptr, envp.ptr, ready[1]);
+                    closeFd(proc_dir);
+                    runInit(options.spec, flags, rootfs, mounts, cwd, fifo, argv.ptr, envp.ptr, ready[1]);
                 }
                 closeFd(ready[1]);
                 var byte: [1]u8 = undefined;
@@ -107,7 +122,7 @@ pub const LinuxBackend = struct {
                 // Capture identity while child2 is still our child, so its PID
                 // cannot be recycled even if it has already exited.
                 var stat_buffer: [4096]u8 = undefined;
-                const stat = readProcStat(child2, &stat_buffer) catch |err| {
+                const stat = readProcStatAt(proc_dir, child2, &stat_buffer) catch |err| {
                     _ = linux.kill(child2, .KILL);
                     _ = waitChild(child2) catch {};
                     failCreate(report[1], err);
@@ -159,6 +174,8 @@ pub const LinuxBackend = struct {
                 else => return error.LivenessFailed,
             }
             var buffer: [4096]u8 = undefined;
+            // ponytail: /proc mounted with hidepid can conceal a live process.
+            // Require a readable host /proc; kill(0) alone cannot verify identity.
             const stat = readProcStat(handle.pid, &buffer) catch |err| switch (err) {
                 error.ProcessNotFound => return false,
                 else => return err,
@@ -173,6 +190,9 @@ pub const LinuxBackend = struct {
         if (comptime builtin.os.tag == .linux) {
             if (handle.pid <= 0) return error.InvalidProcess;
             if (signal < 0 or signal >= linux.NSIG) return error.KillFailed;
+            // ponytail: PID reuse between alive() and kill() can signal the wrong
+            // process. Fix with pidfd_open before checking identity, then use
+            // pidfd_send_signal on that same descriptor.
             if (!try alive(ptr, handle)) return error.ProcessNotFound;
             switch (linux.errno(linux.kill(handle.pid, @enumFromInt(@as(u32, @intCast(signal)))))) {
                 .SUCCESS => {},
@@ -205,9 +225,9 @@ const ProcStat = struct {
     state: u8,
     starttime: []const u8,
 
-    fn matches(self: ProcStat, starttime: ?[]const u8) bool {
+    fn matches(self: ProcStat, starttime: []const u8) bool {
         if (self.state == 'Z' or self.state == 'X') return false;
-        return if (starttime) |expected| std.mem.eql(u8, expected, self.starttime) else true;
+        return std.mem.eql(u8, starttime, self.starttime);
     }
 };
 
@@ -225,10 +245,17 @@ fn parseProcStat(bytes: []const u8) Backend.Error!ProcStat {
 }
 
 fn readProcStat(pid: i32, buffer: []u8) Backend.Error!ProcStat {
+    return readProcStatAt(linux.AT.FDCWD, pid, buffer);
+}
+
+fn readProcStatAt(proc_dir: posix.fd_t, pid: i32, buffer: []u8) Backend.Error!ProcStat {
     var path_buffer: [64]u8 = undefined;
-    const path = std.fmt.bufPrintZ(&path_buffer, "/proc/{d}/stat", .{pid}) catch unreachable;
+    const path = if (proc_dir == linux.AT.FDCWD)
+        std.fmt.bufPrintZ(&path_buffer, "/proc/{d}/stat", .{pid}) catch unreachable
+    else
+        std.fmt.bufPrintZ(&path_buffer, "{d}/stat", .{pid}) catch unreachable;
     const fd: posix.fd_t = open: while (true) {
-        const result = linux.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+        const result = linux.openat(proc_dir, path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
         switch (linux.errno(result)) {
             .SUCCESS => break :open @intCast(result),
             .INTR => continue,
@@ -255,6 +282,11 @@ fn readProcStat(pid: i32, buffer: []u8) Backend.Error!ProcStat {
 
 fn processString(allocator: std.mem.Allocator, value: []const u8) Backend.Error![:0]u8 {
     if (std.mem.indexOfScalar(u8, value, 0) != null) return error.InvalidProcess;
+    return allocator.dupeZ(u8, value);
+}
+
+fn pathString(allocator: std.mem.Allocator, value: []const u8) Backend.Error![:0]u8 {
+    if (std.mem.indexOfScalar(u8, value, 0) != null) return error.InvalidPath;
     return allocator.dupeZ(u8, value);
 }
 
@@ -341,40 +373,189 @@ fn failCreate(fd: posix.fd_t, err: Backend.Error) noreturn {
     linux.exit_group(1);
 }
 
+const PreparedMount = struct {
+    destination: [:0]const u8,
+    source: ?[:0]const u8,
+    type: ?[:0]const u8,
+    flags: u32,
+    propagation: u32,
+    data: [:0]const u8,
+};
+
+fn openPath(dir_fd: posix.fd_t, path: [*:0]const u8, flags: linux.O) Backend.Error!posix.fd_t {
+    const result = linux.openat(dir_fd, path, flags, 0);
+    try checkResult(result);
+    return @intCast(result);
+}
+
+fn fileType(fd: posix.fd_t) Backend.Error!u16 {
+    var stat: linux.Statx = undefined;
+    try checkResult(linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .TYPE = true }, &stat));
+    if (!stat.mask.TYPE) return error.CreateFailed;
+    return stat.mode & linux.S.IFMT;
+}
+
+/// Walk beneath a pinned root, rejecting symlinks in every component. Mounting
+/// through the returned fd also avoids a destination swap between lookup/mount.
+fn mountDestination(root_fd: posix.fd_t, destination: []const u8, is_file: bool, create: bool) Backend.Error!posix.fd_t {
+    var current = try openPath(root_fd, ".", .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true });
+    errdefer closeFd(current);
+    var components = std.mem.tokenizeScalar(u8, destination, '/');
+    var component = components.next() orelse {
+        if (is_file) return error.InvalidPath;
+        return current;
+    };
+    while (true) {
+        // Frontend paths are normalized; reject traversal from library callers too.
+        if (std.mem.eql(u8, component, "..") or std.mem.eql(u8, component, ".")) return error.InvalidPath;
+        const next = components.next();
+        var buffer: [256]u8 = undefined;
+        const name = std.fmt.bufPrintZ(&buffer, "{s}", .{component}) catch return error.InvalidPath;
+        if (next == null and is_file) {
+            if (create) {
+                const created = linux.openat(current, name, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .NOFOLLOW = true, .CLOEXEC = true }, 0o644);
+                switch (linux.errno(created)) {
+                    .SUCCESS => closeFd(@intCast(created)),
+                    .EXIST => {},
+                    else => try checkResult(created),
+                }
+            }
+            const fd = try openPath(current, name, .{ .PATH = true, .NOFOLLOW = true, .CLOEXEC = true });
+            errdefer closeFd(fd);
+            const kind = try fileType(fd);
+            if (kind == linux.S.IFLNK or kind == linux.S.IFDIR) return error.InvalidPath;
+            closeFd(current);
+            return fd;
+        }
+        if (create) {
+            const created = linux.mkdirat(current, name, 0o755);
+            switch (linux.errno(created)) {
+                .SUCCESS, .EXIST => {},
+                else => try checkResult(created),
+            }
+        }
+        const fd = try openPath(current, name, .{ .PATH = true, .DIRECTORY = true, .NOFOLLOW = true, .CLOEXEC = true });
+        closeFd(current);
+        current = fd;
+        component = next orelse return current;
+    }
+}
+
+fn fdPath(buffer: []u8, fd: posix.fd_t) [:0]u8 {
+    return std.fmt.bufPrintZ(buffer, "/proc/self/fd/{d}", .{fd}) catch unreachable;
+}
+
+fn applyMount(rootfs: [:0]const u8, root_fd: posix.fd_t, mount: PreparedMount) Backend.Error!void {
+    const ms = linux.MS;
+    const bind = mount.flags & ms.BIND != 0;
+    const source_fd: ?posix.fd_t = if (bind)
+        try openPath(linux.AT.FDCWD, (mount.source orelse return error.InvalidConfig).ptr, .{ .PATH = true, .CLOEXEC = true })
+    else
+        null;
+    defer if (source_fd) |fd| closeFd(fd);
+    const is_file = if (source_fd) |fd| try fileType(fd) != linux.S.IFDIR else false;
+    var target_fd = try mountDestination(root_fd, mount.destination, is_file, true);
+    defer closeFd(target_fd);
+    var target_buffer: [64]u8 = undefined;
+    var source_buffer: [64]u8 = undefined;
+    const source: ?[*:0]const u8 = if (source_fd) |fd|
+        fdPath(&source_buffer, fd).ptr
+    else if (mount.source) |value|
+        value.ptr
+    else
+        null;
+    try checkResult(linux.mount(
+        source,
+        fdPath(&target_buffer, target_fd),
+        if (bind) null else if (mount.type) |value| value.ptr else null,
+        if (bind) mount.flags & (ms.BIND | ms.REC) else mount.flags,
+        if (bind or mount.data.len == 0) 0 else @intFromPtr(mount.data.ptr),
+    ));
+    // The original fd pins the covered mount. Reopen to address the new mount
+    // for remount and propagation changes, still without following symlinks.
+    const mounted_fd = if (std.mem.eql(u8, mount.destination, "/"))
+        try openPath(linux.AT.FDCWD, rootfs, .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true })
+    else
+        try mountDestination(root_fd, mount.destination, is_file, false);
+    closeFd(target_fd);
+    target_fd = mounted_fd;
+    if (bind and mount.flags & ~@as(u32, ms.BIND | ms.REC) != 0) {
+        try checkResult(linux.mount(null, fdPath(&target_buffer, target_fd), null, (mount.flags & ~@as(u32, ms.REC)) | ms.BIND | ms.REMOUNT, 0));
+    }
+    if (mount.propagation != 0) {
+        try checkResult(linux.mount(null, fdPath(&target_buffer, target_fd), null, mount.propagation, 0));
+    }
+}
+
+/// All paths/data are prepared before fork; child2 needs no allocator.
+fn setupRootfs(rootfs: [:0]const u8, mounts: []const PreparedMount, readonly: bool) Backend.Error!void {
+    const ms = linux.MS;
+    try checkResult(linux.mount(null, "/", null, ms.PRIVATE | ms.REC, 0));
+    try checkResult(linux.mount(rootfs, rootfs, null, ms.BIND | ms.REC, 0));
+    for (mounts) |mount| {
+        const root_fd = try openPath(linux.AT.FDCWD, rootfs, .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true });
+        defer closeFd(root_fd);
+        try applyMount(rootfs, root_fd, mount);
+    }
+    // runc's fd trick stacks the old root on the new root without a put_old
+    // directory. Detach it and close both handles before any container exec.
+    const old_root = try openPath(linux.AT.FDCWD, "/", .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true });
+    defer closeFd(old_root);
+    const new_root = try openPath(linux.AT.FDCWD, rootfs, .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true });
+    defer closeFd(new_root);
+    try checkResult(linux.fchdir(new_root));
+    try checkResult(linux.pivot_root(".", "."));
+    try checkResult(linux.fchdir(old_root));
+    try checkResult(linux.umount2(".", linux.MNT.DETACH));
+    try checkResult(linux.chdir("/"));
+    if (readonly) try checkResult(linux.mount(null, "/", null, ms.BIND | ms.REMOUNT | ms.RDONLY, 0));
+}
+
 fn runInit(
     spec: *const oci.Spec,
     flags: usize,
     rootfs: [:0]const u8,
+    mounts: []const PreparedMount,
     cwd: [:0]const u8,
     fifo: [:0]const u8,
     argv: [*:null]const ?[*:0]const u8,
     envp: [*:null]const ?[*:0]const u8,
     ready_fd: posix.fd_t,
 ) noreturn {
-    // Chroot-only filesystem isolation: no mount namespace cleanup, mounts, or cgroups.
-    // pivot_root comes in a later milestone.
+    // Keep the host FIFO reachable without requiring /proc inside the rootfs.
+    // These host descriptors are used only by init and closed before exec.
+    const fifo_path = openPath(linux.AT.FDCWD, fifo, .{ .PATH = true, .CLOEXEC = true }) catch linux.exit_group(1);
+    const fd_dir = openPath(linux.AT.FDCWD, "/proc/self/fd", .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true }) catch linux.exit_group(1);
+    var fifo_buffer: [32]u8 = undefined;
+    const fifo_name = std.fmt.bufPrintZ(&fifo_buffer, "{d}", .{fifo_path}) catch unreachable;
+    setupRootfs(rootfs, mounts, spec.root.readonly) catch linux.exit_group(1);
     if (flags & linux.CLONE.NEWUTS != 0) {
         if (spec.hostname) |hostname| {
             // Zig 0.16 has no sethostname wrapper.
             checkResult(linux.syscall2(.sethostname, @intFromPtr(hostname.ptr), hostname.len)) catch linux.exit_group(1);
         }
     }
+    checkResult(linux.chdir(cwd)) catch linux.exit_group(1);
     if (!writeAll(ready_fd, &.{1})) linux.exit_group(1);
     closeFd(ready_fd);
 
     // O_WRONLY blocks until start opens a reader; the byte acknowledges that start.
     const fd: posix.fd_t = open: while (true) {
-        const result = linux.open(fifo, .{ .ACCMODE = .WRONLY, .CLOEXEC = true }, 0);
+        const result = linux.openat(fd_dir, fifo_name, .{ .ACCMODE = .WRONLY, .CLOEXEC = true }, 0);
         switch (linux.errno(result)) {
             .SUCCESS => break :open @intCast(result),
             .INTR => continue,
             else => linux.exit_group(1),
         }
     };
+    closeFd(fd_dir);
+    closeFd(fifo_path);
     if (!writeAll(fd, &.{1})) linux.exit_group(1);
     closeFd(fd);
-    checkResult(linux.chroot(rootfs)) catch linux.exit_group(1);
-    checkResult(linux.chdir(cwd)) catch linux.exit_group(1);
+    runProcess(spec, argv, envp);
+}
+
+fn runProcess(spec: *const oci.Spec, argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*:0]const u8) noreturn {
     // A process-less config can be created; it cannot be started.
     const process = spec.process orelse linux.exit_group(1);
     // Replace inherited groups and set the primary GID before dropping UID privileges.
@@ -406,7 +587,7 @@ fn execProcess(argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*:0]con
             break;
         }
     }
-    // Lookup happens inside the chroot, without allocating after fork.
+    // Lookup happens inside the rootfs, without allocating after fork.
     var buffer: [std.fs.max_path_bytes]u8 = undefined;
     var directories = std.mem.splitScalar(u8, path, ':');
     while (directories.next()) |directory| {
@@ -432,7 +613,6 @@ test "proc stat treats zombie and dead states as not alive" {
         const line = try std.fmt.allocPrint(std.testing.allocator, "1234 (init) ) {c} 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 12345\n", .{state});
         defer std.testing.allocator.free(line);
         const stat = try parseProcStat(line);
-        try std.testing.expectEqual(state != 'Z' and state != 'X', stat.matches(null));
         try std.testing.expectEqual(state != 'Z' and state != 'X', stat.matches("12345"));
         try std.testing.expect(!stat.matches("54321"));
     }
@@ -457,7 +637,7 @@ test "linux backend is unavailable on other platforms" {
         .root = .{ .path = "rootfs" },
         .process = .{ .args = &.{"/bin/sh"}, .cwd = "/", .user = .{ .uid = 0, .gid = 0 } },
     };
-    const handle: Backend.Handle = .{ .id = "example", .pid = 1234 };
+    const handle: Backend.Handle = .{ .id = "example", .pid = 1234, .starttime = "12345" };
     var implementation: LinuxBackend = .{};
     const backend = implementation.backend();
     if (comptime builtin.os.tag != .linux) {
@@ -502,8 +682,8 @@ test "linux liveness and signaling work with a handle loaded by a new backend" {
     try std.testing.expectError(error.ProcessNotFound, backend.kill(reused, 9));
     try std.testing.expect(try backend.alive(handle));
     try backend.kill(handle, 0);
-    try std.testing.expectError(error.InvalidProcess, backend.kill(.{ .id = "invalid", .pid = 0 }, 9));
-    try std.testing.expectError(error.InvalidProcess, backend.alive(.{ .id = "invalid", .pid = -1 }));
+    try std.testing.expectError(error.InvalidProcess, backend.kill(.{ .id = "invalid", .pid = 0, .starttime = "" }, 9));
+    try std.testing.expectError(error.InvalidProcess, backend.alive(.{ .id = "invalid", .pid = -1, .starttime = "" }));
     try std.testing.expectError(error.KillFailed, backend.kill(handle, 65));
     try backend.kill(handle, 9);
     _ = try waitChild(pid);
@@ -529,7 +709,9 @@ test "linux liveness rejects an unreaped zombie even though kill zero succeeds" 
     try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.kill(pid, @enumFromInt(0))));
     var implementation: LinuxBackend = .{};
     const backend = implementation.backend();
-    const handle: Backend.Handle = .{ .id = "zombie", .pid = pid };
+    var buffer: [4096]u8 = undefined;
+    const stat = try readProcStat(pid, &buffer);
+    const handle: Backend.Handle = .{ .id = "zombie", .pid = pid, .starttime = stat.starttime };
     try std.testing.expect(!try backend.alive(handle));
     try std.testing.expectError(error.ProcessNotFound, backend.kill(handle, 15));
 }
@@ -581,7 +763,7 @@ test "linux create rejects relative process cwd" {
             .spec = &spec,
         });
         if (result) |handle| {
-            defer if (handle.starttime) |starttime| std.testing.allocator.free(starttime);
+            defer std.testing.allocator.free(handle.starttime);
             // Clean up if a regression incorrectly creates an init.
             backend.kill(handle, 9) catch {};
         } else |_| {}
@@ -608,7 +790,7 @@ test "linux create rejects empty process args" {
         .spec = &spec,
     });
     if (result) |handle| {
-        defer if (handle.starttime) |starttime| std.testing.allocator.free(starttime);
+        defer std.testing.allocator.free(handle.starttime);
         backend.kill(handle, 9) catch {};
     } else |_| {}
     try std.testing.expectError(
@@ -618,6 +800,7 @@ test "linux create rejects empty process args" {
 }
 
 test "linux create rejects a cwd missing from the resolved rootfs" {
+    if (comptime builtin.os.tag == .linux) try requireTestMountNamespace();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const base = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
@@ -629,6 +812,7 @@ test "linux create rejects a cwd missing from the resolved rootfs" {
     const spec: oci.Spec = .{
         .ociVersion = "1.0.2",
         .root = .{ .path = "/" },
+        .linux = .{ .namespaces = &.{.{ .type = .mount }} },
         .process = .{ .args = &.{ "/bin/sleep", "1000" }, .cwd = "/proc", .user = .{ .uid = 0, .gid = 0 } },
     };
     var implementation: LinuxBackend = .{};
@@ -641,7 +825,7 @@ test "linux create rejects a cwd missing from the resolved rootfs" {
         .spec = &spec,
     });
     if (result) |handle| {
-        defer if (handle.starttime) |starttime| std.testing.allocator.free(starttime);
+        defer std.testing.allocator.free(handle.starttime);
         // Clean up if a regression incorrectly creates an init.
         backend.kill(handle, 9) catch {};
     } else |_| {}
@@ -768,8 +952,7 @@ test "linux init applies uid gid and replaces inherited supplementary groups bef
             checkResult(linux.setgroups(1, &.{42})) catch linux.exit_group(1);
             checkResult(linux.dup2(output[1], posix.STDOUT_FILENO)) catch linux.exit_group(1);
             closeFd(output[1]);
-            // /dev/null lets this focused init test complete the FIFO writes immediately.
-            runInit(&spec, 0, "/", "/", "/dev/null", &argv, &envp, ready[1]);
+            runProcess(&spec, &argv, &envp);
         }
         closeFd(output[1]);
         closeFd(ready[1]);
@@ -802,7 +985,7 @@ test "linux init exits nonzero instead of exec when it cannot apply process user
             checkResult(linux.setgid(1000)) catch linux.exit_group(2);
             checkResult(linux.setuid(1000)) catch linux.exit_group(2);
         }
-        runInit(&spec, 0, "/", "/", "/dev/null", &argv, &envp, ready[1]);
+        runProcess(&spec, &argv, &envp);
     }
     closeFd(ready[1]);
     try std.testing.expectEqual(@as(u32, 1 << 8), try waitChild(pid));
@@ -833,7 +1016,7 @@ test "linux init marks inherited descriptors CLOEXEC and sets noNewPrivileges" {
     if (pid == 0) {
         closeFd(ready[0]);
         checkResult(linux.dup2(ready[1], 200)) catch linux.exit_group(2);
-        runInit(&spec, 0, "/", "/", "/dev/null", &argv, &envp, ready[1]);
+        runProcess(&spec, &argv, &envp);
     }
     closeFd(ready[1]);
     try std.testing.expectEqual(@as(u32, 0), try waitChild(pid));
@@ -841,6 +1024,7 @@ test "linux init marks inherited descriptors CLOEXEC and sets noNewPrivileges" {
 
 test "linux create reports child setup failures without leaving an init" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    try requireTestMountNamespace();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const base = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
@@ -851,9 +1035,13 @@ test "linux create reports child setup failures without leaving an init" {
     defer std.testing.allocator.free(missing_cwd);
     const fifo = try std.fs.path.join(std.testing.allocator, &.{ absolute_base, "exec.fifo" });
     defer std.testing.allocator.free(fifo);
+    const fifo_z = try std.testing.allocator.dupeZ(u8, fifo);
+    defer std.testing.allocator.free(fifo_z);
+    try checkResult(linux.mknod(fifo_z, linux.S.IFIFO | 0o600, 0));
     const spec: oci.Spec = .{
         .ociVersion = "1.0.2",
         .root = .{ .path = "/" },
+        .linux = .{ .namespaces = &.{.{ .type = .mount }} },
         .process = .{ .args = &.{"/bin/sh"}, .cwd = missing_cwd, .user = .{ .uid = 0, .gid = 0 } },
     };
     var implementation: LinuxBackend = .{};
@@ -868,6 +1056,7 @@ test "linux create reports child setup failures without leaving an init" {
 
 test "linux create accepts an empty rootfs and returns a live blocked init" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    try requireTestMountNamespace();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const base = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
@@ -886,9 +1075,10 @@ test "linux create accepts an empty rootfs and returns a live blocked init" {
         .{
             .ociVersion = "1.0.2",
             .root = .{ .path = "rootfs" },
+            .linux = .{ .namespaces = &.{.{ .type = .mount }} },
             .process = .{ .args = &.{ "/bin/sleep", "1000" }, .cwd = "/", .user = .{ .uid = 0, .gid = 0 } },
         },
-        .{ .ociVersion = "1.0.2", .root = .{ .path = "rootfs" } },
+        .{ .ociVersion = "1.0.2", .root = .{ .path = "rootfs" }, .linux = .{ .namespaces = &.{.{ .type = .mount }} } },
     };
     for (specs) |spec| {
         var implementation: LinuxBackend = .{};
@@ -900,13 +1090,95 @@ test "linux create accepts an empty rootfs and returns a live blocked init" {
             .exec_fifo = fifo,
             .spec = &spec,
         });
-        defer if (handle.starttime) |starttime| std.testing.allocator.free(starttime);
+        defer std.testing.allocator.free(handle.starttime);
         defer backend.kill(handle, 9) catch {};
         try std.testing.expect(handle.pid > 0);
         try std.testing.expectEqualStrings("example", handle.id);
-        try std.testing.expect(handle.starttime != null);
+        try std.testing.expect(handle.starttime.len != 0);
         try std.testing.expect(try backend.alive(handle));
         try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.kill(handle.pid, @enumFromInt(0))));
         try backend.kill(handle, 9);
     }
+}
+
+test "linux mount destinations reject symlinks without creating host paths" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "rootfs", .default_dir);
+    try tmp.dir.createDir(std.testing.io, "outside", .default_dir);
+    const base = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer std.testing.allocator.free(base);
+    const absolute = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, base, std.testing.allocator);
+    defer std.testing.allocator.free(absolute);
+    const outside = try std.fs.path.join(std.testing.allocator, &.{ absolute, "outside" });
+    defer std.testing.allocator.free(outside);
+    try tmp.dir.symLink(std.testing.io, outside, "rootfs/escape", .{});
+    try tmp.dir.symLink(std.testing.io, outside, "rootfs/file", .{});
+    const rootfs = try std.fs.path.join(std.testing.allocator, &.{ absolute, "rootfs" });
+    defer std.testing.allocator.free(rootfs);
+    const rootfs_z = try std.testing.allocator.dupeZ(u8, rootfs);
+    defer std.testing.allocator.free(rootfs_z);
+    const root_fd = try openPath(linux.AT.FDCWD, rootfs_z, .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true });
+    defer closeFd(root_fd);
+    if (mountDestination(root_fd, "/escape/new", false, true)) |fd| {
+        closeFd(fd);
+        return error.TestUnexpectedResult;
+    } else |_| {}
+    try std.testing.expectError(error.InvalidPath, mountDestination(root_fd, "/file", true, true));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, "outside/new", .{}));
+}
+
+test "linux rootfs setup applies ordered mounts detaches the host root and enforces readonly" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    try requireTestMountNamespace();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "rootfs", .default_dir);
+    try tmp.dir.createDir(std.testing.io, "source", .default_dir);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "source/item", .data = "bind contents" });
+    const base = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer std.testing.allocator.free(base);
+    const absolute = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, base, std.testing.allocator);
+    defer std.testing.allocator.free(absolute);
+    const rootfs = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/rootfs", .{absolute}, 0);
+    defer std.testing.allocator.free(rootfs);
+    const source_dir = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/source", .{absolute}, 0);
+    defer std.testing.allocator.free(source_dir);
+    const source_file = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/source/item", .{absolute}, 0);
+    defer std.testing.allocator.free(source_file);
+    const mounts = [_]PreparedMount{
+        .{ .destination = "/work", .source = "tmpfs", .type = "tmpfs", .flags = linux.MS.NOSUID, .propagation = linux.MS.PRIVATE, .data = "mode=755" },
+        .{ .destination = "/work/from-bind", .source = source_dir, .type = null, .flags = linux.MS.BIND | linux.MS.REC, .propagation = 0, .data = "" },
+        .{ .destination = "/etc/config", .source = source_file, .type = null, .flags = linux.MS.BIND | linux.MS.RDONLY | linux.MS.NOSUID, .propagation = 0, .data = "" },
+    };
+    const pid = try forkProcess();
+    if (pid == 0) {
+        checkResult(linux.unshare(linux.CLONE.NEWNS)) catch linux.exit_group(1);
+        setupRootfs(rootfs, &mounts, true) catch linux.exit_group(2);
+        // The source's old absolute host path is unreachable after detaching.
+        if (linux.errno(linux.access(source_file, linux.F_OK)) != .NOENT) linux.exit_group(3);
+        if (linux.errno(linux.open("/new", .{ .ACCMODE = .WRONLY, .CREAT = true }, 0o644)) != .ROFS) linux.exit_group(4);
+        if (linux.errno(linux.open("/etc/config", .{ .ACCMODE = .WRONLY }, 0)) != .ROFS) linux.exit_group(5);
+        const fd = openPath(linux.AT.FDCWD, "/etc/config", .{}) catch linux.exit_group(6);
+        var contents: ["bind contents".len]u8 = undefined;
+        if (!readAll(fd, &contents) or !std.mem.eql(u8, &contents, "bind contents")) linux.exit_group(7);
+        closeFd(fd);
+        if (linux.errno(linux.access("/work/from-bind/item", linux.F_OK)) != .SUCCESS) linux.exit_group(8);
+        const writable = linux.open("/work/new", .{ .ACCMODE = .WRONLY, .CREAT = true }, 0o644);
+        if (linux.errno(writable) != .SUCCESS) linux.exit_group(9);
+        closeFd(@intCast(writable));
+        linux.exit_group(0);
+    }
+    try std.testing.expectEqual(@as(u32, 0), try waitChild(pid));
+}
+
+fn requireTestMountNamespace() !void {
+    const pid = try forkProcess();
+    if (pid == 0) {
+        checkResult(linux.unshare(linux.CLONE.NEWNS)) catch linux.exit_group(1);
+        checkResult(linux.mount(null, "/", null, linux.MS.PRIVATE | linux.MS.REC, 0)) catch linux.exit_group(1);
+        linux.exit_group(0);
+    }
+    if (try waitChild(pid) != 0) return error.SkipZigTest;
 }

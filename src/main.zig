@@ -123,8 +123,32 @@ fn createContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, c
     defer allocator.free(bundle);
     const parsed = try oci.loadSpec(allocator, io, bundle);
     defer parsed.deinit();
+    try oci.requireCreate(parsed.value);
     const rootfs = try oci.resolveRootfs(allocator, bundle, parsed.value.root.path);
     defer allocator.free(rootfs);
+    var mount_arena: std.heap.ArenaAllocator = .init(allocator);
+    defer mount_arena.deinit();
+    const mount_allocator = mount_arena.allocator();
+    const spec_mounts = parsed.value.mounts orelse &.{};
+    const mounts = try mount_allocator.alloc(Backend.Mount, spec_mounts.len);
+    for (spec_mounts, mounts) |mount, *prepared| {
+        const options = try oci.parseMountOptions(mount_allocator, mount.options orelse &.{});
+        var flags = options.flags;
+        if (mount.type) |mount_type| {
+            if (std.mem.eql(u8, mount_type, "bind")) flags |= std.os.linux.MS.BIND;
+        }
+        prepared.* = .{
+            .destination = try oci.resolveMountDestination(mount_allocator, mount.destination),
+            .source = if (flags & std.os.linux.MS.BIND != 0)
+                try oci.resolveRootfs(mount_allocator, bundle, mount.source orelse return error.InvalidConfig)
+            else
+                mount.source,
+            .type = mount.type,
+            .flags = flags,
+            .propagation = options.propagation,
+            .data = options.data,
+        };
+    }
 
     try cwd.createDirPath(io, config.root);
     const root = try cwd.realPathFileAlloc(io, config.root, allocator);
@@ -146,15 +170,14 @@ fn createContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, c
         .rootfs = rootfs,
         .exec_fifo = fifo,
         .spec = &parsed.value,
+        .mounts = mounts,
     });
-    defer if (handle.starttime) |starttime| allocator.free(starttime);
+    defer allocator.free(handle.starttime);
     errdefer backend.kill(handle, 9) catch {};
 
-    if (handle.starttime) |starttime| {
-        const path = try std.fs.path.join(allocator, &.{ state_dir, oci.starttime_file_name });
-        defer allocator.free(path);
-        try oci.atomicWrite(io, path, starttime);
-    }
+    const starttime_path = try std.fs.path.join(allocator, &.{ state_dir, oci.starttime_file_name });
+    defer allocator.free(starttime_path);
+    try oci.atomicWrite(io, starttime_path, handle.starttime);
     try oci.saveState(allocator, io, root, .{
         .id = config.id,
         .status = .created,
@@ -174,44 +197,55 @@ fn stateHandle(allocator: std.mem.Allocator, io: std.Io, root: []const u8, state
     if (pid <= 0) return error.InvalidState;
     const path = try std.fs.path.join(allocator, &.{ root, state.id, oci.starttime_file_name });
     defer allocator.free(path);
-    // Legacy containers have no starttime file and match any process with this PID.
     const starttime = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(32)) catch |err| switch (err) {
-        error.FileNotFound => null,
+        error.FileNotFound => return error.InvalidState,
         else => return err,
     };
+    errdefer allocator.free(starttime);
+    if (starttime.len == 0) return error.InvalidState;
     return .{ .id = state.id, .pid = pid, .starttime = starttime };
 }
 
-fn readLiveState(allocator: std.mem.Allocator, io: std.Io, backend: Backend, config: Config) !std.json.Parsed(oci.State) {
+const LiveState = struct {
+    parsed: std.json.Parsed(oci.State),
+    handle: ?Backend.Handle,
+    allocator: std.mem.Allocator,
+
+    fn deinit(self: LiveState) void {
+        if (self.handle) |handle| self.allocator.free(handle.starttime);
+        self.parsed.deinit();
+    }
+};
+
+fn readLiveState(allocator: std.mem.Allocator, io: std.Io, backend: Backend, config: Config) !LiveState {
     var parsed = try oci.loadState(allocator, io, config.root, config.id);
     errdefer parsed.deinit();
     if (!std.mem.eql(u8, parsed.value.id, config.id)) return error.InvalidState;
+    var handle: ?Backend.Handle = null;
+    errdefer if (handle) |value| allocator.free(value.starttime);
     if (parsed.value.status == .created or parsed.value.status == .running) {
-        const handle = try stateHandle(allocator, io, config.root, parsed.value);
-        defer if (handle.starttime) |starttime| allocator.free(starttime);
-        if (!try backend.alive(handle)) {
+        handle = try stateHandle(allocator, io, config.root, parsed.value);
+        if (!try backend.alive(handle.?)) {
             parsed.value.status = .stopped;
             try oci.saveState(allocator, io, config.root, parsed.value);
         }
     }
-    return parsed;
+    return .{ .parsed = parsed, .handle = handle, .allocator = allocator };
 }
 
 fn startContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, config: Config) !void {
     var state = try readLiveState(allocator, io, backend, config);
     defer state.deinit();
-    try oci.requireStart(state.value.status, true);
-    const spec = try oci.loadSpec(allocator, io, state.value.bundle);
+    try oci.requireStart(state.parsed.value.status, true);
+    const spec = try oci.loadSpec(allocator, io, state.parsed.value.bundle);
     defer spec.deinit();
-    try oci.requireStart(state.value.status, spec.value.process != null);
+    try oci.requireStart(state.parsed.value.status, spec.value.process != null);
     const path = try std.fs.path.join(allocator, &.{ config.root, config.id, oci.exec_fifo_name });
     defer allocator.free(path);
-    const handle = try stateHandle(allocator, io, config.root, state.value);
-    defer if (handle.starttime) |starttime| allocator.free(starttime);
-    try waitForStart(allocator, io, backend, handle, path);
-    try std.Io.Dir.cwd().deleteFile(io, path);
-    state.value.status = .running;
-    try oci.saveState(allocator, io, config.root, state.value);
+    try waitForStart(allocator, io, backend, state.handle.?, path);
+    state.parsed.value.status = .running;
+    try oci.saveState(allocator, io, config.root, state.parsed.value);
+    std.Io.Dir.cwd().deleteFile(io, path) catch {};
 }
 
 fn requireStartWait(is_alive: bool, elapsed: std.Io.Duration) !void {
@@ -264,20 +298,32 @@ fn killContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, con
     const signal = try parseSignal(config.signal);
     const state = try readLiveState(allocator, io, backend, config);
     defer state.deinit();
-    try oci.requireKill(state.value.status);
-    const handle = try stateHandle(allocator, io, config.root, state.value);
-    defer if (handle.starttime) |starttime| allocator.free(starttime);
-    try backend.kill(handle, signal);
+    try oci.requireKill(state.parsed.value.status);
+    try backend.kill(state.handle.?, signal);
 }
 
 fn deleteContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, config: Config) !void {
     const state = try readLiveState(allocator, io, backend, config);
     defer state.deinit();
-    try oci.requireDelete(state.value.status);
-    try backend.delete(.{ .id = state.value.id, .pid = state.value.pid orelse 0 });
+    try oci.requireDelete(state.parsed.value.status);
+    try backend.delete(state.handle orelse .{
+        .id = state.parsed.value.id,
+        .pid = state.parsed.value.pid orelse 0,
+        .starttime = "",
+    });
     const path = try std.fs.path.join(allocator, &.{ config.root, config.id });
     defer allocator.free(path);
     try std.Io.Dir.cwd().deleteTree(io, path);
+}
+
+fn stateContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, config: Config) !void {
+    const state = try readLiveState(allocator, io, backend, config);
+    defer state.deinit();
+    var buffer: [4096]u8 = undefined;
+    var stdout = std.Io.File.stdout().writerStreaming(io, &buffer);
+    try std.json.Stringify.value(state.parsed.value, .{ .emit_null_optional_fields = false }, &stdout.interface);
+    try stdout.interface.writeByte('\n');
+    try stdout.interface.flush();
 }
 
 fn makeExecFifo(allocator: std.mem.Allocator, path: []const u8) !void {
@@ -323,18 +369,7 @@ pub fn main(init: std.process.Init) !u8 {
     var implementation: backend_module.LinuxBackend = .{};
     const backend = implementation.backend();
     const result = switch (config.subcommand) {
-        .state => {
-            const state = readLiveState(allocator, init.io, backend, config) catch |err| {
-                reportError(config, err);
-                return 1;
-            };
-            defer state.deinit();
-            var buffer: [4096]u8 = undefined;
-            var stdout = std.Io.File.stdout().writerStreaming(init.io, &buffer);
-            try oci.writeState(allocator, init.io, config.root, config.id, &stdout.interface);
-            try stdout.interface.flush();
-            return 0;
-        },
+        .state => stateContainer(allocator, init.io, backend, config),
         .create => createContainer(allocator, init.io, backend, config),
         .start => startContainer(allocator, init.io, backend, config),
         .kill => killContainer(allocator, init.io, backend, config),
@@ -372,19 +407,64 @@ test "start wait expires at ten seconds while allowing earlier retries" {
     try std.testing.expectError(error.StartTimeout, requireStartWait(true, .fromMilliseconds(10001)));
 }
 
-test "state handle loads opaque starttime and accepts legacy missing files" {
+test "state handle requires a nonempty starttime file" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDir(std.testing.io, "example", .default_dir);
     const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
     defer std.testing.allocator.free(root);
     const state: oci.State = .{ .id = "example", .pid = 1234, .status = .created, .bundle = "/bundle" };
-    const legacy = try stateHandle(std.testing.allocator, std.testing.io, root, state);
-    try std.testing.expect(legacy.starttime == null);
+    try std.testing.expectError(error.InvalidState, stateHandle(std.testing.allocator, std.testing.io, root, state));
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "example/starttime", .data = "" });
+    try std.testing.expectError(error.InvalidState, stateHandle(std.testing.allocator, std.testing.io, root, state));
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "example/starttime", .data = "987654321" });
     const handle = try stateHandle(std.testing.allocator, std.testing.io, root, state);
-    defer std.testing.allocator.free(handle.starttime.?);
-    try std.testing.expectEqualStrings("987654321", handle.starttime.?);
+    defer std.testing.allocator.free(handle.starttime);
+    try std.testing.expectEqualStrings("987654321", handle.starttime);
+}
+
+test "kill reuses the handle loaded during the liveness check" {
+    const TestBackend = struct {
+        starttime_path: []const u8,
+        killed: bool = false,
+
+        const vtable: Backend.VTable = .{ .create = unusedCreate, .alive = alive, .kill = kill, .delete = unusedDelete };
+
+        fn unusedCreate(_: *anyopaque, _: Backend.CreateOptions) Backend.Error!Backend.Handle {
+            return error.NotImplemented;
+        }
+        fn unusedDelete(_: *anyopaque, _: Backend.Handle) Backend.Error!void {
+            return error.NotImplemented;
+        }
+        fn alive(ptr: *anyopaque, _: Backend.Handle) Backend.Error!bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            std.Io.Dir.cwd().deleteFile(std.testing.io, self.starttime_path) catch return error.LivenessFailed;
+            return true;
+        }
+        fn kill(ptr: *anyopaque, handle: Backend.Handle, signal: i32) Backend.Error!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (!std.mem.eql(u8, handle.starttime, "12345") or signal != 15) return error.KillFailed;
+            self.killed = true;
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "example", .default_dir);
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer std.testing.allocator.free(root);
+    try oci.saveState(std.testing.allocator, std.testing.io, root, .{
+        .id = "example",
+        .pid = 1234,
+        .status = .created,
+        .bundle = "/bundle",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "example/starttime", .data = "12345" });
+    const path = try std.fs.path.join(std.testing.allocator, &.{ root, "example/starttime" });
+    defer std.testing.allocator.free(path);
+    var implementation: TestBackend = .{ .starttime_path = path };
+    const backend: Backend = .{ .ptr = &implementation, .vtable = &TestBackend.vtable };
+    try killContainer(std.testing.allocator, std.testing.io, backend, .{ .root = root, .subcommand = .kill, .id = "example" });
+    try std.testing.expect(implementation.killed);
 }
 
 test "dispatch recognizes lifecycle subcommands and rejects unknown commands" {
@@ -513,7 +593,7 @@ test "create rejects a duplicate id without changing existing state" {
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "bundle/config.json",
         .data =
-        \\{"ociVersion":"1.0.2","root":{"path":"rootfs"}}
+        \\{"ociVersion":"1.0.2","root":{"path":"rootfs"},"linux":{"namespaces":[{"type":"mount"}]}}
         ,
     });
     try tmp.dir.createDirPath(std.testing.io, "containers/example");
@@ -553,6 +633,30 @@ test "create rejects a missing bundle before creating the state directory" {
     try std.testing.expectError(error.FileNotFound, tmp.dir.openDir(std.testing.io, "example", .{}));
 }
 
+test "create rejects missing mount isolation before creating runtime state" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "bundle", .default_dir);
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "bundle/config.json",
+        .data =
+        \\{"ociVersion":"1.0.2","root":{"path":"rootfs"},"mounts":[{"destination":"/proc","type":"proc"}]}
+        ,
+    });
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer std.testing.allocator.free(root);
+    const bundle = try std.fs.path.join(std.testing.allocator, &.{ root, "bundle" });
+    defer std.testing.allocator.free(bundle);
+    var implementation: backend_module.LinuxBackend = .{};
+    try std.testing.expectError(error.InvalidConfig, createContainer(std.testing.allocator, std.testing.io, implementation.backend(), .{
+        .root = root,
+        .subcommand = .create,
+        .id = "example",
+        .bundle = bundle,
+    }));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.openDir(std.testing.io, "example", .{}));
+}
+
 test "create removes its new state directory when setup fails" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -560,7 +664,7 @@ test "create removes its new state directory when setup fails" {
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "bundle/config.json",
         .data =
-        \\{"ociVersion":"1.0.2","root":{"path":"rootfs"},"linux":{"namespaces":[{"type":"network","path":"/proc/1/ns/net"}]}}
+        \\{"ociVersion":"1.0.2","root":{"path":"rootfs"},"linux":{"namespaces":[{"type":"mount"},{"type":"network","path":"/proc/1/ns/net"}]}}
         ,
     });
     const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
@@ -585,6 +689,7 @@ test "create persists backend pid and absolute paths and rolls back a failed pid
     const TestBackend = struct {
         rootfs: [std.fs.max_path_bytes]u8 = undefined,
         rootfs_len: usize = 0,
+        mounts_checked: bool = false,
         killed: bool = false,
 
         const vtable: Backend.VTable = .{
@@ -598,6 +703,20 @@ test "create persists backend pid and absolute paths and rolls back a failed pid
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.rootfs_len = options.rootfs.len;
             @memcpy(self.rootfs[0..self.rootfs_len], options.rootfs);
+            if (options.mounts.len != 2) return error.InvalidConfig;
+            const bind = options.mounts[0];
+            if (!std.mem.eql(u8, bind.destination, "/mnt") or
+                !std.fs.path.isAbsolute(bind.source orelse return error.InvalidConfig) or
+                !std.mem.endsWith(u8, bind.source.?, "/bundle/source") or
+                bind.flags != (std.os.linux.MS.BIND | std.os.linux.MS.RDONLY) or
+                bind.propagation != (std.os.linux.MS.PRIVATE | std.os.linux.MS.REC))
+                return error.InvalidConfig;
+            const proc = options.mounts[1];
+            if (!std.mem.eql(u8, proc.destination, "/proc") or
+                !std.mem.eql(u8, proc.source orelse return error.InvalidConfig, "proc") or
+                proc.flags != std.os.linux.MS.NOSUID or !std.mem.eql(u8, proc.data, "mode=755"))
+                return error.InvalidConfig;
+            self.mounts_checked = true;
             return .{ .id = options.id, .pid = 1234, .starttime = try options.allocator.dupe(u8, "987654321") };
         }
 
@@ -620,7 +739,7 @@ test "create persists backend pid and absolute paths and rolls back a failed pid
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "bundle/config.json",
         .data =
-        \\{"ociVersion":"9.9.9","root":{"path":"rootfs"},"annotations":{"org.example.description":"hello"}}
+        \\{"ociVersion":"9.9.9","root":{"path":"rootfs"},"linux":{"namespaces":[{"type":"mount"}]},"mounts":[{"destination":"/a/../mnt","type":"bind","source":"source","options":["ro","rprivate"]},{"destination":"/proc","type":"proc","source":"proc","options":["nosuid","mode=755"]}],"annotations":{"org.example.description":"hello"}}
         ,
     });
     const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
@@ -658,6 +777,7 @@ test "create persists backend pid and absolute paths and rolls back a failed pid
     const fifo = try tmp.dir.statFile(std.testing.io, "example/exec.fifo", .{});
     try std.testing.expectEqual(std.Io.File.Kind.named_pipe, fifo.kind);
     try std.testing.expect(!implementation.killed);
+    try std.testing.expect(implementation.mounts_checked);
 
     const bad_pid_file = try std.fs.path.join(std.testing.allocator, &.{ root, "missing", "init.pid" });
     defer std.testing.allocator.free(bad_pid_file);
@@ -717,6 +837,7 @@ test "linux lifecycle exchanges the FIFO byte and persists running then stopped"
         .pid = pid,
         .bundle = bundle,
     });
+    try saveTestStarttime(root, pid);
     var implementation: backend_module.LinuxBackend = .{};
     const backend = implementation.backend();
     const config: Config = .{ .root = root, .subcommand = .start, .id = "example" };
@@ -741,7 +862,7 @@ test "linux lifecycle exchanges the FIFO byte and persists running then stopped"
     reaped = true;
     const stopped = try readLiveState(std.testing.allocator, std.testing.io, backend, config);
     defer stopped.deinit();
-    try std.testing.expectEqual(oci.Status.stopped, stopped.value.status);
+    try std.testing.expectEqual(oci.Status.stopped, stopped.parsed.value.status);
     const persisted = try oci.loadState(std.testing.allocator, std.testing.io, root, "example");
     defer persisted.deinit();
     try std.testing.expectEqual(oci.Status.stopped, persisted.value.status);
@@ -772,6 +893,7 @@ test "linux start rejects an absent process before opening the FIFO" {
         .pid = std.os.linux.getpid(),
         .bundle = bundle,
     });
+    try saveTestStarttime(root, std.os.linux.getpid());
     var implementation: backend_module.LinuxBackend = .{};
     try std.testing.expectError(error.MissingProcess, startContainer(std.testing.allocator, std.testing.io, implementation.backend(), .{
         .root = root,
@@ -811,12 +933,13 @@ test "linux state kill and delete refresh stale created and running states" {
                 .pid = pid,
                 .bundle = "/bundle",
             });
+            try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "example/starttime", .data = "12345" });
             const config: Config = .{ .root = root, .subcommand = subcommand, .id = "example" };
             switch (subcommand) {
                 .state => {
                     const state = try readLiveState(std.testing.allocator, std.testing.io, backend, config);
                     defer state.deinit();
-                    try std.testing.expectEqual(oci.Status.stopped, state.value.status);
+                    try std.testing.expectEqual(oci.Status.stopped, state.parsed.value.status);
                 },
                 .kill => try std.testing.expectError(error.InvalidStatus, killContainer(std.testing.allocator, std.testing.io, backend, config)),
                 .delete => {
@@ -831,4 +954,23 @@ test "linux state kill and delete refresh stale created and running states" {
             try std.testing.expectEqual(oci.Status.stopped, persisted.value.status);
         }
     }
+}
+
+fn saveTestStarttime(root: []const u8, pid: i32) !void {
+    const allocator = std.testing.allocator;
+    const path = try std.fmt.allocPrint(allocator, "/proc/{d}/stat", .{pid});
+    defer allocator.free(path);
+    const file = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{});
+    defer file.close(std.testing.io);
+    // proc files report size zero; a streaming reader must read through EOF.
+    var reader = file.readerStreaming(std.testing.io, &.{});
+    const bytes = try reader.interface.allocRemaining(allocator, .limited(4096));
+    defer allocator.free(bytes);
+    const end = std.mem.lastIndexOfScalar(u8, bytes, ')') orelse return error.InvalidState;
+    var fields = std.mem.tokenizeAny(u8, bytes[end + 1 ..], " \t\n");
+    for (3..22) |_| _ = fields.next() orelse return error.InvalidState;
+    const starttime = fields.next() orelse return error.InvalidState;
+    const destination = try std.fs.path.join(allocator, &.{ root, "example/starttime" });
+    defer allocator.free(destination);
+    try oci.atomicWrite(std.testing.io, destination, starttime);
 }

@@ -16,6 +16,17 @@ pub const Backend = struct {
         /// Absolute path to the FIFO created by the frontend.
         exec_fifo: []const u8,
         spec: *const oci.Spec,
+        mounts: []const Mount = &.{},
+    };
+
+    /// Mount options and destinations have already been translated by the frontend.
+    pub const Mount = struct {
+        destination: []const u8,
+        source: ?[]const u8,
+        type: ?[]const u8,
+        flags: u32,
+        propagation: u32,
+        data: []const u8,
     };
 
     /// The id is borrowed. create() allocates starttime with the supplied allocator;
@@ -23,8 +34,8 @@ pub const Backend = struct {
     pub const Handle = struct {
         id: []const u8,
         pid: i32,
-        /// Opaque process identity; null allows legacy containers without one.
-        starttime: ?[]const u8 = null,
+        /// Opaque process identity, required to detect PID reuse.
+        starttime: []const u8,
     };
 
     pub const Error = error{
@@ -94,7 +105,7 @@ test "backend dispatches lifecycle operations through its vtable" {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.options = options;
             if (self.fail_create) return error.NotImplemented;
-            return .{ .id = options.id, .pid = 1234 };
+            return .{ .id = options.id, .pid = 1234, .starttime = "12345" };
         }
 
         fn alive(ptr: *anyopaque, handle: Backend.Handle) Backend.Error!bool {
@@ -139,11 +150,11 @@ test "backend dispatches lifecycle operations through its vtable" {
     try std.testing.expect(try backend.alive(handle));
     try std.testing.expectEqualStrings("example", implementation.checked.?.id);
     try std.testing.expectEqual(@as(i32, 1234), implementation.checked.?.pid);
-    try backend.kill(.{ .id = "other", .pid = 1235 }, 15);
+    try backend.kill(.{ .id = "other", .pid = 1235, .starttime = "12346" }, 15);
     try std.testing.expectEqualStrings("other", implementation.killed.?.id);
     try std.testing.expectEqual(@as(i32, 1235), implementation.killed.?.pid);
     try std.testing.expectEqual(@as(?i32, 15), implementation.signal);
-    try backend.delete(.{ .id = "example", .pid = 0 });
+    try backend.delete(.{ .id = "example", .pid = 0, .starttime = "" });
     try std.testing.expectEqualStrings("example", implementation.deleted.?.id);
     try std.testing.expectEqual(@as(i32, 0), implementation.deleted.?.pid);
 
