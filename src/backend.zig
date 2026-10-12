@@ -18,10 +18,13 @@ pub const Backend = struct {
         spec: *const oci.Spec,
     };
 
-    /// Container identity with a borrowed id owned by the frontend.
+    /// The id is borrowed. create() allocates starttime with the supplied allocator;
+    /// loaded handles borrow starttime from the frontend.
     pub const Handle = struct {
         id: []const u8,
         pid: i32,
+        /// Opaque process identity; null allows legacy containers without one.
+        starttime: ?[]const u8 = null,
     };
 
     pub const Error = error{
@@ -44,7 +47,7 @@ pub const Backend = struct {
         /// The FIFO ready exchange is runtime state machinery, not isolation.
         /// A backend start hook can be added when an isolation mechanism needs it.
         alive: *const fn (ptr: *anyopaque, handle: Handle) Error!bool,
-        /// Handles currently identify processes by host PID.
+        /// Validate the process identity before signaling its host PID.
         kill: *const fn (ptr: *anyopaque, handle: Handle, signal: i32) Error!void,
         /// The id identifies resources after the container stops and its pid is gone.
         delete: *const fn (ptr: *anyopaque, handle: Handle) Error!void,

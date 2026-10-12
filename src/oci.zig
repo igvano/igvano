@@ -2,6 +2,7 @@ const std = @import("std");
 
 pub const state_file_name = "state.json";
 pub const exec_fifo_name = "exec.fifo";
+pub const starttime_file_name = "starttime";
 pub const runtime_oci_version = "1.0.2";
 
 /// Parsed config.json values needed by a namespace backend.
@@ -112,6 +113,7 @@ pub fn atomicWrite(io: std.Io, path: []const u8, bytes: []const u8) !void {
     var file = try std.Io.Dir.cwd().createFileAtomic(io, path, .{ .replace = true });
     defer file.deinit(io);
     try file.file.writeStreamingAll(io, bytes);
+    try file.file.sync(io);
     try file.replace(io);
 }
 

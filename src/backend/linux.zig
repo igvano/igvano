@@ -42,7 +42,7 @@ pub const LinuxBackend = struct {
         .delete = delete,
     };
 
-    fn create(_: *anyopaque, options: Backend.CreateOptions) Backend.Error!Backend.Handle {
+    fn create(ptr: *anyopaque, options: Backend.CreateOptions) Backend.Error!Backend.Handle {
         if (comptime builtin.os.tag == .linux) {
             const flags = try namespaceFlags(options.spec.linux);
             if (options.spec.hostname != null and flags & linux.CLONE.NEWUTS == 0)
@@ -55,7 +55,7 @@ pub const LinuxBackend = struct {
                 std.mem.indexOfScalar(u8, options.exec_fifo, 0) != null)
                 return error.InvalidPath;
 
-            // All allocation and string termination happen before either fork.
+            // Prepare the init's strings before either fork.
             var arena: std.heap.ArenaAllocator = .init(options.allocator);
             defer arena.deinit();
             const allocator = arena.allocator();
@@ -104,7 +104,18 @@ pub const LinuxBackend = struct {
                     _ = waitChild(child2) catch {};
                     failCreate(report[1], error.CreateFailed);
                 }
-                var response: CreateResponse = .{ .pid = child2 };
+                // Capture identity while child2 is still our child, so its PID
+                // cannot be recycled even if it has already exited.
+                var stat_buffer: [4096]u8 = undefined;
+                const stat = readProcStat(child2, &stat_buffer) catch |err| {
+                    _ = linux.kill(child2, .KILL);
+                    _ = waitChild(child2) catch {};
+                    failCreate(report[1], err);
+                };
+                var response: CreateResponse = .{
+                    .pid = child2,
+                    .starttime = std.fmt.parseInt(u64, stat.starttime, 10) catch unreachable,
+                };
                 if (!writeAll(report[1], std.mem.asBytes(&response))) {
                     _ = linux.kill(child2, .KILL);
                     _ = waitChild(child2) catch {};
@@ -119,17 +130,21 @@ pub const LinuxBackend = struct {
             defer closeFd(report[0]);
             var response: CreateResponse = .{};
             const reported = readAll(report[0], std.mem.asBytes(&response));
-            const status = waitChild(child1) catch |err| {
-                if (reported and response.pid > 0) _ = linux.kill(response.pid, .KILL);
-                return err;
-            };
+            var starttime_buffer: [20]u8 = undefined;
+            const starttime = std.fmt.bufPrint(&starttime_buffer, "{d}", .{response.starttime}) catch unreachable;
+            const handle: Backend.Handle = .{ .id = options.id, .pid = response.pid, .starttime = starttime };
+            errdefer if (reported and response.pid > 0) kill(ptr, handle, 9) catch {};
+            const status = try waitChild(child1);
             if (!reported) return error.CreateFailed;
             if (response.failure != 0) return @errorCast(@errorFromInt(@as(u16, @intCast(response.failure))));
             if (status != 0 or response.pid <= 0) {
-                if (response.pid > 0) _ = linux.kill(response.pid, .KILL);
                 return error.CreateFailed;
             }
-            return .{ .id = options.id, .pid = response.pid };
+            return .{
+                .id = options.id,
+                .pid = response.pid,
+                .starttime = try options.allocator.dupe(u8, starttime),
+            };
         } else {
             return error.NotImplemented;
         }
@@ -138,20 +153,27 @@ pub const LinuxBackend = struct {
     fn alive(_: *anyopaque, handle: Backend.Handle) Backend.Error!bool {
         if (comptime builtin.os.tag == .linux) {
             if (handle.pid <= 0) return error.InvalidProcess;
-            return switch (linux.errno(linux.kill(handle.pid, @enumFromInt(0)))) {
-                .SUCCESS, .PERM => true,
-                .SRCH => false,
-                else => error.LivenessFailed,
+            switch (linux.errno(linux.kill(handle.pid, @enumFromInt(0)))) {
+                .SUCCESS, .PERM => {},
+                .SRCH => return false,
+                else => return error.LivenessFailed,
+            }
+            var buffer: [4096]u8 = undefined;
+            const stat = readProcStat(handle.pid, &buffer) catch |err| switch (err) {
+                error.ProcessNotFound => return false,
+                else => return err,
             };
+            return stat.matches(handle.starttime);
         } else {
             return error.NotImplemented;
         }
     }
 
-    fn kill(_: *anyopaque, handle: Backend.Handle, signal: i32) Backend.Error!void {
+    fn kill(ptr: *anyopaque, handle: Backend.Handle, signal: i32) Backend.Error!void {
         if (comptime builtin.os.tag == .linux) {
             if (handle.pid <= 0) return error.InvalidProcess;
             if (signal < 0 or signal >= linux.NSIG) return error.KillFailed;
+            if (!try alive(ptr, handle)) return error.ProcessNotFound;
             switch (linux.errno(linux.kill(handle.pid, @enumFromInt(@as(u32, @intCast(signal)))))) {
                 .SUCCESS => {},
                 .SRCH => return error.ProcessNotFound,
@@ -176,7 +198,60 @@ pub const LinuxBackend = struct {
 const CreateResponse = extern struct {
     pid: i32 = 0,
     failure: u32 = 0,
+    starttime: u64 = 0,
 };
+
+const ProcStat = struct {
+    state: u8,
+    starttime: []const u8,
+
+    fn matches(self: ProcStat, starttime: ?[]const u8) bool {
+        if (self.state == 'Z' or self.state == 'X') return false;
+        return if (starttime) |expected| std.mem.eql(u8, expected, self.starttime) else true;
+    }
+};
+
+fn parseProcStat(bytes: []const u8) Backend.Error!ProcStat {
+    // comm can contain spaces and parentheses; only its final ')' delimits it.
+    const end = std.mem.lastIndexOfScalar(u8, bytes, ')') orelse return error.LivenessFailed;
+    var fields = std.mem.tokenizeAny(u8, bytes[end + 1 ..], " \t\n");
+    const state = fields.next() orelse return error.LivenessFailed;
+    if (state.len != 1) return error.LivenessFailed;
+    // State is field 3; skip fields 4 through 21 to reach starttime.
+    for (4..22) |_| _ = fields.next() orelse return error.LivenessFailed;
+    const starttime = fields.next() orelse return error.LivenessFailed;
+    _ = std.fmt.parseInt(u64, starttime, 10) catch return error.LivenessFailed;
+    return .{ .state = state[0], .starttime = starttime };
+}
+
+fn readProcStat(pid: i32, buffer: []u8) Backend.Error!ProcStat {
+    var path_buffer: [64]u8 = undefined;
+    const path = std.fmt.bufPrintZ(&path_buffer, "/proc/{d}/stat", .{pid}) catch unreachable;
+    const fd: posix.fd_t = open: while (true) {
+        const result = linux.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+        switch (linux.errno(result)) {
+            .SUCCESS => break :open @intCast(result),
+            .INTR => continue,
+            .NOENT, .SRCH => return error.ProcessNotFound,
+            else => return error.LivenessFailed,
+        }
+    };
+    defer closeFd(fd);
+    var used: usize = 0;
+    while (used < buffer.len) {
+        const result = linux.read(fd, buffer[used..].ptr, buffer.len - used);
+        switch (linux.errno(result)) {
+            .SUCCESS => {
+                if (result == 0) return parseProcStat(buffer[0..used]);
+                used += result;
+            },
+            .INTR => continue,
+            .SRCH => return error.ProcessNotFound,
+            else => return error.LivenessFailed,
+        }
+    }
+    return error.LivenessFailed;
+}
 
 fn processString(allocator: std.mem.Allocator, value: []const u8) Backend.Error![:0]u8 {
     if (std.mem.indexOfScalar(u8, value, 0) != null) return error.InvalidProcess;
@@ -344,6 +419,37 @@ fn execProcess(argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*:0]con
     linux.exit_group(1);
 }
 
+test "proc stat parses field 22 after comm containing spaces and closing parentheses" {
+    const stat = try parseProcStat(
+        "1234 (init) name (x)) S 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 987654321 23 24\n",
+    );
+    try std.testing.expectEqual(@as(u8, 'S'), stat.state);
+    try std.testing.expectEqualStrings("987654321", stat.starttime);
+}
+
+test "proc stat treats zombie and dead states as not alive" {
+    for ([_]u8{ 'Z', 'X', 'S', 'R', 'T' }) |state| {
+        const line = try std.fmt.allocPrint(std.testing.allocator, "1234 (init) ) {c} 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 12345\n", .{state});
+        defer std.testing.allocator.free(line);
+        const stat = try parseProcStat(line);
+        try std.testing.expectEqual(state != 'Z' and state != 'X', stat.matches(null));
+        try std.testing.expectEqual(state != 'Z' and state != 'X', stat.matches("12345"));
+        try std.testing.expect(!stat.matches("54321"));
+    }
+}
+
+test "proc stat rejects missing fields and malformed starttime" {
+    for ([_][]const u8{
+        "1234 init S 4",
+        "1234 (init)",
+        "1234 (init) SS 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 12345",
+        "1234 (init) S 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21",
+        "1234 (init) S 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 invalid",
+    }) |line| {
+        try std.testing.expectError(error.LivenessFailed, parseProcStat(line));
+    }
+}
+
 test "linux backend is unavailable on other platforms" {
     if (comptime builtin.os.tag == .linux) return error.SkipZigTest;
     const spec: oci.Spec = .{
@@ -387,7 +493,13 @@ test "linux liveness and signaling work with a handle loaded by a new backend" {
     };
     var implementation: LinuxBackend = .{};
     const backend = implementation.backend();
-    const handle: Backend.Handle = .{ .id = "persisted", .pid = pid };
+    var stat_buffer: [4096]u8 = undefined;
+    const stat = try readProcStat(pid, &stat_buffer);
+    const handle: Backend.Handle = .{ .id = "persisted", .pid = pid, .starttime = stat.starttime };
+    try std.testing.expect(try backend.alive(handle));
+    const reused: Backend.Handle = .{ .id = "persisted", .pid = pid, .starttime = "mismatched" };
+    try std.testing.expect(!try backend.alive(reused));
+    try std.testing.expectError(error.ProcessNotFound, backend.kill(reused, 9));
     try std.testing.expect(try backend.alive(handle));
     try backend.kill(handle, 0);
     try std.testing.expectError(error.InvalidProcess, backend.kill(.{ .id = "invalid", .pid = 0 }, 9));
@@ -399,6 +511,27 @@ test "linux liveness and signaling work with a handle loaded by a new backend" {
     try std.testing.expect(!try backend.alive(handle));
     try std.testing.expectError(error.ProcessNotFound, backend.kill(handle, 15));
     try backend.delete(handle);
+}
+
+test "linux liveness rejects an unreaped zombie even though kill zero succeeds" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const pid = try forkProcess();
+    if (pid == 0) linux.exit_group(0);
+    defer _ = waitChild(pid) catch {};
+    var info: linux.siginfo_t = undefined;
+    while (true) {
+        switch (linux.errno(linux.waitid(.PID, pid, &info, linux.W.EXITED | linux.W.NOWAIT, null))) {
+            .SUCCESS => break,
+            .INTR => continue,
+            else => return error.WaitFailed,
+        }
+    }
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.kill(pid, @enumFromInt(0))));
+    var implementation: LinuxBackend = .{};
+    const backend = implementation.backend();
+    const handle: Backend.Handle = .{ .id = "zombie", .pid = pid };
+    try std.testing.expect(!try backend.alive(handle));
+    try std.testing.expectError(error.ProcessNotFound, backend.kill(handle, 15));
 }
 
 test "linux create rejects hostname without UTS isolation and unsupported terminals" {
@@ -448,6 +581,7 @@ test "linux create rejects relative process cwd" {
             .spec = &spec,
         });
         if (result) |handle| {
+            defer if (handle.starttime) |starttime| std.testing.allocator.free(starttime);
             // Clean up if a regression incorrectly creates an init.
             backend.kill(handle, 9) catch {};
         } else |_| {}
@@ -474,6 +608,7 @@ test "linux create rejects empty process args" {
         .spec = &spec,
     });
     if (result) |handle| {
+        defer if (handle.starttime) |starttime| std.testing.allocator.free(starttime);
         backend.kill(handle, 9) catch {};
     } else |_| {}
     try std.testing.expectError(
@@ -506,6 +641,7 @@ test "linux create rejects a cwd missing from the resolved rootfs" {
         .spec = &spec,
     });
     if (result) |handle| {
+        defer if (handle.starttime) |starttime| std.testing.allocator.free(starttime);
         // Clean up if a regression incorrectly creates an init.
         backend.kill(handle, 9) catch {};
     } else |_| {}
@@ -764,9 +900,12 @@ test "linux create accepts an empty rootfs and returns a live blocked init" {
             .exec_fifo = fifo,
             .spec = &spec,
         });
+        defer if (handle.starttime) |starttime| std.testing.allocator.free(starttime);
         defer backend.kill(handle, 9) catch {};
         try std.testing.expect(handle.pid > 0);
         try std.testing.expectEqualStrings("example", handle.id);
+        try std.testing.expect(handle.starttime != null);
+        try std.testing.expect(try backend.alive(handle));
         try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.kill(handle.pid, @enumFromInt(0))));
         try backend.kill(handle, 9);
     }
