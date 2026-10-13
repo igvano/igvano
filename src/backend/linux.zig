@@ -35,7 +35,7 @@ pub fn namespaceFlags(config: ?oci.Spec.Linux) Backend.Error!usize {
             .mount => linux.CLONE.NEWNS,
             .ipc => linux.CLONE.NEWIPC,
             .uts => linux.CLONE.NEWUTS,
-            .user => return error.Unsupported,
+            .user => linux.CLONE.NEWUSER,
             .cgroup => linux.CLONE.NEWCGROUP,
             .time => linux.CLONE.NEWTIME,
         };
@@ -70,8 +70,9 @@ pub const LinuxBackend = struct {
             }
             if (options.capabilities) |caps| {
                 if (caps.ambient & ~(caps.permitted & caps.inheritable) != 0)
-                    return error.InvalidConfig;
+                    return error.AmbientCapabilitiesRequirePermittedAndInheritable;
             }
+            const capabilities = if (options.capabilities) |caps| try kernelCapabilities(caps) else null;
             for (options.rlimits) |limit| {
                 if (limit.soft > limit.hard) return error.InvalidConfig;
             }
@@ -83,6 +84,15 @@ pub const LinuxBackend = struct {
             var arena: std.heap.ArenaAllocator = .init(options.allocator);
             defer arena.deinit();
             const allocator = arena.allocator();
+            const user_namespace = flags & linux.CLONE.NEWUSER != 0;
+            // Library callers bypass frontend validation, so mapping-presence checks are intentional.
+            const uid_mappings = if (user_namespace) options.spec.linux.?.uidMappings orelse return error.InvalidConfig else &.{};
+            const gid_mappings = if (user_namespace) options.spec.linux.?.gidMappings orelse return error.InvalidConfig else &.{};
+            if (user_namespace and (uid_mappings.len == 0 or gid_mappings.len == 0)) return error.InvalidConfig;
+            const fifo_uid = if (user_namespace) try mappedRootID(uid_mappings) else 0;
+            const fifo_gid = if (user_namespace) try mappedRootID(gid_mappings) else 0;
+            const uid_map = try formatIDMappings(allocator, uid_mappings);
+            const gid_map = try formatIDMappings(allocator, gid_mappings);
             const fifo = try allocator.dupeZ(u8, options.exec_fifo);
             const rootfs = try processString(allocator, options.rootfs);
             const cwd = try processString(allocator, if (options.spec.process) |process| process.cwd else "/");
@@ -135,26 +145,56 @@ pub const LinuxBackend = struct {
                 for (report) |fd| closeFd(fd);
                 return err;
             };
-            const child1 = forkProcess() catch |err| {
+            const map_pipe = if (user_namespace) makePipe() catch |err| {
                 for (report) |fd| closeFd(fd);
                 for (ready) |fd| closeFd(fd);
                 return err;
+            } else null;
+            const child1 = forkProcess() catch |err| {
+                for (report) |fd| closeFd(fd);
+                for (ready) |fd| closeFd(fd);
+                if (map_pipe) |fds| for (fds) |fd| closeFd(fd);
+                return err;
             };
             if (child1 == 0) {
+                if (map_pipe) |fds| closeFd(fds[1]);
                 closeFd(cgroup_root.fd);
                 closeFd(report[0]);
                 // Join before NEWCGROUP snapshots the namespace root. Child2
                 // inherits this membership; the runtime parent stays outside.
                 writeCgroupFile(cgroup, "cgroup.procs", "0", options.cgroup_path) catch |err| failCreate(report[1], err);
                 closeFd(cgroup);
+                // NEWUSER is unshared together with the others so it owns them.
                 if (flags != 0) checkResult(linux.unshare(flags)) catch |err| failCreate(report[1], err);
                 // NEWPID affects the next fork, making child2 pid 1 inside the namespace.
                 const child2 = forkProcess() catch |err| failCreate(report[1], err);
                 if (child2 == 0) {
+                    // Let the parent see report EOF if child1 dies during the map wait.
                     closeFd(report[1]);
                     closeFd(ready[0]);
                     closeFd(proc_dir);
-                    runInit(options.spec, options.capabilities, options.rlimits, flags, rootfs, mounts, cwd, fifo, argv.ptr, envp.ptr, ready[1]);
+                    // The outside parent must install our ID maps
+                    // before any rootfs, mount, hostname, or process work.
+                    if (map_pipe) |fds| {
+                        var byte: [1]u8 = undefined;
+                        if (!readAll(fds[0], &byte)) linux.exit_group(1);
+                        closeFd(fds[0]);
+                        // Like runc nsexec stage-2, become root in the user ns.
+                        // Unmapped host-root fsuid/fsgid make may_create() fail
+                        // with EOVERFLOW on filesystems mounted in this ns.
+                        checkResult(linux.setgid(0)) catch linux.exit_group(1);
+                        checkResult(linux.setuid(0)) catch linux.exit_group(1);
+                    }
+                    runInit(options.spec, capabilities, options.rlimits, flags, rootfs, mounts, cwd, fifo, argv.ptr, envp.ptr, ready[1]);
+                }
+                if (map_pipe) |fds| {
+                    closeFd(fds[0]);
+                    var mapping_response: CreateResponse = .{ .pid = child2 };
+                    if (!writeAll(report[1], std.mem.asBytes(&mapping_response))) {
+                        _ = linux.kill(child2, .KILL);
+                        _ = waitChild(child2) catch {};
+                        linux.exit_group(1);
+                    }
                 }
                 closeFd(ready[1]);
                 var byte: [1]u8 = undefined;
@@ -188,6 +228,32 @@ pub const LinuxBackend = struct {
             closeFd(report[1]);
             for (ready) |fd| closeFd(fd);
             defer closeFd(report[0]);
+            // Retain a reader so a dying init cannot SIGPIPE the runtime on go.
+            defer if (map_pipe) |fds| closeFd(fds[0]);
+            var map_writer: ?posix.fd_t = if (map_pipe) |fds| fds[1] else null;
+            // On failure, close before waiting to unblock init; null prevents double close.
+            defer if (map_writer) |fd| closeFd(fd);
+            var child1_reaped = false;
+            errdefer if (!child1_reaped) {
+                if (map_writer) |fd| {
+                    closeFd(fd);
+                    map_writer = null;
+                }
+                _ = waitChild(child1) catch {};
+            };
+            if (map_writer) |fd| {
+                var mapping_response: CreateResponse = .{};
+                if (!readAll(report[0], std.mem.asBytes(&mapping_response))) return error.CreateFailed;
+                if (mapping_response.failure != 0)
+                    return @errorCast(@errorFromInt(@as(u16, @intCast(mapping_response.failure))));
+                if (mapping_response.pid <= 0) return error.CreateFailed;
+                try writeUserMappings(mapping_response.pid, gid_map, uid_map);
+                // Init needs ownership as namespace root, even for a non-root process.
+                try checkResult(linux.chown(fifo, fifo_uid, fifo_gid));
+                if (!writeAll(fd, &.{1})) return error.CreateFailed;
+                closeFd(fd);
+                map_writer = null;
+            }
             var response: CreateResponse = .{};
             const reported = readAll(report[0], std.mem.asBytes(&response));
             var starttime_buffer: [20]u8 = undefined;
@@ -202,6 +268,7 @@ pub const LinuxBackend = struct {
                 kill(ptr, handle, 9) catch {};
             };
             const status = try waitChild(child1);
+            child1_reaped = true;
             if (!reported) return error.CreateFailed;
             if (response.failure != 0) return @errorCast(@errorFromInt(@as(u16, @intCast(response.failure))));
             if (status != 0 or response.pid <= 0) {
@@ -680,6 +747,68 @@ fn closeFd(fd: posix.fd_t) void {
     _ = posix.system.close(fd);
 }
 
+fn mappedRootID(mappings: []const oci.Spec.IDMapping) Backend.Error!u32 {
+    for (mappings) |mapping| {
+        if (mapping.containerID == 0 and mapping.size > 0) return mapping.hostID;
+    }
+    return error.InvalidConfig;
+}
+
+fn formatIDMappings(allocator: std.mem.Allocator, mappings: []const oci.Spec.IDMapping) std.mem.Allocator.Error![]u8 {
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(allocator);
+    for (mappings) |mapping| {
+        try text.print(allocator, "{d} {d} {d}\n", .{ mapping.containerID, mapping.hostID, mapping.size });
+    }
+    return text.toOwnedSlice(allocator);
+}
+
+/// The runtime parent writes maps from its original user namespace.
+fn writeUserMappings(pid: i32, gid_map: []const u8, uid_map: []const u8) Backend.Error!void {
+    var path_buffer: [32]u8 = undefined;
+    const path = std.fmt.bufPrintZ(&path_buffer, "/proc/{d}", .{pid}) catch unreachable;
+    const dir = try openPath(linux.AT.FDCWD, path, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true });
+    defer closeFd(dir);
+    // setgroups defaults to "allow"; only rootless setup needs a "deny" write.
+    try writeMappingFile(dir, "gid_map", gid_map);
+    try writeMappingFile(dir, "uid_map", uid_map);
+}
+
+fn writeMappingFile(dir: posix.fd_t, name: [*:0]const u8, text: []const u8) Backend.Error!void {
+    const fd = try openPath(dir, name, .{ .ACCMODE = .WRONLY, .CLOEXEC = true });
+    defer closeFd(fd);
+    // proc ID maps must be supplied in a single write.
+    while (true) {
+        const result = linux.write(fd, text.ptr, text.len);
+        if (linux.errno(result) == .INTR) continue;
+        try checkResult(result);
+        if (result != text.len) return error.CreateFailed;
+        return;
+    }
+}
+
+/// Filter before fork so warnings and any stderr bookkeeping stay in the parent.
+fn kernelCapabilities(configured: Backend.Capabilities) Backend.Error!Backend.Capabilities {
+    var supported: u64 = 0;
+    for (0..64) |cap| {
+        const result = linux.prctl(@intFromEnum(linux.PR.CAPBSET_READ), cap, 0, 0, 0);
+        if (linux.errno(result) == .INVAL) break;
+        try checkResult(result);
+        supported |= @as(u64, 1) << @intCast(cap);
+    }
+    var result = configured;
+    var ignored: u64 = 0;
+    inline for (std.meta.fields(Backend.Capabilities)) |field| {
+        ignored |= @field(result, field.name) & ~supported;
+        @field(result, field.name) &= supported;
+    }
+    for (0..64) |cap| {
+        if (ignored & (@as(u64, 1) << @intCast(cap)) != 0)
+            std.debug.print("igvano: warning: ignoring capability {d}, unsupported by this kernel\n", .{cap});
+    }
+    return result;
+}
+
 fn waitChild(pid: i32) Backend.Error!u32 {
     var status: if (builtin.link_libc) c_int else u32 = undefined;
     while (true) {
@@ -916,7 +1045,8 @@ fn runInit(
     checkResult(linux.chdir(cwd)) catch linux.exit_group(1);
     if (spec.process) |process| {
         // Allow write-only reopen after setuid while keeping readers root-only.
-        checkResult(linux.fchmodat(fd_dir, fifo_name, 0o622)) catch linux.exit_group(1);
+        if (process.user.uid != 0)
+            checkResult(linux.fchmodat(fd_dir, fifo_name, 0o622)) catch linux.exit_group(1);
         applyProcess(process, capabilities, rlimits) catch |err| {
             std.debug.print("igvano: cannot apply process settings: {s}\n", .{@errorName(err)});
             linux.exit_group(1);
@@ -951,6 +1081,7 @@ fn runProcess(spec: *const oci.Spec, argv: [*:null]const ?[*:0]const u8, envp: [
 
 /// Runs before readiness, without allocating. Keep privileges until limits and
 /// bounding drops finish, then retain permitted caps across the UID transition.
+// For UID 0, exec recomputes permitted/effective as inheritable | bounding (as in runc).
 fn applyProcess(process: oci.Spec.Process, capabilities: ?Backend.Capabilities, rlimits: []const Backend.Rlimit) Backend.Error!void {
     if (comptime builtin.os.tag == .linux) {
         for (rlimits) |limit| {
@@ -970,6 +1101,7 @@ fn applyProcess(process: oci.Spec.Process, capabilities: ?Backend.Capabilities, 
             }
             try checkResult(linux.prctl(@intFromEnum(linux.PR.SET_KEEPCAPS), 1, 0, 0, 0));
         }
+        // With a user namespace, additionalGids (like uid/gid) are namespace IDs.
         const groups = process.user.additionalGids orelse &.{};
         try checkResult(linux.setgroups(groups.len, groups.ptr));
         try checkResult(linux.setgid(process.user.gid));
@@ -1293,6 +1425,7 @@ test "namespace flags map each namespace and combine flags without system calls"
         .{ .mount, linux.CLONE.NEWNS },
         .{ .ipc, linux.CLONE.NEWIPC },
         .{ .uts, linux.CLONE.NEWUTS },
+        .{ .user, linux.CLONE.NEWUSER },
         .{ .cgroup, linux.CLONE.NEWCGROUP },
         .{ .time, linux.CLONE.NEWTIME },
     };
@@ -1314,26 +1447,77 @@ test "namespace flags reject duplicate types" {
     );
 }
 
-test "namespace flags reject joins and user namespaces" {
+test "namespace flags reject joins including existing user namespaces" {
     try std.testing.expectError(error.Unsupported, namespaceFlags(.{
         .namespaces = &.{.{ .type = .network, .path = "/proc/1234/ns/net" }},
     }));
     try std.testing.expectError(error.Unsupported, namespaceFlags(.{
-        .namespaces = &.{.{ .type = .user }},
-    }));
-    try std.testing.expectError(error.Unsupported, namespaceFlags(.{
-        .namespaces = &.{.{ .type = .user }},
-        .uidMappings = &.{},
-        .gidMappings = &.{},
+        .namespaces = &.{.{ .type = .user, .path = "/proc/1234/ns/user" }},
     }));
     const mappings: []const oci.Spec.IDMapping = &.{.{ .containerID = 0, .hostID = 1000, .size = 1 }};
-    try std.testing.expectError(error.Unsupported, namespaceFlags(.{
-        .namespaces = &.{.{ .type = .user }},
+    try std.testing.expectEqual(@as(usize, linux.CLONE.NEWUSER | linux.CLONE.NEWNS), try namespaceFlags(.{
+        .namespaces = &.{ .{ .type = .user }, .{ .type = .mount } },
         .uidMappings = mappings,
-    }));
-    try std.testing.expectError(error.Unsupported, namespaceFlags(.{
-        .namespaces = &.{.{ .type = .user }},
         .gidMappings = mappings,
+    }));
+}
+
+test "ID mapping lines preserve order and decimal IDs" {
+    const text = try formatIDMappings(std.testing.allocator, &.{
+        .{ .containerID = 0, .hostID = 100000, .size = 65536 },
+        .{ .containerID = 100000, .hostID = 200000, .size = 1 },
+    });
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("0 100000 65536\n100000 200000 1\n", text);
+}
+
+test "FIFO ownership uses namespace root's mapped host UID and GID" {
+    try std.testing.expectEqual(@as(u32, 100000), try mappedRootID(&.{
+        .{ .containerID = 10, .hostID = 300000, .size = 10 },
+        .{ .containerID = 0, .hostID = 100000, .size = 10 },
+    }));
+    try std.testing.expectEqual(@as(u32, 200000), try mappedRootID(&.{.{ .containerID = 0, .hostID = 200000, .size = 10 }}));
+    try std.testing.expectEqual(@as(u32, 0), try mappedRootID(&.{.{ .containerID = 0, .hostID = 0, .size = 1 }}));
+    for ([_][]const oci.Spec.IDMapping{
+        &.{},
+        &.{.{ .containerID = 1, .hostID = 100000, .size = 10 }},
+        &.{.{ .containerID = 0, .hostID = 100000, .size = 0 }},
+    }) |mappings| {
+        try std.testing.expectError(error.InvalidConfig, mappedRootID(mappings));
+    }
+}
+
+test "linux create reports the frontend ambient capability validation error" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const spec: oci.Spec = .{ .ociVersion = "1.0.2", .root = .{ .path = "/" } };
+    var implementation: LinuxBackend = .{};
+    try std.testing.expectError(error.AmbientCapabilitiesRequirePermittedAndInheritable, implementation.backend().create(.{
+        .allocator = std.testing.allocator,
+        .id = "example",
+        .rootfs = "/",
+        .exec_fifo = "/dev/null",
+        .spec = &spec,
+        .capabilities = .{ .ambient = 1 },
+    }));
+}
+
+test "linux capability preparation skips bits unsupported by the running kernel" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (linux.errno(linux.prctl(@intFromEnum(linux.PR.CAPBSET_READ), 63, 0, 0, 0)) != .INVAL)
+        return error.SkipZigTest;
+    const future = @as(u64, 1) << 63;
+    try std.testing.expectEqual(Backend.Capabilities{
+        .bounding = 1,
+        .effective = 1,
+        .permitted = 1,
+        .inheritable = 1,
+        .ambient = 1,
+    }, try kernelCapabilities(.{
+        .bounding = future | 1,
+        .effective = future | 1,
+        .permitted = future | 1,
+        .inheritable = future | 1,
+        .ambient = future | 1,
     }));
 }
 
@@ -1704,6 +1888,8 @@ test "linux create accepts an empty rootfs and returns a live blocked init" {
         try std.testing.expect(handle.starttime.len != 0);
         try std.testing.expect(try backend.alive(handle));
         try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.kill(handle.pid, @enumFromInt(0))));
+        const fifo_stat = try tmp.dir.statFile(std.testing.io, "exec.fifo", .{});
+        try std.testing.expectEqual(@as(posix.mode_t, 0o600), fifo_stat.permissions.toMode());
         if (spec.process != null) {
             var path_buffer: [64]u8 = undefined;
             const namespace_path = std.fmt.bufPrintZ(&path_buffer, "/proc/{d}/ns/cgroup", .{handle.pid}) catch unreachable;
@@ -1726,6 +1912,133 @@ test "linux create accepts an empty rootfs and returns a live blocked init" {
         try backend.delete(handle);
         try backend.delete(handle);
     }
+}
+
+test "linux mapped create installs maps outside init and cleans up rejected maps" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (linux.geteuid() != 0) return error.SkipZigTest;
+    var header: CapabilityHeader = .{};
+    var caps: [2]linux.cap_user_data_t = undefined;
+    try checkResult(linux.syscall2(.capget, @intFromPtr(&header), @intFromPtr(&caps)));
+    const required = (@as(u32, 1) << linux.CAP.CHOWN) |
+        (@as(u32, 1) << linux.CAP.SETUID) | (@as(u32, 1) << linux.CAP.SETGID);
+    if (caps[0].effective & required != required) return error.SkipZigTest;
+    const namespace_probe = try forkProcess();
+    if (namespace_probe == 0) {
+        checkResult(linux.unshare(linux.CLONE.NEWUSER | linux.CLONE.NEWNS | linux.CLONE.NEWPID)) catch linux.exit_group(1);
+        linux.exit_group(0);
+    }
+    if (try waitChild(namespace_probe) != 0) return error.SkipZigTest;
+    const cgroup_root = openCgroupRoot() catch return error.SkipZigTest;
+    defer closeFd(cgroup_root.fd);
+    const cgroup_path = try std.fmt.allocPrint(std.testing.allocator, "igvano-mapped-test-{d}", .{linux.getpid()});
+    defer std.testing.allocator.free(cgroup_path);
+    const cgroup_probe = (walkCgroup(cgroup_root.fd, cgroup_path, true, &.{}) catch return error.SkipZigTest).?;
+    closeFd(cgroup_probe);
+    try removeCgroup(cgroup_root.fd, cgroup_path);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "rootfs", .default_dir);
+    try tmp.dir.createDir(std.testing.io, "rootfs/dev", .default_dir);
+    const base = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer std.testing.allocator.free(base);
+    const absolute = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, base, std.testing.allocator);
+    defer std.testing.allocator.free(absolute);
+    const rootfs = try std.fs.path.join(std.testing.allocator, &.{ absolute, "rootfs" });
+    defer std.testing.allocator.free(rootfs);
+    const fifo = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/exec.fifo", .{absolute}, 0);
+    defer std.testing.allocator.free(fifo);
+    try checkResult(linux.mknod(fifo, linux.S.IFIFO | 0o600, 0));
+    var spec: oci.Spec = .{
+        .ociVersion = "1.0.2",
+        .root = .{ .path = "rootfs" },
+        .linux = .{
+            .namespaces = &.{ .{ .type = .user }, .{ .type = .mount }, .{ .type = .pid } },
+            // Distinct container ranges with overlapping host ranges: the
+            // kernel rejects uid_map after gid_map is written.
+            .uidMappings = &.{
+                .{ .containerID = 0, .hostID = 100000, .size = 2 },
+                .{ .containerID = 2, .hostID = 100001, .size = 1 },
+            },
+            .gidMappings = &.{.{ .containerID = 0, .hostID = 200000, .size = 10 }},
+        },
+        .process = .{
+            .args = &.{"/bin/sh"},
+            .cwd = "/",
+            .user = .{ .uid = 0, .gid = 0, .additionalGids = &.{ 1, 2 } },
+        },
+    };
+    var implementation: LinuxBackend = .{};
+    const backend = implementation.backend();
+    const options: Backend.CreateOptions = .{
+        .allocator = std.testing.allocator,
+        .id = "mapped",
+        .rootfs = rootfs,
+        .exec_fifo = fifo,
+        .spec = &spec,
+        // Creating /dev/pts on the namespace-owned tmpfs needs mapped
+        // fsuid/fsgid; unmapped host-root would fail mkdirat with EOVERFLOW.
+        .mounts = &.{
+            .{ .destination = "/dev", .source = "tmpfs", .type = "tmpfs", .flags = 0, .propagation = 0, .data = "mode=755" },
+            .{ .destination = "/dev/pts", .source = "tmpfs", .type = "tmpfs", .flags = 0, .propagation = 0, .data = "mode=755" },
+        },
+        .cgroup_path = cgroup_path,
+    };
+    try std.testing.expectError(error.Unsupported, backend.create(options));
+    try std.testing.expectEqual(@as(?posix.fd_t, null), try walkCgroup(cgroup_root.fd, cgroup_path, false, &.{}));
+    spec.linux.?.uidMappings = &.{.{ .containerID = 0, .hostID = 100000, .size = 10 }};
+    const handle = try backend.create(options);
+    defer std.testing.allocator.free(handle.starttime);
+    defer {
+        backend.kill(handle, 9) catch {};
+        backend.delete(handle) catch {};
+    }
+    try std.testing.expect(try backend.alive(handle));
+    for ([_]struct { name: []const u8, tokens: []const []const u8 }{
+        .{ .name = "uid_map", .tokens = &.{ "0", "100000", "10" } },
+        .{ .name = "gid_map", .tokens = &.{ "0", "200000", "10" } },
+        .{ .name = "setgroups", .tokens = &.{"allow"} },
+    }) |expected| {
+        const path = try std.fmt.allocPrint(std.testing.allocator, "/proc/{d}/{s}", .{ handle.pid, expected.name });
+        defer std.testing.allocator.free(path);
+        const text = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, std.testing.allocator, .limited(4096));
+        defer std.testing.allocator.free(text);
+        var tokens = std.mem.tokenizeAny(u8, text, " \t\n");
+        for (expected.tokens) |token| try std.testing.expectEqualStrings(token, tokens.next().?);
+        try std.testing.expect(tokens.next() == null);
+    }
+    const status_path = try std.fmt.allocPrint(std.testing.allocator, "/proc/{d}/status", .{handle.pid});
+    defer std.testing.allocator.free(status_path);
+    const status = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, status_path, std.testing.allocator, .limited(16384));
+    defer std.testing.allocator.free(status);
+    for ([_]struct { prefix: []const u8, tokens: []const []const u8 }{
+        .{ .prefix = "Uid:", .tokens = &.{ "100000", "100000", "100000", "100000" } },
+        .{ .prefix = "Gid:", .tokens = &.{ "200000", "200000", "200000", "200000" } },
+        .{ .prefix = "Groups:", .tokens = &.{ "200001", "200002" } },
+    }) |expected| {
+        var lines = std.mem.tokenizeScalar(u8, status, '\n');
+        var found = false;
+        while (lines.next()) |line| {
+            if (!std.mem.startsWith(u8, line, expected.prefix)) continue;
+            var tokens = std.mem.tokenizeAny(u8, line[expected.prefix.len..], " \t");
+            for (expected.tokens) |token| try std.testing.expectEqualStrings(token, tokens.next().?);
+            try std.testing.expect(tokens.next() == null);
+            found = true;
+            break;
+        }
+        try std.testing.expect(found);
+    }
+    const fifo_stat = try tmp.dir.statFile(std.testing.io, "exec.fifo", .{});
+    try std.testing.expectEqual(@as(posix.mode_t, 0o600), fifo_stat.permissions.toMode());
+    // Mapped root (host UID 100000) must still acknowledge start on the FIFO.
+    const reader = try openPath(linux.AT.FDCWD, fifo, .{ .ACCMODE = .RDONLY, .NONBLOCK = true, .CLOEXEC = true });
+    defer closeFd(reader);
+    var poll = [_]linux.pollfd{.{ .fd = reader, .events = linux.POLL.IN, .revents = 0 }};
+    try checkResult(linux.poll(&poll, 1, 2000));
+    try std.testing.expect(poll[0].revents & linux.POLL.IN != 0);
+    var byte: [1]u8 = undefined;
+    try std.testing.expect(readAll(reader, &byte));
+    try std.testing.expectEqual(@as(u8, 1), byte[0]);
 }
 
 test "linux mount destinations reject symlinks without creating host paths" {

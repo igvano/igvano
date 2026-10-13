@@ -258,8 +258,13 @@ pub fn cpuWeight(shares: u64) !u64 {
 const Backend = @import("backend.zig").Backend;
 const CgroupWrite = Backend.CgroupWrite;
 
+/// Null means a well-formed CAP_* name unknown to our table, possibly a newer cap.
 /// Linux constants are available on every build host; no syscalls are made.
-pub fn capabilityNumber(name: []const u8) error{InvalidConfig}!u6 {
+pub fn capabilityNumber(name: []const u8) error{InvalidConfig}!?u6 {
+    if (!std.mem.startsWith(u8, name, "CAP_") or name.len == 4) return error.InvalidConfig;
+    for (name[4..]) |c| {
+        if (!std.ascii.isUpper(c) and !std.ascii.isDigit(c) and c != '_') return error.InvalidConfig;
+    }
     inline for (comptime std.meta.declarations(std.os.linux.CAP)) |decl| {
         if (comptime !std.mem.eql(u8, decl.name, "LAST_CAP") and
             @TypeOf(@field(std.os.linux.CAP, decl.name)) == comptime_int)
@@ -268,7 +273,7 @@ pub fn capabilityNumber(name: []const u8) error{InvalidConfig}!u6 {
                 return @intCast(@field(std.os.linux.CAP, decl.name));
         }
     }
-    return error.InvalidConfig;
+    return null;
 }
 
 pub fn rlimitResource(name: []const u8) error{InvalidConfig}!std.os.linux.rlimit_resource {
@@ -279,8 +284,14 @@ pub fn rlimitResource(name: []const u8) error{InvalidConfig}!std.os.linux.rlimit
 pub fn processCapabilities(config: Spec.Capabilities) !Backend.Capabilities {
     var result: Backend.Capabilities = .{};
     inline for (std.meta.fields(Backend.Capabilities)) |field| {
-        for (@field(config, field.name) orelse &.{}) |name|
-            @field(result, field.name) |= @as(u64, 1) << try capabilityNumber(name);
+        for (@field(config, field.name) orelse &.{}) |name| {
+            const number = try capabilityNumber(name) orelse {
+                // OCI 1.1 says runtimes SHOULD NOT fail on unknown capabilities.
+                std.debug.print("igvano: warning: ignoring unknown capability {s}\n", .{name});
+                continue;
+            };
+            @field(result, field.name) |= @as(u64, 1) << number;
+        }
     }
     if (result.ambient & ~(result.permitted & result.inheritable) != 0)
         return error.AmbientCapabilitiesRequirePermittedAndInheritable;
@@ -306,7 +317,7 @@ pub fn processRlimits(allocator: std.mem.Allocator, config: ?[]const Spec.Rlimit
     return result;
 }
 
-test "capability names map the complete Linux set and reject unknown names" {
+test "capability names map the complete Linux set and reject malformed names" {
     const names = [_][]const u8{
         "CAP_CHOWN",           "CAP_DAC_OVERRIDE",       "CAP_DAC_READ_SEARCH",
         "CAP_FOWNER",          "CAP_FSETID",             "CAP_KILL",
@@ -324,9 +335,10 @@ test "capability names map the complete Linux set and reject unknown names" {
         "CAP_BPF",             "CAP_CHECKPOINT_RESTORE",
     };
     for (names, 0..) |name, number|
-        try std.testing.expectEqual(@as(u6, @intCast(number)), try capabilityNumber(name));
-    for ([_][]const u8{ "", "CHOWN", "cap_chown", "CAP_UNKNOWN", "CAP_LAST_CAP", "CAP_CHOWN\x00" }) |name|
+        try std.testing.expectEqual(@as(?u6, @intCast(number)), try capabilityNumber(name));
+    for ([_][]const u8{ "", "CHOWN", "cap_chown", "CAP_", "CAP_chown", "CAP_CHOWN\x00", "CAP_CHOWN!" }) |name|
         try std.testing.expectError(error.InvalidConfig, capabilityNumber(name));
+    try std.testing.expectEqual(@as(?u6, null), try capabilityNumber("CAP_FUTURE"));
 }
 
 test "rlimit names map every Linux resource and reject unknown names" {
@@ -373,11 +385,19 @@ test "ambient capabilities require membership in both permitted and inheritable"
     }
     inline for (std.meta.fields(Spec.Capabilities)) |field| {
         var config: Spec.Capabilities = .{};
-        @field(config, field.name) = &.{"CAP_UNKNOWN"};
+        @field(config, field.name) = &.{"not-a-capability"};
         try std.testing.expectError(error.InvalidConfig, processCapabilities(config));
     }
     const upper = try processCapabilities(.{ .bounding = &.{ "CAP_CHECKPOINT_RESTORE", "CAP_CHECKPOINT_RESTORE" } });
     try std.testing.expectEqual(@as(u64, 1) << 40, upper.bounding);
+}
+
+test "process capabilities skip well formed names unknown to the capability table" {
+    const caps = try processCapabilities(.{
+        .bounding = &.{ "CAP_CHOWN", "CAP_FUTURE" },
+        .ambient = &.{"CAP_FUTURE"},
+    });
+    try std.testing.expectEqual(Backend.Capabilities{ .bounding = 1 }, caps);
 }
 
 test "process parses capabilities rlimits and supplementary groups" {
@@ -570,14 +590,54 @@ pub fn resolveMountDestination(allocator: std.mem.Allocator, destination: []cons
     return std.fs.path.resolve(allocator, &.{destination});
 }
 
+/// Map ranges are half-open; widen before adding to avoid wrapping u32 IDs.
+pub fn validateIDMappings(mappings: []const Spec.IDMapping) error{InvalidConfig}!void {
+    if (mappings.len == 0 or mappings.len > 340) return error.InvalidConfig;
+    var text_size: usize = 0;
+    for (mappings, 0..) |mapping, i| {
+        const end = @as(u64, mapping.containerID) + mapping.size;
+        const host_end = @as(u64, mapping.hostID) + mapping.size;
+        // Linux reserves (uid_t)-1 and (gid_t)-1 as unmapped IDs.
+        if (mapping.size == 0 or end > std.math.maxInt(u32) or host_end > std.math.maxInt(u32))
+            return error.InvalidConfig;
+        text_size += std.fmt.count("{d} {d} {d}\n", .{ mapping.containerID, mapping.hostID, mapping.size });
+        if (text_size >= 4096) return error.InvalidConfig; // Linux requires a write smaller than one page.
+        for (mappings[0..i]) |previous| {
+            const previous_end = @as(u64, previous.containerID) + previous.size;
+            const previous_host_end = @as(u64, previous.hostID) + previous.size;
+            if ((mapping.containerID < previous_end and previous.containerID < end) or
+                (mapping.hostID < previous_host_end and previous.hostID < host_end))
+                return error.InvalidConfig;
+        }
+    }
+}
+
 /// Rootfs isolation always needs a mount namespace, even with an empty mount list.
 pub fn requireCreate(spec: Spec) !void {
     _ = std.SemanticVersion.parse(spec.ociVersion) catch return error.InvalidConfig;
     const settings = spec.linux orelse return error.MissingMountNamespace;
-    const namespaces = settings.namespaces orelse return error.MissingMountNamespace;
+    const uid_mappings: []const Spec.IDMapping = settings.uidMappings orelse &.{};
+    const gid_mappings: []const Spec.IDMapping = settings.gidMappings orelse &.{};
+    const namespaces = settings.namespaces orelse &.{};
     var has_mount = false;
+    var has_user = false;
     for (namespaces) |namespace| {
         if (namespace.type == .mount) has_mount = true;
+        if (namespace.type == .user) {
+            if (namespace.path != null) return error.Unsupported;
+            has_user = true;
+        }
+    }
+    if (has_user) {
+        for ([_][]const Spec.IDMapping{ uid_mappings, gid_mappings }) |mappings| {
+            try validateIDMappings(mappings);
+            // OCI does not require a root mapping; our init, like runc, needs one.
+            for (mappings) |mapping| {
+                if (mapping.containerID == 0) break;
+            } else return error.InvalidConfig;
+        }
+    } else if (uid_mappings.len > 0 or gid_mappings.len > 0) {
+        return error.InvalidConfig;
     }
     if (!has_mount) return error.MissingMountNamespace;
     if (spec.root.path.len == 0) return error.InvalidConfig;
@@ -695,6 +755,147 @@ test "create rejects malformed OCI version strings" {
         spec.ociVersion = version;
         try std.testing.expectError(error.InvalidConfig, requireCreate(spec));
     }
+}
+
+test "create accepts user namespaces with UID and GID mappings and rejects joins" {
+    var spec: Spec = .{
+        .ociVersion = "1.0.2",
+        .root = .{ .path = "rootfs" },
+        .linux = .{
+            .namespaces = &.{ .{ .type = .mount }, .{ .type = .user } },
+            .uidMappings = &.{.{ .containerID = 0, .hostID = 100000, .size = 65536 }},
+            .gidMappings = &.{.{ .containerID = 0, .hostID = 200000, .size = 65536 }},
+        },
+    };
+    try requireCreate(spec);
+    spec.linux.?.namespaces = &.{ .{ .type = .mount }, .{ .type = .user, .path = "/proc/1/ns/user" } };
+    try std.testing.expectError(error.Unsupported, requireCreate(spec));
+}
+
+test "create rejects mappings without a user namespace and missing user namespace maps" {
+    const mappings: []const Spec.IDMapping = &.{.{ .containerID = 0, .hostID = 100000, .size = 1 }};
+    var spec: Spec = .{
+        .ociVersion = "1.0.2",
+        .root = .{ .path = "rootfs" },
+    };
+    for ([_]Spec.Linux{
+        .{ .namespaces = &.{.{ .type = .mount }}, .uidMappings = mappings },
+        .{ .namespaces = &.{.{ .type = .mount }}, .gidMappings = mappings },
+        .{ .uidMappings = mappings },
+        .{ .namespaces = &.{ .{ .type = .mount }, .{ .type = .user } } },
+        .{ .namespaces = &.{ .{ .type = .mount }, .{ .type = .user } }, .uidMappings = mappings },
+        .{ .namespaces = &.{ .{ .type = .mount }, .{ .type = .user } }, .gidMappings = mappings },
+    }) |settings| {
+        spec.linux = settings;
+        try std.testing.expectError(error.InvalidConfig, requireCreate(spec));
+    }
+}
+
+test "create tolerates empty mapping arrays without a user namespace" {
+    var spec: Spec = .{
+        .ociVersion = "1.0.2",
+        .root = .{ .path = "rootfs" },
+    };
+    for ([_]Spec.Linux{
+        .{ .namespaces = &.{.{ .type = .mount }}, .uidMappings = &.{} },
+        .{ .namespaces = &.{.{ .type = .mount }}, .gidMappings = &.{} },
+        .{ .namespaces = &.{.{ .type = .mount }}, .uidMappings = &.{}, .gidMappings = &.{} },
+    }) |settings| {
+        spec.linux = settings;
+        try requireCreate(spec);
+    }
+}
+
+test "mapping validation rejects empty zero sized overlapping and oversized maps" {
+    try std.testing.expectError(error.InvalidConfig, validateIDMappings(&.{}));
+    try std.testing.expectError(error.InvalidConfig, validateIDMappings(&.{.{ .containerID = 0, .hostID = 1000, .size = 0 }}));
+    for ([_][]const Spec.IDMapping{
+        &.{ .{ .containerID = 0, .hostID = 1000, .size = 10 }, .{ .containerID = 9, .hostID = 2000, .size = 2 } },
+        &.{ .{ .containerID = 9, .hostID = 2000, .size = 2 }, .{ .containerID = 0, .hostID = 1000, .size = 10 } },
+        &.{ .{ .containerID = 0, .hostID = 1000, .size = 10 }, .{ .containerID = 2, .hostID = 2000, .size = 1 } },
+        &.{.{ .containerID = std.math.maxInt(u32) - 1, .hostID = 0, .size = 3 }},
+        &.{.{ .containerID = 0, .hostID = std.math.maxInt(u32) - 1, .size = 3 }},
+    }) |mappings| {
+        try std.testing.expectError(error.InvalidConfig, validateIDMappings(mappings));
+    }
+    var mappings: [341]Spec.IDMapping = undefined;
+    for (&mappings, 0..) |*mapping, i| {
+        mapping.* = .{ .containerID = @intCast(i), .hostID = @intCast(1000 + i), .size = 1 };
+    }
+    try validateIDMappings(mappings[0..340]);
+    try std.testing.expectError(error.InvalidConfig, validateIDMappings(&mappings));
+    try validateIDMappings(&.{
+        .{ .containerID = 10, .hostID = 2000, .size = 2 },
+        .{ .containerID = 0, .hostID = 1000, .size = 10 },
+    });
+}
+
+test "mapping validation rejects overlapping host ranges in either order" {
+    for ([_][]const Spec.IDMapping{
+        &.{ .{ .containerID = 0, .hostID = 1000, .size = 10 }, .{ .containerID = 10, .hostID = 1009, .size = 2 } },
+        &.{ .{ .containerID = 10, .hostID = 1009, .size = 2 }, .{ .containerID = 0, .hostID = 1000, .size = 10 } },
+        &.{ .{ .containerID = 0, .hostID = 1000, .size = 10 }, .{ .containerID = 20, .hostID = 1002, .size = 1 } },
+    }) |mappings| {
+        try std.testing.expectError(error.InvalidConfig, validateIDMappings(mappings));
+    }
+    try validateIDMappings(&.{
+        .{ .containerID = 10, .hostID = 1010, .size = 2 },
+        .{ .containerID = 0, .hostID = 1000, .size = 10 },
+    });
+}
+
+test "mapping validation requires formatted text smaller than 4096 bytes" {
+    var mappings: [171]Spec.IDMapping = undefined;
+    for (&mappings, 0..) |*mapping, i| {
+        // Each line is 24 bytes; 170 lines fit, but 171 exceed the limit.
+        mapping.* = .{ .containerID = @intCast(1000000000 + i), .hostID = @intCast(2000000000 + i), .size = 1 };
+    }
+    try validateIDMappings(mappings[0..170]);
+    try std.testing.expectError(error.InvalidConfig, validateIDMappings(&mappings));
+    // The final line brings the total to 4095 bytes, then exactly 4096.
+    mappings[170] = .{ .containerID = 0, .hostID = 1000000000, .size = 1 };
+    try validateIDMappings(&mappings);
+    mappings[170].containerID = 10;
+    try std.testing.expectError(error.InvalidConfig, validateIDMappings(&mappings));
+}
+
+test "create validates both user namespace mapping arrays" {
+    const valid: []const Spec.IDMapping = &.{.{ .containerID = 0, .hostID = 100000, .size = 1 }};
+    var spec: Spec = .{
+        .ociVersion = "1.0.2",
+        .root = .{ .path = "rootfs" },
+        .linux = .{
+            .namespaces = &.{ .{ .type = .mount }, .{ .type = .user } },
+            .uidMappings = valid,
+            .gidMappings = valid,
+        },
+    };
+    spec.linux.?.uidMappings = &.{};
+    try std.testing.expectError(error.InvalidConfig, requireCreate(spec));
+    spec.linux.?.uidMappings = valid;
+    spec.linux.?.gidMappings = &.{};
+    try std.testing.expectError(error.InvalidConfig, requireCreate(spec));
+}
+
+test "create requires container root in both user namespace maps" {
+    const root_mapping: []const Spec.IDMapping = &.{.{ .containerID = 0, .hostID = 100000, .size = 10 }};
+    const nonroot_mapping: []const Spec.IDMapping = &.{.{ .containerID = 1, .hostID = 200000, .size = 10 }};
+    var spec: Spec = .{
+        .ociVersion = "1.0.2",
+        .root = .{ .path = "rootfs" },
+        .linux = .{
+            .namespaces = &.{ .{ .type = .mount }, .{ .type = .user } },
+            .uidMappings = nonroot_mapping,
+            .gidMappings = root_mapping,
+        },
+    };
+    try std.testing.expectError(error.InvalidConfig, requireCreate(spec));
+    spec.linux.?.uidMappings = root_mapping;
+    spec.linux.?.gidMappings = nonroot_mapping;
+    try std.testing.expectError(error.InvalidConfig, requireCreate(spec));
+    spec.linux.?.gidMappings = root_mapping;
+    spec.process = .{ .args = &.{"/bin/sh"}, .cwd = "/", .user = .{ .uid = 1, .gid = 1 } };
+    try requireCreate(spec);
 }
 
 /// Loads <bundle>/config.json. The caller owns the result and must call deinit().

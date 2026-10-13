@@ -839,7 +839,7 @@ test "create rejects invalid process settings before creating runtime state" {
     const bundle = try std.fs.path.join(std.testing.allocator, &.{ root, "bundle" });
     defer std.testing.allocator.free(bundle);
     const cases = [_]struct { settings: []const u8, expected: anyerror }{
-        .{ .settings = "\"capabilities\":{\"bounding\":[\"CAP_UNKNOWN\"]}", .expected = error.InvalidConfig },
+        .{ .settings = "\"capabilities\":{\"bounding\":[\"not-a-capability\"]}", .expected = error.InvalidConfig },
         .{ .settings = "\"capabilities\":{\"ambient\":[\"CAP_CHOWN\"]}", .expected = error.AmbientCapabilitiesRequirePermittedAndInheritable },
         .{ .settings = "\"rlimits\":[{\"type\":\"RLIMIT_UNKNOWN\",\"hard\":1024,\"soft\":512}]", .expected = error.InvalidConfig },
         .{ .settings = "\"rlimits\":[{\"type\":\"RLIMIT_NOFILE\",\"hard\":512,\"soft\":1024}]", .expected = error.InvalidConfig },

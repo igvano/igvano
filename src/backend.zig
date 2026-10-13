@@ -72,6 +72,7 @@ pub const Backend = struct {
         NotImplemented,
         Unsupported,
         InvalidConfig,
+        AmbientCapabilitiesRequirePermittedAndInheritable,
         InvalidProcess,
         InvalidPath,
         MissingMountNamespace,
