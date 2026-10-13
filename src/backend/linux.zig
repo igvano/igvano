@@ -5,6 +5,22 @@ const posix = std.posix;
 const Backend = @import("../backend.zig").Backend;
 const oci = @import("../oci.zig");
 
+/// Pure filesystem selection; mount flags, including read-only, stay unchanged.
+pub fn cgroupMountType(mount_type: []const u8, host_fs_type: usize) Backend.Error![]const u8 {
+    if (!std.mem.eql(u8, mount_type, "cgroup")) return mount_type;
+    if (host_fs_type != 0x63677270) return error.Unsupported; // CGROUP2_SUPER_MAGIC
+    return "cgroup2";
+}
+
+test "cgroup mounts map to cgroup2 only on unified hosts" {
+    try std.testing.expectEqualStrings("cgroup2", try cgroupMountType("cgroup", 0x63677270));
+    for ([_]usize{ 0x01021994, 0x27e0eb, 0 }) |host_fs_type| {
+        try std.testing.expectError(error.Unsupported, cgroupMountType("cgroup", host_fs_type));
+    }
+    try std.testing.expectEqualStrings("tmpfs", try cgroupMountType("tmpfs", 0x01021994));
+    try std.testing.expectEqualStrings("cgroup2", try cgroupMountType("cgroup2", 0x01021994));
+}
+
 /// Pure translation and validation; Linux flag constants are available on macOS too.
 pub fn namespaceFlags(config: ?oci.Spec.Linux) Backend.Error!usize {
     const settings = config orelse return 0;
@@ -68,10 +84,21 @@ pub const LinuxBackend = struct {
             const mounts = try allocator.alloc(PreparedMount, options.mounts.len);
             for (options.mounts, mounts) |mount, *prepared| {
                 if (!std.mem.startsWith(u8, mount.destination, "/")) return error.InvalidPath;
+                var mount_type = mount.type;
+                if (mount_type != null and std.mem.eql(u8, mount_type.?, "cgroup") and mount.flags & linux.MS.BIND == 0) {
+                    // Zig has no statfs wrapper. Linux statfs fits in this buffer;
+                    // f_type is its first native word on the supported targets.
+                    var fs: [32]usize = undefined;
+                    try checkResult(linux.syscall2(.statfs, @intFromPtr("/sys/fs/cgroup"), @intFromPtr(&fs)));
+                    mount_type = cgroupMountType(mount_type.?, fs[0]) catch |err| {
+                        std.debug.print("igvano: cgroup mounts require cgroup2 at /sys/fs/cgroup; legacy and hybrid hosts are unsupported\n", .{});
+                        return err;
+                    };
+                }
                 prepared.* = .{
                     .destination = try pathString(allocator, mount.destination),
                     .source = if (mount.source) |source| try pathString(allocator, source) else null,
-                    .type = if (mount.type) |mount_type| try pathString(allocator, mount_type) else null,
+                    .type = if (mount_type) |value| try pathString(allocator, value) else null,
                     .flags = mount.flags,
                     .propagation = mount.propagation,
                     .data = try pathString(allocator, mount.data),
@@ -481,6 +508,24 @@ fn applyMount(rootfs: [:0]const u8, root_fd: posix.fd_t, mount: PreparedMount) B
     target_fd = mounted_fd;
     if (bind and mount.flags & ~@as(u32, ms.BIND | ms.REC) != 0) {
         try checkResult(linux.mount(null, fdPath(&target_buffer, target_fd), null, (mount.flags & ~@as(u32, ms.REC)) | ms.BIND | ms.REMOUNT, 0));
+    }
+    if (bind and mount.flags & ms.REC != 0 and mount.flags & ms.RDONLY != 0) {
+        const MountAttr = extern struct {
+            attr_set: u64 = 1, // MOUNT_ATTR_RDONLY
+            attr_clr: u64 = 0,
+            propagation: u64 = 0,
+            userns_fd: u64 = 0,
+        };
+        const attr: MountAttr = .{};
+        // Zig 0.16's wrapper omits the attr pointer and size; use the full ABI.
+        const result = linux.syscall5(.mount_setattr, @intCast(target_fd), @intFromPtr(""), linux.AT.EMPTY_PATH | linux.AT.RECURSIVE, @intFromPtr(&attr), @sizeOf(MountAttr));
+        switch (linux.errno(result)) {
+            .SUCCESS => {},
+            // ponytail: kernels without mount_setattr only get the top-level
+            // ro remount above; recursive read-only requires Linux 5.12 or newer.
+            .NOSYS => {},
+            else => try checkResult(result),
+        }
     }
     if (mount.propagation != 0) {
         try checkResult(linux.mount(null, fdPath(&target_buffer, target_fd), null, mount.propagation, 0));

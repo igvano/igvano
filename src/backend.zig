@@ -20,6 +20,8 @@ pub const Backend = struct {
     };
 
     /// Mount options and destinations have already been translated by the frontend.
+    // ponytail: MS_* flags tie this neutral interface to Linux; acceptable while
+    // Linux is the only backend. Translate to neutral options when another is added.
     pub const Mount = struct {
         destination: []const u8,
         source: ?[]const u8,

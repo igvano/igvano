@@ -68,7 +68,7 @@ pub const MountOptions = struct {
     data: [:0]u8,
 };
 
-pub fn parseMountOptions(allocator: std.mem.Allocator, options: []const []const u8) !MountOptions {
+pub fn parseMountOptions(allocator: std.mem.Allocator, options: []const []const u8, mount_type: ?[]const u8) !MountOptions {
     const ms = std.os.linux.MS;
     const atime = ms.NOATIME | ms.RELATIME | ms.STRICTATIME;
     const flag_options = [_]struct { name: []const u8, set: u32 = 0, clear: u32 = 0 }{
@@ -101,8 +101,9 @@ pub fn parseMountOptions(allocator: std.mem.Allocator, options: []const []const 
         .{ .name = "shared", .flags = ms.SHARED },
         .{ .name = "rshared", .flags = ms.SHARED | ms.REC },
     };
-    var flags: u32 = 0;
+    var flags: u32 = if (mount_type != null and std.mem.eql(u8, mount_type.?, "bind")) ms.BIND else 0;
     var propagation: u32 = 0;
+    var has_unknown_option = false;
     var data: std.ArrayList(u8) = .empty;
     defer data.deinit(allocator);
     option: for (options) |option| {
@@ -120,9 +121,12 @@ pub fn parseMountOptions(allocator: std.mem.Allocator, options: []const []const 
                 continue :option;
             }
         }
+        has_unknown_option = true;
         if (data.items.len != 0) try data.append(allocator, ',');
         try data.appendSlice(allocator, option);
     }
+    // Bind mounts ignore filesystem data, so unknown options cannot be honored.
+    if (flags & ms.BIND != 0 and has_unknown_option) return error.InvalidConfig;
     return .{ .flags = flags, .propagation = propagation, .data = try data.toOwnedSliceSentinel(allocator, 0) };
 }
 
@@ -150,13 +154,15 @@ pub fn resolveMountDestination(allocator: std.mem.Allocator, destination: []cons
 
 /// Rootfs isolation always needs a mount namespace, even with an empty mount list.
 pub fn requireCreate(spec: Spec) !void {
-    const settings = spec.linux orelse return error.InvalidConfig;
-    const namespaces = settings.namespaces orelse return error.InvalidConfig;
+    _ = std.SemanticVersion.parse(spec.ociVersion) catch return error.InvalidConfig;
+    const settings = spec.linux orelse return error.MissingMountNamespace;
+    const namespaces = settings.namespaces orelse return error.MissingMountNamespace;
     var has_mount = false;
     for (namespaces) |namespace| {
         if (namespace.type == .mount) has_mount = true;
     }
-    if (!has_mount or spec.root.path.len == 0) return error.InvalidConfig;
+    if (!has_mount) return error.MissingMountNamespace;
+    if (spec.root.path.len == 0) return error.InvalidConfig;
     if (spec.process) |process| {
         if (!std.mem.startsWith(u8, process.cwd, "/") or
             std.mem.indexOfScalar(u8, process.cwd, 0) != null) return error.InvalidProcess;
@@ -196,13 +202,13 @@ test "mount options translate flags propagation and filesystem data" {
         .{ .options = &.{ "ro", "size=65536k", "nosuid", "mode=755", "custom" }, .flags = ms.RDONLY | ms.NOSUID, .data = "size=65536k,mode=755,custom" },
     };
     for (cases) |case| {
-        const result = try parseMountOptions(std.testing.allocator, case.options);
+        const result = try parseMountOptions(std.testing.allocator, case.options, null);
         defer std.testing.allocator.free(result.data);
         try std.testing.expectEqual(case.flags, result.flags);
         try std.testing.expectEqual(case.propagation, result.propagation);
         try std.testing.expectEqualStrings(case.data, result.data);
     }
-    try std.testing.expectError(error.InvalidConfig, parseMountOptions(std.testing.allocator, &.{"mode=7\x0055"}));
+    try std.testing.expectError(error.InvalidConfig, parseMountOptions(std.testing.allocator, &.{"mode=7\x0055"}, null));
 }
 
 test "mount destinations normalize within the root and reject escapes" {
@@ -223,14 +229,32 @@ test "mount destinations normalize within the root and reject escapes" {
     }
 }
 
+test "bind mounts reject unknown options regardless of option order" {
+    const cases = [_][]const []const u8{
+        &.{ "bind", "custom" },
+        &.{ "custom", "bind" },
+        &.{ "rbind", "size=65536k", "ro" },
+        &.{ "mode=755", "rbind", "rprivate" },
+        &.{ "bind", "" },
+    };
+    for (cases) |options| {
+        try std.testing.expectError(error.InvalidConfig, parseMountOptions(std.testing.allocator, options, null));
+    }
+    try std.testing.expectError(error.InvalidConfig, parseMountOptions(std.testing.allocator, &.{"custom"}, "bind"));
+    const bind = try parseMountOptions(std.testing.allocator, &.{ "ro", "rprivate" }, "bind");
+    defer std.testing.allocator.free(bind.data);
+    try std.testing.expectEqual(@as(u32, std.os.linux.MS.BIND | std.os.linux.MS.RDONLY), bind.flags);
+    try std.testing.expectEqual(@as(u32, std.os.linux.MS.PRIVATE | std.os.linux.MS.REC), bind.propagation);
+}
+
 test "create validation requires mount isolation with or without mounts" {
     var spec: Spec = .{ .ociVersion = "1.0.2", .root = .{ .path = "rootfs" } };
-    try std.testing.expectError(error.InvalidConfig, requireCreate(spec));
+    try std.testing.expectError(error.MissingMountNamespace, requireCreate(spec));
     spec.linux = .{};
-    try std.testing.expectError(error.InvalidConfig, requireCreate(spec));
+    try std.testing.expectError(error.MissingMountNamespace, requireCreate(spec));
     spec.linux = .{ .namespaces = &.{.{ .type = .pid }} };
     spec.mounts = &.{.{ .destination = "/proc", .type = "proc" }};
-    try std.testing.expectError(error.InvalidConfig, requireCreate(spec));
+    try std.testing.expectError(error.MissingMountNamespace, requireCreate(spec));
     spec.linux = .{ .namespaces = &.{.{ .type = .mount }} };
     try requireCreate(spec);
     spec.mounts = null;
@@ -241,6 +265,18 @@ test "create validation requires mount isolation with or without mounts" {
     spec.mounts = null;
     spec.process = .{ .args = &.{"/bin/sh"}, .cwd = "relative", .user = .{ .uid = 0, .gid = 0 } };
     try std.testing.expectError(error.InvalidProcess, requireCreate(spec));
+}
+
+test "create rejects malformed OCI version strings" {
+    var spec: Spec = .{
+        .ociVersion = "1.0.2",
+        .root = .{ .path = "rootfs" },
+        .linux = .{ .namespaces = &.{.{ .type = .mount }} },
+    };
+    for ([_][]const u8{ "", "invalid", "1.0", "1.0.0.0" }) |version| {
+        spec.ociVersion = version;
+        try std.testing.expectError(error.InvalidConfig, requireCreate(spec));
+    }
 }
 
 /// Loads <bundle>/config.json. The caller owns the result and must call deinit().
@@ -317,19 +353,6 @@ pub fn loadState(allocator: std.mem.Allocator, io: std.Io, root: []const u8, id:
     return std.json.parseFromSlice(State, allocator, json, .{ .allocate = .alloc_always });
 }
 
-pub fn writeState(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    root: []const u8,
-    id: []const u8,
-    writer: *std.Io.Writer,
-) !void {
-    const parsed = try loadState(allocator, io, root, id);
-    defer parsed.deinit();
-    try std.json.Stringify.value(parsed.value, .{ .emit_null_optional_fields = false }, writer);
-    try writer.writeByte('\n');
-}
-
 test "state JSON round-trips a running container with annotations" {
     const json =
         \\{"ociVersion":"1.0.2","id":"example","status":"running","pid":1234,"bundle":"/tmp/bundle","annotations":{"org.example.description":"hello"}}
@@ -380,7 +403,7 @@ test "state JSON rejects an unknown lifecycle status" {
     , .{}));
 }
 
-test "state reads a fixture from the selected root and writes JSON" {
+test "state reads a fixture from the selected root" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDir(std.testing.io, "example", .default_dir);
@@ -400,27 +423,23 @@ test "state reads a fixture from the selected root and writes JSON" {
 
     const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
     defer std.testing.allocator.free(root);
-    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer output.deinit();
-    try writeState(std.testing.allocator, std.testing.io, root, "example", &output.writer);
-    try std.testing.expectEqualStrings(
-        "{\"ociVersion\":\"1.0.2\",\"id\":\"example\",\"status\":\"created\",\"pid\":1234,\"bundle\":\"/tmp/bundle\",\"annotations\":{\"org.example.description\":\"hello\"}}\n",
-        output.written(),
-    );
+    const parsed = try loadState(std.testing.allocator, std.testing.io, root, "example");
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("example", parsed.value.id);
+    try std.testing.expectEqual(Status.created, parsed.value.status);
+    try std.testing.expectEqual(@as(?i32, 1234), parsed.value.pid);
+    try std.testing.expectEqualStrings("hello", parsed.value.annotations.?.map.get("org.example.description").?);
 }
 
-test "state reports a missing container without writing output" {
+test "state reports a missing container" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
     defer std.testing.allocator.free(root);
-    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer output.deinit();
-    try std.testing.expectError(error.FileNotFound, writeState(std.testing.allocator, std.testing.io, root, "missing", &output.writer));
-    try std.testing.expectEqualStrings("", output.written());
+    try std.testing.expectError(error.FileNotFound, loadState(std.testing.allocator, std.testing.io, root, "missing"));
 }
 
-test "state rejects files larger than one MiB without writing output" {
+test "state rejects files larger than one MiB" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDir(std.testing.io, "example", .default_dir);
@@ -434,10 +453,7 @@ test "state rejects files larger than one MiB without writing output" {
 
     const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
     defer std.testing.allocator.free(root);
-    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer output.deinit();
-    try std.testing.expectError(error.StreamTooLong, writeState(std.testing.allocator, std.testing.io, root, "example", &output.writer));
-    try std.testing.expectEqualStrings("", output.written());
+    try std.testing.expectError(error.StreamTooLong, loadState(std.testing.allocator, std.testing.io, root, "example"));
 }
 
 test "loadSpec parses a runc-style config and tolerates unknown fields" {

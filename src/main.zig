@@ -132,19 +132,15 @@ fn createContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, c
     const spec_mounts = parsed.value.mounts orelse &.{};
     const mounts = try mount_allocator.alloc(Backend.Mount, spec_mounts.len);
     for (spec_mounts, mounts) |mount, *prepared| {
-        const options = try oci.parseMountOptions(mount_allocator, mount.options orelse &.{});
-        var flags = options.flags;
-        if (mount.type) |mount_type| {
-            if (std.mem.eql(u8, mount_type, "bind")) flags |= std.os.linux.MS.BIND;
-        }
+        const options = try oci.parseMountOptions(mount_allocator, mount.options orelse &.{}, mount.type);
         prepared.* = .{
             .destination = try oci.resolveMountDestination(mount_allocator, mount.destination),
-            .source = if (flags & std.os.linux.MS.BIND != 0)
+            .source = if (options.flags & std.os.linux.MS.BIND != 0)
                 try oci.resolveRootfs(mount_allocator, bundle, mount.source orelse return error.InvalidConfig)
             else
                 mount.source,
             .type = mount.type,
-            .flags = flags,
+            .flags = options.flags,
             .propagation = options.propagation,
             .data = options.data,
         };
@@ -273,7 +269,7 @@ fn waitForStart(allocator: std.mem.Allocator, io: std.Io, backend: Backend, hand
         defer _ = linux.close(fd);
         var byte: [1]u8 = undefined;
         while (true) {
-            try requireStartWait(try backend.alive(handle), started.untilNow(io, .awake));
+            const is_alive = try backend.alive(handle);
             const result = linux.read(fd, &byte, byte.len);
             switch (linux.errno(result)) {
                 .SUCCESS => {
@@ -287,6 +283,9 @@ fn waitForStart(allocator: std.mem.Allocator, io: std.Io, backend: Backend, hand
                 .INTR => continue,
                 else => return error.StartFailed,
             }
+            // A short-lived init may exit after acknowledging start. Drain its
+            // byte before rejecting the dead process sampled above.
+            try requireStartWait(is_alive, started.untilNow(io, .awake));
             try std.Io.sleep(io, .fromMilliseconds(10), .awake);
         }
     } else {
@@ -391,6 +390,8 @@ fn reportError(config: Config, err: anyerror) void {
         std.debug.print("igvano: start for '{s}' timed out waiting for init readiness\n", .{config.id});
     } else if (config.subcommand == .start and err == error.ProcessNotFound) {
         std.debug.print("igvano: init for '{s}' is no longer alive; start failed\n", .{config.id});
+    } else if (err == error.MissingMountNamespace) {
+        std.debug.print("igvano requires a mount namespace (spec allows inheriting; unsupported here)\n", .{});
     } else {
         std.debug.print("igvano: {s} for '{s}' failed: {s}\n", .{ @tagName(config.subcommand), config.id, @errorName(err) });
     }
@@ -405,6 +406,55 @@ test "start wait expires at ten seconds while allowing earlier retries" {
     try requireStartWait(true, .fromMilliseconds(9999));
     try std.testing.expectError(error.StartTimeout, requireStartWait(true, .fromSeconds(10)));
     try std.testing.expectError(error.StartTimeout, requireStartWait(true, .fromMilliseconds(10001)));
+}
+
+test "linux start accepts a buffered acknowledgement after init exits" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const linux = std.os.linux;
+    const TestBackend = struct {
+        writer: std.posix.fd_t,
+        opened: bool = false,
+
+        const vtable: Backend.VTable = .{ .create = unusedCreate, .alive = alive, .kill = unusedKill, .delete = unusedDelete };
+
+        fn unusedCreate(_: *anyopaque, _: Backend.CreateOptions) Backend.Error!Backend.Handle {
+            return error.NotImplemented;
+        }
+        fn unusedKill(_: *anyopaque, _: Backend.Handle, _: i32) Backend.Error!void {
+            return error.NotImplemented;
+        }
+        fn unusedDelete(_: *anyopaque, _: Backend.Handle) Backend.Error!void {
+            return error.NotImplemented;
+        }
+        fn alive(ptr: *anyopaque, _: Backend.Handle) Backend.Error!bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (!self.opened) {
+                self.opened = true;
+                return true;
+            }
+            // Model init writing its acknowledgement and exiting before start
+            // samples liveness. The real FIFO still holds that acknowledgement.
+            if (linux.errno(linux.write(self.writer, &.{1}, 1)) != .SUCCESS) return error.CreateFailed;
+            return false;
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const fifo = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "exec.fifo" });
+    defer std.testing.allocator.free(fifo);
+    try makeExecFifo(std.testing.allocator, fifo);
+    const fifo_z = try std.testing.allocator.dupeZ(u8, fifo);
+    defer std.testing.allocator.free(fifo_z);
+    const opened = linux.open(fifo_z, .{ .ACCMODE = .RDWR, .NONBLOCK = true, .CLOEXEC = true }, 0);
+    if (linux.errno(opened) != .SUCCESS) return error.OpenFailed;
+    const writer: std.posix.fd_t = @intCast(opened);
+    defer _ = linux.close(writer);
+    var implementation: TestBackend = .{ .writer = writer };
+    try waitForStart(std.testing.allocator, std.testing.io, .{ .ptr = &implementation, .vtable = &TestBackend.vtable }, .{
+        .id = "example",
+        .pid = 1234,
+        .starttime = "12345",
+    }, fifo);
 }
 
 test "state handle requires a nonempty starttime file" {
@@ -648,7 +698,7 @@ test "create rejects missing mount isolation before creating runtime state" {
     const bundle = try std.fs.path.join(std.testing.allocator, &.{ root, "bundle" });
     defer std.testing.allocator.free(bundle);
     var implementation: backend_module.LinuxBackend = .{};
-    try std.testing.expectError(error.InvalidConfig, createContainer(std.testing.allocator, std.testing.io, implementation.backend(), .{
+    try std.testing.expectError(error.MissingMountNamespace, createContainer(std.testing.allocator, std.testing.io, implementation.backend(), .{
         .root = root,
         .subcommand = .create,
         .id = "example",
