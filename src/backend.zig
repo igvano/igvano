@@ -17,6 +17,14 @@ pub const Backend = struct {
         exec_fifo: []const u8,
         spec: *const oci.Spec,
         mounts: []const Mount = &.{},
+        /// Normalized path relative to the cgroup2 mount root.
+        cgroup_path: []const u8 = "",
+        cgroup_writes: []const CgroupWrite = &.{},
+    };
+
+    pub const CgroupWrite = struct {
+        name: []const u8,
+        value: []const u8,
     };
 
     /// Mount options and destinations have already been translated by the frontend.
@@ -29,6 +37,7 @@ pub const Backend = struct {
         flags: u32,
         propagation: u32,
         data: []const u8,
+        recursive_readonly: ?bool = null,
     };
 
     /// The id is borrowed. create() allocates starttime with the supplied allocator;
@@ -38,6 +47,8 @@ pub const Backend = struct {
         pid: i32,
         /// Opaque process identity, required to detect PID reuse.
         starttime: []const u8,
+        /// Borrowed from create options, or loaded from the runtime state directory.
+        cgroup_path: ?[]const u8 = null,
     };
 
     pub const Error = error{
@@ -46,12 +57,15 @@ pub const Backend = struct {
         InvalidConfig,
         InvalidProcess,
         InvalidPath,
+        MissingMountNamespace,
         PermissionDenied,
         SystemResources,
         CreateFailed,
         KillFailed,
         LivenessFailed,
         ProcessNotFound,
+        CgroupWriteFailed,
+        CgroupDeleteFailed,
     } || std.mem.Allocator.Error;
 
     /// Backends receive parsed values only; the frontend loads config.json and resolves paths.
@@ -61,6 +75,7 @@ pub const Backend = struct {
         /// A backend start hook can be added when an isolation mechanism needs it.
         alive: *const fn (ptr: *anyopaque, handle: Handle) Error!bool,
         /// Validate the process identity before signaling its host PID.
+        /// Whole-cgroup termination happens at delete, not kill.
         kill: *const fn (ptr: *anyopaque, handle: Handle, signal: i32) Error!void,
         /// The id identifies resources after the container stops and its pid is gone.
         delete: *const fn (ptr: *anyopaque, handle: Handle) Error!void,

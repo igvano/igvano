@@ -143,8 +143,14 @@ fn createContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, c
             .flags = options.flags,
             .propagation = options.propagation,
             .data = options.data,
+            .recursive_readonly = options.recursive_readonly,
         };
     }
+    const settings = parsed.value.linux.?;
+    const cgroup_path = try oci.resolveCgroupPath(allocator, settings.cgroupsPath, config.id);
+    defer allocator.free(cgroup_path);
+    const cgroup_writes = try oci.cgroupWrites(allocator, settings.resources);
+    defer oci.freeCgroupWrites(allocator, cgroup_writes);
 
     try cwd.createDirPath(io, config.root);
     const root = try cwd.realPathFileAlloc(io, config.root, allocator);
@@ -157,6 +163,9 @@ fn createContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, c
     };
     errdefer cwd.deleteTree(io, state_dir) catch {};
 
+    const cgroup_state_path = try std.fs.path.join(allocator, &.{ state_dir, oci.cgroup_file_name });
+    defer allocator.free(cgroup_state_path);
+    try oci.atomicWrite(io, cgroup_state_path, cgroup_path);
     const fifo = try std.fs.path.join(allocator, &.{ state_dir, oci.exec_fifo_name });
     defer allocator.free(fifo);
     try makeExecFifo(allocator, fifo);
@@ -167,9 +176,14 @@ fn createContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, c
         .exec_fifo = fifo,
         .spec = &parsed.value,
         .mounts = mounts,
+        .cgroup_path = cgroup_path,
+        .cgroup_writes = cgroup_writes,
     });
     defer allocator.free(handle.starttime);
-    errdefer backend.kill(handle, 9) catch {};
+    errdefer {
+        backend.kill(handle, 9) catch {};
+        backend.delete(handle) catch {};
+    }
 
     const starttime_path = try std.fs.path.join(allocator, &.{ state_dir, oci.starttime_file_name });
     defer allocator.free(starttime_path);
@@ -199,7 +213,32 @@ fn stateHandle(allocator: std.mem.Allocator, io: std.Io, root: []const u8, state
     };
     errdefer allocator.free(starttime);
     if (starttime.len == 0) return error.InvalidState;
-    return .{ .id = state.id, .pid = pid, .starttime = starttime };
+    return .{
+        .id = state.id,
+        .pid = pid,
+        .starttime = starttime,
+        .cgroup_path = try loadCgroupPath(allocator, io, root, state.id),
+    };
+}
+
+fn loadCgroupPath(allocator: std.mem.Allocator, io: std.Io, root: []const u8, id: []const u8) !?[]u8 {
+    const path = try std.fs.path.join(allocator, &.{ root, id, oci.cgroup_file_name });
+    defer allocator.free(path);
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(std.fs.max_path_bytes)) catch |err| switch (err) {
+        // Handles from earlier runtime versions have no cgroup to clean up.
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer allocator.free(bytes);
+    return oci.resolveCgroupPath(allocator, bytes, id) catch |err| switch (err) {
+        error.InvalidConfig => return error.InvalidState,
+        else => return err,
+    };
+}
+
+fn freeStateHandle(allocator: std.mem.Allocator, handle: Backend.Handle) void {
+    allocator.free(handle.starttime);
+    if (handle.cgroup_path) |path| allocator.free(path);
 }
 
 const LiveState = struct {
@@ -208,7 +247,7 @@ const LiveState = struct {
     allocator: std.mem.Allocator,
 
     fn deinit(self: LiveState) void {
-        if (self.handle) |handle| self.allocator.free(handle.starttime);
+        if (self.handle) |handle| freeStateHandle(self.allocator, handle);
         self.parsed.deinit();
     }
 };
@@ -218,7 +257,7 @@ fn readLiveState(allocator: std.mem.Allocator, io: std.Io, backend: Backend, con
     errdefer parsed.deinit();
     if (!std.mem.eql(u8, parsed.value.id, config.id)) return error.InvalidState;
     var handle: ?Backend.Handle = null;
-    errdefer if (handle) |value| allocator.free(value.starttime);
+    errdefer if (handle) |value| freeStateHandle(allocator, value);
     if (parsed.value.status == .created or parsed.value.status == .running) {
         handle = try stateHandle(allocator, io, config.root, parsed.value);
         if (!try backend.alive(handle.?)) {
@@ -305,10 +344,18 @@ fn deleteContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, c
     const state = try readLiveState(allocator, io, backend, config);
     defer state.deinit();
     try oci.requireDelete(state.parsed.value.status);
+    const cgroup_path = if (state.handle) |handle|
+        handle.cgroup_path
+    else
+        try loadCgroupPath(allocator, io, config.root, config.id);
+    defer if (state.handle == null) {
+        if (cgroup_path) |path| allocator.free(path);
+    };
     try backend.delete(state.handle orelse .{
         .id = state.parsed.value.id,
         .pid = state.parsed.value.pid orelse 0,
         .starttime = "",
+        .cgroup_path = cgroup_path,
     });
     const path = try std.fs.path.join(allocator, &.{ config.root, config.id });
     defer allocator.free(path);
@@ -391,7 +438,7 @@ fn reportError(config: Config, err: anyerror) void {
     } else if (config.subcommand == .start and err == error.ProcessNotFound) {
         std.debug.print("igvano: init for '{s}' is no longer alive; start failed\n", .{config.id});
     } else if (err == error.MissingMountNamespace) {
-        std.debug.print("igvano requires a mount namespace (spec allows inheriting; unsupported here)\n", .{});
+        std.debug.print("igvano: {s} for '{s}' failed: requires a mount namespace (spec allows inheriting; unsupported here)\n", .{ @tagName(config.subcommand), config.id });
     } else {
         std.debug.print("igvano: {s} for '{s}' failed: {s}\n", .{ @tagName(config.subcommand), config.id, @errorName(err) });
     }
@@ -468,14 +515,76 @@ test "state handle requires a nonempty starttime file" {
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "example/starttime", .data = "" });
     try std.testing.expectError(error.InvalidState, stateHandle(std.testing.allocator, std.testing.io, root, state));
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "example/starttime", .data = "987654321" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "example/cgroup", .data = "/custom/from-state" });
     const handle = try stateHandle(std.testing.allocator, std.testing.io, root, state);
-    defer std.testing.allocator.free(handle.starttime);
+    defer freeStateHandle(std.testing.allocator, handle);
     try std.testing.expectEqualStrings("987654321", handle.starttime);
+    try std.testing.expectEqualStrings("custom/from-state", handle.cgroup_path.?);
+}
+
+test "delete uses the persisted cgroup path and preserves state on backend failure" {
+    const TestBackend = struct {
+        fail_delete: bool = true,
+        deleted: bool = false,
+        const vtable: Backend.VTable = .{ .create = create, .alive = alive, .kill = kill, .delete = delete };
+
+        fn create(_: *anyopaque, _: Backend.CreateOptions) Backend.Error!Backend.Handle {
+            return error.NotImplemented;
+        }
+        fn alive(_: *anyopaque, _: Backend.Handle) Backend.Error!bool {
+            return error.NotImplemented;
+        }
+        fn kill(_: *anyopaque, _: Backend.Handle, _: i32) Backend.Error!void {
+            return error.NotImplemented;
+        }
+        fn delete(ptr: *anyopaque, handle: Backend.Handle) Backend.Error!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (!std.mem.eql(u8, handle.cgroup_path orelse return error.InvalidPath, "custom/persisted"))
+                return error.InvalidPath;
+            if (self.fail_delete) return error.CgroupDeleteFailed;
+            self.deleted = true;
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "example", .default_dir);
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer std.testing.allocator.free(root);
+    try oci.saveState(std.testing.allocator, std.testing.io, root, .{
+        .id = "example",
+        .status = .stopped,
+        .bundle = "/no-longer-present",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "example/cgroup", .data = "custom/persisted" });
+    var implementation: TestBackend = .{};
+    const backend: Backend = .{ .ptr = &implementation, .vtable = &TestBackend.vtable };
+    const config: Config = .{ .root = root, .subcommand = .delete, .id = "example" };
+    try std.testing.expectError(error.CgroupDeleteFailed, deleteContainer(std.testing.allocator, std.testing.io, backend, config));
+    const state = try oci.loadState(std.testing.allocator, std.testing.io, root, "example");
+    state.deinit();
+    implementation.fail_delete = false;
+    try deleteContainer(std.testing.allocator, std.testing.io, backend, config);
+    try std.testing.expect(implementation.deleted);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.openDir(std.testing.io, "example", .{}));
+}
+
+test "loading persisted cgroup paths rejects escapes and the mount root" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "example", .default_dir);
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer std.testing.allocator.free(root);
+    try std.testing.expect(try loadCgroupPath(std.testing.allocator, std.testing.io, root, "example") == null);
+    for ([_][]const u8{ "", "/", "../outside", "a/../../outside", "a/..", "a\x00b" }) |path| {
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "example/cgroup", .data = path });
+        try std.testing.expectError(error.InvalidState, loadCgroupPath(std.testing.allocator, std.testing.io, root, "example"));
+    }
 }
 
 test "kill reuses the handle loaded during the liveness check" {
     const TestBackend = struct {
         starttime_path: []const u8,
+        cgroup_path: []const u8,
         killed: bool = false,
 
         const vtable: Backend.VTable = .{ .create = unusedCreate, .alive = alive, .kill = kill, .delete = unusedDelete };
@@ -489,11 +598,14 @@ test "kill reuses the handle loaded during the liveness check" {
         fn alive(ptr: *anyopaque, _: Backend.Handle) Backend.Error!bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             std.Io.Dir.cwd().deleteFile(std.testing.io, self.starttime_path) catch return error.LivenessFailed;
+            std.Io.Dir.cwd().deleteFile(std.testing.io, self.cgroup_path) catch return error.LivenessFailed;
             return true;
         }
         fn kill(ptr: *anyopaque, handle: Backend.Handle, signal: i32) Backend.Error!void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            if (!std.mem.eql(u8, handle.starttime, "12345") or signal != 15) return error.KillFailed;
+            if (!std.mem.eql(u8, handle.starttime, "12345") or signal != 15 or
+                !std.mem.eql(u8, handle.cgroup_path orelse return error.InvalidPath, "custom/from-state"))
+                return error.KillFailed;
             self.killed = true;
         }
     };
@@ -509,9 +621,12 @@ test "kill reuses the handle loaded during the liveness check" {
         .bundle = "/bundle",
     });
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "example/starttime", .data = "12345" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "example/cgroup", .data = "custom/from-state" });
     const path = try std.fs.path.join(std.testing.allocator, &.{ root, "example/starttime" });
     defer std.testing.allocator.free(path);
-    var implementation: TestBackend = .{ .starttime_path = path };
+    const cgroup_path = try std.fs.path.join(std.testing.allocator, &.{ root, "example/cgroup" });
+    defer std.testing.allocator.free(cgroup_path);
+    var implementation: TestBackend = .{ .starttime_path = path, .cgroup_path = cgroup_path };
     const backend: Backend = .{ .ptr = &implementation, .vtable = &TestBackend.vtable };
     try killContainer(std.testing.allocator, std.testing.io, backend, .{ .root = root, .subcommand = .kill, .id = "example" });
     try std.testing.expect(implementation.killed);
@@ -741,12 +856,13 @@ test "create persists backend pid and absolute paths and rolls back a failed pid
         rootfs_len: usize = 0,
         mounts_checked: bool = false,
         killed: bool = false,
+        deleted: bool = false,
 
         const vtable: Backend.VTable = .{
             .create = create,
             .alive = alive,
             .kill = kill,
-            .delete = unused,
+            .delete = delete,
         };
 
         fn create(ptr: *anyopaque, options: Backend.CreateOptions) Backend.Error!Backend.Handle {
@@ -767,11 +883,26 @@ test "create persists backend pid and absolute paths and rolls back a failed pid
                 proc.flags != std.os.linux.MS.NOSUID or !std.mem.eql(u8, proc.data, "mode=755"))
                 return error.InvalidConfig;
             self.mounts_checked = true;
-            return .{ .id = options.id, .pid = 1234, .starttime = try options.allocator.dupe(u8, "987654321") };
+            if (!std.mem.eql(u8, options.cgroup_path, "custom/test") or options.cgroup_writes.len != 2)
+                return error.InvalidConfig;
+            if (!std.mem.eql(u8, options.cgroup_writes[0].name, "memory.max") or
+                !std.mem.eql(u8, options.cgroup_writes[0].value, "33554432") or
+                !std.mem.eql(u8, options.cgroup_writes[1].name, "pids.max") or
+                !std.mem.eql(u8, options.cgroup_writes[1].value, "5"))
+                return error.InvalidConfig;
+            return .{
+                .id = options.id,
+                .pid = 1234,
+                .starttime = try options.allocator.dupe(u8, "987654321"),
+                .cgroup_path = options.cgroup_path,
+            };
         }
 
-        fn unused(_: *anyopaque, _: Backend.Handle) Backend.Error!void {
-            return error.NotImplemented;
+        fn delete(ptr: *anyopaque, handle: Backend.Handle) Backend.Error!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (!std.mem.eql(u8, handle.cgroup_path orelse return error.InvalidPath, "custom/test"))
+                return error.InvalidPath;
+            self.deleted = true;
         }
 
         fn alive(_: *anyopaque, _: Backend.Handle) Backend.Error!bool {
@@ -789,7 +920,7 @@ test "create persists backend pid and absolute paths and rolls back a failed pid
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "bundle/config.json",
         .data =
-        \\{"ociVersion":"9.9.9","root":{"path":"rootfs"},"linux":{"namespaces":[{"type":"mount"}]},"mounts":[{"destination":"/a/../mnt","type":"bind","source":"source","options":["ro","rprivate"]},{"destination":"/proc","type":"proc","source":"proc","options":["nosuid","mode=755"]}],"annotations":{"org.example.description":"hello"}}
+        \\{"ociVersion":"9.9.9","root":{"path":"rootfs"},"linux":{"namespaces":[{"type":"mount"}],"cgroupsPath":"/custom/test","resources":{"memory":{"limit":33554432},"pids":{"limit":5}}},"mounts":[{"destination":"/a/../mnt","type":"bind","source":"source","options":["ro","rprivate"]},{"destination":"/proc","type":"proc","source":"proc","options":["nosuid","mode=755"]}],"annotations":{"org.example.description":"hello"}}
         ,
     });
     const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
@@ -824,9 +955,13 @@ test "create persists backend pid and absolute paths and rolls back a failed pid
     const starttime = try tmp.dir.readFileAlloc(std.testing.io, "example/starttime", std.testing.allocator, .limited(32));
     defer std.testing.allocator.free(starttime);
     try std.testing.expectEqualStrings("987654321", starttime);
+    const cgroup = try tmp.dir.readFileAlloc(std.testing.io, "example/cgroup", std.testing.allocator, .limited(1024));
+    defer std.testing.allocator.free(cgroup);
+    try std.testing.expectEqualStrings("custom/test", cgroup);
     const fifo = try tmp.dir.statFile(std.testing.io, "example/exec.fifo", .{});
     try std.testing.expectEqual(std.Io.File.Kind.named_pipe, fifo.kind);
     try std.testing.expect(!implementation.killed);
+    try std.testing.expect(!implementation.deleted);
     try std.testing.expect(implementation.mounts_checked);
 
     const bad_pid_file = try std.fs.path.join(std.testing.allocator, &.{ root, "missing", "init.pid" });
@@ -835,6 +970,7 @@ test "create persists backend pid and absolute paths and rolls back a failed pid
     config.pid_file = bad_pid_file;
     try std.testing.expectError(error.FileNotFound, createContainer(std.testing.allocator, std.testing.io, backend, config));
     try std.testing.expect(implementation.killed);
+    try std.testing.expect(implementation.deleted);
     try std.testing.expectError(error.FileNotFound, tmp.dir.openDir(std.testing.io, "other", .{}));
 }
 

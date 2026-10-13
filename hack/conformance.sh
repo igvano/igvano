@@ -2,6 +2,7 @@
 # Run from any directory. Requires Nix and Docker on the host.
 # CONFORMANCE_LOG defaults to .zig-cache/conformance.log.
 # CONFORMANCE_IMAGE and CONFORMANCE_TIMEOUT override the Go image and seconds/test.
+# RUNTIME_TOOLS_REF overrides the runtime-tools branch, tag, or commit.
 set -eu
 
 if [ "${1-}" = "--inside" ]; then
@@ -9,14 +10,35 @@ if [ "${1-}" = "--inside" ]; then
     case "$timeout_seconds" in
         ''|*[!0-9]*) echo "CONFORMANCE_TIMEOUT must be a positive integer" >&2; exit 1 ;;
     esac
-    [ "$timeout_seconds" -gt 0 ]
+    if [ "$timeout_seconds" -eq 0 ]; then
+        echo "CONFORMANCE_TIMEOUT must be a positive integer (got 0); exiting" >&2
+        exit 1
+    fi
+
+    if [ -f /sys/fs/cgroup/cgroup.controllers ]; then
+        # Empty Docker's cgroup namespace root so controllers can be enabled.
+        mkdir -p /sys/fs/cgroup/init
+        # Snapshot the PIDs before moving them; short-lived processes may exit.
+        cgroup_pids=$(cat /sys/fs/cgroup/cgroup.procs)
+        for pid in $cgroup_pids; do
+            printf '%s\n' "$pid" > /sys/fs/cgroup/init/cgroup.procs || true
+        done
+        if [ -n "$(cat /sys/fs/cgroup/cgroup.procs)" ]; then
+            echo "Unable to empty the cgroup namespace root for conformance tests" >&2
+            exit 1
+        fi
+    fi
 
     apt-get update
     apt-get install -y --no-install-recommends busybox-static
     command -v timeout >/dev/null
-    git clone --depth 1 --branch master https://github.com/opencontainers/runtime-tools.git /tmp/runtime-tools
+    runtime_tools_ref=${RUNTIME_TOOLS_REF:-master}
+    git init /tmp/runtime-tools
     cd /tmp/runtime-tools
-    printf 'runtime-tools master: %s\n' "$(git rev-parse HEAD)"
+    git remote add origin https://github.com/opencontainers/runtime-tools.git
+    git fetch --depth 1 origin "$runtime_tools_ref"
+    git checkout --detach FETCH_HEAD
+    printf 'runtime-tools %s: %s\n' "$runtime_tools_ref" "$(git rev-parse HEAD)"
     go version
     uname -a
     make runtimetest validation-executables
@@ -46,7 +68,7 @@ if [ "${1-}" = "--inside" ]; then
     while IFS= read -r test; do
         printf '\n===== %s =====\n' "$test"
         status=0
-        timeout --kill-after=5 "$timeout_seconds" "./$test" > /tmp/conformance-tap 2>&1 || status=$?
+        timeout --kill-after=5 "$timeout_seconds" "./$test" < /dev/null > /tmp/conformance-tap 2>&1 || status=$?
         cat /tmp/conformance-tap
         printf '\nExit status: %s\n' "$status"
         # A crash, timeout, bailout, empty or incomplete TAP plan is a suite failure,
@@ -100,6 +122,7 @@ status=0
         --mount "type=bind,src=$snapshot/igvano,dst=/usr/local/bin/igvano,readonly" \
         --mount "type=bind,src=$snapshot/conformance.sh,dst=/conformance.sh,readonly" \
         -e "CONFORMANCE_TIMEOUT=${CONFORMANCE_TIMEOUT:-120}" \
+        -e "RUNTIME_TOOLS_REF=${RUNTIME_TOOLS_REF:-master}" \
         "${CONFORMANCE_IMAGE:-golang:1.25-bookworm}" sh /conformance.sh --inside
 ) > "$log" 2>&1 || status=$?
 cat "$log"

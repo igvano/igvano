@@ -7,7 +7,7 @@ const oci = @import("../oci.zig");
 
 /// Pure filesystem selection; mount flags, including read-only, stay unchanged.
 pub fn cgroupMountType(mount_type: []const u8, host_fs_type: usize) Backend.Error![]const u8 {
-    if (!std.mem.eql(u8, mount_type, "cgroup")) return mount_type;
+    if (!std.mem.eql(u8, mount_type, "cgroup") and !std.mem.eql(u8, mount_type, "cgroup2")) return mount_type;
     if (host_fs_type != 0x63677270) return error.Unsupported; // CGROUP2_SUPER_MAGIC
     return "cgroup2";
 }
@@ -18,7 +18,8 @@ test "cgroup mounts map to cgroup2 only on unified hosts" {
         try std.testing.expectError(error.Unsupported, cgroupMountType("cgroup", host_fs_type));
     }
     try std.testing.expectEqualStrings("tmpfs", try cgroupMountType("tmpfs", 0x01021994));
-    try std.testing.expectEqualStrings("cgroup2", try cgroupMountType("cgroup2", 0x01021994));
+    try std.testing.expectError(error.Unsupported, cgroupMountType("cgroup2", 0x01021994));
+    try std.testing.expectEqualStrings("cgroup2", try cgroupMountType("cgroup2", 0x63677270));
 }
 
 /// Pure translation and validation; Linux flag constants are available on macOS too.
@@ -79,21 +80,17 @@ pub const LinuxBackend = struct {
             const rootfs = try processString(allocator, options.rootfs);
             const cwd = try processString(allocator, if (options.spec.process) |process| process.cwd else "/");
             if (!std.fs.path.isAbsolute(cwd)) return error.InvalidProcess;
-            if (flags & linux.CLONE.NEWNS == 0) return error.InvalidConfig;
+            if (flags & linux.CLONE.NEWNS == 0) return error.MissingMountNamespace;
             if (!std.fs.path.isAbsolute(rootfs)) return error.InvalidPath;
+            try validateCgroupPath(options.cgroup_path);
+            const cgroup_root = try openCgroupRoot();
+            defer closeFd(cgroup_root);
             const mounts = try allocator.alloc(PreparedMount, options.mounts.len);
             for (options.mounts, mounts) |mount, *prepared| {
                 if (!std.mem.startsWith(u8, mount.destination, "/")) return error.InvalidPath;
                 var mount_type = mount.type;
-                if (mount_type != null and std.mem.eql(u8, mount_type.?, "cgroup") and mount.flags & linux.MS.BIND == 0) {
-                    // Zig has no statfs wrapper. Linux statfs fits in this buffer;
-                    // f_type is its first native word on the supported targets.
-                    var fs: [32]usize = undefined;
-                    try checkResult(linux.syscall2(.statfs, @intFromPtr("/sys/fs/cgroup"), @intFromPtr(&fs)));
-                    mount_type = cgroupMountType(mount_type.?, fs[0]) catch |err| {
-                        std.debug.print("igvano: cgroup mounts require cgroup2 at /sys/fs/cgroup; legacy and hybrid hosts are unsupported\n", .{});
-                        return err;
-                    };
+                if (mount_type != null and mount.flags & linux.MS.BIND == 0) {
+                    mount_type = try cgroupMountType(mount_type.?, 0x63677270);
                 }
                 prepared.* = .{
                     .destination = try pathString(allocator, mount.destination),
@@ -102,6 +99,7 @@ pub const LinuxBackend = struct {
                     .flags = mount.flags,
                     .propagation = mount.propagation,
                     .data = try pathString(allocator, mount.data),
+                    .recursive_readonly = mount.recursive_readonly,
                 };
             }
             const args: []const []const u8 = if (options.spec.process) |process| process.args else &.{};
@@ -115,6 +113,11 @@ pub const LinuxBackend = struct {
             // mount namespace. Pin host /proc so it can still capture identity.
             const proc_dir = try openPath(linux.AT.FDCWD, "/proc", .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true });
             defer closeFd(proc_dir);
+            const cgroup = (try walkCgroup(cgroup_root, options.cgroup_path, true, options.cgroup_writes)).?;
+            defer closeFd(cgroup);
+            errdefer removeCgroup(cgroup_root, options.cgroup_path) catch {};
+            for (options.cgroup_writes) |write|
+                try writeCgroupFile(cgroup, write.name, write.value, options.cgroup_path);
             const report = try makePipe();
             const ready = makePipe() catch |err| {
                 for (report) |fd| closeFd(fd);
@@ -126,7 +129,12 @@ pub const LinuxBackend = struct {
                 return err;
             };
             if (child1 == 0) {
+                closeFd(cgroup_root);
                 closeFd(report[0]);
+                // Join before NEWCGROUP snapshots the namespace root. Child2
+                // inherits this membership; the runtime parent stays outside.
+                writeCgroupFile(cgroup, "cgroup.procs", "0", options.cgroup_path) catch |err| failCreate(report[1], err);
+                closeFd(cgroup);
                 if (flags != 0) checkResult(linux.unshare(flags)) catch |err| failCreate(report[1], err);
                 // NEWPID affects the next fork, making child2 pid 1 inside the namespace.
                 const child2 = forkProcess() catch |err| failCreate(report[1], err);
@@ -174,18 +182,28 @@ pub const LinuxBackend = struct {
             const reported = readAll(report[0], std.mem.asBytes(&response));
             var starttime_buffer: [20]u8 = undefined;
             const starttime = std.fmt.bufPrint(&starttime_buffer, "{d}", .{response.starttime}) catch unreachable;
-            const handle: Backend.Handle = .{ .id = options.id, .pid = response.pid, .starttime = starttime };
-            errdefer if (reported and response.pid > 0) kill(ptr, handle, 9) catch {};
+            const handle: Backend.Handle = .{
+                .id = options.id,
+                .pid = response.pid,
+                .starttime = starttime,
+                .cgroup_path = options.cgroup_path,
+            };
+            errdefer if (reported and response.pid > 0) {
+                kill(ptr, handle, 9) catch {};
+            };
             const status = try waitChild(child1);
             if (!reported) return error.CreateFailed;
             if (response.failure != 0) return @errorCast(@errorFromInt(@as(u16, @intCast(response.failure))));
             if (status != 0 or response.pid <= 0) {
                 return error.CreateFailed;
             }
+            const owned_starttime = try options.allocator.dupe(u8, starttime);
+            errdefer options.allocator.free(owned_starttime);
             return .{
                 .id = options.id,
                 .pid = response.pid,
-                .starttime = try options.allocator.dupe(u8, starttime),
+                .starttime = owned_starttime,
+                .cgroup_path = options.cgroup_path,
             };
         } else {
             return error.NotImplemented;
@@ -232,15 +250,315 @@ pub const LinuxBackend = struct {
         }
     }
 
-    fn delete(_: *anyopaque, _: Backend.Handle) Backend.Error!void {
+    fn delete(_: *anyopaque, handle: Backend.Handle) Backend.Error!void {
         if (comptime builtin.os.tag == .linux) {
-            // No backend resources to clean up until cgroups are implemented.
-            // The frontend owns and removes the runtime state directory.
+            const path = handle.cgroup_path orelse return;
+            try validateCgroupPath(path);
+            const root = try openCgroupRoot();
+            defer closeFd(root);
+            const cgroup = (try walkCgroup(root, path, false, &.{})) orelse return;
+            defer closeFd(cgroup);
+            // kill targets init only. delete terminates any remaining descendants.
+            if (try cgroupPopulated(cgroup))
+                try writeCgroupFile(cgroup, "cgroup.kill", "1", path);
+            try removeCgroup(root, path);
         } else {
             return error.NotImplemented;
         }
     }
 };
+
+fn validateCgroupPath(path: []const u8) Backend.Error!void {
+    if (path.len == 0 or path[0] == '/' or std.mem.indexOfScalar(u8, path, 0) != null)
+        return error.InvalidPath;
+    var components = std.mem.splitScalar(u8, path, '/');
+    while (components.next()) |component| {
+        if (component.len == 0 or std.mem.eql(u8, component, ".") or
+            std.mem.eql(u8, component, "..") or component.len > 255)
+            return error.InvalidPath;
+    }
+}
+
+fn openCgroupRoot() Backend.Error!posix.fd_t {
+    const opened = linux.openat(linux.AT.FDCWD, "/sys/fs/cgroup", .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .NOFOLLOW = true, .CLOEXEC = true }, 0);
+    switch (linux.errno(opened)) {
+        .SUCCESS => {},
+        .NOENT, .NOTDIR => return error.Unsupported,
+        else => try checkResult(opened),
+    }
+    const root: posix.fd_t = @intCast(opened);
+    errdefer closeFd(root);
+    // Zig has no statfs wrapper. f_type is the first native word of Linux statfs.
+    var fs: [32]usize = undefined;
+    try checkResult(linux.syscall2(.fstatfs, @intCast(root), @intFromPtr(&fs)));
+    if (fs[0] != 0x63677270) {
+        std.debug.print("igvano: cgroups require cgroup2 at /sys/fs/cgroup; legacy and hybrid hosts are unsupported\n", .{});
+        return error.Unsupported;
+    }
+    return root;
+}
+
+test "backend cgroup paths must name a normalized child directory" {
+    for ([_][]const u8{ "igvano/example", "custom", "a/b/c" }) |path| try validateCgroupPath(path);
+    for ([_][]const u8{ "", "/", "/custom", "..", "a/../b", "a/./b", "a//b", "a/", "a\x00b" }) |path| {
+        try std.testing.expectError(error.InvalidPath, validateCgroupPath(path));
+    }
+}
+
+test "linux cgroup creation reuses parents but rejects existing leaves" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "parent/foreign");
+    try tmp.dir.createDir(std.testing.io, "foreign", .default_dir);
+    const base = try std.fmt.allocPrintSentinel(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path}, 0);
+    defer std.testing.allocator.free(base);
+    const root = try openPath(linux.AT.FDCWD, base, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true });
+    defer closeFd(root);
+    for ([_][]const u8{ "foreign", "parent/foreign" }) |path| {
+        const result = walkCgroup(root, path, true, &.{});
+        if (result) |fd| {
+            if (fd) |opened| closeFd(opened);
+        } else |_| {}
+        try std.testing.expectError(error.CreateFailed, result);
+        const existing = (try walkCgroup(root, path, false, &.{})).?;
+        closeFd(existing);
+    }
+    const owned = (try walkCgroup(root, "parent/owned", true, &.{})).?;
+    closeFd(owned);
+    try removeCgroup(root, "parent/owned");
+    try std.testing.expectEqual(@as(?posix.fd_t, null), try walkCgroup(root, "parent/owned", false, &.{}));
+}
+
+test "linux cgroup removal deletes nested children and preserves sibling cgroups" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "parent/owned/child/grandchild");
+    try tmp.dir.createDirPath(std.testing.io, "parent/owned/other");
+    try tmp.dir.createDirPath(std.testing.io, "parent/foreign/keep");
+    const base = try std.fmt.allocPrintSentinel(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path}, 0);
+    defer std.testing.allocator.free(base);
+    const root = try openPath(linux.AT.FDCWD, base, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true });
+    defer closeFd(root);
+    try removeCgroup(root, "parent/owned");
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, "parent/owned", .{}));
+    _ = try tmp.dir.statFile(std.testing.io, "parent/foreign/keep", .{});
+    try removeCgroup(root, "parent/owned");
+    try removeCgroup(root, "missing/container");
+}
+
+test "linux child cgroup cleanup leaves control files and symlinks untouched" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "owned/child/grandchild");
+    try tmp.dir.createDirPath(std.testing.io, "outside/keep");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "owned/cgroup.events", .data = "populated 0\n" });
+    try tmp.dir.symLink(std.testing.io, "../outside", "owned/escape", .{});
+    const base = try std.fmt.allocPrintSentinel(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path}, 0);
+    defer std.testing.allocator.free(base);
+    const root = try openPath(linux.AT.FDCWD, base, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true });
+    defer closeFd(root);
+    const owned = (try walkCgroup(root, "owned", false, &.{})).?;
+    defer closeFd(owned);
+    try removeCgroupChildren(owned, "owned");
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, "owned/child", .{}));
+    _ = try tmp.dir.statFile(std.testing.io, "owned/cgroup.events", .{});
+    _ = try tmp.dir.statFile(std.testing.io, "owned/escape", .{});
+    _ = try tmp.dir.statFile(std.testing.io, "outside/keep", .{});
+}
+
+/// Walk through pinned directory fds so symlinks cannot redirect cgroup writes.
+/// Enable requested controllers in every parent before creating its child.
+/// Creation requires a new leaf so cleanup cannot kill or remove a foreign cgroup.
+fn walkCgroup(root: posix.fd_t, path: []const u8, create: bool, writes: []const Backend.CgroupWrite) Backend.Error!?posix.fd_t {
+    try validateCgroupPath(path);
+    var current = try openPath(root, ".", .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true });
+    errdefer closeFd(current);
+    var controller_buffer: [32]u8 = undefined;
+    var controller_len: usize = 0;
+    const controllers = [_]struct { prefix: []const u8, enable: []const u8 }{
+        .{ .prefix = "memory.", .enable = "+memory " },
+        .{ .prefix = "cpu.", .enable = "+cpu " },
+        .{ .prefix = "pids.", .enable = "+pids " },
+    };
+    for (controllers) |controller| {
+        for (writes) |write| {
+            if (std.mem.startsWith(u8, write.name, controller.prefix)) {
+                @memcpy(controller_buffer[controller_len..][0..controller.enable.len], controller.enable);
+                controller_len += controller.enable.len;
+                break;
+            }
+        }
+    }
+    var components = std.mem.tokenizeScalar(u8, path, '/');
+    while (components.next()) |component| {
+        var buffer: [256]u8 = undefined;
+        const name = std.fmt.bufPrintZ(&buffer, "{s}", .{component}) catch return error.InvalidPath;
+        if (create) {
+            if (controller_len != 0)
+                try writeCgroupFile(current, "cgroup.subtree_control", controller_buffer[0..controller_len], path);
+            const result = linux.mkdirat(current, name, 0o755);
+            switch (linux.errno(result)) {
+                .SUCCESS => {},
+                .EXIST => {
+                    if (components.peek() == null) {
+                        std.debug.print("igvano: cgroup '{s}' already exists\n", .{path});
+                        return error.CreateFailed;
+                    }
+                },
+                else => try checkResult(result),
+            }
+        }
+        const result = linux.openat(current, name, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .NOFOLLOW = true, .CLOEXEC = true }, 0);
+        switch (linux.errno(result)) {
+            .SUCCESS => {
+                closeFd(current);
+                current = @intCast(result);
+            },
+            .NOENT => {
+                if (create) return error.CreateFailed;
+                closeFd(current);
+                return null;
+            },
+            else => try checkResult(result),
+        }
+    }
+    return current;
+}
+
+fn writeCgroupFile(dir: posix.fd_t, filename: []const u8, value: []const u8, path: []const u8) Backend.Error!void {
+    if (filename.len == 0 or std.mem.indexOfAny(u8, filename, "/\x00") != null or
+        std.mem.eql(u8, filename, ".") or std.mem.eql(u8, filename, "..")) return error.InvalidPath;
+    var buffer: [256]u8 = undefined;
+    const name = std.fmt.bufPrintZ(&buffer, "{s}", .{filename}) catch return error.InvalidPath;
+    const fd: posix.fd_t = open: while (true) {
+        const result = linux.openat(dir, name, .{ .ACCMODE = .WRONLY, .NOFOLLOW = true, .CLOEXEC = true }, 0);
+        switch (linux.errno(result)) {
+            .SUCCESS => break :open @intCast(result),
+            .INTR => continue,
+            else => |err| {
+                std.debug.print("igvano: cgroup '{s}' cannot open {s}: {s}\n", .{ path, filename, @tagName(err) });
+                return error.CgroupWriteFailed;
+            },
+        }
+    };
+    defer closeFd(fd);
+    var offset: usize = 0;
+    while (offset < value.len) {
+        const result = linux.write(fd, value[offset..].ptr, value.len - offset);
+        switch (linux.errno(result)) {
+            .SUCCESS => {
+                if (result == 0) return error.CgroupWriteFailed;
+                offset += result;
+            },
+            .INTR => continue,
+            else => |err| {
+                std.debug.print("igvano: cgroup '{s}' cannot write {s} = '{s}': {s}\n", .{ path, filename, value, @tagName(err) });
+                return error.CgroupWriteFailed;
+            },
+        }
+    }
+}
+
+fn cgroupPopulated(dir: posix.fd_t) Backend.Error!bool {
+    const fd = try openPath(dir, "cgroup.events", .{ .ACCMODE = .RDONLY, .NOFOLLOW = true, .CLOEXEC = true });
+    defer closeFd(fd);
+    var buffer: [256]u8 = undefined;
+    var used: usize = 0;
+    while (used < buffer.len) {
+        const result = linux.read(fd, buffer[used..].ptr, buffer.len - used);
+        switch (linux.errno(result)) {
+            .SUCCESS => {
+                if (result == 0) break;
+                used += result;
+            },
+            .INTR => continue,
+            else => return error.CgroupDeleteFailed,
+        }
+    }
+    var fields = std.mem.tokenizeAny(u8, buffer[0..used], " \t\n");
+    while (fields.next()) |key| {
+        const value = fields.next() orelse return error.CgroupDeleteFailed;
+        if (std.mem.eql(u8, key, "populated")) {
+            if (std.mem.eql(u8, value, "0")) return false;
+            if (std.mem.eql(u8, value, "1")) return true;
+            return error.CgroupDeleteFailed;
+        }
+    }
+    return error.CgroupDeleteFailed;
+}
+
+fn removeCgroup(root: posix.fd_t, path: []const u8) Backend.Error!void {
+    try validateCgroupPath(path);
+    const parent = if (std.fs.path.dirname(path)) |parent_path|
+        (try walkCgroup(root, parent_path, false, &.{})) orelse return
+    else
+        try openPath(root, ".", .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true });
+    defer closeFd(parent);
+    var buffer: [256]u8 = undefined;
+    const name = std.fmt.bufPrintZ(&buffer, "{s}", .{std.fs.path.basename(path)}) catch return error.InvalidPath;
+    const delay: linux.timespec = .{ .sec = 0, .nsec = 10_000_000 };
+    for (0..50) |_| {
+        const opened = linux.openat(parent, name, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .NOFOLLOW = true, .CLOEXEC = true }, 0);
+        switch (linux.errno(opened)) {
+            .SUCCESS => {
+                const cgroup: posix.fd_t = @intCast(opened);
+                defer closeFd(cgroup);
+                try removeCgroupChildren(cgroup, path);
+            },
+            .NOENT => return,
+            .INTR => continue,
+            else => |err| {
+                std.debug.print("igvano: cannot open cgroup '{s}' for removal: {s}\n", .{ path, @tagName(err) });
+                return error.CgroupDeleteFailed;
+            },
+        }
+        const result = linux.unlinkat(parent, name, linux.AT.REMOVEDIR);
+        switch (linux.errno(result)) {
+            .SUCCESS, .NOENT => return,
+            .INTR => continue,
+            .BUSY, .NOTEMPTY => _ = linux.nanosleep(&delay, null),
+            else => |err| {
+                std.debug.print("igvano: cannot remove cgroup '{s}': {s}\n", .{ path, @tagName(err) });
+                return error.CgroupDeleteFailed;
+            },
+        }
+    }
+    std.debug.print("igvano: cgroup '{s}' is still busy after waiting for members to exit\n", .{path});
+    return error.CgroupDeleteFailed;
+}
+
+/// Remove descendants before their parent, without touching cgroup control files.
+fn removeCgroupChildren(dir: posix.fd_t, path: []const u8) Backend.Error!void {
+    var buffer: [4096]u8 = undefined;
+    while (true) {
+        const result = linux.getdents64(dir, &buffer, buffer.len);
+        switch (linux.errno(result)) {
+            .SUCCESS => {},
+            .NOENT => return,
+            .INTR => continue,
+            else => |err| {
+                std.debug.print("igvano: cannot read child cgroups of '{s}': {s}\n", .{ path, @tagName(err) });
+                return error.CgroupDeleteFailed;
+            },
+        }
+        if (result == 0) return;
+        var offset: usize = 0;
+        while (offset < result) {
+            const entry: *align(1) const linux.dirent64 = @ptrCast(&buffer[offset]);
+            offset += entry.reclen;
+            if (entry.type != linux.DT.DIR) continue;
+            const name_ptr: [*]const u8 = &entry.name;
+            const padded_name = name_ptr[0 .. entry.reclen - @offsetOf(linux.dirent64, "name")];
+            const name_len = std.mem.indexOfScalar(u8, padded_name, 0).?;
+            const name = name_ptr[0..name_len :0];
+            if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
+            try removeCgroup(dir, name);
+        }
+    }
+}
 
 const CreateResponse = extern struct {
     pid: i32 = 0,
@@ -407,6 +725,7 @@ const PreparedMount = struct {
     flags: u32,
     propagation: u32,
     data: [:0]const u8,
+    recursive_readonly: ?bool = null,
 };
 
 fn openPath(dir_fd: posix.fd_t, path: [*:0]const u8, flags: linux.O) Backend.Error!posix.fd_t {
@@ -509,23 +828,19 @@ fn applyMount(rootfs: [:0]const u8, root_fd: posix.fd_t, mount: PreparedMount) B
     if (bind and mount.flags & ~@as(u32, ms.BIND | ms.REC) != 0) {
         try checkResult(linux.mount(null, fdPath(&target_buffer, target_fd), null, (mount.flags & ~@as(u32, ms.REC)) | ms.BIND | ms.REMOUNT, 0));
     }
-    if (bind and mount.flags & ms.REC != 0 and mount.flags & ms.RDONLY != 0) {
+    if (mount.recursive_readonly) |readonly| {
         const MountAttr = extern struct {
-            attr_set: u64 = 1, // MOUNT_ATTR_RDONLY
-            attr_clr: u64 = 0,
+            attr_set: u64,
+            attr_clr: u64,
             propagation: u64 = 0,
             userns_fd: u64 = 0,
         };
-        const attr: MountAttr = .{};
+        const attr: MountAttr = .{
+            .attr_set = if (readonly) 1 else 0, // MOUNT_ATTR_RDONLY
+            .attr_clr = if (readonly) 0 else 1,
+        };
         // Zig 0.16's wrapper omits the attr pointer and size; use the full ABI.
-        const result = linux.syscall5(.mount_setattr, @intCast(target_fd), @intFromPtr(""), linux.AT.EMPTY_PATH | linux.AT.RECURSIVE, @intFromPtr(&attr), @sizeOf(MountAttr));
-        switch (linux.errno(result)) {
-            .SUCCESS => {},
-            // ponytail: kernels without mount_setattr only get the top-level
-            // ro remount above; recursive read-only requires Linux 5.12 or newer.
-            .NOSYS => {},
-            else => try checkResult(result),
-        }
+        try checkResult(linux.syscall5(.mount_setattr, @intCast(target_fd), @intFromPtr(""), linux.AT.EMPTY_PATH | linux.AT.RECURSIVE, @intFromPtr(&attr), @sizeOf(MountAttr)));
     }
     if (mount.propagation != 0) {
         try checkResult(linux.mount(null, fdPath(&target_buffer, target_fd), null, mount.propagation, 0));
@@ -783,6 +1098,19 @@ test "linux create rejects hostname without UTS isolation and unsupported termin
     try std.testing.expectError(error.Unsupported, backend.create(options));
 }
 
+test "linux create requires mount isolation for library callers too" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const spec: oci.Spec = .{ .ociVersion = "1.0.2", .root = .{ .path = "/" } };
+    var implementation: LinuxBackend = .{};
+    try std.testing.expectError(error.MissingMountNamespace, implementation.backend().create(.{
+        .allocator = std.testing.allocator,
+        .id = "example",
+        .rootfs = "/",
+        .exec_fifo = "/dev/null",
+        .spec = &spec,
+    }));
+}
+
 test "linux create rejects relative process cwd" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -833,6 +1161,7 @@ test "linux create rejects empty process args" {
         .rootfs = "/",
         .exec_fifo = "/dev/null",
         .spec = &spec,
+        .cgroup_path = "igvano/example",
     });
     if (result) |handle| {
         defer std.testing.allocator.free(handle.starttime);
@@ -845,7 +1174,11 @@ test "linux create rejects empty process args" {
 }
 
 test "linux create rejects a cwd missing from the resolved rootfs" {
-    if (comptime builtin.os.tag == .linux) try requireTestMountNamespace();
+    if (comptime builtin.os.tag == .linux) {
+        try requireTestMountNamespace();
+        const cgroup_root = openCgroupRoot() catch return error.SkipZigTest;
+        closeFd(cgroup_root);
+    }
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const base = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
@@ -868,6 +1201,7 @@ test "linux create rejects a cwd missing from the resolved rootfs" {
         .rootfs = rootfs,
         .exec_fifo = "/dev/null",
         .spec = &spec,
+        .cgroup_path = "igvano/example",
     });
     if (result) |handle| {
         defer std.testing.allocator.free(handle.starttime);
@@ -1070,6 +1404,8 @@ test "linux init marks inherited descriptors CLOEXEC and sets noNewPrivileges" {
 test "linux create reports child setup failures without leaving an init" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     try requireTestMountNamespace();
+    const cgroup_root = openCgroupRoot() catch return error.SkipZigTest;
+    defer closeFd(cgroup_root);
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const base = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
@@ -1096,12 +1432,20 @@ test "linux create reports child setup failures without leaving an init" {
         .rootfs = "/",
         .exec_fifo = fifo,
         .spec = &spec,
+        .cgroup_path = "igvano/example",
     }));
 }
 
 test "linux create accepts an empty rootfs and returns a live blocked init" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     try requireTestMountNamespace();
+    const cgroup_root = openCgroupRoot() catch return error.SkipZigTest;
+    defer closeFd(cgroup_root);
+    const cgroup_path = try std.fmt.allocPrint(std.testing.allocator, "igvano-test-{d}", .{linux.getpid()});
+    defer std.testing.allocator.free(cgroup_path);
+    const probe = (walkCgroup(cgroup_root, cgroup_path, true, &.{}) catch return error.SkipZigTest).?;
+    closeFd(probe);
+    try removeCgroup(cgroup_root, cgroup_path);
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const base = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
@@ -1120,7 +1464,7 @@ test "linux create accepts an empty rootfs and returns a live blocked init" {
         .{
             .ociVersion = "1.0.2",
             .root = .{ .path = "rootfs" },
-            .linux = .{ .namespaces = &.{.{ .type = .mount }} },
+            .linux = .{ .namespaces = &.{ .{ .type = .mount }, .{ .type = .cgroup } } },
             .process = .{ .args = &.{ "/bin/sleep", "1000" }, .cwd = "/", .user = .{ .uid = 0, .gid = 0 } },
         },
         .{ .ociVersion = "1.0.2", .root = .{ .path = "rootfs" }, .linux = .{ .namespaces = &.{.{ .type = .mount }} } },
@@ -1134,15 +1478,39 @@ test "linux create accepts an empty rootfs and returns a live blocked init" {
             .rootfs = rootfs,
             .exec_fifo = fifo,
             .spec = &spec,
+            .cgroup_path = cgroup_path,
         });
         defer std.testing.allocator.free(handle.starttime);
-        defer backend.kill(handle, 9) catch {};
+        defer {
+            backend.kill(handle, 9) catch {};
+            backend.delete(handle) catch {};
+        }
         try std.testing.expect(handle.pid > 0);
         try std.testing.expectEqualStrings("example", handle.id);
         try std.testing.expect(handle.starttime.len != 0);
         try std.testing.expect(try backend.alive(handle));
         try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.kill(handle.pid, @enumFromInt(0))));
+        if (spec.process != null) {
+            var path_buffer: [64]u8 = undefined;
+            const namespace_path = std.fmt.bufPrintZ(&path_buffer, "/proc/{d}/ns/cgroup", .{handle.pid}) catch unreachable;
+            const namespace = try openPath(linux.AT.FDCWD, namespace_path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true });
+            defer closeFd(namespace);
+            const membership_path = std.fmt.bufPrintZ(&path_buffer, "/proc/{d}/cgroup", .{handle.pid}) catch unreachable;
+            // Read init's membership from its cgroup namespace without changing
+            // the test runner's namespace or needing /proc in the empty rootfs.
+            const checker = try forkProcess();
+            if (checker == 0) {
+                checkResult(linux.setns(namespace, linux.CLONE.NEWCGROUP)) catch linux.exit_group(1);
+                const membership = openPath(linux.AT.FDCWD, membership_path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }) catch linux.exit_group(1);
+                var bytes: [5]u8 = undefined;
+                if (!readAll(membership, &bytes)) linux.exit_group(1);
+                linux.exit_group(if (std.mem.eql(u8, &bytes, "0::/\n")) 0 else 1);
+            }
+            try std.testing.expectEqual(@as(u32, 0), try waitChild(checker));
+        }
         try backend.kill(handle, 9);
+        try backend.delete(handle);
+        try backend.delete(handle);
     }
 }
 

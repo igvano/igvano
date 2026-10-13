@@ -1,8 +1,128 @@
 const std = @import("std");
 
+test "cgroup paths are relative to the mount root and reject escapes" {
+    const cases = [_]struct { path: ?[]const u8, expected: []const u8 }{
+        .{ .path = null, .expected = "igvano/example" },
+        .{ .path = "/custom/example", .expected = "custom/example" },
+        .{ .path = "custom/example", .expected = "custom/example" },
+        .{ .path = "//custom/./nested/../example/", .expected = "custom/example" },
+    };
+    for (cases) |case| {
+        const path = try resolveCgroupPath(std.testing.allocator, case.path, "example");
+        defer std.testing.allocator.free(path);
+        try std.testing.expectEqualStrings(case.expected, path);
+    }
+    for ([_][]const u8{ "", "/", ".", "..", "../outside", "/../outside", "a/../../outside", "a/..", "a\x00b" }) |path| {
+        try std.testing.expectError(error.InvalidConfig, resolveCgroupPath(std.testing.allocator, path, "example"));
+    }
+    try std.testing.expectError(error.InvalidConfig, resolveCgroupPath(std.testing.allocator, null, "../outside"));
+}
+
+test "cpu shares map to cgroup2 weights without underflow or overflow" {
+    const cases = [_]struct { shares: u64, weight: u64 }{
+        .{ .shares = 0, .weight = 0 },
+        .{ .shares = 2, .weight = 1 },
+        .{ .shares = 1024, .weight = 39 },
+        .{ .shares = 262144, .weight = 10000 },
+    };
+    for (cases) |case| try std.testing.expectEqual(case.weight, try cpuWeight(case.shares));
+    for ([_]u64{ 1, 262145, std.math.maxInt(u64) }) |shares| {
+        try std.testing.expectError(error.InvalidConfig, cpuWeight(shares));
+    }
+}
+
+test "OCI resources parse and map to cgroup2 writes" {
+    const parsed = try std.json.parseFromSlice(Spec.Linux, std.testing.allocator,
+        \\{"cgroupsPath":"/custom/example","resources":{"memory":{"limit":67108864},"cpu":{"quota":50000,"period":100000,"shares":1024},"pids":{"limit":32},"devices":[]}}
+    , .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("/custom/example", parsed.value.cgroupsPath.?);
+    const writes = try cgroupWrites(std.testing.allocator, parsed.value.resources);
+    defer freeCgroupWrites(std.testing.allocator, writes);
+    const expected = [_]struct { name: []const u8, value: []const u8 }{
+        .{ .name = "memory.max", .value = "67108864" },
+        .{ .name = "cpu.max", .value = "50000 100000" },
+        .{ .name = "cpu.weight", .value = "39" },
+        .{ .name = "pids.max", .value = "32" },
+    };
+    try std.testing.expectEqual(expected.len, writes.len);
+    for (expected, writes) |want, actual| {
+        try std.testing.expectEqualStrings(want.name, actual.name);
+        try std.testing.expectEqualStrings(want.value, actual.value);
+    }
+}
+
+test "cgroup writes preserve unlimited values and CPU defaults" {
+    const cases = [_]struct { json: []const u8, name: []const u8, value: []const u8 }{
+        .{ .json = "{\"memory\":{\"limit\":-1}}", .name = "memory.max", .value = "max" },
+        .{ .json = "{\"memory\":{\"limit\":0}}", .name = "memory.max", .value = "0" },
+        .{ .json = "{\"pids\":{\"limit\":-1}}", .name = "pids.max", .value = "max" },
+        .{ .json = "{\"pids\":{\"limit\":0}}", .name = "pids.max", .value = "0" },
+        .{ .json = "{\"cpu\":{\"quota\":-1,\"period\":200000}}", .name = "cpu.max", .value = "max 200000" },
+        .{ .json = "{\"cpu\":{\"period\":200000}}", .name = "cpu.max", .value = "max 200000" },
+        .{ .json = "{\"cpu\":{\"quota\":50000}}", .name = "cpu.max", .value = "50000 100000" },
+        .{ .json = "{\"cpu\":{\"quota\":0,\"period\":0}}", .name = "cpu.max", .value = "max 100000" },
+    };
+    for (cases) |case| {
+        const parsed = try std.json.parseFromSlice(Spec.Resources, std.testing.allocator, case.json, .{});
+        defer parsed.deinit();
+        const writes = try cgroupWrites(std.testing.allocator, parsed.value);
+        defer freeCgroupWrites(std.testing.allocator, writes);
+        try std.testing.expectEqual(@as(usize, 1), writes.len);
+        try std.testing.expectEqualStrings(case.name, writes[0].name);
+        try std.testing.expectEqualStrings(case.value, writes[0].value);
+    }
+    for ([_]?Spec.Resources{ null, .{}, .{ .cpu = .{ .shares = 0 } }, .{ .memory = .{} } }) |resources| {
+        const writes = try cgroupWrites(std.testing.allocator, resources);
+        defer freeCgroupWrites(std.testing.allocator, writes);
+        try std.testing.expectEqual(@as(usize, 0), writes.len);
+    }
+    for ([_]Spec.Resources{
+        .{ .memory = .{ .limit = -2 } },
+        .{ .pids = .{ .limit = -2 } },
+        .{ .cpu = .{ .quota = -2 } },
+        .{ .cpu = .{ .shares = 1 } },
+        .{ .memory = .{ .limit = 64 }, .cpu = .{ .shares = 1 } },
+    }) |resources| {
+        try std.testing.expectError(error.InvalidConfig, cgroupWrites(std.testing.allocator, resources));
+    }
+}
+
+test "bind mount recursive read-only options are explicit and ordered" {
+    const cases = [_]struct { options: []const []const u8, recursive: ?bool }{
+        .{ .options = &.{ "ro", "rbind" }, .recursive = null },
+        .{ .options = &.{ "rbind", "rro" }, .recursive = true },
+        .{ .options = &.{ "bind", "rrw" }, .recursive = false },
+        .{ .options = &.{ "rbind", "rro", "rrw" }, .recursive = false },
+        .{ .options = &.{ "rbind", "rrw", "rro" }, .recursive = true },
+    };
+    for (cases) |case| {
+        const options = try parseMountOptions(std.testing.allocator, case.options, null);
+        defer std.testing.allocator.free(options.data);
+        try std.testing.expectEqual(case.recursive, options.recursive_readonly);
+        try std.testing.expectEqualStrings("", options.data);
+    }
+}
+
+test "cgroup resource mapping frees partially allocated writes on allocation failure" {
+    const AllocationTest = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            const writes = try cgroupWrites(allocator, .{
+                .memory = .{ .limit = 67108864 },
+                .cpu = .{ .quota = 50000, .period = 100000, .shares = 1024 },
+                .pids = .{ .limit = 32 },
+            });
+            defer freeCgroupWrites(allocator, writes);
+            try std.testing.expectEqual(@as(usize, 4), writes.len);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, AllocationTest.run, .{});
+}
+
 pub const state_file_name = "state.json";
 pub const exec_fifo_name = "exec.fifo";
 pub const starttime_file_name = "starttime";
+pub const cgroup_file_name = "cgroup";
 pub const runtime_oci_version = "1.0.2";
 
 /// Parsed config.json values needed by a namespace backend.
@@ -46,6 +166,22 @@ pub const Spec = struct {
         namespaces: ?[]const Namespace = null,
         uidMappings: ?[]const IDMapping = null,
         gidMappings: ?[]const IDMapping = null,
+        cgroupsPath: ?[]const u8 = null,
+        resources: ?Resources = null,
+    };
+
+    pub const Resources = struct {
+        memory: ?Memory = null,
+        cpu: ?Cpu = null,
+        pids: ?Pids = null,
+
+        pub const Memory = struct { limit: ?i64 = null };
+        pub const Cpu = struct {
+            quota: ?i64 = null,
+            period: ?u64 = null,
+            shares: ?u64 = null,
+        };
+        pub const Pids = struct { limit: i64 };
     };
 
     pub const Namespace = struct {
@@ -60,12 +196,89 @@ pub const Spec = struct {
     };
 };
 
+/// Resolve absolute OCI paths relative to the cgroup mount, never the host root.
+/// Root itself is forbidden, since delete must only remove a container cgroup.
+pub fn resolveCgroupPath(allocator: std.mem.Allocator, configured: ?[]const u8, id: []const u8) ![]u8 {
+    if (configured == null and (id.len == 0 or
+        std.mem.eql(u8, id, ".") or std.mem.eql(u8, id, "..") or
+        std.mem.indexOfScalar(u8, id, '/') != null or
+        std.mem.indexOfScalar(u8, id, 0) != null)) return error.InvalidConfig;
+    const path = if (configured) |value|
+        try std.fmt.allocPrint(allocator, "/{s}", .{value})
+    else
+        try std.fmt.allocPrint(allocator, "/igvano/{s}", .{id});
+    defer allocator.free(path);
+    const normalized = try resolveMountDestination(allocator, path);
+    defer allocator.free(normalized);
+    if (normalized.len == 1) return error.InvalidConfig;
+    return allocator.dupe(u8, normalized[1..]);
+}
+
+/// Zero shares means unset; the remaining OCI range maps to [1, 10000].
+pub fn cpuWeight(shares: u64) !u64 {
+    if (shares == 0) return 0;
+    if (shares < 2 or shares > 262144) return error.InvalidConfig;
+    return 1 + ((shares - 2) * 9999) / 262142;
+}
+
+const CgroupWrite = @import("backend.zig").Backend.CgroupWrite;
+
+/// The caller owns the slice and each value; filenames are static strings.
+pub fn cgroupWrites(allocator: std.mem.Allocator, resources: ?Spec.Resources) ![]CgroupWrite {
+    var writes: std.ArrayList(CgroupWrite) = .empty;
+    defer writes.deinit(allocator);
+    errdefer for (writes.items) |write| allocator.free(write.value);
+    if (resources) |settings| {
+        if (settings.memory) |memory| {
+            if (memory.limit) |limit|
+                try appendCgroupWrite(allocator, &writes, "memory.max", try cgroupLimit(allocator, limit));
+        }
+        if (settings.cpu) |cpu| {
+            const quota = cpu.quota orelse -1;
+            if (quota < -1) return error.InvalidConfig;
+            const period = if ((cpu.period orelse 0) == 0) 100000 else cpu.period.?;
+            if (cpu.quota != null or cpu.period != null) {
+                const value = if (quota <= 0)
+                    try std.fmt.allocPrint(allocator, "max {d}", .{period})
+                else
+                    try std.fmt.allocPrint(allocator, "{d} {d}", .{ quota, period });
+                try appendCgroupWrite(allocator, &writes, "cpu.max", value);
+            }
+            if (cpu.shares) |shares| {
+                const weight = try cpuWeight(shares);
+                if (weight != 0)
+                    try appendCgroupWrite(allocator, &writes, "cpu.weight", try std.fmt.allocPrint(allocator, "{d}", .{weight}));
+            }
+        }
+        if (settings.pids) |pids|
+            try appendCgroupWrite(allocator, &writes, "pids.max", try cgroupLimit(allocator, pids.limit));
+    }
+    return writes.toOwnedSlice(allocator);
+}
+
+fn cgroupLimit(allocator: std.mem.Allocator, limit: i64) ![]u8 {
+    if (limit < -1) return error.InvalidConfig;
+    if (limit == -1) return allocator.dupe(u8, "max");
+    return std.fmt.allocPrint(allocator, "{d}", .{limit});
+}
+
+fn appendCgroupWrite(allocator: std.mem.Allocator, writes: *std.ArrayList(CgroupWrite), name: []const u8, value: []u8) !void {
+    errdefer allocator.free(value);
+    try writes.append(allocator, .{ .name = name, .value = value });
+}
+
+pub fn freeCgroupWrites(allocator: std.mem.Allocator, writes: []const CgroupWrite) void {
+    for (writes) |write| allocator.free(write.value);
+    allocator.free(writes);
+}
+
 /// Linux mount constants are available on every build host; this performs no I/O.
 /// The caller owns data, including when there are no filesystem-specific options.
 pub const MountOptions = struct {
     flags: u32,
     propagation: u32,
     data: [:0]u8,
+    recursive_readonly: ?bool = null,
 };
 
 pub fn parseMountOptions(allocator: std.mem.Allocator, options: []const []const u8, mount_type: ?[]const u8) !MountOptions {
@@ -103,11 +316,16 @@ pub fn parseMountOptions(allocator: std.mem.Allocator, options: []const []const 
     };
     var flags: u32 = if (mount_type != null and std.mem.eql(u8, mount_type.?, "bind")) ms.BIND else 0;
     var propagation: u32 = 0;
+    var recursive_readonly: ?bool = null;
     var has_unknown_option = false;
     var data: std.ArrayList(u8) = .empty;
     defer data.deinit(allocator);
     option: for (options) |option| {
         if (std.mem.indexOfScalar(u8, option, 0) != null) return error.InvalidConfig;
+        if (std.mem.eql(u8, option, "rro") or std.mem.eql(u8, option, "rrw")) {
+            recursive_readonly = std.mem.eql(u8, option, "rro");
+            continue;
+        }
         for (flag_options) |entry| {
             if (std.mem.eql(u8, option, entry.name)) {
                 flags = (flags & ~entry.clear) | entry.set;
@@ -127,7 +345,12 @@ pub fn parseMountOptions(allocator: std.mem.Allocator, options: []const []const 
     }
     // Bind mounts ignore filesystem data, so unknown options cannot be honored.
     if (flags & ms.BIND != 0 and has_unknown_option) return error.InvalidConfig;
-    return .{ .flags = flags, .propagation = propagation, .data = try data.toOwnedSliceSentinel(allocator, 0) };
+    return .{
+        .flags = flags,
+        .propagation = propagation,
+        .data = try data.toOwnedSliceSentinel(allocator, 0),
+        .recursive_readonly = recursive_readonly,
+    };
 }
 
 pub fn validateMountDestination(destination: []const u8) !void {
