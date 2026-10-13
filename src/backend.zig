@@ -20,6 +20,23 @@ pub const Backend = struct {
         /// Normalized path relative to the cgroup2 mount root.
         cgroup_path: []const u8 = "",
         cgroup_writes: []const CgroupWrite = &.{},
+        capabilities: ?Capabilities = null,
+        rlimits: []const Rlimit = &.{},
+    };
+
+    /// Capability names and rlimit types have been translated by the frontend.
+    pub const Capabilities = struct {
+        bounding: u64 = 0,
+        effective: u64 = 0,
+        inheritable: u64 = 0,
+        permitted: u64 = 0,
+        ambient: u64 = 0,
+    };
+
+    pub const Rlimit = struct {
+        resource: std.os.linux.rlimit_resource,
+        hard: u64,
+        soft: u64,
     };
 
     pub const CgroupWrite = struct {

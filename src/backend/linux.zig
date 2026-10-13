@@ -68,6 +68,13 @@ pub const LinuxBackend = struct {
                 if (process.terminal orelse false) return error.Unsupported;
                 if (process.args.len == 0) return error.InvalidProcess;
             }
+            if (options.capabilities) |caps| {
+                if (caps.ambient & ~(caps.permitted & caps.inheritable) != 0)
+                    return error.InvalidConfig;
+            }
+            for (options.rlimits) |limit| {
+                if (limit.soft > limit.hard) return error.InvalidConfig;
+            }
             if (!std.fs.path.isAbsolute(options.exec_fifo) or
                 std.mem.indexOfScalar(u8, options.exec_fifo, 0) != null)
                 return error.InvalidPath;
@@ -84,13 +91,13 @@ pub const LinuxBackend = struct {
             if (!std.fs.path.isAbsolute(rootfs)) return error.InvalidPath;
             try validateCgroupPath(options.cgroup_path);
             const cgroup_root = try openCgroupRoot();
-            defer closeFd(cgroup_root);
+            defer closeFd(cgroup_root.fd);
             const mounts = try allocator.alloc(PreparedMount, options.mounts.len);
             for (options.mounts, mounts) |mount, *prepared| {
                 if (!std.mem.startsWith(u8, mount.destination, "/")) return error.InvalidPath;
                 var mount_type = mount.type;
                 if (mount_type != null and mount.flags & linux.MS.BIND == 0) {
-                    mount_type = try cgroupMountType(mount_type.?, 0x63677270);
+                    mount_type = try cgroupMountType(mount_type.?, cgroup_root.fs_type);
                 }
                 prepared.* = .{
                     .destination = try pathString(allocator, mount.destination),
@@ -113,9 +120,14 @@ pub const LinuxBackend = struct {
             // mount namespace. Pin host /proc so it can still capture identity.
             const proc_dir = try openPath(linux.AT.FDCWD, "/proc", .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true });
             defer closeFd(proc_dir);
-            const cgroup = (try walkCgroup(cgroup_root, options.cgroup_path, true, options.cgroup_writes)).?;
+            const cgroup = (try walkCgroup(cgroup_root.fd, options.cgroup_path, true, options.cgroup_writes)).?;
             defer closeFd(cgroup);
-            errdefer removeCgroup(cgroup_root, options.cgroup_path) catch {};
+            errdefer {
+                // Child1 can die before reporting child2's PID. Kill the entire
+                // cgroup before removing it, including any blocked init.
+                writeCgroupFile(cgroup, "cgroup.kill", "1", options.cgroup_path) catch {};
+                removeCgroup(cgroup_root.fd, options.cgroup_path) catch {};
+            }
             for (options.cgroup_writes) |write|
                 try writeCgroupFile(cgroup, write.name, write.value, options.cgroup_path);
             const report = try makePipe();
@@ -129,7 +141,7 @@ pub const LinuxBackend = struct {
                 return err;
             };
             if (child1 == 0) {
-                closeFd(cgroup_root);
+                closeFd(cgroup_root.fd);
                 closeFd(report[0]);
                 // Join before NEWCGROUP snapshots the namespace root. Child2
                 // inherits this membership; the runtime parent stays outside.
@@ -139,12 +151,10 @@ pub const LinuxBackend = struct {
                 // NEWPID affects the next fork, making child2 pid 1 inside the namespace.
                 const child2 = forkProcess() catch |err| failCreate(report[1], err);
                 if (child2 == 0) {
-                    // ponytail: a create that dies mid-flight can leak a blocked init.
-                    // PDEATHSIG races with child1's normal exit; fix with a parent pidfd watch.
                     closeFd(report[1]);
                     closeFd(ready[0]);
                     closeFd(proc_dir);
-                    runInit(options.spec, flags, rootfs, mounts, cwd, fifo, argv.ptr, envp.ptr, ready[1]);
+                    runInit(options.spec, options.capabilities, options.rlimits, flags, rootfs, mounts, cwd, fifo, argv.ptr, envp.ptr, ready[1]);
                 }
                 closeFd(ready[1]);
                 var byte: [1]u8 = undefined;
@@ -255,13 +265,13 @@ pub const LinuxBackend = struct {
             const path = handle.cgroup_path orelse return;
             try validateCgroupPath(path);
             const root = try openCgroupRoot();
-            defer closeFd(root);
-            const cgroup = (try walkCgroup(root, path, false, &.{})) orelse return;
+            defer closeFd(root.fd);
+            const cgroup = (try walkCgroup(root.fd, path, false, &.{})) orelse return;
             defer closeFd(cgroup);
             // kill targets init only. delete terminates any remaining descendants.
             if (try cgroupPopulated(cgroup))
                 try writeCgroupFile(cgroup, "cgroup.kill", "1", path);
-            try removeCgroup(root, path);
+            try removeCgroup(root.fd, path);
         } else {
             return error.NotImplemented;
         }
@@ -279,7 +289,7 @@ fn validateCgroupPath(path: []const u8) Backend.Error!void {
     }
 }
 
-fn openCgroupRoot() Backend.Error!posix.fd_t {
+fn openCgroupRoot() Backend.Error!struct { fd: posix.fd_t, fs_type: usize } {
     const opened = linux.openat(linux.AT.FDCWD, "/sys/fs/cgroup", .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .NOFOLLOW = true, .CLOEXEC = true }, 0);
     switch (linux.errno(opened)) {
         .SUCCESS => {},
@@ -295,7 +305,7 @@ fn openCgroupRoot() Backend.Error!posix.fd_t {
         std.debug.print("igvano: cgroups require cgroup2 at /sys/fs/cgroup; legacy and hybrid hosts are unsupported\n", .{});
         return error.Unsupported;
     }
-    return root;
+    return .{ .fd = root, .fs_type = fs[0] };
 }
 
 test "backend cgroup paths must name a normalized child directory" {
@@ -371,7 +381,8 @@ test "linux child cgroup cleanup leaves control files and symlinks untouched" {
 
 /// Walk through pinned directory fds so symlinks cannot redirect cgroup writes.
 /// Enable requested controllers in every parent before creating its child.
-/// Creation requires a new leaf so cleanup cannot kill or remove a foreign cgroup.
+/// Creation requires a new leaf. Nested paths can still change controllers in
+/// existing parents, including other containers' cgroups. Like runc, config is trusted.
 fn walkCgroup(root: posix.fd_t, path: []const u8, create: bool, writes: []const Backend.CgroupWrite) Backend.Error!?posix.fd_t {
     try validateCgroupPath(path);
     var current = try openPath(root, ".", .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true });
@@ -728,6 +739,11 @@ const PreparedMount = struct {
     recursive_readonly: ?bool = null,
 };
 
+const CapabilityHeader = extern struct {
+    version: u32 = 0x20080522, // _LINUX_CAPABILITY_VERSION_3
+    pid: i32 = 0,
+};
+
 fn openPath(dir_fd: posix.fd_t, path: [*:0]const u8, flags: linux.O) Backend.Error!posix.fd_t {
     const result = linux.openat(dir_fd, path, flags, 0);
     try checkResult(result);
@@ -873,6 +889,8 @@ fn setupRootfs(rootfs: [:0]const u8, mounts: []const PreparedMount, readonly: bo
 
 fn runInit(
     spec: *const oci.Spec,
+    capabilities: ?Backend.Capabilities,
+    rlimits: []const Backend.Rlimit,
     flags: usize,
     rootfs: [:0]const u8,
     mounts: []const PreparedMount,
@@ -896,6 +914,14 @@ fn runInit(
         }
     }
     checkResult(linux.chdir(cwd)) catch linux.exit_group(1);
+    if (spec.process) |process| {
+        // Allow write-only reopen after setuid while keeping readers root-only.
+        checkResult(linux.fchmodat(fd_dir, fifo_name, 0o622)) catch linux.exit_group(1);
+        applyProcess(process, capabilities, rlimits) catch |err| {
+            std.debug.print("igvano: cannot apply process settings: {s}\n", .{@errorName(err)});
+            linux.exit_group(1);
+        };
+    }
     if (!writeAll(ready_fd, &.{1})) linux.exit_group(1);
     closeFd(ready_fd);
 
@@ -917,18 +943,56 @@ fn runInit(
 
 fn runProcess(spec: *const oci.Spec, argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*:0]const u8) noreturn {
     // A process-less config can be created; it cannot be started.
-    const process = spec.process orelse linux.exit_group(1);
-    // Replace inherited groups and set the primary GID before dropping UID privileges.
-    const groups = process.user.additionalGids orelse &.{};
-    checkResult(linux.setgroups(groups.len, groups.ptr)) catch linux.exit_group(1);
-    checkResult(linux.setgid(process.user.gid)) catch linux.exit_group(1);
-    checkResult(linux.setuid(process.user.uid)) catch linux.exit_group(1);
-    if (process.noNewPrivileges) {
-        checkResult(linux.prctl(@intFromEnum(linux.PR.SET_NO_NEW_PRIVS), 1, 0, 0, 0)) catch linux.exit_group(1);
-    }
+    if (spec.process == null) linux.exit_group(1);
     // Linux CLOSE_RANGE_CLOEXEC is 1 << 2; Zig 0.16's packed flags use 1 << 1.
     checkResult(linux.syscall3(.close_range, 3, std.math.maxInt(u32), 1 << 2)) catch linux.exit_group(1);
     execProcess(argv, envp);
+}
+
+/// Runs before readiness, without allocating. Keep privileges until limits and
+/// bounding drops finish, then retain permitted caps across the UID transition.
+fn applyProcess(process: oci.Spec.Process, capabilities: ?Backend.Capabilities, rlimits: []const Backend.Rlimit) Backend.Error!void {
+    if (comptime builtin.os.tag == .linux) {
+        for (rlimits) |limit| {
+            const value: linux.rlimit = .{ .cur = limit.soft, .max = limit.hard };
+            try checkResult(linux.setrlimit(limit.resource, &value));
+        }
+        if (process.noNewPrivileges)
+            try checkResult(linux.prctl(@intFromEnum(linux.PR.SET_NO_NEW_PRIVS), 1, 0, 0, 0));
+        if (capabilities) |caps| {
+            for (0..64) |cap| {
+                // EINVAL marks the running kernel's last supported capability.
+                const result = linux.prctl(@intFromEnum(linux.PR.CAPBSET_READ), cap, 0, 0, 0);
+                if (linux.errno(result) == .INVAL) break;
+                try checkResult(result);
+                if (result != 0 and caps.bounding & (@as(u64, 1) << @intCast(cap)) == 0)
+                    try checkResult(linux.prctl(@intFromEnum(linux.PR.CAPBSET_DROP), cap, 0, 0, 0));
+            }
+            try checkResult(linux.prctl(@intFromEnum(linux.PR.SET_KEEPCAPS), 1, 0, 0, 0));
+        }
+        const groups = process.user.additionalGids orelse &.{};
+        try checkResult(linux.setgroups(groups.len, groups.ptr));
+        try checkResult(linux.setgid(process.user.gid));
+        try checkResult(linux.setuid(process.user.uid));
+        if (capabilities) |caps| {
+            // Linux's header uses a 32-bit pid, unlike Zig 0.16's usize field.
+            const header: CapabilityHeader = .{};
+            const data = [2]linux.cap_user_data_t{
+                .{ .effective = @truncate(caps.effective), .permitted = @truncate(caps.permitted), .inheritable = @truncate(caps.inheritable) },
+                .{ .effective = @truncate(caps.effective >> 32), .permitted = @truncate(caps.permitted >> 32), .inheritable = @truncate(caps.inheritable >> 32) },
+            };
+            try checkResult(linux.syscall2(.capset, @intFromPtr(&header), @intFromPtr(&data)));
+            try checkResult(linux.prctl(@intFromEnum(linux.PR.SET_KEEPCAPS), 0, 0, 0, 0));
+            // Discard inherited ambient caps even when the configured set is empty.
+            try checkResult(linux.prctl(@intFromEnum(linux.PR.CAP_AMBIENT), linux.PR.CAP_AMBIENT_CLEAR_ALL, 0, 0, 0));
+            for (0..64) |cap| {
+                if (caps.ambient & (@as(u64, 1) << @intCast(cap)) != 0)
+                    try checkResult(linux.prctl(@intFromEnum(linux.PR.CAP_AMBIENT), linux.PR.CAP_AMBIENT_RAISE, cap, 0, 0));
+            }
+        }
+    } else {
+        return error.NotImplemented;
+    }
 }
 
 fn execProcess(argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*:0]const u8) noreturn {
@@ -1155,13 +1219,17 @@ test "linux create rejects empty process args" {
     };
     var implementation: LinuxBackend = .{};
     const backend = implementation.backend();
+    const cgroup_path = try std.fmt.allocPrint(std.testing.allocator, "igvano/example-{d}", .{
+        if (comptime builtin.os.tag == .linux) linux.getpid() else 0,
+    });
+    defer std.testing.allocator.free(cgroup_path);
     const result = backend.create(.{
         .allocator = std.testing.allocator,
         .id = "example",
         .rootfs = "/",
         .exec_fifo = "/dev/null",
         .spec = &spec,
-        .cgroup_path = "igvano/example",
+        .cgroup_path = cgroup_path,
     });
     if (result) |handle| {
         defer std.testing.allocator.free(handle.starttime);
@@ -1177,7 +1245,7 @@ test "linux create rejects a cwd missing from the resolved rootfs" {
     if (comptime builtin.os.tag == .linux) {
         try requireTestMountNamespace();
         const cgroup_root = openCgroupRoot() catch return error.SkipZigTest;
-        closeFd(cgroup_root);
+        closeFd(cgroup_root.fd);
     }
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1195,13 +1263,17 @@ test "linux create rejects a cwd missing from the resolved rootfs" {
     };
     var implementation: LinuxBackend = .{};
     const backend = implementation.backend();
+    const cgroup_path = try std.fmt.allocPrint(std.testing.allocator, "igvano/example-{d}", .{
+        if (comptime builtin.os.tag == .linux) linux.getpid() else 0,
+    });
+    defer std.testing.allocator.free(cgroup_path);
     const result = backend.create(.{
         .allocator = std.testing.allocator,
         .id = "example",
         .rootfs = rootfs,
         .exec_fifo = "/dev/null",
         .spec = &spec,
-        .cgroup_path = "igvano/example",
+        .cgroup_path = cgroup_path,
     });
     if (result) |handle| {
         defer std.testing.allocator.free(handle.starttime);
@@ -1293,7 +1365,7 @@ test "linux exec searches the process PATH and preserves explicit paths" {
     }
 }
 
-test "linux init applies uid gid and replaces inherited supplementary groups before exec" {
+test "linux init applies uid gid and optional supplementary groups before exec" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     if (linux.geteuid() != 0) return error.SkipZigTest;
     const cases = [_]struct { user_json: []const u8, expected: []const u8 }{
@@ -1331,6 +1403,7 @@ test "linux init applies uid gid and replaces inherited supplementary groups bef
             checkResult(linux.setgroups(1, &.{42})) catch linux.exit_group(1);
             checkResult(linux.dup2(output[1], posix.STDOUT_FILENO)) catch linux.exit_group(1);
             closeFd(output[1]);
+            applyProcess(spec.process.?, null, &.{}) catch linux.exit_group(1);
             runProcess(&spec, &argv, &envp);
         }
         closeFd(output[1]);
@@ -1364,6 +1437,7 @@ test "linux init exits nonzero instead of exec when it cannot apply process user
             checkResult(linux.setgid(1000)) catch linux.exit_group(2);
             checkResult(linux.setuid(1000)) catch linux.exit_group(2);
         }
+        applyProcess(spec.process.?, null, &.{}) catch linux.exit_group(1);
         runProcess(&spec, &argv, &envp);
     }
     closeFd(ready[1]);
@@ -1395,17 +1469,150 @@ test "linux init marks inherited descriptors CLOEXEC and sets noNewPrivileges" {
     if (pid == 0) {
         closeFd(ready[0]);
         checkResult(linux.dup2(ready[1], 200)) catch linux.exit_group(2);
+        applyProcess(spec.process.?, null, &.{}) catch linux.exit_group(1);
         runProcess(&spec, &argv, &envp);
     }
     closeFd(ready[1]);
     try std.testing.expectEqual(@as(u32, 0), try waitChild(pid));
 }
 
+test "linux process settings apply rlimits without changing inherited capabilities" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (linux.geteuid() != 0) return error.SkipZigTest;
+    var header: CapabilityHeader = .{};
+    var inherited: [2]linux.cap_user_data_t = undefined;
+    try checkResult(linux.syscall2(.capget, @intFromPtr(&header), @intFromPtr(&inherited)));
+    var original: linux.rlimit = undefined;
+    try checkResult(linux.getrlimit(.NOFILE, &original));
+    const hard = @min(original.max, 1024);
+    const soft = @min(hard, 512);
+    const process: oci.Spec.Process = .{
+        .args = &.{"/bin/true"},
+        .cwd = "/",
+        .user = .{ .uid = linux.geteuid(), .gid = linux.getegid(), .additionalGids = &.{} },
+    };
+    const pid = try forkProcess();
+    if (pid == 0) {
+        applyProcess(process, null, &.{.{ .resource = .NOFILE, .hard = hard, .soft = soft }}) catch linux.exit_group(1);
+        var actual: linux.rlimit = undefined;
+        checkResult(linux.getrlimit(.NOFILE, &actual)) catch linux.exit_group(2);
+        if (actual.cur != soft or actual.max != hard) linux.exit_group(3);
+        var caps: [2]linux.cap_user_data_t = undefined;
+        checkResult(linux.syscall2(.capget, @intFromPtr(&header), @intFromPtr(&caps))) catch linux.exit_group(4);
+        for (inherited, caps) |before, after| {
+            if (before.effective != after.effective or before.permitted != after.permitted or
+                before.inheritable != after.inheritable) linux.exit_group(5);
+        }
+        linux.exit_group(0);
+    }
+    try std.testing.expectEqual(@as(u32, 0), try waitChild(pid));
+}
+
+test "linux process settings retain configured capabilities across nonzero uid and exec" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (linux.geteuid() != 0) return error.SkipZigTest;
+    var header: CapabilityHeader = .{};
+    var inherited: [2]linux.cap_user_data_t = undefined;
+    try checkResult(linux.syscall2(.capget, @intFromPtr(&header), @intFromPtr(&inherited)));
+    const required = (@as(u32, 1) << linux.CAP.CHOWN) | (@as(u32, 1) << linux.CAP.SETPCAP) |
+        (@as(u32, 1) << linux.CAP.SETUID) | (@as(u32, 1) << linux.CAP.SETGID);
+    if (inherited[0].effective & required != required) return error.SkipZigTest;
+    if (linux.prctl(@intFromEnum(linux.PR.CAPBSET_READ), linux.CAP.CHOWN, 0, 0, 0) != 1)
+        return error.SkipZigTest;
+    const command = "test \"$(id -u)\" = 1000 && grep -q '^CapAmb:[[:space:]]*0000000000000001$' /proc/self/status";
+    const process: oci.Spec.Process = .{
+        .args = &.{ "/bin/sh", "-c", command },
+        .cwd = "/",
+        .user = .{ .uid = 1000, .gid = 1000, .additionalGids = &.{} },
+        .noNewPrivileges = true,
+    };
+    const pid = try forkProcess();
+    if (pid == 0) {
+        applyProcess(process, .{
+            .bounding = 1,
+            .permitted = 1,
+            .effective = 1,
+            .inheritable = 1,
+            .ambient = 1,
+        }, &.{}) catch linux.exit_group(1);
+        var caps: [2]linux.cap_user_data_t = undefined;
+        checkResult(linux.syscall2(.capget, @intFromPtr(&header), @intFromPtr(&caps))) catch linux.exit_group(2);
+        if (caps[0].effective != 1 or caps[0].permitted != 1 or caps[0].inheritable != 1 or
+            caps[1].effective != 0 or caps[1].permitted != 0 or caps[1].inheritable != 0) linux.exit_group(3);
+        if (linux.prctl(@intFromEnum(linux.PR.GET_KEEPCAPS), 0, 0, 0, 0) != 0) linux.exit_group(4);
+        if (linux.prctl(@intFromEnum(linux.PR.CAPBSET_READ), linux.CAP.SETUID, 0, 0, 0) != 0) linux.exit_group(5);
+        if (linux.prctl(@intFromEnum(linux.PR.CAP_AMBIENT), linux.PR.CAP_AMBIENT_IS_SET, linux.CAP.CHOWN, 0, 0) != 1)
+            linux.exit_group(6);
+        const argv = [_:null]?[*:0]const u8{ "/bin/sh", "-c", command };
+        const envp = [_:null]?[*:0]const u8{"PATH=/usr/bin:/bin"};
+        execProcess(&argv, &envp);
+    }
+    try std.testing.expectEqual(@as(u32, 0), try waitChild(pid));
+}
+
+test "linux init reopens its root-owned pinned FIFO only for writing after dropping uid" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (linux.geteuid() != 0) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer std.testing.allocator.free(base);
+    const absolute = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, base, std.testing.allocator);
+    defer std.testing.allocator.free(absolute);
+    const fifo = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/exec.fifo", .{absolute}, 0);
+    defer std.testing.allocator.free(fifo);
+    try checkResult(linux.mknod(fifo, linux.S.IFIFO | 0o600, 0));
+    const ready = try makePipe();
+    defer closeFd(ready[0]);
+    const pid = forkProcess() catch |err| {
+        closeFd(ready[1]);
+        return err;
+    };
+    if (pid == 0) {
+        closeFd(ready[0]);
+        const path_fd = openPath(linux.AT.FDCWD, fifo, .{ .PATH = true, .CLOEXEC = true }) catch linux.exit_group(1);
+        const fd_dir = openPath(linux.AT.FDCWD, "/proc/self/fd", .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true }) catch linux.exit_group(1);
+        var buffer: [32]u8 = undefined;
+        const name = std.fmt.bufPrintZ(&buffer, "{d}", .{path_fd}) catch unreachable;
+        checkResult(linux.fchmodat(fd_dir, name, 0o622)) catch linux.exit_group(2);
+        applyProcess(.{
+            .args = &.{"/bin/true"},
+            .cwd = "/",
+            .user = .{ .uid = 1000, .gid = 1000, .additionalGids = &.{} },
+        }, null, &.{}) catch linux.exit_group(3);
+        if (linux.errno(linux.openat(fd_dir, name, .{ .ACCMODE = .RDONLY, .NONBLOCK = true, .CLOEXEC = true }, 0)) != .ACCES)
+            linux.exit_group(7);
+        if (linux.errno(linux.openat(fd_dir, name, .{ .ACCMODE = .RDWR, .NONBLOCK = true, .CLOEXEC = true }, 0)) != .ACCES)
+            linux.exit_group(8);
+        if (!writeAll(ready[1], &.{1})) linux.exit_group(4);
+        const fd = openPath(fd_dir, name, .{ .ACCMODE = .WRONLY, .CLOEXEC = true }) catch linux.exit_group(5);
+        if (!writeAll(fd, &.{1})) linux.exit_group(6);
+        linux.exit_group(0);
+    }
+    closeFd(ready[1]);
+    var reaped = false;
+    defer if (!reaped) {
+        _ = linux.kill(pid, .KILL);
+        _ = waitChild(pid) catch {};
+    };
+    var byte: [1]u8 = undefined;
+    try std.testing.expect(readAll(ready[0], &byte));
+    const reader = try openPath(linux.AT.FDCWD, fifo, .{ .ACCMODE = .RDONLY, .NONBLOCK = true, .CLOEXEC = true });
+    defer closeFd(reader);
+    const status = try waitChild(pid);
+    reaped = true;
+    try std.testing.expectEqual(@as(u32, 0), status);
+    try std.testing.expect(readAll(reader, &byte));
+    try std.testing.expectEqual(@as(u8, 1), byte[0]);
+}
+
 test "linux create reports child setup failures without leaving an init" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     try requireTestMountNamespace();
     const cgroup_root = openCgroupRoot() catch return error.SkipZigTest;
-    defer closeFd(cgroup_root);
+    defer closeFd(cgroup_root.fd);
+    const cgroup_path = try std.fmt.allocPrint(std.testing.allocator, "igvano/example-{d}", .{linux.getpid()});
+    defer std.testing.allocator.free(cgroup_path);
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const base = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
@@ -1419,33 +1626,40 @@ test "linux create reports child setup failures without leaving an init" {
     const fifo_z = try std.testing.allocator.dupeZ(u8, fifo);
     defer std.testing.allocator.free(fifo_z);
     try checkResult(linux.mknod(fifo_z, linux.S.IFIFO | 0o600, 0));
-    const spec: oci.Spec = .{
+    var spec: oci.Spec = .{
         .ociVersion = "1.0.2",
         .root = .{ .path = "/" },
         .linux = .{ .namespaces = &.{.{ .type = .mount }} },
         .process = .{ .args = &.{"/bin/sh"}, .cwd = missing_cwd, .user = .{ .uid = 0, .gid = 0 } },
     };
     var implementation: LinuxBackend = .{};
-    try std.testing.expectError(error.CreateFailed, implementation.backend().create(.{
+    var options: Backend.CreateOptions = .{
         .allocator = std.testing.allocator,
         .id = "example",
         .rootfs = "/",
         .exec_fifo = fifo,
         .spec = &spec,
-        .cgroup_path = "igvano/example",
-    }));
+        .cgroup_path = cgroup_path,
+    };
+    try std.testing.expectError(error.CreateFailed, implementation.backend().create(options));
+    try std.testing.expectEqual(@as(?posix.fd_t, null), try walkCgroup(cgroup_root.fd, cgroup_path, false, &.{}));
+    spec.process.?.cwd = "/";
+    // Linux rejects NOFILE above fs.nr_open even with CAP_SYS_RESOURCE.
+    options.rlimits = &.{.{ .resource = .NOFILE, .hard = std.math.maxInt(u64), .soft = 0 }};
+    try std.testing.expectError(error.CreateFailed, implementation.backend().create(options));
+    try std.testing.expectEqual(@as(?posix.fd_t, null), try walkCgroup(cgroup_root.fd, cgroup_path, false, &.{}));
 }
 
 test "linux create accepts an empty rootfs and returns a live blocked init" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     try requireTestMountNamespace();
     const cgroup_root = openCgroupRoot() catch return error.SkipZigTest;
-    defer closeFd(cgroup_root);
+    defer closeFd(cgroup_root.fd);
     const cgroup_path = try std.fmt.allocPrint(std.testing.allocator, "igvano-test-{d}", .{linux.getpid()});
     defer std.testing.allocator.free(cgroup_path);
-    const probe = (walkCgroup(cgroup_root, cgroup_path, true, &.{}) catch return error.SkipZigTest).?;
+    const probe = (walkCgroup(cgroup_root.fd, cgroup_path, true, &.{}) catch return error.SkipZigTest).?;
     closeFd(probe);
-    try removeCgroup(cgroup_root, cgroup_path);
+    try removeCgroup(cgroup_root.fd, cgroup_path);
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const base = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });

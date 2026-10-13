@@ -151,6 +151,12 @@ fn createContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, c
     defer allocator.free(cgroup_path);
     const cgroup_writes = try oci.cgroupWrites(allocator, settings.resources);
     defer oci.freeCgroupWrites(allocator, cgroup_writes);
+    const capabilities = if (parsed.value.process) |process|
+        if (process.capabilities) |caps| try oci.processCapabilities(caps) else null
+    else
+        null;
+    const rlimits = try oci.processRlimits(allocator, if (parsed.value.process) |process| process.rlimits else null);
+    defer allocator.free(rlimits);
 
     try cwd.createDirPath(io, config.root);
     const root = try cwd.realPathFileAlloc(io, config.root, allocator);
@@ -178,6 +184,8 @@ fn createContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, c
         .mounts = mounts,
         .cgroup_path = cgroup_path,
         .cgroup_writes = cgroup_writes,
+        .capabilities = capabilities,
+        .rlimits = rlimits,
     });
     defer allocator.free(handle.starttime);
     errdefer {
@@ -822,6 +830,39 @@ test "create rejects missing mount isolation before creating runtime state" {
     try std.testing.expectError(error.FileNotFound, tmp.dir.openDir(std.testing.io, "example", .{}));
 }
 
+test "create rejects invalid process settings before creating runtime state" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "bundle", .default_dir);
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer std.testing.allocator.free(root);
+    const bundle = try std.fs.path.join(std.testing.allocator, &.{ root, "bundle" });
+    defer std.testing.allocator.free(bundle);
+    const cases = [_]struct { settings: []const u8, expected: anyerror }{
+        .{ .settings = "\"capabilities\":{\"bounding\":[\"CAP_UNKNOWN\"]}", .expected = error.InvalidConfig },
+        .{ .settings = "\"capabilities\":{\"ambient\":[\"CAP_CHOWN\"]}", .expected = error.AmbientCapabilitiesRequirePermittedAndInheritable },
+        .{ .settings = "\"rlimits\":[{\"type\":\"RLIMIT_UNKNOWN\",\"hard\":1024,\"soft\":512}]", .expected = error.InvalidConfig },
+        .{ .settings = "\"rlimits\":[{\"type\":\"RLIMIT_NOFILE\",\"hard\":512,\"soft\":1024}]", .expected = error.InvalidConfig },
+    };
+    for (cases) |case| {
+        const json = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "{{\"ociVersion\":\"1.0.2\",\"root\":{{\"path\":\"rootfs\"}},\"linux\":{{\"namespaces\":[{{\"type\":\"mount\"}}]}},\"process\":{{\"args\":[\"/bin/sh\"],\"cwd\":\"/\",\"user\":{{\"uid\":0,\"gid\":0}},{s}}}}}",
+            .{case.settings},
+        );
+        defer std.testing.allocator.free(json);
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "bundle/config.json", .data = json });
+        var implementation: backend_module.LinuxBackend = .{};
+        try std.testing.expectError(case.expected, createContainer(std.testing.allocator, std.testing.io, implementation.backend(), .{
+            .root = root,
+            .subcommand = .create,
+            .id = "example",
+            .bundle = bundle,
+        }));
+        try std.testing.expectError(error.FileNotFound, tmp.dir.openDir(std.testing.io, "example", .{}));
+    }
+}
+
 test "create removes its new state directory when setup fails" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -890,6 +931,19 @@ test "create persists backend pid and absolute paths and rolls back a failed pid
                 !std.mem.eql(u8, options.cgroup_writes[1].name, "pids.max") or
                 !std.mem.eql(u8, options.cgroup_writes[1].value, "5"))
                 return error.InvalidConfig;
+            const caps = options.capabilities orelse return error.InvalidConfig;
+            if (!std.meta.eql(caps, Backend.Capabilities{
+                .bounding = 1 | (@as(u64, 1) << 39),
+                .effective = 1,
+                .permitted = 1,
+                .inheritable = 1,
+                .ambient = 1,
+            })) return error.InvalidConfig;
+            if (options.rlimits.len != 1 or !std.meta.eql(options.rlimits[0], Backend.Rlimit{
+                .resource = .NOFILE,
+                .hard = 1024,
+                .soft = 512,
+            })) return error.InvalidConfig;
             return .{
                 .id = options.id,
                 .pid = 1234,
@@ -920,7 +974,7 @@ test "create persists backend pid and absolute paths and rolls back a failed pid
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "bundle/config.json",
         .data =
-        \\{"ociVersion":"9.9.9","root":{"path":"rootfs"},"linux":{"namespaces":[{"type":"mount"}],"cgroupsPath":"/custom/test","resources":{"memory":{"limit":33554432},"pids":{"limit":5}}},"mounts":[{"destination":"/a/../mnt","type":"bind","source":"source","options":["ro","rprivate"]},{"destination":"/proc","type":"proc","source":"proc","options":["nosuid","mode=755"]}],"annotations":{"org.example.description":"hello"}}
+        \\{"ociVersion":"9.9.9","root":{"path":"rootfs"},"linux":{"namespaces":[{"type":"mount"}],"cgroupsPath":"/custom/test","resources":{"memory":{"limit":33554432},"pids":{"limit":5}}},"process":{"args":["/bin/sh"],"cwd":"/","user":{"uid":1000,"gid":1000},"capabilities":{"bounding":["CAP_CHOWN","CAP_BPF"],"effective":["CAP_CHOWN"],"permitted":["CAP_CHOWN"],"inheritable":["CAP_CHOWN"],"ambient":["CAP_CHOWN"]},"rlimits":[{"type":"RLIMIT_NOFILE","hard":1024,"soft":512}]},"mounts":[{"destination":"/a/../mnt","type":"bind","source":"source","options":["ro","rprivate"]},{"destination":"/proc","type":"proc","source":"proc","options":["nosuid","mode=755"]}],"annotations":{"org.example.description":"hello"}}
         ,
     });
     const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });

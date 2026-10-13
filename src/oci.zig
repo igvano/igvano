@@ -55,9 +55,7 @@ test "OCI resources parse and map to cgroup2 writes" {
 test "cgroup writes preserve unlimited values and CPU defaults" {
     const cases = [_]struct { json: []const u8, name: []const u8, value: []const u8 }{
         .{ .json = "{\"memory\":{\"limit\":-1}}", .name = "memory.max", .value = "max" },
-        .{ .json = "{\"memory\":{\"limit\":0}}", .name = "memory.max", .value = "0" },
         .{ .json = "{\"pids\":{\"limit\":-1}}", .name = "pids.max", .value = "max" },
-        .{ .json = "{\"pids\":{\"limit\":0}}", .name = "pids.max", .value = "0" },
         .{ .json = "{\"cpu\":{\"quota\":-1,\"period\":200000}}", .name = "cpu.max", .value = "max 200000" },
         .{ .json = "{\"cpu\":{\"period\":200000}}", .name = "cpu.max", .value = "max 200000" },
         .{ .json = "{\"cpu\":{\"quota\":50000}}", .name = "cpu.max", .value = "50000 100000" },
@@ -72,7 +70,15 @@ test "cgroup writes preserve unlimited values and CPU defaults" {
         try std.testing.expectEqualStrings(case.name, writes[0].name);
         try std.testing.expectEqualStrings(case.value, writes[0].value);
     }
-    for ([_]?Spec.Resources{ null, .{}, .{ .cpu = .{ .shares = 0 } }, .{ .memory = .{} } }) |resources| {
+    for ([_]?Spec.Resources{
+        null,
+        .{},
+        .{ .cpu = .{ .shares = 0 } },
+        .{ .memory = .{} },
+        .{ .memory = .{ .limit = 0 } },
+        .{ .pids = .{ .limit = 0 } },
+        .{ .memory = .{ .limit = 0 }, .pids = .{ .limit = 0 } },
+    }) |resources| {
         const writes = try cgroupWrites(std.testing.allocator, resources);
         defer freeCgroupWrites(std.testing.allocator, writes);
         try std.testing.expectEqual(@as(usize, 0), writes.len);
@@ -86,6 +92,18 @@ test "cgroup writes preserve unlimited values and CPU defaults" {
     }) |resources| {
         try std.testing.expectError(error.InvalidConfig, cgroupWrites(std.testing.allocator, resources));
     }
+}
+
+test "zero memory and pids limits are unset without suppressing other resources" {
+    const parsed = try std.json.parseFromSlice(Spec.Resources, std.testing.allocator,
+        \\{"memory":{"limit":0},"pids":{"limit":0},"cpu":{"shares":1024}}
+    , .{});
+    defer parsed.deinit();
+    const writes = try cgroupWrites(std.testing.allocator, parsed.value);
+    defer freeCgroupWrites(std.testing.allocator, writes);
+    try std.testing.expectEqual(@as(usize, 1), writes.len);
+    try std.testing.expectEqualStrings("cpu.weight", writes[0].name);
+    try std.testing.expectEqualStrings("39", writes[0].value);
 }
 
 test "bind mount recursive read-only options are explicit and ordered" {
@@ -147,6 +165,22 @@ pub const Spec = struct {
         terminal: ?bool = null,
         noNewPrivileges: bool = false,
         user: User,
+        capabilities: ?Capabilities = null,
+        rlimits: ?[]const Rlimit = null,
+    };
+
+    pub const Capabilities = struct {
+        bounding: ?[]const []const u8 = null,
+        effective: ?[]const []const u8 = null,
+        inheritable: ?[]const []const u8 = null,
+        permitted: ?[]const []const u8 = null,
+        ambient: ?[]const []const u8 = null,
+    };
+
+    pub const Rlimit = struct {
+        type: []const u8,
+        hard: u64,
+        soft: u64,
     };
 
     pub const User = struct {
@@ -221,7 +255,164 @@ pub fn cpuWeight(shares: u64) !u64 {
     return 1 + ((shares - 2) * 9999) / 262142;
 }
 
-const CgroupWrite = @import("backend.zig").Backend.CgroupWrite;
+const Backend = @import("backend.zig").Backend;
+const CgroupWrite = Backend.CgroupWrite;
+
+/// Linux constants are available on every build host; no syscalls are made.
+pub fn capabilityNumber(name: []const u8) error{InvalidConfig}!u6 {
+    inline for (comptime std.meta.declarations(std.os.linux.CAP)) |decl| {
+        if (comptime !std.mem.eql(u8, decl.name, "LAST_CAP") and
+            @TypeOf(@field(std.os.linux.CAP, decl.name)) == comptime_int)
+        {
+            if (std.mem.eql(u8, name, "CAP_" ++ decl.name))
+                return @intCast(@field(std.os.linux.CAP, decl.name));
+        }
+    }
+    return error.InvalidConfig;
+}
+
+pub fn rlimitResource(name: []const u8) error{InvalidConfig}!std.os.linux.rlimit_resource {
+    if (!std.mem.startsWith(u8, name, "RLIMIT_")) return error.InvalidConfig;
+    return std.meta.stringToEnum(std.os.linux.rlimit_resource, name["RLIMIT_".len..]) orelse error.InvalidConfig;
+}
+
+pub fn processCapabilities(config: Spec.Capabilities) !Backend.Capabilities {
+    var result: Backend.Capabilities = .{};
+    inline for (std.meta.fields(Backend.Capabilities)) |field| {
+        for (@field(config, field.name) orelse &.{}) |name|
+            @field(result, field.name) |= @as(u64, 1) << try capabilityNumber(name);
+    }
+    if (result.ambient & ~(result.permitted & result.inheritable) != 0)
+        return error.AmbientCapabilitiesRequirePermittedAndInheritable;
+    return result;
+}
+
+pub fn processRlimits(allocator: std.mem.Allocator, config: ?[]const Spec.Rlimit) ![]Backend.Rlimit {
+    const limits = config orelse &.{};
+    const result = try allocator.alloc(Backend.Rlimit, limits.len);
+    errdefer allocator.free(result);
+    for (limits, result, 0..) |limit, *prepared, i| {
+        if (limit.soft > limit.hard) return error.InvalidConfig;
+        const resource = try rlimitResource(limit.type);
+        for (result[0..i]) |previous| {
+            if (previous.resource == resource) return error.InvalidConfig;
+        }
+        prepared.* = .{
+            .resource = resource,
+            .hard = limit.hard,
+            .soft = limit.soft,
+        };
+    }
+    return result;
+}
+
+test "capability names map the complete Linux set and reject unknown names" {
+    const names = [_][]const u8{
+        "CAP_CHOWN",           "CAP_DAC_OVERRIDE",       "CAP_DAC_READ_SEARCH",
+        "CAP_FOWNER",          "CAP_FSETID",             "CAP_KILL",
+        "CAP_SETGID",          "CAP_SETUID",             "CAP_SETPCAP",
+        "CAP_LINUX_IMMUTABLE", "CAP_NET_BIND_SERVICE",   "CAP_NET_BROADCAST",
+        "CAP_NET_ADMIN",       "CAP_NET_RAW",            "CAP_IPC_LOCK",
+        "CAP_IPC_OWNER",       "CAP_SYS_MODULE",         "CAP_SYS_RAWIO",
+        "CAP_SYS_CHROOT",      "CAP_SYS_PTRACE",         "CAP_SYS_PACCT",
+        "CAP_SYS_ADMIN",       "CAP_SYS_BOOT",           "CAP_SYS_NICE",
+        "CAP_SYS_RESOURCE",    "CAP_SYS_TIME",           "CAP_SYS_TTY_CONFIG",
+        "CAP_MKNOD",           "CAP_LEASE",              "CAP_AUDIT_WRITE",
+        "CAP_AUDIT_CONTROL",   "CAP_SETFCAP",            "CAP_MAC_OVERRIDE",
+        "CAP_MAC_ADMIN",       "CAP_SYSLOG",             "CAP_WAKE_ALARM",
+        "CAP_BLOCK_SUSPEND",   "CAP_AUDIT_READ",         "CAP_PERFMON",
+        "CAP_BPF",             "CAP_CHECKPOINT_RESTORE",
+    };
+    for (names, 0..) |name, number|
+        try std.testing.expectEqual(@as(u6, @intCast(number)), try capabilityNumber(name));
+    for ([_][]const u8{ "", "CHOWN", "cap_chown", "CAP_UNKNOWN", "CAP_LAST_CAP", "CAP_CHOWN\x00" }) |name|
+        try std.testing.expectError(error.InvalidConfig, capabilityNumber(name));
+}
+
+test "rlimit names map every Linux resource and reject unknown names" {
+    const cases = .{
+        .{ "RLIMIT_CPU", .CPU },           .{ "RLIMIT_FSIZE", .FSIZE },
+        .{ "RLIMIT_DATA", .DATA },         .{ "RLIMIT_STACK", .STACK },
+        .{ "RLIMIT_CORE", .CORE },         .{ "RLIMIT_RSS", .RSS },
+        .{ "RLIMIT_NPROC", .NPROC },       .{ "RLIMIT_NOFILE", .NOFILE },
+        .{ "RLIMIT_MEMLOCK", .MEMLOCK },   .{ "RLIMIT_AS", .AS },
+        .{ "RLIMIT_LOCKS", .LOCKS },       .{ "RLIMIT_SIGPENDING", .SIGPENDING },
+        .{ "RLIMIT_MSGQUEUE", .MSGQUEUE }, .{ "RLIMIT_NICE", .NICE },
+        .{ "RLIMIT_RTPRIO", .RTPRIO },     .{ "RLIMIT_RTTIME", .RTTIME },
+    };
+    inline for (cases) |case|
+        try std.testing.expectEqual(@as(std.os.linux.rlimit_resource, case[1]), try rlimitResource(case[0]));
+    for ([_][]const u8{ "", "NOFILE", "rlimit_nofile", "RLIMIT_UNKNOWN", "RLIMIT_", "RLIMIT_NOFILE\x00" }) |name|
+        try std.testing.expectError(error.InvalidConfig, rlimitResource(name));
+}
+
+test "ambient capabilities require membership in both permitted and inheritable" {
+    const cap: u64 = @as(u64, 1) << std.os.linux.CAP.NET_BIND_SERVICE;
+    const valid = try processCapabilities(.{
+        .bounding = &.{"CAP_NET_BIND_SERVICE"},
+        .effective = &.{"CAP_NET_BIND_SERVICE"},
+        .permitted = &.{"CAP_NET_BIND_SERVICE"},
+        .inheritable = &.{"CAP_NET_BIND_SERVICE"},
+        .ambient = &.{"CAP_NET_BIND_SERVICE"},
+    });
+    try std.testing.expectEqual(Backend.Capabilities{
+        .bounding = cap,
+        .effective = cap,
+        .permitted = cap,
+        .inheritable = cap,
+        .ambient = cap,
+    }, valid);
+    try std.testing.expectEqual(Backend.Capabilities{}, try processCapabilities(.{}));
+    for ([_]Spec.Capabilities{
+        .{ .ambient = &.{"CAP_NET_BIND_SERVICE"} },
+        .{ .ambient = &.{"CAP_NET_BIND_SERVICE"}, .permitted = &.{"CAP_NET_BIND_SERVICE"} },
+        .{ .ambient = &.{"CAP_NET_BIND_SERVICE"}, .inheritable = &.{"CAP_NET_BIND_SERVICE"} },
+        .{ .ambient = &.{"CAP_NET_BIND_SERVICE"}, .permitted = &.{"CAP_NET_BIND_SERVICE"}, .inheritable = &.{"CAP_CHOWN"} },
+    }) |config| {
+        try std.testing.expectError(error.AmbientCapabilitiesRequirePermittedAndInheritable, processCapabilities(config));
+    }
+    inline for (std.meta.fields(Spec.Capabilities)) |field| {
+        var config: Spec.Capabilities = .{};
+        @field(config, field.name) = &.{"CAP_UNKNOWN"};
+        try std.testing.expectError(error.InvalidConfig, processCapabilities(config));
+    }
+    const upper = try processCapabilities(.{ .bounding = &.{ "CAP_CHECKPOINT_RESTORE", "CAP_CHECKPOINT_RESTORE" } });
+    try std.testing.expectEqual(@as(u64, 1) << 40, upper.bounding);
+}
+
+test "process parses capabilities rlimits and supplementary groups" {
+    const parsed = try std.json.parseFromSlice(Spec.Process, std.testing.allocator,
+        \\{"args":["/bin/sh"],"cwd":"/","user":{"uid":1000,"gid":1001,"additionalGids":[1002,1003]},"capabilities":{"bounding":["CAP_CHOWN"],"effective":[],"permitted":["CAP_CHOWN"],"inheritable":[],"ambient":[]},"rlimits":[{"type":"RLIMIT_NOFILE","hard":1024,"soft":512},{"type":"RLIMIT_CORE","hard":18446744073709551615,"soft":0}]}
+    , .{});
+    defer parsed.deinit();
+    const process = parsed.value;
+    try std.testing.expectEqualSlices(u32, &.{ 1002, 1003 }, process.user.additionalGids.?);
+    const caps = try processCapabilities(process.capabilities.?);
+    try std.testing.expectEqual(@as(u64, 1), caps.bounding);
+    try std.testing.expectEqual(@as(u64, 1), caps.permitted);
+    try std.testing.expectEqual(@as(u64, 0), caps.effective);
+    const limits = try processRlimits(std.testing.allocator, process.rlimits);
+    defer std.testing.allocator.free(limits);
+    try std.testing.expectEqual(@as(usize, 2), limits.len);
+    try std.testing.expectEqual(Backend.Rlimit{ .resource = .NOFILE, .hard = 1024, .soft = 512 }, limits[0]);
+    try std.testing.expectEqual(Backend.Rlimit{ .resource = .CORE, .hard = std.math.maxInt(u64), .soft = 0 }, limits[1]);
+}
+
+test "rlimit preparation rejects invalid names inverted limits and duplicates without leaking" {
+    for ([_]Spec.Rlimit{
+        .{ .type = "RLIMIT_UNKNOWN", .hard = 1024, .soft = 512 },
+        .{ .type = "RLIMIT_NOFILE", .hard = 512, .soft = 1024 },
+        .{ .type = "RLIMIT_NOFILE", .hard = 2048, .soft = 1024 },
+    }) |invalid| {
+        try std.testing.expectError(error.InvalidConfig, processRlimits(std.testing.allocator, &.{
+            .{ .type = "RLIMIT_NOFILE", .hard = 1024, .soft = 512 },
+            invalid,
+        }));
+    }
+    const omitted = try processRlimits(std.testing.allocator, null);
+    defer std.testing.allocator.free(omitted);
+    try std.testing.expectEqual(@as(usize, 0), omitted.len);
+}
 
 /// The caller owns the slice and each value; filenames are static strings.
 pub fn cgroupWrites(allocator: std.mem.Allocator, resources: ?Spec.Resources) ![]CgroupWrite {
@@ -230,8 +421,10 @@ pub fn cgroupWrites(allocator: std.mem.Allocator, resources: ?Spec.Resources) ![
     errdefer for (writes.items) |write| allocator.free(write.value);
     if (resources) |settings| {
         if (settings.memory) |memory| {
-            if (memory.limit) |limit|
-                try appendCgroupWrite(allocator, &writes, "memory.max", try cgroupLimit(allocator, limit));
+            if (memory.limit) |limit| {
+                if (limit != 0)
+                    try appendCgroupWrite(allocator, &writes, "memory.max", try cgroupLimit(allocator, limit));
+            }
         }
         if (settings.cpu) |cpu| {
             const quota = cpu.quota orelse -1;
@@ -250,8 +443,10 @@ pub fn cgroupWrites(allocator: std.mem.Allocator, resources: ?Spec.Resources) ![
                     try appendCgroupWrite(allocator, &writes, "cpu.weight", try std.fmt.allocPrint(allocator, "{d}", .{weight}));
             }
         }
-        if (settings.pids) |pids|
-            try appendCgroupWrite(allocator, &writes, "pids.max", try cgroupLimit(allocator, pids.limit));
+        if (settings.pids) |pids| {
+            if (pids.limit != 0)
+                try appendCgroupWrite(allocator, &writes, "pids.max", try cgroupLimit(allocator, pids.limit));
+        }
     }
     return writes.toOwnedSlice(allocator);
 }
@@ -765,6 +960,8 @@ test "spec defaults omitted optional fields" {
     try std.testing.expect(parsed.value.process.?.env == null);
     try std.testing.expect(parsed.value.process.?.terminal == null);
     try std.testing.expect(!parsed.value.process.?.noNewPrivileges);
+    try std.testing.expect(parsed.value.process.?.capabilities == null);
+    try std.testing.expect(parsed.value.process.?.rlimits == null);
     try std.testing.expect(parsed.value.process.?.user.additionalGids == null);
     try std.testing.expect(parsed.value.hostname == null);
     try std.testing.expect(parsed.value.mounts == null);
