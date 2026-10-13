@@ -5,6 +5,35 @@ const posix = std.posix;
 const Backend = @import("../backend.zig").Backend;
 const oci = @import("../oci.zig");
 
+/// statfs ST_RELATIME is 4096, unlike MS_RELATIME. Strict atime is implicit.
+pub fn lockedMountFlags(requested: u32, fs_flags: usize) u32 {
+    const ms = linux.MS;
+    const common = ms.RDONLY | ms.NOSUID | ms.NODEV | ms.NOEXEC | ms.NOATIME | ms.NODIRATIME;
+    return requested | @as(u32, @intCast(fs_flags & common)) |
+        (if (fs_flags & 4096 != 0) @as(u32, ms.RELATIME) else 0) |
+        (if (fs_flags & (1024 | 4096) == 0) @as(u32, ms.STRICTATIME) else 0);
+}
+
+test "user namespace remount flags retain only locked statfs flags" {
+    const ms = linux.MS;
+    const requested: u32 = ms.BIND | ms.REMOUNT | ms.RDONLY;
+    const cases = [_]struct { statfs: usize, expected: u32 }{
+        .{ .statfs = 0, .expected = requested | ms.STRICTATIME },
+        .{ .statfs = 2, .expected = requested | ms.NOSUID | ms.STRICTATIME },
+        .{ .statfs = 4, .expected = requested | ms.NODEV | ms.STRICTATIME },
+        .{ .statfs = 8, .expected = requested | ms.NOEXEC | ms.STRICTATIME },
+        .{ .statfs = 1024, .expected = requested | ms.NOATIME },
+        .{ .statfs = 2048, .expected = requested | ms.NODIRATIME | ms.STRICTATIME },
+        .{ .statfs = 4096, .expected = requested | ms.RELATIME },
+        .{ .statfs = 2 | 4 | 8 | 1024 | 2048 | 4096, .expected = requested | ms.NOSUID | ms.NODEV | ms.NOEXEC | ms.NOATIME | ms.NODIRATIME | ms.RELATIME },
+        .{ .statfs = 1 | 16 | 32 | 64 | 128 | 256 | 512 | 8192, .expected = requested | ms.STRICTATIME },
+    };
+    for (cases) |case|
+        try std.testing.expectEqual(case.expected, lockedMountFlags(requested, case.statfs));
+    try std.testing.expectEqual(ms.NOEXEC | ms.NOSUID | ms.STRICTATIME, lockedMountFlags(ms.NOEXEC, 2));
+    try std.testing.expectEqual(ms.RDONLY | ms.RELATIME, lockedMountFlags(0, 1 | 4096));
+}
+
 /// Pure filesystem selection; mount flags, including read-only, stay unchanged.
 pub fn cgroupMountType(mount_type: []const u8, host_fs_type: usize) Backend.Error![]const u8 {
     if (!std.mem.eql(u8, mount_type, "cgroup") and !std.mem.eql(u8, mount_type, "cgroup2")) return mount_type;
@@ -20,6 +49,69 @@ test "cgroup mounts map to cgroup2 only on unified hosts" {
     try std.testing.expectEqualStrings("tmpfs", try cgroupMountType("tmpfs", 0x01021994));
     try std.testing.expectError(error.Unsupported, cgroupMountType("cgroup2", 0x01021994));
     try std.testing.expectEqualStrings("cgroup2", try cgroupMountType("cgroup2", 0x63677270));
+}
+
+fn hasDevTmpfs(mounts: anytype) bool {
+    var populate_dev = false;
+    for (mounts) |mount| {
+        if (!std.mem.eql(u8, mount.destination, "/dev")) continue;
+        populate_dev = mount.flags & linux.MS.BIND == 0 and
+            std.mem.eql(u8, mount.type orelse "", "tmpfs");
+    }
+    return populate_dev;
+}
+
+fn validateDeviceMounts(mounts: []const Backend.Mount, devices: []const Backend.Device) Backend.Error!void {
+    if (hasDevTmpfs(mounts)) return;
+    for (devices) |device| {
+        if (device.required) return error.Unsupported;
+    }
+}
+
+test "required devices need a populated dev mount while defaults may be skipped" {
+    const tmpfs: Backend.Mount = .{ .destination = "/dev", .source = "tmpfs", .type = "tmpfs", .flags = 0, .propagation = 0, .data = "" };
+    const bind: Backend.Mount = .{ .destination = "/dev", .source = "/dev", .type = null, .flags = linux.MS.BIND, .propagation = 0, .data = "" };
+    const other: Backend.Mount = .{ .destination = "/dev", .source = "ramfs", .type = "ramfs", .flags = 0, .propagation = 0, .data = "" };
+    const cases = [_]struct { mounts: []const Backend.Mount, supported: bool }{
+        .{ .mounts = &.{}, .supported = false },
+        .{ .mounts = &.{bind}, .supported = false },
+        .{ .mounts = &.{other}, .supported = false },
+        .{ .mounts = &.{tmpfs}, .supported = true },
+        .{ .mounts = &.{ tmpfs, bind }, .supported = false },
+        .{ .mounts = &.{ bind, tmpfs }, .supported = true },
+    };
+    const defaults = [_]Backend.Device{
+        .{ .path = "/dev/null", .kind = .character, .major = 1, .minor = 3, .required = false },
+    };
+    for (cases) |case| {
+        try validateDeviceMounts(case.mounts, &.{});
+        try validateDeviceMounts(case.mounts, &defaults);
+        for ([_][]const u8{ "/dev/pipe", "/run/pipe" }) |path| {
+            const configured = [_]Backend.Device{ defaults[0], .{ .path = path, .kind = .fifo } };
+            if (case.supported) {
+                try validateDeviceMounts(case.mounts, &configured);
+            } else {
+                try std.testing.expectError(error.Unsupported, validateDeviceMounts(case.mounts, &configured));
+                if (comptime builtin.os.tag == .linux) {
+                    const spec: oci.Spec = .{
+                        .ociVersion = "1.0.2",
+                        .root = .{ .path = "/" },
+                        .linux = .{ .namespaces = &.{.{ .type = .mount }} },
+                    };
+                    var implementation: LinuxBackend = .{};
+                    try std.testing.expectError(error.Unsupported, implementation.backend().create(.{
+                        .allocator = std.testing.allocator,
+                        .id = "required-devices",
+                        .rootfs = "/",
+                        .exec_fifo = "/tmp/igvano-device-test.fifo",
+                        .spec = &spec,
+                        .mounts = case.mounts,
+                        .devices = &configured,
+                    }));
+                }
+            }
+        }
+    }
 }
 
 /// Pure translation and validation; Linux flag constants are available on macOS too.
@@ -99,6 +191,7 @@ pub const LinuxBackend = struct {
             if (!std.fs.path.isAbsolute(cwd)) return error.InvalidProcess;
             if (flags & linux.CLONE.NEWNS == 0) return error.MissingMountNamespace;
             if (!std.fs.path.isAbsolute(rootfs)) return error.InvalidPath;
+            try validateDeviceMounts(options.mounts, options.devices);
             try validateCgroupPath(options.cgroup_path);
             const cgroup_root = try openCgroupRoot();
             defer closeFd(cgroup_root.fd);
@@ -117,6 +210,24 @@ pub const LinuxBackend = struct {
                     .propagation = mount.propagation,
                     .data = try pathString(allocator, mount.data),
                     .recursive_readonly = mount.recursive_readonly,
+                };
+            }
+            const devices = try allocator.alloc(PreparedDevice, options.devices.len);
+            for (options.devices, devices) |device, *prepared| {
+                if (!std.mem.startsWith(u8, device.path, "/") or
+                    device.major > 0xfff or device.minor > 0xfffff or
+                    device.mode & ~@as(u32, 0o7777) != 0)
+                    return error.InvalidConfig;
+                prepared.* = .{
+                    .path = try pathString(allocator, device.path),
+                    .mode = device.mode | @as(u32, switch (device.kind) {
+                        .character => linux.S.IFCHR,
+                        .block => linux.S.IFBLK,
+                        .fifo => linux.S.IFIFO,
+                    }),
+                    .dev = (device.major << 8) | (device.minor & 0xff) | ((device.minor & 0xfff00) << 12),
+                    .uid = device.uid,
+                    .gid = device.gid,
                 };
             }
             const args: []const []const u8 = if (options.spec.process) |process| process.args else &.{};
@@ -185,7 +296,7 @@ pub const LinuxBackend = struct {
                         checkResult(linux.setgid(0)) catch linux.exit_group(1);
                         checkResult(linux.setuid(0)) catch linux.exit_group(1);
                     }
-                    runInit(options.spec, capabilities, options.rlimits, flags, rootfs, mounts, cwd, fifo, argv.ptr, envp.ptr, ready[1]);
+                    runInit(options.spec, capabilities, options.rlimits, flags, rootfs, mounts, devices, options.device_symlinks, cwd, fifo, argv.ptr, envp.ptr, ready[1]);
                 }
                 if (map_pipe) |fds| {
                     closeFd(fds[0]);
@@ -267,8 +378,8 @@ pub const LinuxBackend = struct {
             errdefer if (reported and response.pid > 0) {
                 kill(ptr, handle, 9) catch {};
             };
-            const status = try waitChild(child1);
             child1_reaped = true;
+            const status = try waitChild(child1);
             if (!reported) return error.CreateFailed;
             if (response.failure != 0) return @errorCast(@errorFromInt(@as(u16, @intCast(response.failure))));
             if (status != 0 or response.pid <= 0) {
@@ -781,6 +892,7 @@ fn writeMappingFile(dir: posix.fd_t, name: [*:0]const u8, text: []const u8) Back
     while (true) {
         const result = linux.write(fd, text.ptr, text.len);
         if (linux.errno(result) == .INTR) continue;
+        if (linux.errno(result) == .INVAL) return error.InvalidConfig;
         try checkResult(result);
         if (result != text.len) return error.CreateFailed;
         return;
@@ -868,6 +980,14 @@ const PreparedMount = struct {
     recursive_readonly: ?bool = null,
 };
 
+const PreparedDevice = struct {
+    path: [:0]const u8,
+    mode: u32,
+    dev: u32,
+    uid: u32 = 0,
+    gid: u32 = 0,
+};
+
 const CapabilityHeader = extern struct {
     version: u32 = 0x20080522, // _LINUX_CAPABILITY_VERSION_3
     pid: i32 = 0,
@@ -936,7 +1056,33 @@ fn fdPath(buffer: []u8, fd: posix.fd_t) [:0]u8 {
     return std.fmt.bufPrintZ(buffer, "/proc/self/fd/{d}", .{fd}) catch unreachable;
 }
 
-fn applyMount(rootfs: [:0]const u8, root_fd: posix.fd_t, mount: PreparedMount) Backend.Error!void {
+fn remountFlags(target_fd: posix.fd_t, requested: u32, user_namespace: bool) Backend.Error!u32 {
+    if (comptime builtin.os.tag == .linux) {
+        if (!user_namespace) return requested;
+        // Linux statfs uses native words, except for the two-int fsid.
+        const Statfs = extern struct {
+            type: usize,
+            bsize: usize,
+            blocks: usize,
+            bfree: usize,
+            bavail: usize,
+            files: usize,
+            ffree: usize,
+            fsid: [2]i32,
+            namelen: usize,
+            frsize: usize,
+            flags: usize,
+            spare: [4]usize,
+        };
+        var fs: Statfs = undefined;
+        try checkResult(linux.syscall2(.fstatfs, @intCast(target_fd), @intFromPtr(&fs)));
+        return lockedMountFlags(requested, fs.flags);
+    } else {
+        return error.NotImplemented;
+    }
+}
+
+fn applyMount(rootfs: [:0]const u8, root_fd: posix.fd_t, mount: PreparedMount, user_namespace: bool) Backend.Error!void {
     const ms = linux.MS;
     const bind = mount.flags & ms.BIND != 0;
     const source_fd: ?posix.fd_t = if (bind)
@@ -971,7 +1117,8 @@ fn applyMount(rootfs: [:0]const u8, root_fd: posix.fd_t, mount: PreparedMount) B
     closeFd(target_fd);
     target_fd = mounted_fd;
     if (bind and mount.flags & ~@as(u32, ms.BIND | ms.REC) != 0) {
-        try checkResult(linux.mount(null, fdPath(&target_buffer, target_fd), null, (mount.flags & ~@as(u32, ms.REC)) | ms.BIND | ms.REMOUNT, 0));
+        const flags = try remountFlags(target_fd, (mount.flags & ~@as(u32, ms.REC)) | ms.BIND | ms.REMOUNT, user_namespace);
+        try checkResult(linux.mount(null, fdPath(&target_buffer, target_fd), null, flags, 0));
     }
     if (mount.recursive_readonly) |readonly| {
         const MountAttr = extern struct {
@@ -992,15 +1139,97 @@ fn applyMount(rootfs: [:0]const u8, root_fd: posix.fd_t, mount: PreparedMount) B
     }
 }
 
+fn validateDeviceNode(fd: posix.fd_t, device: PreparedDevice) Backend.Error!void {
+    var stat: linux.Statx = undefined;
+    try checkResult(linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .TYPE = true }, &stat));
+    if (!stat.mask.TYPE) return error.CreateFailed;
+    const kind = device.mode & linux.S.IFMT;
+    if (stat.mode & linux.S.IFMT != kind) return error.InvalidPath;
+    if (kind == linux.S.IFCHR or kind == linux.S.IFBLK) {
+        // Decode the Linux device number passed to mknodat.
+        const major = (device.dev >> 8) & 0xfff;
+        const minor = (device.dev & 0xff) | ((device.dev >> 12) & 0xfff00);
+        if (stat.rdev_major != major or stat.rdev_minor != minor) return error.InvalidPath;
+    }
+}
+
+fn createDevice(root_fd: posix.fd_t, device: PreparedDevice) Backend.Error!void {
+    if (comptime builtin.os.tag == .linux) {
+        const parent = std.fs.path.dirname(device.path) orelse return error.InvalidPath;
+        const dir = try mountDestination(root_fd, parent, false, true);
+        defer closeFd(dir);
+        var name_buffer: [256]u8 = undefined;
+        const name = std.fmt.bufPrintZ(&name_buffer, "{s}", .{std.fs.path.basename(device.path)}) catch return error.InvalidPath;
+        if (name.len == 0 or std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) return error.InvalidPath;
+        const created = linux.mknodat(dir, name, device.mode, device.dev);
+        switch (linux.errno(created)) {
+            .SUCCESS => {
+                // Pin the new node for metadata updates, even if the name changes.
+                const node = try openPath(dir, name, .{ .PATH = true, .NOFOLLOW = true, .CLOEXEC = true });
+                defer closeFd(node);
+                try validateDeviceNode(node, device);
+                try checkResult(linux.fchownat(node, "", device.uid, device.gid, linux.AT.EMPTY_PATH));
+                var buffer: [64]u8 = undefined;
+                try checkResult(linux.fchmodat(linux.AT.FDCWD, fdPath(&buffer, node), device.mode & 0o7777));
+            },
+            // A configured mount may already supply this device. Preserve it
+            // only when its type and device number match the requested node.
+            .EXIST => {
+                const node = try openPath(dir, name, .{ .PATH = true, .NOFOLLOW = true, .CLOEXEC = true });
+                defer closeFd(node);
+                try validateDeviceNode(node, device);
+            },
+            .PERM => {
+                // mknod is forbidden in user namespaces. Like runc, retry an
+                // EPERM as a bind, including when the runtime inherited a user ns.
+                const source = try openPath(linux.AT.FDCWD, device.path, .{ .PATH = true, .CLOEXEC = true });
+                defer closeFd(source);
+                try validateDeviceNode(source, device);
+                const target = try mountDestination(root_fd, device.path, true, true);
+                defer closeFd(target);
+                var source_buffer: [64]u8 = undefined;
+                var target_buffer: [64]u8 = undefined;
+                try checkResult(linux.mount(fdPath(&source_buffer, source), fdPath(&target_buffer, target), null, linux.MS.BIND, 0));
+                // Like runc, bind fallback inherits host metadata; changing it
+                // here would chmod/chown the host device as well.
+            },
+            else => try checkResult(created),
+        }
+    } else {
+        return error.NotImplemented;
+    }
+}
+
+fn setupDevices(root_fd: posix.fd_t, devices: []const PreparedDevice, symlinks: []const Backend.Symlink) Backend.Error!void {
+    if (comptime builtin.os.tag == .linux) {
+        for (devices) |device| try createDevice(root_fd, device);
+        for (symlinks) |link| {
+            if (!std.mem.startsWith(u8, link.path, "/")) return error.InvalidPath;
+            const parent = std.fs.path.dirname(link.path) orelse return error.InvalidPath;
+            const dir = try mountDestination(root_fd, parent, false, true);
+            defer closeFd(dir);
+            var buffer: [256]u8 = undefined;
+            const name = std.fmt.bufPrintZ(&buffer, "{s}", .{std.fs.path.basename(link.path)}) catch return error.InvalidPath;
+            const result = linux.symlinkat(link.target, dir, name);
+            switch (linux.errno(result)) {
+                .SUCCESS, .EXIST => {},
+                else => try checkResult(result),
+            }
+        }
+    } else {
+        return error.NotImplemented;
+    }
+}
+
 /// All paths/data are prepared before fork; child2 needs no allocator.
-fn setupRootfs(rootfs: [:0]const u8, mounts: []const PreparedMount, readonly: bool) Backend.Error!void {
+fn setupRootfs(rootfs: [:0]const u8, mounts: []const PreparedMount, devices: []const PreparedDevice, symlinks: []const Backend.Symlink, readonly: bool, user_namespace: bool) Backend.Error!void {
     const ms = linux.MS;
     try checkResult(linux.mount(null, "/", null, ms.PRIVATE | ms.REC, 0));
     try checkResult(linux.mount(rootfs, rootfs, null, ms.BIND | ms.REC, 0));
     for (mounts) |mount| {
         const root_fd = try openPath(linux.AT.FDCWD, rootfs, .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true });
         defer closeFd(root_fd);
-        try applyMount(rootfs, root_fd, mount);
+        try applyMount(rootfs, root_fd, mount, user_namespace);
     }
     // runc's fd trick stacks the old root on the new root without a put_old
     // directory. Detach it and close both handles before any container exec.
@@ -1008,12 +1237,18 @@ fn setupRootfs(rootfs: [:0]const u8, mounts: []const PreparedMount, readonly: bo
     defer closeFd(old_root);
     const new_root = try openPath(linux.AT.FDCWD, rootfs, .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true });
     defer closeFd(new_root);
+    // Without a configured /dev tmpfs, only optional defaults may be skipped:
+    // create rejects required devices before setup. Leave bind-mounted /dev alone.
+    if (hasDevTmpfs(mounts)) try setupDevices(new_root, devices, symlinks);
     try checkResult(linux.fchdir(new_root));
     try checkResult(linux.pivot_root(".", "."));
     try checkResult(linux.fchdir(old_root));
     try checkResult(linux.umount2(".", linux.MNT.DETACH));
     try checkResult(linux.chdir("/"));
-    if (readonly) try checkResult(linux.mount(null, "/", null, ms.BIND | ms.REMOUNT | ms.RDONLY, 0));
+    if (readonly) {
+        const flags = try remountFlags(new_root, ms.BIND | ms.REMOUNT | ms.RDONLY, user_namespace);
+        try checkResult(linux.mount(null, "/", null, flags, 0));
+    }
 }
 
 fn runInit(
@@ -1023,6 +1258,8 @@ fn runInit(
     flags: usize,
     rootfs: [:0]const u8,
     mounts: []const PreparedMount,
+    devices: []const PreparedDevice,
+    symlinks: []const Backend.Symlink,
     cwd: [:0]const u8,
     fifo: [:0]const u8,
     argv: [*:null]const ?[*:0]const u8,
@@ -1031,11 +1268,13 @@ fn runInit(
 ) noreturn {
     // Keep the host FIFO reachable without requiring /proc inside the rootfs.
     // These host descriptors are used only by init and closed before exec.
+    // ponytail: this path-based open needs --root traversable by mapped UID 0;
+    // runc passes an O_PATH fd from the parent instead.
     const fifo_path = openPath(linux.AT.FDCWD, fifo, .{ .PATH = true, .CLOEXEC = true }) catch linux.exit_group(1);
     const fd_dir = openPath(linux.AT.FDCWD, "/proc/self/fd", .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true }) catch linux.exit_group(1);
     var fifo_buffer: [32]u8 = undefined;
     const fifo_name = std.fmt.bufPrintZ(&fifo_buffer, "{d}", .{fifo_path}) catch unreachable;
-    setupRootfs(rootfs, mounts, spec.root.readonly) catch linux.exit_group(1);
+    setupRootfs(rootfs, mounts, devices, symlinks, spec.root.readonly, flags & linux.CLONE.NEWUSER != 0) catch linux.exit_group(1);
     if (flags & linux.CLONE.NEWUTS != 0) {
         if (spec.hostname) |hostname| {
             // Zig 0.16 has no sethostname wrapper.
@@ -1877,6 +2116,8 @@ test "linux create accepts an empty rootfs and returns a live blocked init" {
             .exec_fifo = fifo,
             .spec = &spec,
             .cgroup_path = cgroup_path,
+            .devices = &.{.{ .path = "/dev/null", .kind = .character, .major = 1, .minor = 3, .required = false }},
+            .device_symlinks = oci.deviceSymlinks(&.{}),
         });
         defer std.testing.allocator.free(handle.starttime);
         defer {
@@ -1887,9 +2128,10 @@ test "linux create accepts an empty rootfs and returns a live blocked init" {
         try std.testing.expectEqualStrings("example", handle.id);
         try std.testing.expect(handle.starttime.len != 0);
         try std.testing.expect(try backend.alive(handle));
+        try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, "rootfs/dev", .{}));
         try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.kill(handle.pid, @enumFromInt(0))));
         const fifo_stat = try tmp.dir.statFile(std.testing.io, "exec.fifo", .{});
-        try std.testing.expectEqual(@as(posix.mode_t, 0o600), fifo_stat.permissions.toMode());
+        try std.testing.expectEqual(@as(posix.mode_t, 0o600), fifo_stat.permissions.toMode() & 0o7777);
         if (spec.process != null) {
             var path_buffer: [64]u8 = undefined;
             const namespace_path = std.fmt.bufPrintZ(&path_buffer, "/proc/{d}/ns/cgroup", .{handle.pid}) catch unreachable;
@@ -1916,6 +2158,15 @@ test "linux create accepts an empty rootfs and returns a live blocked init" {
 
 test "linux mapped create installs maps outside init and cleans up rejected maps" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const ProcFile = struct {
+        fn read(path: []const u8, limit: std.Io.Limit) ![]u8 {
+            const file = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{});
+            defer file.close(std.testing.io);
+            // Proc files report size zero; force reads through EOF.
+            var reader = file.readerStreaming(std.testing.io, &.{});
+            return reader.interface.allocRemaining(std.testing.allocator, limit);
+        }
+    };
     if (linux.geteuid() != 0) return error.SkipZigTest;
     var header: CapabilityHeader = .{};
     var caps: [2]linux.cap_user_data_t = undefined;
@@ -1951,7 +2202,7 @@ test "linux mapped create installs maps outside init and cleans up rejected maps
     try checkResult(linux.mknod(fifo, linux.S.IFIFO | 0o600, 0));
     var spec: oci.Spec = .{
         .ociVersion = "1.0.2",
-        .root = .{ .path = "rootfs" },
+        .root = .{ .path = "rootfs", .readonly = true },
         .linux = .{
             .namespaces = &.{ .{ .type = .user }, .{ .type = .mount }, .{ .type = .pid } },
             // Distinct container ranges with overlapping host ranges: the
@@ -1981,10 +2232,17 @@ test "linux mapped create installs maps outside init and cleans up rejected maps
         .mounts = &.{
             .{ .destination = "/dev", .source = "tmpfs", .type = "tmpfs", .flags = 0, .propagation = 0, .data = "mode=755" },
             .{ .destination = "/dev/pts", .source = "tmpfs", .type = "tmpfs", .flags = 0, .propagation = 0, .data = "mode=755" },
+            .{ .destination = "/dev/host-null", .source = "/dev/null", .type = null, .flags = linux.MS.BIND | linux.MS.RDONLY, .propagation = 0, .data = "" },
         },
+        .devices = &.{
+            .{ .path = "/dev/null", .kind = .character, .major = 1, .minor = 3 },
+            .{ .path = "/dev/zero", .kind = .character, .major = 1, .minor = 5 },
+            .{ .path = "/dev/pipe", .kind = .fifo, .mode = 0o620, .uid = 1, .gid = 2 },
+        },
+        .device_symlinks = oci.deviceSymlinks(&.{}),
         .cgroup_path = cgroup_path,
     };
-    try std.testing.expectError(error.Unsupported, backend.create(options));
+    try std.testing.expectError(error.InvalidConfig, backend.create(options));
     try std.testing.expectEqual(@as(?posix.fd_t, null), try walkCgroup(cgroup_root.fd, cgroup_path, false, &.{}));
     spec.linux.?.uidMappings = &.{.{ .containerID = 0, .hostID = 100000, .size = 10 }};
     const handle = try backend.create(options);
@@ -2001,7 +2259,7 @@ test "linux mapped create installs maps outside init and cleans up rejected maps
     }) |expected| {
         const path = try std.fmt.allocPrint(std.testing.allocator, "/proc/{d}/{s}", .{ handle.pid, expected.name });
         defer std.testing.allocator.free(path);
-        const text = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, std.testing.allocator, .limited(4096));
+        const text = try ProcFile.read(path, .limited(4096));
         defer std.testing.allocator.free(text);
         var tokens = std.mem.tokenizeAny(u8, text, " \t\n");
         for (expected.tokens) |token| try std.testing.expectEqualStrings(token, tokens.next().?);
@@ -2009,7 +2267,7 @@ test "linux mapped create installs maps outside init and cleans up rejected maps
     }
     const status_path = try std.fmt.allocPrint(std.testing.allocator, "/proc/{d}/status", .{handle.pid});
     defer std.testing.allocator.free(status_path);
-    const status = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, status_path, std.testing.allocator, .limited(16384));
+    const status = try ProcFile.read(status_path, .limited(16384));
     defer std.testing.allocator.free(status);
     for ([_]struct { prefix: []const u8, tokens: []const []const u8 }{
         .{ .prefix = "Uid:", .tokens = &.{ "100000", "100000", "100000", "100000" } },
@@ -2029,7 +2287,7 @@ test "linux mapped create installs maps outside init and cleans up rejected maps
         try std.testing.expect(found);
     }
     const fifo_stat = try tmp.dir.statFile(std.testing.io, "exec.fifo", .{});
-    try std.testing.expectEqual(@as(posix.mode_t, 0o600), fifo_stat.permissions.toMode());
+    try std.testing.expectEqual(@as(posix.mode_t, 0o600), fifo_stat.permissions.toMode() & 0o7777);
     // Mapped root (host UID 100000) must still acknowledge start on the FIFO.
     const reader = try openPath(linux.AT.FDCWD, fifo, .{ .ACCMODE = .RDONLY, .NONBLOCK = true, .CLOEXEC = true });
     defer closeFd(reader);
@@ -2066,7 +2324,51 @@ test "linux mount destinations reject symlinks without creating host paths" {
         return error.TestUnexpectedResult;
     } else |_| {}
     try std.testing.expectError(error.InvalidPath, mountDestination(root_fd, "/file", true, true));
+    if (createDevice(root_fd, .{ .path = "/escape/new", .mode = linux.S.IFIFO | 0o600, .dev = 0 })) {
+        return error.TestUnexpectedResult;
+    } else |_| {}
     try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, "outside/new", .{}));
+}
+
+test "linux device creation rejects mismatched existing nodes and preserves matching FIFOs" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "file", .data = "" });
+    try tmp.dir.createDir(std.testing.io, "directory", .default_dir);
+    try tmp.dir.symLink(std.testing.io, "pipe", "link", .{});
+    const base = try std.fmt.allocPrintSentinel(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path}, 0);
+    defer std.testing.allocator.free(base);
+    const root = try openPath(linux.AT.FDCWD, base, .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true });
+    defer closeFd(root);
+    try checkResult(linux.mknodat(root, "pipe", linux.S.IFIFO | 0o600, 0));
+    const before = try tmp.dir.statFile(std.testing.io, "pipe", .{});
+    for ([_][:0]const u8{ "/file", "/directory", "/link" }) |path| {
+        try std.testing.expectError(error.InvalidPath, createDevice(root, .{
+            .path = path,
+            .mode = linux.S.IFIFO | 0o666,
+            .dev = 0,
+        }));
+    }
+    try createDevice(root, .{ .path = "/pipe", .mode = linux.S.IFIFO | 0o666, .dev = 0 });
+    const stat = try tmp.dir.statFile(std.testing.io, "pipe", .{});
+    try std.testing.expectEqual(before.permissions.toMode(), stat.permissions.toMode());
+}
+
+test "linux device validation rejects mismatched types and device numbers" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const source = try openPath(linux.AT.FDCWD, "/dev/null", .{ .PATH = true, .CLOEXEC = true });
+    defer closeFd(source);
+    try validateDeviceNode(source, .{ .path = "/dev/null", .mode = linux.S.IFCHR | 0o666, .dev = 0x103 });
+    for ([_]PreparedDevice{
+        .{ .path = "/dev/null", .mode = linux.S.IFBLK | 0o666, .dev = 0x103 },
+        .{ .path = "/dev/null", .mode = linux.S.IFIFO | 0o666, .dev = 0 },
+        .{ .path = "/dev/null", .mode = linux.S.IFCHR | 0o666, .dev = 0x203 },
+        .{ .path = "/dev/null", .mode = linux.S.IFCHR | 0o666, .dev = 0x105 },
+        .{ .path = "/dev/null", .mode = linux.S.IFCHR | 0o666, .dev = 0x100103 },
+    }) |device| {
+        try std.testing.expectError(error.InvalidPath, validateDeviceNode(source, device));
+    }
 }
 
 test "linux rootfs setup applies ordered mounts detaches the host root and enforces readonly" {
@@ -2091,11 +2393,19 @@ test "linux rootfs setup applies ordered mounts detaches the host root and enfor
         .{ .destination = "/work", .source = "tmpfs", .type = "tmpfs", .flags = linux.MS.NOSUID, .propagation = linux.MS.PRIVATE, .data = "mode=755" },
         .{ .destination = "/work/from-bind", .source = source_dir, .type = null, .flags = linux.MS.BIND | linux.MS.REC, .propagation = 0, .data = "" },
         .{ .destination = "/etc/config", .source = source_file, .type = null, .flags = linux.MS.BIND | linux.MS.RDONLY | linux.MS.NOSUID, .propagation = 0, .data = "" },
+        .{ .destination = "/dev", .source = "tmpfs", .type = "tmpfs", .flags = linux.MS.NOSUID, .propagation = 0, .data = "mode=755" },
+        .{ .destination = "/dev/pts", .source = "devpts", .type = "devpts", .flags = linux.MS.NOSUID | linux.MS.NOEXEC, .propagation = 0, .data = "newinstance,ptmxmode=666,mode=620" },
     };
+    const devices = [_]PreparedDevice{
+        .{ .path = "/dev/null", .mode = linux.S.IFCHR | 0o666, .dev = 0x103 },
+        .{ .path = "/run/pipe", .mode = linux.S.IFIFO | 0o640, .dev = 0 },
+    };
+    const symlinks = oci.deviceSymlinks(&.{.{ .destination = "/dev/pts", .source = "devpts", .type = "devpts", .flags = 0, .propagation = 0, .data = "" }});
     const pid = try forkProcess();
     if (pid == 0) {
         checkResult(linux.unshare(linux.CLONE.NEWNS)) catch linux.exit_group(1);
-        setupRootfs(rootfs, &mounts, true) catch linux.exit_group(2);
+        _ = linux.syscall1(.umask, 0o777);
+        setupRootfs(rootfs, &mounts, &devices, symlinks, true, false) catch linux.exit_group(2);
         // The source's old absolute host path is unreachable after detaching.
         if (linux.errno(linux.access(source_file, linux.F_OK)) != .NOENT) linux.exit_group(3);
         if (linux.errno(linux.open("/new", .{ .ACCMODE = .WRONLY, .CREAT = true }, 0o644)) != .ROFS) linux.exit_group(4);
@@ -2108,9 +2418,46 @@ test "linux rootfs setup applies ordered mounts detaches the host root and enfor
         const writable = linux.open("/work/new", .{ .ACCMODE = .WRONLY, .CREAT = true }, 0o644);
         if (linux.errno(writable) != .SUCCESS) linux.exit_group(9);
         closeFd(@intCast(writable));
+        var stat: linux.Statx = undefined;
+        checkResult(linux.statx(linux.AT.FDCWD, "/dev/null", 0, .BASIC_STATS, &stat)) catch linux.exit_group(10);
+        if (stat.mode != linux.S.IFCHR | 0o666 or stat.rdev_major != 1 or stat.rdev_minor != 3 or stat.uid != 0 or stat.gid != 0)
+            linux.exit_group(11);
+        checkResult(linux.statx(linux.AT.FDCWD, "/run/pipe", 0, .BASIC_STATS, &stat)) catch linux.exit_group(12);
+        if (stat.mode != linux.S.IFIFO | 0o640) linux.exit_group(13);
+        for (symlinks) |link| {
+            var link_buffer: [64]u8 = undefined;
+            const result = linux.readlink(link.path, &link_buffer, link_buffer.len);
+            checkResult(result) catch linux.exit_group(14);
+            if (!std.mem.eql(u8, link_buffer[0..result], link.target)) linux.exit_group(15);
+        }
+        const null_fd = openPath(linux.AT.FDCWD, "/dev/null", .{ .ACCMODE = .WRONLY, .CLOEXEC = true }) catch linux.exit_group(16);
+        if (!writeAll(null_fd, "device works")) linux.exit_group(17);
+        closeFd(null_fd);
         linux.exit_group(0);
     }
     try std.testing.expectEqual(@as(u32, 0), try waitChild(pid));
+
+    // A later /dev bind covers the tmpfs. Device setup must leave the source alone.
+    var bind_mounts: [mounts.len + 1]PreparedMount = undefined;
+    @memcpy(bind_mounts[0..mounts.len], &mounts);
+    bind_mounts[mounts.len] = .{
+        .destination = "/dev",
+        .source = source_dir,
+        .type = null,
+        .flags = linux.MS.BIND,
+        .propagation = 0,
+        .data = "",
+    };
+    const bind_pid = try forkProcess();
+    if (bind_pid == 0) {
+        checkResult(linux.unshare(linux.CLONE.NEWNS)) catch linux.exit_group(1);
+        setupRootfs(rootfs, &bind_mounts, &devices, symlinks, true, false) catch linux.exit_group(2);
+        if (linux.errno(linux.access("/dev/item", linux.F_OK)) != .SUCCESS) linux.exit_group(3);
+        if (linux.errno(linux.access("/dev/null", linux.F_OK)) != .NOENT) linux.exit_group(4);
+        linux.exit_group(0);
+    }
+    try std.testing.expectEqual(@as(u32, 0), try waitChild(bind_pid));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, "source/null", .{}));
 }
 
 fn requireTestMountNamespace() !void {

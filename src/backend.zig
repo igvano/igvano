@@ -22,6 +22,28 @@ pub const Backend = struct {
         cgroup_writes: []const CgroupWrite = &.{},
         capabilities: ?Capabilities = null,
         rlimits: []const Rlimit = &.{},
+        devices: []const Device = &.{},
+        device_symlinks: []const Symlink = &.{},
+    };
+
+    /// Device types, defaults and paths have been translated by the frontend.
+    pub const Device = struct {
+        path: []const u8,
+        kind: Kind,
+        major: u32 = 0,
+        minor: u32 = 0,
+        mode: u32 = 0o666,
+        uid: u32 = 0,
+        gid: u32 = 0,
+        /// Only frontend defaults may be skipped when device setup is unavailable.
+        required: bool = true,
+
+        pub const Kind = enum { character, block, fifo };
+    };
+
+    pub const Symlink = struct {
+        path: [:0]const u8,
+        target: [:0]const u8,
     };
 
     /// Capability names and rlimit types have been translated by the frontend.
