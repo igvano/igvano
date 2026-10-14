@@ -1274,20 +1274,20 @@ fn setupConsole(socket: posix.fd_t) Backend.Error!void {
     defer closeFd(target);
     bind: {
         const cloned = linux.syscall3(.open_tree, @intCast(slave), @intFromPtr(""), OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC | linux.AT.EMPTY_PATH);
-        if (linux.errno(cloned) != .NOSYS) {
+        if (linux.errno(cloned) != .NOSYS and linux.errno(cloned) != .PERM) {
             try checkResult(cloned);
             const tree: posix.fd_t = @intCast(cloned);
             defer closeFd(tree);
             var flags = std.mem.zeroes(linux.MOVE_MOUNT);
             flags.F_EMPTY_PATH = true;
             flags.T_EMPTY_PATH = true;
-            const moved = linux.syscall5(.move_mount, @intCast(tree), @intFromPtr(""), @intCast(target), @intFromPtr(""), @as(u32, @bitCast(flags)));
+            const moved = linux.move_mount(tree, "", target, "", flags);
             if (linux.errno(moved) != .NOSYS) {
                 try checkResult(moved);
                 break :bind;
             }
         }
-        // Older kernels still need procfs for the descriptor paths.
+        // Older kernels and seccomp policies still need procfs for the descriptor paths.
         var source_buffer: [64]u8 = undefined;
         var target_buffer: [64]u8 = undefined;
         try checkResult(linux.mount(slave_path orelse fdPath(&source_buffer, slave), fdPath(&target_buffer, target), null, linux.MS.BIND, 0));
@@ -3309,7 +3309,7 @@ fn testRootfsConsole(readonly: bool, mount_proc: bool) !void {
         // Invalid descriptors probe syscall availability without changing mounts.
         const invalid_fd = std.math.maxInt(usize);
         if (linux.errno(linux.syscall3(.open_tree, invalid_fd, @intFromPtr(""), linux.AT.EMPTY_PATH)) == .NOSYS or
-            linux.errno(linux.syscall5(.move_mount, invalid_fd, @intFromPtr(""), invalid_fd, @intFromPtr(""), 0)) == .NOSYS)
+            linux.errno(linux.move_mount(-1, "", -1, "", std.mem.zeroes(linux.MOVE_MOUNT))) == .NOSYS)
             return error.SkipZigTest;
     }
     var tmp = std.testing.tmpDir(.{});
