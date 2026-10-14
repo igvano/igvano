@@ -182,6 +182,7 @@ test "bind mount recursive read-only options are explicit and ordered" {
         .{ .options = &.{ "bind", "rrw" }, .recursive = false },
         .{ .options = &.{ "rbind", "rro", "rrw" }, .recursive = false },
         .{ .options = &.{ "rbind", "rrw", "rro" }, .recursive = true },
+        .{ .options = &.{ "mode=755", "rbind", "rro" }, .recursive = true },
     };
     for (cases) |case| {
         const options = try parseMountOptions(std.testing.allocator, case.options, null);
@@ -914,11 +915,12 @@ pub fn parseMountOptions(allocator: std.mem.Allocator, options: []const []const 
         .{ .name = "rslave", .flags = ms.SLAVE | ms.REC },
         .{ .name = "shared", .flags = ms.SHARED },
         .{ .name = "rshared", .flags = ms.SHARED | ms.REC },
+        .{ .name = "unbindable", .flags = ms.UNBINDABLE },
+        .{ .name = "runbindable", .flags = ms.UNBINDABLE | ms.REC },
     };
     var flags: u32 = if (mount_type != null and std.mem.eql(u8, mount_type.?, "bind")) ms.BIND else 0;
     var propagation: u32 = 0;
     var recursive_readonly: ?bool = null;
-    var has_unknown_option = false;
     var data: std.ArrayList(u8) = .empty;
     defer data.deinit(allocator);
     option: for (options) |option| {
@@ -940,12 +942,11 @@ pub fn parseMountOptions(allocator: std.mem.Allocator, options: []const []const 
                 continue :option;
             }
         }
-        has_unknown_option = true;
         if (data.items.len != 0) try data.append(allocator, ',');
         try data.appendSlice(allocator, option);
     }
-    // Bind mounts ignore filesystem data, so unknown options cannot be honored.
-    if (flags & ms.BIND != 0 and has_unknown_option) return error.InvalidConfig;
+    // Discard filesystem data for bind mounts because the kernel ignores it.
+    if (flags & ms.BIND != 0) data.clearRetainingCapacity();
     return .{
         .flags = flags,
         .propagation = propagation,
@@ -1057,8 +1058,12 @@ test "mount options translate flags propagation and filesystem data" {
         .{ .options = &.{"rslave"}, .propagation = ms.SLAVE | ms.REC },
         .{ .options = &.{"shared"}, .propagation = ms.SHARED },
         .{ .options = &.{"rshared"}, .propagation = ms.SHARED | ms.REC },
+        .{ .options = &.{"unbindable"}, .propagation = ms.UNBINDABLE },
+        .{ .options = &.{"runbindable"}, .propagation = ms.UNBINDABLE | ms.REC },
         .{ .options = &.{ "rshared", "private" }, .propagation = ms.PRIVATE },
+        .{ .options = &.{ "runbindable", "shared" }, .propagation = ms.SHARED },
         .{ .options = &.{ "rbind", "private" }, .flags = ms.BIND | ms.REC, .propagation = ms.PRIVATE },
+        .{ .options = &.{ "nosuid", "strictatime", "mode=755", "size=1k", "bind", "shared" }, .flags = ms.NOSUID | ms.STRICTATIME | ms.BIND, .propagation = ms.SHARED },
         .{ .options = &.{"relatime"}, .flags = ms.RELATIME },
         .{ .options = &.{"noatime"}, .flags = ms.NOATIME },
         .{ .options = &.{"strictatime"}, .flags = ms.STRICTATIME },
@@ -1093,7 +1098,7 @@ test "mount destinations normalize within the root and reject escapes" {
     }
 }
 
-test "bind mounts reject unknown options regardless of option order" {
+test "bind mounts discard filesystem data regardless of option order" {
     const cases = [_][]const []const u8{
         &.{ "bind", "custom" },
         &.{ "custom", "bind" },
@@ -1102,9 +1107,13 @@ test "bind mounts reject unknown options regardless of option order" {
         &.{ "bind", "" },
     };
     for (cases) |options| {
-        try std.testing.expectError(error.InvalidConfig, parseMountOptions(std.testing.allocator, options, null));
+        const bind = try parseMountOptions(std.testing.allocator, options, null);
+        defer std.testing.allocator.free(bind.data);
+        try std.testing.expectEqualStrings("", bind.data);
     }
-    try std.testing.expectError(error.InvalidConfig, parseMountOptions(std.testing.allocator, &.{"custom"}, "bind"));
+    const custom = try parseMountOptions(std.testing.allocator, &.{"custom"}, "bind");
+    defer std.testing.allocator.free(custom.data);
+    try std.testing.expectEqualStrings("", custom.data);
     const bind = try parseMountOptions(std.testing.allocator, &.{ "ro", "rprivate" }, "bind");
     defer std.testing.allocator.free(bind.data);
     try std.testing.expectEqual(@as(u32, std.os.linux.MS.BIND | std.os.linux.MS.RDONLY), bind.flags);
