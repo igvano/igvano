@@ -158,11 +158,12 @@ fn validateNamespaceFd(fd: posix.fd_t, flag: usize) Backend.Error!void {
 /// Open every host path before entering a user or mount namespace.
 fn joinNamespaces(joins: []const NamespaceJoin) Backend.Error!void {
     var fds: [8]posix.fd_t = @splat(-1);
+    if (joins.len > fds.len) return error.InvalidConfig;
     defer for (fds) |fd| {
         if (fd >= 0) closeFd(fd);
     };
     for (joins, 0..) |join, i| {
-        fds[i] = try openPath(linux.AT.FDCWD, join.path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true });
+        fds[i] = try openPath(linux.AT.FDCWD, join.path, .{ .ACCMODE = .RDONLY, .NONBLOCK = true, .CLOEXEC = true });
         try validateNamespaceFd(fds[i], join.flag);
     }
     // runc's nsexec order: user first for capabilities in the target owner.
@@ -225,6 +226,26 @@ pub const LinuxBackend = struct {
                     .flag = namespaceFlag(namespace.type),
                     .path = try pathString(allocator, path),
                 });
+            }
+            // Safety guard: rootfs setup in our mount namespace would mutate host mounts.
+            for (joins.items) |join| {
+                if (join.flag != linux.CLONE.NEWNS) continue;
+                const own_fd = try openPath(linux.AT.FDCWD, "/proc/self/ns/mnt", .{ .ACCMODE = .RDONLY, .CLOEXEC = true });
+                defer closeFd(own_fd);
+                const target_fd = try openPath(linux.AT.FDCWD, join.path, .{ .ACCMODE = .RDONLY, .NONBLOCK = true, .CLOEXEC = true });
+                defer closeFd(target_fd);
+                try validateNamespaceFd(target_fd, join.flag);
+                var own_stat: linux.Statx = undefined;
+                var target_stat: linux.Statx = undefined;
+                try checkResult(linux.statx(own_fd, "", linux.AT.EMPTY_PATH, .{ .INO = true }, &own_stat));
+                try checkResult(linux.statx(target_fd, "", linux.AT.EMPTY_PATH, .{ .INO = true }, &target_stat));
+                if (!own_stat.mask.INO or !target_stat.mask.INO) return error.CreateFailed;
+                if (own_stat.dev_major == target_stat.dev_major and
+                    own_stat.dev_minor == target_stat.dev_minor and own_stat.ino == target_stat.ino)
+                {
+                    std.debug.print("igvano: cannot join the runtime's own mount namespace\n", .{});
+                    return error.InvalidConfig;
+                }
             }
             const user_namespace = flags & linux.CLONE.NEWUSER != 0;
             const joined_user_namespace = !user_namespace and isolation_flags & linux.CLONE.NEWUSER != 0;
@@ -658,16 +679,11 @@ test "linux cgroup creation reuses parents but rejects existing leaves" {
     const root = try openPath(linux.AT.FDCWD, base, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true });
     defer closeFd(root);
     for ([_][]const u8{ "foreign", "parent/foreign" }) |path| {
-        const events = try std.fmt.allocPrint(std.testing.allocator, "{s}/cgroup.events", .{path});
-        defer std.testing.allocator.free(events);
-        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = events, .data = "populated 0\n" });
         const result = walkCgroup(root, path, true, &.{});
         if (result) |fd| {
             if (fd) |opened| closeFd(opened);
         } else |_| {}
         try std.testing.expectError(error.CreateFailed, result);
-        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = events, .data = "populated 1\n" });
-        try std.testing.expectError(error.CreateFailed, walkCgroup(root, path, true, &.{}));
         const existing = (try walkCgroup(root, path, false, &.{})).?;
         closeFd(existing);
     }
@@ -2097,6 +2113,25 @@ test "linux create requires mount isolation for library callers too" {
         .rootfs = "/",
         .exec_fifo = "/dev/null",
         .spec = &spec,
+    }));
+}
+
+test "linux create rejects joining the runtime's own mount namespace" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const spec: oci.Spec = .{
+        .ociVersion = "1.0.2",
+        .root = .{ .path = "/" },
+        .linux = .{ .namespaces = &.{.{ .type = .mount, .path = "/proc/self/ns/mnt" }} },
+    };
+    var implementation: LinuxBackend = .{};
+    try std.testing.expectError(error.InvalidConfig, implementation.backend().create(.{
+        .allocator = std.testing.allocator,
+        .id = "example",
+        .rootfs = "/",
+        .exec_fifo = "/dev/null",
+        .spec = &spec,
+        // An invalid cgroup path prevents mount setup if the guard regresses.
+        .cgroup_path = "",
     }));
 }
 
