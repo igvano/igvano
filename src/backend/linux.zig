@@ -647,11 +647,16 @@ test "linux cgroup creation reuses parents but rejects existing leaves" {
     const root = try openPath(linux.AT.FDCWD, base, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true });
     defer closeFd(root);
     for ([_][]const u8{ "foreign", "parent/foreign" }) |path| {
+        const events = try std.fmt.allocPrint(std.testing.allocator, "{s}/cgroup.events", .{path});
+        defer std.testing.allocator.free(events);
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = events, .data = "populated 0\n" });
         const result = walkCgroup(root, path, true, &.{});
         if (result) |fd| {
             if (fd) |opened| closeFd(opened);
         } else |_| {}
         try std.testing.expectError(error.CreateFailed, result);
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = events, .data = "populated 1\n" });
+        try std.testing.expectError(error.CreateFailed, walkCgroup(root, path, true, &.{}));
         const existing = (try walkCgroup(root, path, false, &.{})).?;
         closeFd(existing);
     }
