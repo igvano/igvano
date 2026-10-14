@@ -301,6 +301,10 @@ pub const LinuxBackend = struct {
             // mount namespace. Pin host /proc so it can still capture identity.
             const proc_dir = try openPath(linux.AT.FDCWD, "/proc", .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true });
             defer closeFd(proc_dir);
+            // Init must retain the host FIFO across namespace changes without
+            // traversing the private state directory as a mapped user.
+            const fifo_fd = try openPath(linux.AT.FDCWD, fifo, .{ .PATH = true, .NOFOLLOW = true, .CLOEXEC = true });
+            defer closeFd(fifo_fd);
             const cgroup = (try walkCgroup(cgroup_root.fd, options.cgroup_path, true, options.cgroup_writes)).?;
             defer closeFd(cgroup);
             errdefer {
@@ -369,6 +373,9 @@ pub const LinuxBackend = struct {
                     // Let the parent see report EOF if child1 dies during the map wait.
                     closeFd(report[1]);
                     closeFd(ready[0]);
+                    // Host procfs resolves "self" to child2's host PID, even
+                    // when a joined mount namespace supplies a different /proc.
+                    const fd_dir = openPath(proc_dir, "self/fd", .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true }) catch linux.exit_group(1);
                     closeFd(proc_dir);
                     // The outside parent must install our ID maps
                     // before any rootfs, mount, hostname, or process work.
@@ -390,7 +397,7 @@ pub const LinuxBackend = struct {
                     const start_input = std.fmt.bufPrint(start_state, "{s}{d}{s}", .{
                         options.start_hook_state.prefix, host_pid, options.start_hook_state.suffix,
                     }) catch linux.exit_group(1);
-                    runInit(options.spec, capabilities, options.rlimits, isolation_flags, rootfs, mounts, devices, options.device_symlinks, cwd, fifo, argv.ptr, envp.ptr, ready[1], .{
+                    runInit(options.spec, capabilities, options.rlimits, isolation_flags, rootfs, mounts, devices, options.device_symlinks, cwd, fifo_fd, fd_dir, argv.ptr, envp.ptr, ready[1], .{
                         .propagation = options.rootfs_propagation,
                         .create_hooks = create_hooks,
                         .create_hook_state = create_input,
@@ -401,6 +408,7 @@ pub const LinuxBackend = struct {
                         .fifo_writable = joined_user_namespace,
                     }, start_hooks, start_input);
                 }
+                closeFd(fifo_fd);
                 if (options.console_fds) |fds| closeFd(fds[1]);
                 closeFd(create_go[0]);
                 closeFd(pid_pipe[0]);
@@ -1777,7 +1785,8 @@ fn runInit(
     devices: []const PreparedDevice,
     symlinks: []const Backend.Symlink,
     cwd: [:0]const u8,
-    fifo: [:0]const u8,
+    fifo_fd: posix.fd_t,
+    fd_dir: posix.fd_t,
     argv: [*:null]const ?[*:0]const u8,
     envp: [*:null]const ?[*:0]const u8,
     ready_fd: posix.fd_t,
@@ -1785,14 +1794,10 @@ fn runInit(
     start_hooks: []const hooks.Prepared,
     start_hook_state: []const u8,
 ) noreturn {
-    // Keep the host FIFO reachable without requiring /proc inside the rootfs.
-    // These host descriptors are used only by init and closed before exec.
-    // ponytail: this path-based open needs --root traversable by mapped UID 0;
-    // runc passes an O_PATH fd from the parent instead.
-    const fifo_path = openPath(linux.AT.FDCWD, fifo, .{ .PATH = true, .CLOEXEC = true }) catch linux.exit_group(1);
-    const fd_dir = openPath(linux.AT.FDCWD, "/proc/self/fd", .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true }) catch linux.exit_group(1);
+    // The inherited host descriptors avoid path access to the state directory
+    // or /proc inside the container and are closed before exec.
     var fifo_buffer: [32]u8 = undefined;
-    const fifo_name = std.fmt.bufPrintZ(&fifo_buffer, "{d}", .{fifo_path}) catch unreachable;
+    const fifo_name = std.fmt.bufPrintZ(&fifo_buffer, "{d}", .{fifo_fd}) catch unreachable;
     setupRootfs(rootfs, mounts, devices, symlinks, spec.root.readonly, rootfs_options) catch |err| {
         childError("igvano: cannot prepare rootfs: ", err);
         linux.exit_group(1);
@@ -1833,7 +1838,7 @@ fn runInit(
         }
     };
     closeFd(fd_dir);
-    closeFd(fifo_path);
+    closeFd(fifo_fd);
     // Opening the writer unblocks start. Report success only after hooks pass,
     // so a timeout or nonzero exit fails start without publishing "running".
     hooks.run(start_hooks, start_hook_state) catch |err| {
@@ -2595,6 +2600,10 @@ test "linux init reopens its root-owned pinned FIFO only for writing after dropp
     const fifo = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/exec.fifo", .{absolute}, 0);
     defer std.testing.allocator.free(fifo);
     try checkResult(linux.mknod(fifo, linux.S.IFIFO | 0o600, 0));
+    const fifo_fd = try openPath(linux.AT.FDCWD, fifo, .{ .PATH = true, .NOFOLLOW = true, .CLOEXEC = true });
+    defer closeFd(fifo_fd);
+    const proc_dir = try openPath(linux.AT.FDCWD, "/proc", .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true });
+    defer closeFd(proc_dir);
     const ready = try makePipe();
     defer closeFd(ready[0]);
     const pid = forkProcess() catch |err| {
@@ -2603,10 +2612,10 @@ test "linux init reopens its root-owned pinned FIFO only for writing after dropp
     };
     if (pid == 0) {
         closeFd(ready[0]);
-        const path_fd = openPath(linux.AT.FDCWD, fifo, .{ .PATH = true, .CLOEXEC = true }) catch linux.exit_group(1);
-        const fd_dir = openPath(linux.AT.FDCWD, "/proc/self/fd", .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true }) catch linux.exit_group(1);
+        const fd_dir = openPath(proc_dir, "self/fd", .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true }) catch linux.exit_group(1);
+        closeFd(proc_dir);
         var buffer: [32]u8 = undefined;
-        const name = std.fmt.bufPrintZ(&buffer, "{d}", .{path_fd}) catch unreachable;
+        const name = std.fmt.bufPrintZ(&buffer, "{d}", .{fifo_fd}) catch unreachable;
         checkResult(linux.fchmodat(fd_dir, name, 0o622)) catch linux.exit_group(2);
         applyProcess(.{
             .args = &.{"/bin/true"},
@@ -2811,6 +2820,82 @@ test "linux create accepts an empty rootfs and returns a live blocked init" {
         try backend.delete(handle);
         try backend.delete(handle);
     }
+}
+
+test "linux mapped init acknowledges start without path access to its private state directory" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (linux.geteuid() != 0) return error.SkipZigTest;
+    var header: CapabilityHeader = .{};
+    var caps: [2]linux.cap_user_data_t = undefined;
+    try checkResult(linux.syscall2(.capget, @intFromPtr(&header), @intFromPtr(&caps)));
+    const required = (@as(u32, 1) << linux.CAP.CHOWN) |
+        (@as(u32, 1) << linux.CAP.SETUID) | (@as(u32, 1) << linux.CAP.SETGID);
+    if (caps[0].effective & required != required) return error.SkipZigTest;
+    const namespace_probe = try forkProcess();
+    if (namespace_probe == 0) {
+        checkResult(linux.unshare(linux.CLONE.NEWUSER | linux.CLONE.NEWNS | linux.CLONE.NEWPID)) catch linux.exit_group(1);
+        linux.exit_group(0);
+    }
+    if (try waitChild(namespace_probe) != 0) return error.SkipZigTest;
+    const cgroup_root = openCgroupRoot() catch return error.SkipZigTest;
+    defer closeFd(cgroup_root.fd);
+    const cgroup_path = try std.fmt.allocPrint(std.testing.allocator, "igvano-private-fifo-test-{d}", .{linux.getpid()});
+    defer std.testing.allocator.free(cgroup_path);
+    const cgroup_probe = (walkCgroup(cgroup_root.fd, cgroup_path, true, &.{}) catch return error.SkipZigTest).?;
+    closeFd(cgroup_probe);
+    try removeCgroup(cgroup_root.fd, cgroup_path);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "rootfs", .default_dir);
+    try tmp.dir.createDir(std.testing.io, "state", .fromMode(0o700));
+    const base = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer std.testing.allocator.free(base);
+    const absolute = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, base, std.testing.allocator);
+    defer std.testing.allocator.free(absolute);
+    const rootfs = try std.fs.path.join(std.testing.allocator, &.{ absolute, "rootfs" });
+    defer std.testing.allocator.free(rootfs);
+    const fifo = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/state/exec.fifo", .{absolute}, 0);
+    defer std.testing.allocator.free(fifo);
+    try checkResult(linux.mknod(fifo, linux.S.IFIFO | 0o600, 0));
+    const spec: oci.Spec = .{
+        .ociVersion = "1.0.2",
+        .root = .{ .path = "rootfs" },
+        .linux = .{
+            .namespaces = &.{ .{ .type = .user }, .{ .type = .mount }, .{ .type = .pid } },
+            .uidMappings = &.{.{ .containerID = 0, .hostID = 100000, .size = 2 }},
+            .gidMappings = &.{.{ .containerID = 0, .hostID = 200000, .size = 2 }},
+        },
+        .process = .{
+            .args = &.{"/bin/true"},
+            .cwd = "/",
+            .user = .{ .uid = 1, .gid = 1 },
+        },
+    };
+    var implementation: LinuxBackend = .{};
+    const backend = implementation.backend();
+    const handle = try backend.create(.{
+        .allocator = std.testing.allocator,
+        .id = "private",
+        .rootfs = rootfs,
+        .exec_fifo = fifo,
+        .spec = &spec,
+        .cgroup_path = cgroup_path,
+    });
+    defer std.testing.allocator.free(handle.starttime);
+    defer {
+        backend.kill(handle, 9) catch {};
+        backend.delete(handle) catch {};
+    }
+    const stat = try tmp.dir.statFile(std.testing.io, "state", .{});
+    try std.testing.expectEqual(@as(posix.mode_t, 0o700), stat.permissions.toMode() & 0o7777);
+    const reader = try openPath(linux.AT.FDCWD, fifo, .{ .ACCMODE = .RDONLY, .NONBLOCK = true, .CLOEXEC = true });
+    defer closeFd(reader);
+    var poll_fds = [_]linux.pollfd{.{ .fd = reader, .events = linux.POLL.IN, .revents = 0 }};
+    try checkResult(linux.poll(&poll_fds, 1, 2000));
+    try std.testing.expect(poll_fds[0].revents & linux.POLL.IN != 0);
+    var acknowledgement: [1]u8 = undefined;
+    try std.testing.expect(readAll(reader, &acknowledgement));
+    try std.testing.expectEqual(@as(u8, 1), acknowledgement[0]);
 }
 
 test "linux mapped create installs maps outside init and cleans up rejected maps" {

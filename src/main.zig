@@ -216,7 +216,7 @@ fn createContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, c
     const rlimits = try oci.processRlimits(allocator, if (parsed.value.process) |process| process.rlimits else null);
     defer allocator.free(rlimits);
 
-    try cwd.createDirPath(io, config.root);
+    _ = try cwd.createDirPathStatus(io, config.root, .fromMode(0o700));
     const root = try cwd.realPathFileAlloc(io, config.root, allocator);
     defer allocator.free(root);
     const state_dir = try std.fs.path.join(allocator, &.{ root, config.id });
@@ -227,7 +227,7 @@ fn createContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, c
         .bundle = bundle,
         .annotations = parsed.value.annotations,
     };
-    cwd.createDir(io, state_dir, .default_dir) catch |err| switch (err) {
+    cwd.createDir(io, state_dir, .fromMode(0o700)) catch |err| switch (err) {
         error.PathAlreadyExists => return error.ContainerExists,
         else => return err,
     };
@@ -1572,6 +1572,62 @@ test "signal parsing accepts Linux names, prefixes, aliases and numbers" {
     for ([_][]const u8{ "", "SIG", "unknown", "-1", "65", "999999999999999", "9x", " 9", "+9" }) |value| {
         try std.testing.expectError(error.InvalidSignal, parseSignal(value));
     }
+}
+
+test "create uses private state directories and preserves existing root permissions" {
+    const TestBackend = struct {
+        state_mode: ?std.posix.mode_t = null,
+        const vtable: Backend.VTable = .{ .create = create, .alive = alive, .kill = kill, .delete = delete };
+
+        fn create(ptr: *anyopaque, options: Backend.CreateOptions) Backend.Error!Backend.Handle {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const state_dir = std.fs.path.dirname(options.exec_fifo) orelse return error.InvalidPath;
+            const stat = std.Io.Dir.cwd().statFile(std.testing.io, state_dir, .{}) catch return error.InvalidPath;
+            // Inspect the real directory before setup failure rolls it back.
+            self.state_mode = stat.permissions.toMode() & 0o7777;
+            return error.NotImplemented;
+        }
+        fn alive(_: *anyopaque, _: Backend.Handle) Backend.Error!bool {
+            return error.NotImplemented;
+        }
+        fn kill(_: *anyopaque, _: Backend.Handle, _: i32) Backend.Error!void {
+            return error.NotImplemented;
+        }
+        fn delete(_: *anyopaque, _: Backend.Handle) Backend.Error!void {
+            return error.NotImplemented;
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "bundle", .default_dir);
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "bundle/config.json",
+        .data =
+        \\{"ociVersion":"1.0.2","root":{"path":"/"},"linux":{"namespaces":[{"type":"mount"}]}}
+        ,
+    });
+    const base = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer std.testing.allocator.free(base);
+    const bundle = try std.fs.path.join(std.testing.allocator, &.{ base, "bundle" });
+    defer std.testing.allocator.free(bundle);
+    try tmp.dir.createDir(std.testing.io, "existing", .fromMode(0o755));
+    const existing = try tmp.dir.statFile(std.testing.io, "existing", .{});
+    for ([_][]const u8{ "new/containers", "existing" }) |root_name| {
+        const root = try std.fs.path.join(std.testing.allocator, &.{ base, root_name });
+        defer std.testing.allocator.free(root);
+        var implementation: TestBackend = .{};
+        try std.testing.expectError(error.NotImplemented, createContainer(std.testing.allocator, std.testing.io, .{
+            .ptr = &implementation,
+            .vtable = &TestBackend.vtable,
+        }, .{ .root = root, .subcommand = .create, .id = "example", .bundle = bundle }));
+        if (comptime builtin.os.tag == .linux)
+            try std.testing.expectEqual(@as(?std.posix.mode_t, 0o700), implementation.state_mode);
+        const stat = try tmp.dir.statFile(std.testing.io, root_name, .{});
+        const expected = if (std.mem.eql(u8, root_name, "existing")) existing.permissions.toMode() & 0o7777 else 0o700;
+        try std.testing.expectEqual(expected, stat.permissions.toMode() & 0o7777);
+    }
+    const parent = try tmp.dir.statFile(std.testing.io, "new", .{});
+    try std.testing.expectEqual(@as(std.posix.mode_t, 0o700), parent.permissions.toMode() & 0o7777);
 }
 
 test "create rejects a duplicate id without changing existing state" {
