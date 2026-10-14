@@ -4,14 +4,24 @@ const linux = std.os.linux;
 const posix = std.posix;
 const Backend = @import("../backend.zig").Backend;
 const oci = @import("../oci.zig");
+const hooks = @import("hooks.zig");
 
-/// statfs ST_RELATIME is 4096, unlike MS_RELATIME. Strict atime is implicit.
-pub fn lockedMountFlags(requested: u32, fs_flags: usize) u32 {
+const ST_NOATIME: usize = 1024;
+const ST_RELATIME: usize = 4096; // Unlike MS_RELATIME.
+
+/// EPERM fallback preserves flags even in an inherited user namespace.
+/// Strict atime is implicit in statfs; never combine incompatible atime modes.
+pub fn lockedMountFlags(requested: u32, fs_flags: usize) Backend.Error!u32 {
     const ms = linux.MS;
-    const common = ms.RDONLY | ms.NOSUID | ms.NODEV | ms.NOEXEC | ms.NOATIME | ms.NODIRATIME;
+    const common = ms.RDONLY | ms.NOSUID | ms.NODEV | ms.NOEXEC | ms.NODIRATIME;
+    const atime_mask = ms.NOATIME | ms.RELATIME | ms.STRICTATIME;
+    const atime: u32 = (if (fs_flags & ST_NOATIME != 0) @as(u32, ms.NOATIME) else 0) |
+        (if (fs_flags & ST_RELATIME != 0) @as(u32, ms.RELATIME) else 0) |
+        (if (fs_flags & (ST_NOATIME | ST_RELATIME) == 0) @as(u32, ms.STRICTATIME) else 0);
+    const requested_atime = requested & atime_mask;
+    if (requested_atime != 0 and requested_atime != atime) return error.InvalidConfig;
     return requested | @as(u32, @intCast(fs_flags & common)) |
-        (if (fs_flags & 4096 != 0) @as(u32, ms.RELATIME) else 0) |
-        (if (fs_flags & (1024 | 4096) == 0) @as(u32, ms.STRICTATIME) else 0);
+        (if (requested_atime == 0) atime else 0);
 }
 
 test "user namespace remount flags retain only locked statfs flags" {
@@ -29,9 +39,19 @@ test "user namespace remount flags retain only locked statfs flags" {
         .{ .statfs = 1 | 16 | 32 | 64 | 128 | 256 | 512 | 8192, .expected = requested | ms.STRICTATIME },
     };
     for (cases) |case|
-        try std.testing.expectEqual(case.expected, lockedMountFlags(requested, case.statfs));
-    try std.testing.expectEqual(ms.NOEXEC | ms.NOSUID | ms.STRICTATIME, lockedMountFlags(ms.NOEXEC, 2));
-    try std.testing.expectEqual(ms.RDONLY | ms.RELATIME, lockedMountFlags(0, 1 | 4096));
+        try std.testing.expectEqual(case.expected, try lockedMountFlags(requested, case.statfs));
+    try std.testing.expectEqual(ms.NOEXEC | ms.NOSUID | ms.STRICTATIME, try lockedMountFlags(ms.NOEXEC, 2));
+    try std.testing.expectEqual(ms.RDONLY | ms.RELATIME, try lockedMountFlags(0, 1 | 4096));
+}
+
+test "locked atime modes are inherited only when absent and conflicts are rejected" {
+    const ms = linux.MS;
+    try std.testing.expectEqual(@as(u32, ms.RELATIME), try lockedMountFlags(ms.RELATIME, 4096));
+    try std.testing.expectEqual(@as(u32, ms.NOATIME), try lockedMountFlags(ms.NOATIME, 1024));
+    try std.testing.expectEqual(@as(u32, ms.STRICTATIME), try lockedMountFlags(ms.STRICTATIME, 0));
+    try std.testing.expectError(error.InvalidConfig, lockedMountFlags(ms.STRICTATIME, 4096));
+    try std.testing.expectError(error.InvalidConfig, lockedMountFlags(ms.RELATIME, 1024));
+    try std.testing.expectError(error.InvalidConfig, lockedMountFlags(ms.NOATIME, 0));
 }
 
 /// Pure filesystem selection; mount flags, including read-only, stay unchanged.
@@ -51,66 +71,40 @@ test "cgroup mounts map to cgroup2 only on unified hosts" {
     try std.testing.expectEqualStrings("cgroup2", try cgroupMountType("cgroup2", 0x63677270));
 }
 
-fn hasDevTmpfs(mounts: anytype) bool {
-    var populate_dev = false;
+fn needsSetupDev(mounts: anytype) bool {
+    var setup = true;
     for (mounts) |mount| {
-        if (!std.mem.eql(u8, mount.destination, "/dev")) continue;
-        populate_dev = mount.flags & linux.MS.BIND == 0 and
-            std.mem.eql(u8, mount.type orelse "", "tmpfs");
+        if (std.mem.eql(u8, mount.destination, "/dev"))
+            setup = mount.flags & linux.MS.BIND == 0;
     }
-    return populate_dev;
+    return setup;
 }
 
 fn validateDeviceMounts(mounts: []const Backend.Mount, devices: []const Backend.Device) Backend.Error!void {
-    if (hasDevTmpfs(mounts)) return;
+    if (needsSetupDev(mounts)) return;
     for (devices) |device| {
         if (device.required) return error.Unsupported;
     }
 }
 
-test "required devices need a populated dev mount while defaults may be skipped" {
-    const tmpfs: Backend.Mount = .{ .destination = "/dev", .source = "tmpfs", .type = "tmpfs", .flags = 0, .propagation = 0, .data = "" };
+test "bind-mounted dev skips defaults and rejects explicit devices" {
     const bind: Backend.Mount = .{ .destination = "/dev", .source = "/dev", .type = null, .flags = linux.MS.BIND, .propagation = 0, .data = "" };
-    const other: Backend.Mount = .{ .destination = "/dev", .source = "ramfs", .type = "ramfs", .flags = 0, .propagation = 0, .data = "" };
-    const cases = [_]struct { mounts: []const Backend.Mount, supported: bool }{
-        .{ .mounts = &.{}, .supported = false },
-        .{ .mounts = &.{bind}, .supported = false },
-        .{ .mounts = &.{other}, .supported = false },
-        .{ .mounts = &.{tmpfs}, .supported = true },
-        .{ .mounts = &.{ tmpfs, bind }, .supported = false },
-        .{ .mounts = &.{ bind, tmpfs }, .supported = true },
+    const tmpfs: Backend.Mount = .{ .destination = "/dev", .source = "tmpfs", .type = "tmpfs", .flags = 0, .propagation = 0, .data = "" };
+    const cases = [_]struct { mounts: []const Backend.Mount, setup: bool }{
+        .{ .mounts = &.{}, .setup = true },
+        .{ .mounts = &.{bind}, .setup = false },
+        .{ .mounts = &.{ tmpfs, bind }, .setup = false },
+        .{ .mounts = &.{ bind, tmpfs }, .setup = true },
     };
-    const defaults = [_]Backend.Device{
-        .{ .path = "/dev/null", .kind = .character, .major = 1, .minor = 3, .required = false },
-    };
+    const defaults = [_]Backend.Device{.{ .path = "/dev/null", .kind = .character, .major = 1, .minor = 3, .required = false }};
     for (cases) |case| {
-        try validateDeviceMounts(case.mounts, &.{});
+        try std.testing.expectEqual(case.setup, needsSetupDev(case.mounts));
         try validateDeviceMounts(case.mounts, &defaults);
-        for ([_][]const u8{ "/dev/pipe", "/run/pipe" }) |path| {
-            const configured = [_]Backend.Device{ defaults[0], .{ .path = path, .kind = .fifo } };
-            if (case.supported) {
-                try validateDeviceMounts(case.mounts, &configured);
-            } else {
-                try std.testing.expectError(error.Unsupported, validateDeviceMounts(case.mounts, &configured));
-                if (comptime builtin.os.tag == .linux) {
-                    const spec: oci.Spec = .{
-                        .ociVersion = "1.0.2",
-                        .root = .{ .path = "/" },
-                        .linux = .{ .namespaces = &.{.{ .type = .mount }} },
-                    };
-                    var implementation: LinuxBackend = .{};
-                    try std.testing.expectError(error.Unsupported, implementation.backend().create(.{
-                        .allocator = std.testing.allocator,
-                        .id = "required-devices",
-                        .rootfs = "/",
-                        .exec_fifo = "/tmp/igvano-device-test.fifo",
-                        .spec = &spec,
-                        .mounts = case.mounts,
-                        .devices = &configured,
-                    }));
-                }
-            }
-        }
+        const explicit = [_]Backend.Device{.{ .path = "/dev/custom", .kind = .fifo }};
+        if (case.setup)
+            try validateDeviceMounts(case.mounts, &explicit)
+        else
+            try std.testing.expectError(error.Unsupported, validateDeviceMounts(case.mounts, &explicit));
     }
 }
 
@@ -168,6 +162,7 @@ pub const LinuxBackend = struct {
             for (options.rlimits) |limit| {
                 if (limit.soft > limit.hard) return error.InvalidConfig;
             }
+            try validateDeviceMounts(options.mounts, options.devices);
             if (!std.fs.path.isAbsolute(options.exec_fifo) or
                 std.mem.indexOfScalar(u8, options.exec_fifo, 0) != null)
                 return error.InvalidPath;
@@ -191,7 +186,6 @@ pub const LinuxBackend = struct {
             if (!std.fs.path.isAbsolute(cwd)) return error.InvalidProcess;
             if (flags & linux.CLONE.NEWNS == 0) return error.MissingMountNamespace;
             if (!std.fs.path.isAbsolute(rootfs)) return error.InvalidPath;
-            try validateDeviceMounts(options.mounts, options.devices);
             try validateCgroupPath(options.cgroup_path);
             const cgroup_root = try openCgroupRoot();
             defer closeFd(cgroup_root.fd);
@@ -236,6 +230,12 @@ pub const LinuxBackend = struct {
             for (args, 0..) |arg, i| argv[i] = (try processString(allocator, arg)).ptr;
             const envp = try allocator.allocSentinel(?[*:0]const u8, env.len, null);
             for (env, 0..) |entry, i| envp[i] = (try processString(allocator, entry)).ptr;
+            const create_hooks = try hooks.prepare(allocator, options.create_hooks);
+            const start_hooks = try hooks.prepare(allocator, options.start_hooks);
+            const create_state = try allocator.alloc(u8, options.create_hook_state.prefix.len + 20 + options.create_hook_state.suffix.len);
+            const start_state = try allocator.alloc(u8, options.start_hook_state.prefix.len + 20 + options.start_hook_state.suffix.len);
+            const masked_paths = try preparePaths(allocator, options.masked_paths);
+            const readonly_paths = try preparePaths(allocator, options.readonly_paths);
 
             // pivot_root also changes child1's root while it waits in the same
             // mount namespace. Pin host /proc so it can still capture identity.
@@ -251,10 +251,26 @@ pub const LinuxBackend = struct {
             }
             for (options.cgroup_writes) |write|
                 try writeCgroupFile(cgroup, write.name, write.value, options.cgroup_path);
+            // getpid() in child2 may be 1. Child1 supplies its host PID for
+            // opaque hook input; buffers and JSON fragments were prepared above.
+            const pid_pipe = try makePipe();
+            var owns_pid_pipe = true;
+            defer if (owns_pid_pipe) {
+                for (pid_pipe) |fd| closeFd(fd);
+            };
             const report = try makePipe();
             const ready = makePipe() catch |err| {
                 for (report) |fd| closeFd(fd);
                 return err;
+            };
+            const create_go = makePipe() catch |err| {
+                for (report) |fd| closeFd(fd);
+                for (ready) |fd| closeFd(fd);
+                return err;
+            };
+            var owns_create_go = true;
+            defer if (owns_create_go) {
+                for (create_go) |fd| closeFd(fd);
             };
             const map_pipe = if (user_namespace) makePipe() catch |err| {
                 for (report) |fd| closeFd(fd);
@@ -268,6 +284,7 @@ pub const LinuxBackend = struct {
                 return err;
             };
             if (child1 == 0) {
+                closeFd(create_go[1]);
                 if (map_pipe) |fds| closeFd(fds[1]);
                 closeFd(cgroup_root.fd);
                 closeFd(report[0]);
@@ -280,6 +297,10 @@ pub const LinuxBackend = struct {
                 // NEWPID affects the next fork, making child2 pid 1 inside the namespace.
                 const child2 = forkProcess() catch |err| failCreate(report[1], err);
                 if (child2 == 0) {
+                    closeFd(pid_pipe[1]);
+                    var host_pid: i32 = undefined;
+                    if (!readAll(pid_pipe[0], std.mem.asBytes(&host_pid))) linux.exit_group(1);
+                    closeFd(pid_pipe[0]);
                     // Let the parent see report EOF if child1 dies during the map wait.
                     closeFd(report[1]);
                     closeFd(ready[0]);
@@ -296,8 +317,30 @@ pub const LinuxBackend = struct {
                         checkResult(linux.setgid(0)) catch linux.exit_group(1);
                         checkResult(linux.setuid(0)) catch linux.exit_group(1);
                     }
-                    runInit(options.spec, capabilities, options.rlimits, flags, rootfs, mounts, devices, options.device_symlinks, cwd, fifo, argv.ptr, envp.ptr, ready[1]);
+                    const create_input = std.fmt.bufPrint(create_state, "{s}{d}{s}", .{
+                        options.create_hook_state.prefix, host_pid, options.create_hook_state.suffix,
+                    }) catch linux.exit_group(1);
+                    const start_input = std.fmt.bufPrint(start_state, "{s}{d}{s}", .{
+                        options.start_hook_state.prefix, host_pid, options.start_hook_state.suffix,
+                    }) catch linux.exit_group(1);
+                    runInit(options.spec, capabilities, options.rlimits, flags, rootfs, mounts, devices, options.device_symlinks, cwd, fifo, argv.ptr, envp.ptr, ready[1], .{
+                        .propagation = options.rootfs_propagation,
+                        .create_hooks = create_hooks,
+                        .create_hook_state = create_input,
+                        .masked_paths = masked_paths,
+                        .readonly_paths = readonly_paths,
+                        .runtime_sync = .{ .ready_fd = ready[1], .go_fd = create_go[0] },
+                    }, start_hooks, start_input);
                 }
+                closeFd(create_go[0]);
+                closeFd(pid_pipe[0]);
+                var host_pid = child2;
+                if (!writeAll(pid_pipe[1], std.mem.asBytes(&host_pid))) {
+                    _ = linux.kill(child2, .KILL);
+                    _ = waitChild(child2) catch {};
+                    failCreate(report[1], error.CreateFailed);
+                }
+                closeFd(pid_pipe[1]);
                 if (map_pipe) |fds| {
                     closeFd(fds[0]);
                     var mapping_response: CreateResponse = .{ .pid = child2 };
@@ -309,9 +352,8 @@ pub const LinuxBackend = struct {
                 }
                 closeFd(ready[1]);
                 var byte: [1]u8 = undefined;
-                const initialized = readAll(ready[0], &byte);
-                closeFd(ready[0]);
-                if (!initialized) {
+                // Child2 has applied mounts and waits before child hooks/pivot.
+                if (!readAll(ready[0], &byte)) {
                     _ = waitChild(child2) catch {};
                     failCreate(report[1], error.CreateFailed);
                 }
@@ -332,13 +374,34 @@ pub const LinuxBackend = struct {
                     _ = waitChild(child2) catch {};
                     linux.exit_group(1);
                 }
+                const initialized = readAll(ready[0], &byte);
+                closeFd(ready[0]);
+                if (!initialized) {
+                    _ = waitChild(child2) catch {};
+                    failCreate(report[1], error.CreateFailed);
+                }
+                if (!writeAll(report[1], std.mem.asBytes(&response))) {
+                    _ = linux.kill(child2, .KILL);
+                    _ = waitChild(child2) catch {};
+                    linux.exit_group(1);
+                }
                 // No shim: exiting child1 reparents the blocked init to host init.
                 linux.exit_group(0);
             }
 
+            // Only child1 writes the PID. Keeping a writer in this parent
+            // would strand child2 if child1 died before sending it, preventing
+            // report EOF and hanging create.
+            for (pid_pipe) |fd| closeFd(fd);
+            owns_pid_pipe = false;
             closeFd(report[1]);
             for (ready) |fd| closeFd(fd);
             defer closeFd(report[0]);
+            // Keep a reader to prevent SIGPIPE if init exits before release.
+            defer closeFd(create_go[0]);
+            var create_writer: ?posix.fd_t = create_go[1];
+            defer if (create_writer) |fd| closeFd(fd);
+            owns_create_go = false;
             // Retain a reader so a dying init cannot SIGPIPE the runtime on go.
             defer if (map_pipe) |fds| closeFd(fds[0]);
             var map_writer: ?posix.fd_t = if (map_pipe) |fds| fds[1] else null;
@@ -349,6 +412,10 @@ pub const LinuxBackend = struct {
                 if (map_writer) |fd| {
                     closeFd(fd);
                     map_writer = null;
+                }
+                if (create_writer) |fd| {
+                    closeFd(fd);
+                    create_writer = null;
                 }
                 _ = waitChild(child1) catch {};
             };
@@ -375,12 +442,21 @@ pub const LinuxBackend = struct {
                 .starttime = starttime,
                 .cgroup_path = options.cgroup_path,
             };
-            errdefer if (reported and response.pid > 0) {
+            errdefer if (reported and handle.pid > 0) {
                 kill(ptr, handle, 9) catch {};
             };
+            if (!reported) return error.CreateFailed;
+            if (response.failure != 0) return @errorCast(@errorFromInt(@as(u16, @intCast(response.failure))));
+            if (response.pid <= 0) return error.CreateFailed;
+            if (options.on_create) |callback| try callback.run(callback.ptr, handle);
+            if (!writeAll(create_writer.?, &.{1})) return error.CreateFailed;
+            closeFd(create_writer.?);
+            create_writer = null;
+            response = .{};
+            const initialized = readAll(report[0], std.mem.asBytes(&response));
             child1_reaped = true;
             const status = try waitChild(child1);
-            if (!reported) return error.CreateFailed;
+            if (!initialized) return error.CreateFailed;
             if (response.failure != 0) return @errorCast(@errorFromInt(@as(u16, @intCast(response.failure))));
             if (status != 0 or response.pid <= 0) {
                 return error.CreateFailed;
@@ -824,6 +900,15 @@ fn pathString(allocator: std.mem.Allocator, value: []const u8) Backend.Error![:0
     return allocator.dupeZ(u8, value);
 }
 
+fn preparePaths(allocator: std.mem.Allocator, paths: []const []const u8) Backend.Error![]const [:0]const u8 {
+    const prepared = try allocator.alloc([:0]const u8, paths.len);
+    for (paths, prepared) |path, *value| {
+        if (!std.mem.startsWith(u8, path, "/")) return error.InvalidPath;
+        value.* = try pathString(allocator, path);
+    }
+    return prepared;
+}
+
 fn checkResult(result: usize) Backend.Error!void {
     switch (linux.errno(result)) {
         .SUCCESS => {},
@@ -1056,9 +1141,8 @@ fn fdPath(buffer: []u8, fd: posix.fd_t) [:0]u8 {
     return std.fmt.bufPrintZ(buffer, "/proc/self/fd/{d}", .{fd}) catch unreachable;
 }
 
-fn remountFlags(target_fd: posix.fd_t, requested: u32, user_namespace: bool) Backend.Error!u32 {
+fn remountFlags(target_fd: posix.fd_t, requested: u32) Backend.Error!u32 {
     if (comptime builtin.os.tag == .linux) {
-        if (!user_namespace) return requested;
         // Linux statfs uses native words, except for the two-int fsid.
         const Statfs = extern struct {
             type: usize,
@@ -1082,7 +1166,16 @@ fn remountFlags(target_fd: posix.fd_t, requested: u32, user_namespace: bool) Bac
     }
 }
 
-fn applyMount(rootfs: [:0]const u8, root_fd: posix.fd_t, mount: PreparedMount, user_namespace: bool) Backend.Error!void {
+fn bindRemount(target_fd: posix.fd_t, target: [*:0]const u8, requested: u32) Backend.Error!void {
+    const result = linux.mount(null, target, null, requested, 0);
+    if (linux.errno(result) != .PERM) return checkResult(result);
+    // Retry locked flags on EPERM, including in an inherited user namespace.
+    // Privileged callers may change these flags, so first honor their request.
+    const flags = try remountFlags(target_fd, requested);
+    try checkResult(linux.mount(null, target, null, flags, 0));
+}
+
+fn applyMount(rootfs: [:0]const u8, root_fd: posix.fd_t, mount: PreparedMount) Backend.Error!void {
     const ms = linux.MS;
     const bind = mount.flags & ms.BIND != 0;
     const source_fd: ?posix.fd_t = if (bind)
@@ -1117,8 +1210,7 @@ fn applyMount(rootfs: [:0]const u8, root_fd: posix.fd_t, mount: PreparedMount, u
     closeFd(target_fd);
     target_fd = mounted_fd;
     if (bind and mount.flags & ~@as(u32, ms.BIND | ms.REC) != 0) {
-        const flags = try remountFlags(target_fd, (mount.flags & ~@as(u32, ms.REC)) | ms.BIND | ms.REMOUNT, user_namespace);
-        try checkResult(linux.mount(null, fdPath(&target_buffer, target_fd), null, flags, 0));
+        try bindRemount(target_fd, fdPath(&target_buffer, target_fd), (mount.flags & ~@as(u32, ms.REC)) | ms.BIND | ms.REMOUNT);
     }
     if (mount.recursive_readonly) |readonly| {
         const MountAttr = extern struct {
@@ -1175,6 +1267,8 @@ fn createDevice(root_fd: posix.fd_t, device: PreparedDevice) Backend.Error!void 
             // A configured mount may already supply this device. Preserve it
             // only when its type and device number match the requested node.
             .EXIST => {
+                // Deliberately keep existing metadata: this node may come
+                // from a bind mount, and rewriting it would change the host.
                 const node = try openPath(dir, name, .{ .PATH = true, .NOFOLLOW = true, .CLOEXEC = true });
                 defer closeFd(node);
                 try validateDeviceNode(node, device);
@@ -1221,34 +1315,120 @@ fn setupDevices(root_fd: posix.fd_t, devices: []const PreparedDevice, symlinks: 
     }
 }
 
-/// All paths/data are prepared before fork; child2 needs no allocator.
-fn setupRootfs(rootfs: [:0]const u8, mounts: []const PreparedMount, devices: []const PreparedDevice, symlinks: []const Backend.Symlink, readonly: bool, user_namespace: bool) Backend.Error!void {
+const RootfsOptions = struct {
+    propagation: u32 = linux.MS.PRIVATE | linux.MS.REC,
+    create_hooks: []const hooks.Prepared = &.{},
+    create_hook_state: []const u8 = "",
+    masked_paths: []const [:0]const u8 = &.{},
+    readonly_paths: []const [:0]const u8 = &.{},
+    runtime_sync: ?struct { ready_fd: posix.fd_t, go_fd: posix.fd_t } = null,
+};
+
+/// Paths now resolve entirely inside the pivoted rootfs. Missing targets are
+/// ignored; other mount failures must not silently weaken isolation.
+fn applyPathRestrictions(masked: []const [:0]const u8, readonly: []const [:0]const u8) Backend.Error!void {
     const ms = linux.MS;
-    try checkResult(linux.mount(null, "/", null, ms.PRIVATE | ms.REC, 0));
+    for (masked) |path| {
+        var stat: linux.Statx = undefined;
+        const result = linux.statx(linux.AT.FDCWD, path, 0, .{ .TYPE = true }, &stat);
+        switch (linux.errno(result)) {
+            .NOENT => continue,
+            .SUCCESS => {},
+            else => try checkResult(result),
+        }
+        if (!stat.mask.TYPE) return error.CreateFailed;
+        if (stat.mode & linux.S.IFMT == linux.S.IFDIR) {
+            try checkResult(linux.mount("tmpfs", path, "tmpfs", ms.RDONLY | ms.NOSUID | ms.NODEV | ms.NOEXEC, 0));
+        } else {
+            try checkResult(linux.mount("/dev/null", path, null, ms.BIND, 0));
+        }
+    }
+    for (readonly) |path| {
+        const result = linux.mount(path, path, null, ms.BIND | ms.REC, 0);
+        switch (linux.errno(result)) {
+            .NOENT => continue,
+            .SUCCESS => {},
+            else => try checkResult(result),
+        }
+        const fd = try openPath(linux.AT.FDCWD, path, .{ .PATH = true, .CLOEXEC = true });
+        defer closeFd(fd);
+        try bindRemount(fd, path, ms.BIND | ms.REMOUNT | ms.RDONLY);
+    }
+}
+
+/// Like runc, walk up to the containing mount. Only that mount must be
+/// private for pivot_root; inherited submounts retain their peer groups.
+fn makeRootfsParentPrivate(rootfs: [:0]const u8) Backend.Error!void {
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    if (rootfs.len >= buffer.len) return error.InvalidPath;
+    @memcpy(buffer[0..rootfs.len], rootfs);
+    var end = rootfs.len;
+    while (true) {
+        buffer[end] = 0;
+        const result = linux.mount(null, buffer[0..end :0], null, linux.MS.PRIVATE, 0);
+        switch (linux.errno(result)) {
+            .SUCCESS => return,
+            .INVAL => {
+                if (end == 1) return error.CreateFailed;
+                end = (std.fs.path.dirname(buffer[0..end]) orelse return error.InvalidPath).len;
+            },
+            else => try checkResult(result),
+        }
+    }
+}
+
+/// All paths, hook arguments and state buffers are prepared before fork.
+/// Allocating in child2 risks inherited allocator locks (POSIX only permits
+/// async-signal-safe work after fork). The raw hook runner needs no allocation.
+fn setupRootfs(rootfs: [:0]const u8, mounts: []const PreparedMount, devices: []const PreparedDevice, symlinks: []const Backend.Symlink, readonly: bool, options: RootfsOptions) Backend.Error!void {
+    const ms = linux.MS;
+    try checkResult(linux.mount(null, "/", null, options.propagation, 0));
+    // Shared parents prevent pivot_root; make only the containing mount private.
+    // Unbindable sources require temporary recursive private propagation.
+    const restore_propagation = options.propagation & (ms.SHARED | ms.UNBINDABLE) != 0;
+    if (options.propagation & ms.UNBINDABLE != 0) {
+        try checkResult(linux.mount(null, "/", null, ms.PRIVATE | ms.REC, 0));
+    } else if (options.propagation & ms.SHARED != 0) {
+        try makeRootfsParentPrivate(rootfs);
+    }
     try checkResult(linux.mount(rootfs, rootfs, null, ms.BIND | ms.REC, 0));
     for (mounts) |mount| {
         const root_fd = try openPath(linux.AT.FDCWD, rootfs, .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true });
         defer closeFd(root_fd);
-        try applyMount(rootfs, root_fd, mount, user_namespace);
+        try applyMount(rootfs, root_fd, mount);
     }
+    if (options.runtime_sync) |sync| {
+        if (!writeAll(sync.ready_fd, &.{1})) return error.CreateFailed;
+        var byte: [1]u8 = undefined;
+        const released = readAll(sync.go_fd, &byte);
+        closeFd(sync.go_fd);
+        if (!released or byte[0] != 1) return error.CreateFailed;
+    }
+    // Runtime paths are still reachable; the hook already runs in the new
+    // mount namespace and sees all configured mounts before pivot_root.
+    try hooks.run(options.create_hooks, options.create_hook_state);
     // runc's fd trick stacks the old root on the new root without a put_old
     // directory. Detach it and close both handles before any container exec.
     const old_root = try openPath(linux.AT.FDCWD, "/", .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true });
     defer closeFd(old_root);
     const new_root = try openPath(linux.AT.FDCWD, rootfs, .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true });
     defer closeFd(new_root);
-    // Without a configured /dev tmpfs, only optional defaults may be skipped:
-    // create rejects required devices before setup. Leave bind-mounted /dev alone.
-    if (hasDevTmpfs(mounts)) try setupDevices(new_root, devices, symlinks);
+    // Populate rootfs /dev even without tmpfs, but leave a bind-mounted /dev
+    // untouched: device nodes and symlinks there would mutate the host source.
+    if (needsSetupDev(mounts)) try setupDevices(new_root, devices, symlinks);
     try checkResult(linux.fchdir(new_root));
     try checkResult(linux.pivot_root(".", "."));
     try checkResult(linux.fchdir(old_root));
+    // Detaching inherited shared submounts must not unmount their host peers.
+    try checkResult(linux.mount(null, ".", null, ms.SLAVE | ms.REC, 0));
     try checkResult(linux.umount2(".", linux.MNT.DETACH));
     try checkResult(linux.chdir("/"));
+    try applyPathRestrictions(options.masked_paths, options.readonly_paths);
     if (readonly) {
-        const flags = try remountFlags(new_root, ms.BIND | ms.REMOUNT | ms.RDONLY, user_namespace);
-        try checkResult(linux.mount(null, "/", null, flags, 0));
+        try bindRemount(new_root, "/", ms.BIND | ms.REMOUNT | ms.RDONLY);
     }
+    if (restore_propagation)
+        try checkResult(linux.mount(null, "/", null, options.propagation, 0));
 }
 
 fn runInit(
@@ -1265,6 +1445,9 @@ fn runInit(
     argv: [*:null]const ?[*:0]const u8,
     envp: [*:null]const ?[*:0]const u8,
     ready_fd: posix.fd_t,
+    rootfs_options: RootfsOptions,
+    start_hooks: []const hooks.Prepared,
+    start_hook_state: []const u8,
 ) noreturn {
     // Keep the host FIFO reachable without requiring /proc inside the rootfs.
     // These host descriptors are used only by init and closed before exec.
@@ -1274,7 +1457,10 @@ fn runInit(
     const fd_dir = openPath(linux.AT.FDCWD, "/proc/self/fd", .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true }) catch linux.exit_group(1);
     var fifo_buffer: [32]u8 = undefined;
     const fifo_name = std.fmt.bufPrintZ(&fifo_buffer, "{d}", .{fifo_path}) catch unreachable;
-    setupRootfs(rootfs, mounts, devices, symlinks, spec.root.readonly, flags & linux.CLONE.NEWUSER != 0) catch linux.exit_group(1);
+    setupRootfs(rootfs, mounts, devices, symlinks, spec.root.readonly, rootfs_options) catch |err| {
+        std.debug.print("igvano: cannot prepare rootfs: {s}\n", .{@errorName(err)});
+        linux.exit_group(1);
+    };
     if (flags & linux.CLONE.NEWUTS != 0) {
         if (spec.hostname) |hostname| {
             // Zig 0.16 has no sethostname wrapper.
@@ -1305,6 +1491,13 @@ fn runInit(
     };
     closeFd(fd_dir);
     closeFd(fifo_path);
+    // Opening the writer unblocks start. Report success only after hooks pass,
+    // so a timeout or nonzero exit fails start without publishing "running".
+    hooks.run(start_hooks, start_hook_state) catch |err| {
+        std.debug.print("igvano: start hook failed: {s}\n", .{@errorName(err)});
+        _ = writeAll(fd, &.{0});
+        linux.exit_group(1);
+    };
     if (!writeAll(fd, &.{1})) linux.exit_group(1);
     closeFd(fd);
     runProcess(spec, argv, envp);
@@ -2097,6 +2290,26 @@ test "linux create accepts an empty rootfs and returns a live blocked init" {
     const fifo_z = try std.testing.allocator.dupeZ(u8, fifo);
     defer std.testing.allocator.free(fifo_z);
     try checkResult(linux.mknod(fifo_z, linux.S.IFIFO | 0o600, 0));
+    const parent_marker = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/parent-hook", .{absolute_base}, 0);
+    defer std.testing.allocator.free(parent_marker);
+    const child_marker = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/child-hook", .{absolute_base}, 0);
+    defer std.testing.allocator.free(child_marker);
+    const Callback = struct {
+        parent_marker: [:0]const u8,
+        child_marker: [:0]const u8,
+        pid: i32 = 0,
+        fail: bool = false,
+
+        fn run(ptr: *anyopaque, handle: Backend.Handle) Backend.Error!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.pid = handle.pid;
+            if (linux.errno(linux.access(self.child_marker, linux.F_OK)) != .NOENT)
+                return error.InvalidConfig;
+            if (self.fail) return error.HookFailed;
+            const fd = try openPath(linux.AT.FDCWD, self.parent_marker, .{ .ACCMODE = .WRONLY, .CREAT = true, .CLOEXEC = true });
+            defer closeFd(fd);
+        }
+    };
     const specs = [_]oci.Spec{
         .{
             .ociVersion = "1.0.2",
@@ -2109,26 +2322,47 @@ test "linux create accepts an empty rootfs and returns a live blocked init" {
     for (specs) |spec| {
         var implementation: LinuxBackend = .{};
         const backend = implementation.backend();
-        const handle = try backend.create(.{
+        var callback: Callback = .{ .parent_marker = parent_marker, .child_marker = child_marker, .fail = true };
+        const options: Backend.CreateOptions = .{
             .allocator = std.testing.allocator,
             .id = "example",
             .rootfs = rootfs,
             .exec_fifo = fifo,
             .spec = &spec,
             .cgroup_path = cgroup_path,
-            .devices = &.{.{ .path = "/dev/null", .kind = .character, .major = 1, .minor = 3, .required = false }},
+            .devices = &.{.{ .path = "/dev/null", .kind = .character, .major = 1, .minor = 3 }},
             .device_symlinks = oci.deviceSymlinks(&.{}),
-        });
+            .on_create = .{ .ptr = &callback, .run = Callback.run },
+            .create_hooks = &.{.{
+                .path = "/bin/sh",
+                // The host shell must remain reachable until this hook finishes.
+                .args = &.{ "sh", "-c", "test -e \"$1\" && printf child > \"$2\"", "sh", parent_marker, child_marker },
+                .timeout_seconds = 2,
+            }},
+        };
+        try std.testing.expectError(error.HookFailed, backend.create(options));
+        try std.testing.expectEqual(linux.E.SRCH, linux.errno(linux.kill(callback.pid, @enumFromInt(0))));
+        try std.testing.expectEqual(@as(?posix.fd_t, null), try walkCgroup(cgroup_root.fd, cgroup_path, false, &.{}));
+        try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, "child-hook", .{}));
+        callback.fail = false;
+        const handle = try backend.create(options);
         defer std.testing.allocator.free(handle.starttime);
         defer {
             backend.kill(handle, 9) catch {};
             backend.delete(handle) catch {};
         }
         try std.testing.expect(handle.pid > 0);
+        try std.testing.expectEqual(handle.pid, callback.pid);
+        const child_output = try tmp.dir.readFileAlloc(std.testing.io, "child-hook", std.testing.allocator, .limited(16));
+        defer std.testing.allocator.free(child_output);
+        try std.testing.expectEqualStrings("child", child_output);
+        try tmp.dir.deleteFile(std.testing.io, "parent-hook");
+        try tmp.dir.deleteFile(std.testing.io, "child-hook");
         try std.testing.expectEqualStrings("example", handle.id);
         try std.testing.expect(handle.starttime.len != 0);
         try std.testing.expect(try backend.alive(handle));
-        try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, "rootfs/dev", .{}));
+        const null_device = try tmp.dir.statFile(std.testing.io, "rootfs/dev/null", .{});
+        try std.testing.expectEqual(std.Io.File.Kind.character_device, null_device.kind);
         try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.kill(handle.pid, @enumFromInt(0))));
         const fifo_stat = try tmp.dir.statFile(std.testing.io, "exec.fifo", .{});
         try std.testing.expectEqual(@as(posix.mode_t, 0o600), fifo_stat.permissions.toMode() & 0o7777);
@@ -2371,6 +2605,53 @@ test "linux device validation rejects mismatched types and device numbers" {
     }
 }
 
+test "linux privileged bind remount honors atime changes and clears unrequested flags" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    try requireTestMountNamespace();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "rootfs", .default_dir);
+    try tmp.dir.createDir(std.testing.io, "source", .default_dir);
+    const base = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer std.testing.allocator.free(base);
+    const absolute = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, base, std.testing.allocator);
+    defer std.testing.allocator.free(absolute);
+    const rootfs = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/rootfs", .{absolute}, 0);
+    defer std.testing.allocator.free(rootfs);
+    const source = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/source", .{absolute}, 0);
+    defer std.testing.allocator.free(source);
+    const ms = linux.MS;
+    const cases = [_]struct { source_atime: u32, requested: u32 }{
+        .{ .source_atime = ms.RELATIME, .requested = ms.STRICTATIME },
+        .{ .source_atime = ms.STRICTATIME, .requested = ms.NOATIME },
+        .{ .source_atime = ms.NOATIME, .requested = ms.RELATIME },
+    };
+    for (cases) |case| {
+        const pid = try forkProcess();
+        if (pid == 0) {
+            checkResult(linux.unshare(linux.CLONE.NEWNS)) catch linux.exit_group(1);
+            checkResult(linux.mount(null, "/", null, ms.PRIVATE | ms.REC, 0)) catch linux.exit_group(2);
+            checkResult(linux.mount("tmpfs", source, "tmpfs", 0, 0)) catch linux.exit_group(3);
+            // Set per-mount readonly without making the superblock readonly.
+            checkResult(linux.mount(null, source, null, ms.BIND | ms.REMOUNT | ms.RDONLY | ms.NOSUID | ms.NODEV | ms.NOEXEC | case.source_atime, 0)) catch linux.exit_group(4);
+            const root_fd = openPath(linux.AT.FDCWD, rootfs, .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true }) catch linux.exit_group(5);
+            applyMount(rootfs, root_fd, .{
+                .destination = "/bound",
+                .source = source,
+                .type = null,
+                .flags = ms.BIND | case.requested,
+                .propagation = 0,
+                .data = "",
+            }) catch linux.exit_group(6);
+            const target = mountDestination(root_fd, "/bound", false, false) catch linux.exit_group(7);
+            const actual = remountFlags(target, 0) catch linux.exit_group(8);
+            if (actual != case.requested) linux.exit_group(9);
+            linux.exit_group(0);
+        }
+        try std.testing.expectEqual(@as(u32, 0), try waitChild(pid));
+    }
+}
+
 test "linux rootfs setup applies ordered mounts detaches the host root and enforces readonly" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     try requireTestMountNamespace();
@@ -2405,7 +2686,7 @@ test "linux rootfs setup applies ordered mounts detaches the host root and enfor
     if (pid == 0) {
         checkResult(linux.unshare(linux.CLONE.NEWNS)) catch linux.exit_group(1);
         _ = linux.syscall1(.umask, 0o777);
-        setupRootfs(rootfs, &mounts, &devices, symlinks, true, false) catch linux.exit_group(2);
+        setupRootfs(rootfs, &mounts, &devices, symlinks, true, .{}) catch linux.exit_group(2);
         // The source's old absolute host path is unreachable after detaching.
         if (linux.errno(linux.access(source_file, linux.F_OK)) != .NOENT) linux.exit_group(3);
         if (linux.errno(linux.open("/new", .{ .ACCMODE = .WRONLY, .CREAT = true }, 0o644)) != .ROFS) linux.exit_group(4);
@@ -2437,7 +2718,7 @@ test "linux rootfs setup applies ordered mounts detaches the host root and enfor
     }
     try std.testing.expectEqual(@as(u32, 0), try waitChild(pid));
 
-    // A later /dev bind covers the tmpfs. Device setup must leave the source alone.
+    // A later /dev bind covers the tmpfs. Leave its host source untouched.
     var bind_mounts: [mounts.len + 1]PreparedMount = undefined;
     @memcpy(bind_mounts[0..mounts.len], &mounts);
     bind_mounts[mounts.len] = .{
@@ -2451,13 +2732,94 @@ test "linux rootfs setup applies ordered mounts detaches the host root and enfor
     const bind_pid = try forkProcess();
     if (bind_pid == 0) {
         checkResult(linux.unshare(linux.CLONE.NEWNS)) catch linux.exit_group(1);
-        setupRootfs(rootfs, &bind_mounts, &devices, symlinks, true, false) catch linux.exit_group(2);
+        setupRootfs(rootfs, &bind_mounts, &devices, symlinks, true, .{}) catch linux.exit_group(2);
         if (linux.errno(linux.access("/dev/item", linux.F_OK)) != .SUCCESS) linux.exit_group(3);
         if (linux.errno(linux.access("/dev/null", linux.F_OK)) != .NOENT) linux.exit_group(4);
         linux.exit_group(0);
     }
     try std.testing.expectEqual(@as(u32, 0), try waitChild(bind_pid));
     try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, "source/null", .{}));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, "source/fd", .{ .follow_symlinks = false }));
+}
+
+test "linux rootfs restrictions hide files and directories and preserve propagation modes" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    try requireTestMountNamespace();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "rootfs/masked-dir");
+    try tmp.dir.createDirPath(std.testing.io, "rootfs/readonly-dir");
+    for ([_][]const u8{ "masked-file", "masked-dir/secret", "readonly-file", "readonly-dir/item" }) |path| {
+        const name = try std.fmt.allocPrint(std.testing.allocator, "rootfs/{s}", .{path});
+        defer std.testing.allocator.free(name);
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = name, .data = "secret" });
+    }
+    const base = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer std.testing.allocator.free(base);
+    const absolute = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, base, std.testing.allocator);
+    defer std.testing.allocator.free(absolute);
+    const rootfs = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/rootfs", .{absolute}, 0);
+    defer std.testing.allocator.free(rootfs);
+    const mounts = [_]PreparedMount{
+        .{ .destination = "/proc", .source = "proc", .type = "proc", .flags = 0, .propagation = 0, .data = "" },
+    };
+    const devices = [_]PreparedDevice{.{ .path = "/dev/null", .mode = linux.S.IFCHR | 0o666, .dev = 0x103 }};
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const hook_env = try std.fmt.allocPrint(arena.allocator(), "ROOTFS={s}", .{rootfs});
+    const create_hooks = try hooks.prepare(arena.allocator(), &.{.{
+        .path = "/bin/sh",
+        .args = &.{ "sh", "-c", "test -f \"$ROOTFS/masked-dir/secret\" && IFS= read -r state && test \"$state\" = creating && printf hook > \"$ROOTFS/hook-observed\"" },
+        .env = &.{hook_env},
+        .timeout_seconds = 2,
+    }});
+    for ([_]u32{ linux.MS.PRIVATE, linux.MS.SLAVE, linux.MS.SHARED, linux.MS.UNBINDABLE }) |propagation| {
+        const pid = try forkProcess();
+        if (pid == 0) {
+            checkResult(linux.unshare(linux.CLONE.NEWNS)) catch linux.exit_group(1);
+            setupRootfs(rootfs, &mounts, &devices, &.{}, false, .{
+                .propagation = propagation | linux.MS.REC,
+                .create_hooks = create_hooks,
+                .create_hook_state = "creating\n",
+                .masked_paths = &.{ "/masked-file", "/masked-dir", "/missing-mask" },
+                .readonly_paths = &.{ "/readonly-file", "/readonly-dir", "/missing-readonly" },
+            }) catch |err| {
+                std.debug.print("rootfs restriction setup: {s}\n", .{@errorName(err)});
+                linux.exit_group(2);
+            };
+            if (linux.errno(linux.access("/hook-observed", linux.F_OK)) != .SUCCESS) linux.exit_group(3);
+            const masked = openPath(linux.AT.FDCWD, "/masked-file", .{}) catch linux.exit_group(4);
+            var byte: [1]u8 = undefined;
+            if (linux.read(masked, &byte, 1) != 0) linux.exit_group(5);
+            closeFd(masked);
+            if (linux.errno(linux.access("/masked-dir/secret", linux.F_OK)) != .NOENT) linux.exit_group(6);
+            for ([_][*:0]const u8{ "/masked-dir/new", "/readonly-file", "/readonly-dir/item", "/readonly-dir/new" }) |path| {
+                if (linux.errno(linux.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true }, 0o600)) != .ROFS)
+                    linux.exit_group(7);
+            }
+            if (linux.errno(linux.access("/missing-mask", linux.F_OK)) != .NOENT or
+                linux.errno(linux.access("/missing-readonly", linux.F_OK)) != .NOENT) linux.exit_group(8);
+            const mountinfo = openPath(linux.AT.FDCWD, "/proc/self/mountinfo", .{}) catch linux.exit_group(9);
+            var buffer: [65536]u8 = undefined;
+            const size = linux.read(mountinfo, &buffer, buffer.len);
+            checkResult(size) catch linux.exit_group(10);
+            var lines = std.mem.splitScalar(u8, buffer[0..size], '\n');
+            var root_seen = false;
+            while (lines.next()) |line| {
+                var fields = std.mem.tokenizeScalar(u8, line, ' ');
+                for (0..4) |_| _ = fields.next();
+                const mountpoint = fields.next() orelse continue;
+                if (std.mem.eql(u8, mountpoint, "/")) root_seen = true;
+                const shared = std.mem.indexOf(u8, line, " shared:") != null;
+                const unbindable = std.mem.indexOf(u8, line, " unbindable ") != null;
+                if (shared != (propagation == linux.MS.SHARED) or
+                    unbindable != (propagation == linux.MS.UNBINDABLE)) linux.exit_group(11);
+            }
+            if (!root_seen) linux.exit_group(12);
+            linux.exit_group(0);
+        }
+        try std.testing.expectEqual(@as(u32, 0), try waitChild(pid));
+    }
 }
 
 fn requireTestMountNamespace() !void {

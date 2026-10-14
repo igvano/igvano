@@ -1,5 +1,74 @@
 const std = @import("std");
 
+test "hooks parse all lifecycle stages and preserve their optional settings" {
+    const parsed = try std.json.parseFromSlice(Spec, std.testing.allocator,
+        \\{"ociVersion":"1.0.2","root":{"path":"rootfs"},"hooks":{
+        \\ "prestart":[{"path":"/compat"}],"createRuntime":[{"path":"/runtime","args":["custom","arg"],"env":["ONLY=hook"],"timeout":2}],
+        \\ "createContainer":[{"path":"/create"}],"startContainer":[{"path":"/start"}],
+        \\ "poststart":[{"path":"/started"}],"poststop":[{"path":"/stopped"}]}}
+    , .{});
+    defer parsed.deinit();
+    try validateHooks(parsed.value.hooks);
+    const hooks = parsed.value.hooks.?;
+    try std.testing.expectEqualStrings("/compat", hooks.prestart.?[0].path);
+    try std.testing.expectEqualStrings("custom", hooks.createRuntime.?[0].args.?[0]);
+    try std.testing.expectEqualStrings("ONLY=hook", hooks.createRuntime.?[0].env.?[0]);
+    try std.testing.expectEqual(@as(?u64, 2), hooks.createRuntime.?[0].timeout);
+    try std.testing.expectEqualStrings("/create", hooks.createContainer.?[0].path);
+    try std.testing.expectEqualStrings("/start", hooks.startContainer.?[0].path);
+    try std.testing.expectEqualStrings("/started", hooks.poststart.?[0].path);
+    try std.testing.expectEqualStrings("/stopped", hooks.poststop.?[0].path);
+    try std.testing.expect(hooks.prestart.?[0].args == null);
+    try std.testing.expect(hooks.prestart.?[0].env == null);
+    try std.testing.expect(hooks.prestart.?[0].timeout == null);
+}
+
+test "hook validation rejects missing relative and NUL paths and zero timeout" {
+    try std.testing.expectError(error.MissingField, std.json.parseFromSlice(Spec.Hook, std.testing.allocator, "{}", .{}));
+    for ([_][]const u8{
+        "{\"path\":\"relative\"}",
+        "{\"path\":\"\"}",
+        "{\"path\":\"/hook\\u0000\"}",
+        "{\"path\":\"/hook\",\"timeout\":0}",
+        "{\"path\":\"/hook\",\"args\":[\"bad\\u0000\"]}",
+        "{\"path\":\"/hook\",\"env\":[\"bad\\u0000\"]}",
+    }) |json| {
+        const parsed = try std.json.parseFromSlice(Spec.Hook, std.testing.allocator, json, .{});
+        defer parsed.deinit();
+        try std.testing.expectError(error.InvalidConfig, validateHooks(.{ .poststop = &.{parsed.value} }));
+    }
+    try validateHooks(null);
+    try validateHooks(.{ .prestart = &.{} });
+    try validateHooks(.{ .startContainer = &.{.{ .path = "/hook", .timeout = 1 }} });
+}
+
+test "linux path restrictions parse ordered string lists and propagation modes" {
+    const parsed = try std.json.parseFromSlice(Spec.Linux, std.testing.allocator,
+        \\{"maskedPaths":["/proc/kcore","/secret"],"readonlyPaths":["/proc/sys"],"rootfsPropagation":"slave"}
+    , .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 2), parsed.value.maskedPaths.?.len);
+    try std.testing.expectEqualStrings("/proc/kcore", parsed.value.maskedPaths.?[0]);
+    try std.testing.expectEqualStrings("/secret", parsed.value.maskedPaths.?[1]);
+    try std.testing.expectEqualStrings("/proc/sys", parsed.value.readonlyPaths.?[0]);
+    try std.testing.expectEqual(Spec.Propagation.slave, parsed.value.rootfsPropagation.?);
+    const ms = std.os.linux.MS;
+    const cases = [_]struct { mode: ?Spec.Propagation, expected: u32 }{
+        .{ .mode = null, .expected = ms.PRIVATE | ms.REC },
+        .{ .mode = .shared, .expected = ms.SHARED | ms.REC },
+        .{ .mode = .slave, .expected = ms.SLAVE | ms.REC },
+        .{ .mode = .private, .expected = ms.PRIVATE | ms.REC },
+        .{ .mode = .unbindable, .expected = ms.UNBINDABLE | ms.REC },
+    };
+    for (cases) |case| try std.testing.expectEqual(case.expected, rootfsPropagation(case.mode));
+    try std.testing.expectError(error.InvalidEnumTag, std.json.parseFromSlice(Spec.Linux, std.testing.allocator,
+        \\{"rootfsPropagation":"rshared"}
+    , .{}));
+    try std.testing.expectError(error.UnexpectedToken, std.json.parseFromSlice(Spec.Linux, std.testing.allocator,
+        \\{"maskedPaths":[1]}
+    , .{}));
+}
+
 test "cgroup paths are relative to the mount root and reject escapes" {
     const cases = [_]struct { path: ?[]const u8, expected: []const u8 }{
         .{ .path = null, .expected = "igvano/example" },
@@ -141,6 +210,7 @@ pub const state_file_name = "state.json";
 pub const exec_fifo_name = "exec.fifo";
 pub const starttime_file_name = "starttime";
 pub const cgroup_file_name = "cgroup";
+pub const hooks_file_name = "hooks.json";
 pub const runtime_oci_version = "1.0.2";
 
 /// Parsed config.json values needed by a namespace backend.
@@ -150,6 +220,7 @@ pub const Spec = struct {
     process: ?Process = null,
     hostname: ?[]const u8 = null,
     mounts: ?[]const Mount = null,
+    hooks: ?Hooks = null,
     linux: ?Linux = null,
     annotations: ?std.json.ArrayHashMap([]const u8) = null,
 
@@ -203,6 +274,27 @@ pub const Spec = struct {
         cgroupsPath: ?[]const u8 = null,
         resources: ?Resources = null,
         devices: ?[]const Device = null,
+        maskedPaths: ?[]const []const u8 = null,
+        readonlyPaths: ?[]const []const u8 = null,
+        rootfsPropagation: ?Propagation = null,
+    };
+
+    pub const Propagation = enum { shared, slave, private, unbindable };
+
+    pub const Hook = struct {
+        path: []const u8,
+        args: ?[]const []const u8 = null,
+        env: ?[]const []const u8 = null,
+        timeout: ?u64 = null,
+    };
+
+    pub const Hooks = struct {
+        prestart: ?[]const Hook = null,
+        createRuntime: ?[]const Hook = null,
+        createContainer: ?[]const Hook = null,
+        startContainer: ?[]const Hook = null,
+        poststart: ?[]const Hook = null,
+        poststop: ?[]const Hook = null,
     };
 
     pub const Device = struct {
@@ -268,6 +360,44 @@ pub fn cpuWeight(shares: u64) !u64 {
 
 const Backend = @import("backend.zig").Backend;
 const CgroupWrite = Backend.CgroupWrite;
+
+pub fn validateHooks(configured: ?Spec.Hooks) error{InvalidConfig}!void {
+    const hooks = configured orelse return;
+    inline for (std.meta.fields(Spec.Hooks)) |field| {
+        for (@field(hooks, field.name) orelse &.{}) |hook| {
+            if (!std.mem.startsWith(u8, hook.path, "/") or
+                std.mem.indexOfScalar(u8, hook.path, 0) != null or
+                (hook.timeout != null and hook.timeout.? == 0)) return error.InvalidConfig;
+            for (hook.args orelse &.{}) |arg|
+                if (std.mem.indexOfScalar(u8, arg, 0) != null) return error.InvalidConfig;
+            for (hook.env orelse &.{}) |env|
+                if (std.mem.indexOfScalar(u8, env, 0) != null) return error.InvalidConfig;
+        }
+    }
+}
+
+/// Translate OCI hook entries; all slices are borrowed from the parsed spec.
+pub fn prepareHooks(allocator: std.mem.Allocator, configured: ?[]const Spec.Hook) ![]Backend.Hook {
+    const entries = configured orelse &.{};
+    const hooks = try allocator.alloc(Backend.Hook, entries.len);
+    for (entries, hooks) |entry, *hook| hook.* = .{
+        .path = entry.path,
+        .args = entry.args orelse &.{},
+        .env = entry.env orelse &.{},
+        .timeout_seconds = entry.timeout,
+    };
+    return hooks;
+}
+
+pub fn rootfsPropagation(mode: ?Spec.Propagation) u32 {
+    const ms = std.os.linux.MS;
+    return ms.REC | @as(u32, switch (mode orelse .private) {
+        .shared => ms.SHARED,
+        .slave => ms.SLAVE,
+        .private => ms.PRIVATE,
+        .unbindable => ms.UNBINDABLE,
+    });
+}
 
 const default_devices = [_]Backend.Device{
     .{ .path = "/dev/null", .kind = .character, .major = 1, .minor = 3, .required = false },
@@ -465,9 +595,9 @@ test "linux configured devices override default paths and preserve other default
         try std.testing.expectEqual(want.minor, actual.minor);
         try std.testing.expectEqual(Backend.Device.Kind.character, actual.kind);
         try std.testing.expectEqual(@as(u32, 0o666), actual.mode);
+        try std.testing.expect(!actual.required);
         try std.testing.expectEqual(@as(u32, 0), actual.uid);
         try std.testing.expectEqual(@as(u32, 0), actual.gid);
-        try std.testing.expect(!actual.required);
     }
 }
 
@@ -871,6 +1001,7 @@ pub fn validateIDMappings(mappings: []const Spec.IDMapping) error{InvalidConfig}
 /// Rootfs isolation always needs a mount namespace, even with an empty mount list.
 pub fn requireCreate(spec: Spec) !void {
     _ = std.SemanticVersion.parse(spec.ociVersion) catch return error.InvalidConfig;
+    try validateHooks(spec.hooks);
     const settings = spec.linux orelse return error.MissingMountNamespace;
     const uid_mappings: []const Spec.IDMapping = settings.uidMappings orelse &.{};
     const gid_mappings: []const Spec.IDMapping = settings.gidMappings orelse &.{};
@@ -902,6 +1033,8 @@ pub fn requireCreate(spec: Spec) !void {
             std.mem.indexOfScalar(u8, process.cwd, 0) != null) return error.InvalidProcess;
     }
     for (spec.mounts orelse &.{}) |mount| try validateMountDestination(mount.destination);
+    for (settings.maskedPaths orelse &.{}) |path| try validateMountDestination(path);
+    for (settings.readonlyPaths orelse &.{}) |path| try validateMountDestination(path);
 }
 
 test "mount options translate flags propagation and filesystem data" {
@@ -1160,10 +1293,13 @@ pub fn loadSpec(allocator: std.mem.Allocator, io: std.Io, bundle_dir: []const u8
     defer allocator.free(path);
     const json = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1 << 20));
     defer allocator.free(json);
-    return std.json.parseFromSlice(Spec, allocator, json, .{
+    const parsed = try std.json.parseFromSlice(Spec, allocator, json, .{
         .ignore_unknown_fields = true,
         .allocate = .alloc_always,
     });
+    errdefer parsed.deinit();
+    try validateHooks(parsed.value.hooks);
+    return parsed;
 }
 
 /// Resolves root.path against an absolute bundle directory. The caller owns the path.
@@ -1202,6 +1338,13 @@ pub const State = struct {
     annotations: ?std.json.ArrayHashMap([]const u8) = null,
 };
 
+/// Used by state stdout and every hook, with identical optional-field handling.
+pub fn stateJson(allocator: std.mem.Allocator, state: State) ![]u8 {
+    const json = try std.json.Stringify.valueAlloc(allocator, state, .{ .emit_null_optional_fields = false });
+    defer allocator.free(json);
+    return std.fmt.allocPrint(allocator, "{s}\n", .{json});
+}
+
 /// A named temporary file in the destination directory is renamed after writing.
 pub fn atomicWrite(io: std.Io, path: []const u8, bytes: []const u8) !void {
     var file = try std.Io.Dir.cwd().createFileAtomic(io, path, .{ .replace = true });
@@ -1214,7 +1357,7 @@ pub fn atomicWrite(io: std.Io, path: []const u8, bytes: []const u8) !void {
 pub fn saveState(allocator: std.mem.Allocator, io: std.Io, root: []const u8, state: State) !void {
     const path = try std.fs.path.join(allocator, &.{ root, state.id, state_file_name });
     defer allocator.free(path);
-    const json = try std.json.Stringify.valueAlloc(allocator, state, .{ .emit_null_optional_fields = false });
+    const json = try stateJson(allocator, state);
     defer allocator.free(json);
     try atomicWrite(io, path, json);
 }

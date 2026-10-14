@@ -2,6 +2,7 @@ const std = @import("std");
 const oci = @import("oci.zig");
 
 pub const LinuxBackend = @import("backend/linux.zig").LinuxBackend;
+pub const hooks = @import("backend/hooks.zig");
 
 pub const Backend = struct {
     ptr: *anyopaque,
@@ -24,6 +25,28 @@ pub const Backend = struct {
         rlimits: []const Rlimit = &.{},
         devices: []const Device = &.{},
         device_symlinks: []const Symlink = &.{},
+        create_hooks: []const Hook = &.{},
+        start_hooks: []const Hook = &.{},
+        /// Opaque serialized input, split where the host PID is inserted.
+        /// Only the frontend knows its JSON schema and lifecycle status.
+        create_hook_state: HookState = .{},
+        start_hook_state: HookState = .{},
+        /// Called in the parent after mounts are ready, before child hooks and
+        /// pivot_root. Returning an error aborts create and cleans up init.
+        on_create: ?CreateCallback = null,
+        masked_paths: []const []const u8 = &.{},
+        readonly_paths: []const []const u8 = &.{},
+        rootfs_propagation: u32 = std.os.linux.MS.PRIVATE | std.os.linux.MS.REC,
+    };
+
+    pub const Hook = hooks.Hook;
+    pub const CreateCallback = struct {
+        ptr: *anyopaque,
+        run: *const fn (*anyopaque, Handle) Error!void,
+    };
+    pub const HookState = struct {
+        prefix: []const u8 = "",
+        suffix: []const u8 = "",
     };
 
     /// Device types, defaults and paths have been translated by the frontend.
@@ -35,9 +58,8 @@ pub const Backend = struct {
         mode: u32 = 0o666,
         uid: u32 = 0,
         gid: u32 = 0,
-        /// Only frontend defaults may be skipped when device setup is unavailable.
+        /// Explicit devices cannot be skipped when /dev is bind-mounted.
         required: bool = true,
-
         pub const Kind = enum { character, block, fifo };
     };
 
@@ -106,6 +128,8 @@ pub const Backend = struct {
         ProcessNotFound,
         CgroupWriteFailed,
         CgroupDeleteFailed,
+        HookFailed,
+        HookTimeout,
     } || std.mem.Allocator.Error;
 
     /// Backends receive parsed values only; the frontend loads config.json and resolves paths.
