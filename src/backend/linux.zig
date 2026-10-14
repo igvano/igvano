@@ -8,6 +8,8 @@ const hooks = @import("hooks.zig");
 
 const ST_NOATIME: usize = 1024;
 const ST_RELATIME: usize = 4096; // Unlike MS_RELATIME.
+const OPEN_TREE_CLONE: u32 = 1;
+const OPEN_TREE_CLOEXEC: u32 = 1 << @bitOffsetOf(linux.O, "CLOEXEC");
 
 /// EPERM fallback preserves flags even in an inherited user namespace.
 /// Strict atime is implicit in statfs; never combine incompatible atime modes.
@@ -1270,9 +1272,26 @@ fn setupConsole(socket: posix.fd_t) Backend.Error!void {
     defer closeFd(root);
     const target = try consoleAboveStdio(try mountDestination(root, "/dev/console", true, true));
     defer closeFd(target);
-    var source_buffer: [64]u8 = undefined;
-    var target_buffer: [64]u8 = undefined;
-    try checkResult(linux.mount(slave_path orelse fdPath(&source_buffer, slave), fdPath(&target_buffer, target), null, linux.MS.BIND, 0));
+    bind: {
+        const cloned = linux.syscall3(.open_tree, @intCast(slave), @intFromPtr(""), OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC | linux.AT.EMPTY_PATH);
+        if (linux.errno(cloned) != .NOSYS) {
+            try checkResult(cloned);
+            const tree: posix.fd_t = @intCast(cloned);
+            defer closeFd(tree);
+            var flags = std.mem.zeroes(linux.MOVE_MOUNT);
+            flags.F_EMPTY_PATH = true;
+            flags.T_EMPTY_PATH = true;
+            const moved = linux.syscall5(.move_mount, @intCast(tree), @intFromPtr(""), @intCast(target), @intFromPtr(""), @as(u32, @bitCast(flags)));
+            if (linux.errno(moved) != .NOSYS) {
+                try checkResult(moved);
+                break :bind;
+            }
+        }
+        // Older kernels still need procfs for the descriptor paths.
+        var source_buffer: [64]u8 = undefined;
+        var target_buffer: [64]u8 = undefined;
+        try checkResult(linux.mount(slave_path orelse fdPath(&source_buffer, slave), fdPath(&target_buffer, target), null, linux.MS.BIND, 0));
+    }
     try checkResult(linux.setsid());
     try checkResult(linux.ioctl(slave, linux.T.IOCSCTTY, 0));
     for (0..3) |fd| {
@@ -1769,9 +1788,10 @@ fn setupRootfs(rootfs: [:0]const u8, mounts: []const PreparedMount, devices: []c
     try hooks.run(options.create_hooks, options.create_hook_state);
     // runc's fd trick stacks the old root on the new root without a put_old
     // directory. Detach it and close both handles before any container exec.
-    const old_root = try openPath(linux.AT.FDCWD, "/", .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true });
+    // Keep them above stdio, which console setup replaces before they close.
+    const old_root = try consolePath("/", .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true });
     defer closeFd(old_root);
-    const new_root = try openPath(linux.AT.FDCWD, rootfs, .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true });
+    const new_root = try consolePath(rootfs, .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true });
     defer closeFd(new_root);
     // Populate rootfs /dev even without tmpfs, but leave a bind-mounted /dev
     // untouched: device nodes and symlinks there would mutate the host source.
@@ -1783,6 +1803,13 @@ fn setupRootfs(rootfs: [:0]const u8, mounts: []const PreparedMount, devices: []c
     try checkResult(linux.mount(null, ".", null, ms.SLAVE | ms.REC, 0));
     try checkResult(linux.umount2(".", linux.MNT.DETACH));
     try checkResult(linux.chdir("/"));
+    if (options.console_fd) |socket| {
+        defer closeFd(socket);
+        setupConsole(socket) catch |err| {
+            childError("igvano: cannot set up console (requires devpts mounted at /dev/pts): ", err);
+            linux.exit_group(1);
+        };
+    }
     try applyPathRestrictions(options.masked_paths, options.readonly_paths);
     if (readonly) {
         try bindRemount(new_root, "/", ms.BIND | ms.REMOUNT | ms.RDONLY);
@@ -1818,13 +1845,6 @@ fn runInit(
         childError("igvano: cannot prepare rootfs: ", err);
         linux.exit_group(1);
     };
-    if (rootfs_options.console_fd) |socket| {
-        setupConsole(socket) catch |err| {
-            childError("igvano: cannot set up console (requires devpts mounted at /dev/pts): ", err);
-            linux.exit_group(1);
-        };
-        closeFd(socket);
-    }
     if (flags & linux.CLONE.NEWUTS != 0) {
         if (spec.hostname) |hostname| {
             // Zig 0.16 has no sethostname wrapper.
@@ -3271,6 +3291,99 @@ test "linux privileged bind remount honors atime changes and clears unrequested 
         }
         try std.testing.expectEqual(@as(u32, 0), try waitChild(pid));
     }
+}
+
+test "linux rootfs console setup precedes restrictions and readonly without a dev tmpfs" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    try testRootfsConsole(true, true);
+}
+
+test "linux rootfs console setup uses move mount without procfs" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    try testRootfsConsole(false, false);
+}
+
+fn testRootfsConsole(readonly: bool, mount_proc: bool) !void {
+    try requireTestMountNamespace();
+    if (!mount_proc) {
+        // Invalid descriptors probe syscall availability without changing mounts.
+        const invalid_fd = std.math.maxInt(usize);
+        if (linux.errno(linux.syscall3(.open_tree, invalid_fd, @intFromPtr(""), linux.AT.EMPTY_PATH)) == .NOSYS or
+            linux.errno(linux.syscall5(.move_mount, invalid_fd, @intFromPtr(""), invalid_fd, @intFromPtr(""), 0)) == .NOSYS)
+            return error.SkipZigTest;
+    }
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "rootfs", .default_dir);
+    const base = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer std.testing.allocator.free(base);
+    const absolute = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, base, std.testing.allocator);
+    defer std.testing.allocator.free(absolute);
+    const rootfs = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/rootfs", .{absolute}, 0);
+    defer std.testing.allocator.free(rootfs);
+    const mounts = [_]PreparedMount{
+        .{ .destination = "/dev/pts", .source = "devpts", .type = "devpts", .flags = linux.MS.NOSUID | linux.MS.NOEXEC, .propagation = 0, .data = "newinstance,ptmxmode=666,mode=620" },
+        .{ .destination = "/proc", .source = "proc", .type = "proc", .flags = 0, .propagation = 0, .data = "" },
+    };
+    const symlinks = [_]Backend.Symlink{.{ .path = "/dev/ptmx", .target = "pts/ptmx" }};
+    const sockets = try console.socketpair();
+    const go = try makePipe();
+    defer for (go) |fd| closeFd(fd);
+    const pid = try forkProcess();
+    if (pid == 0) {
+        closeFd(sockets[0]);
+        closeFd(go[1]);
+        checkResult(linux.unshare(linux.CLONE.NEWNS)) catch linux.exit_group(1);
+        // Exercise retained root descriptors when console replaces closed stdio.
+        for (0..3) |fd| closeFd(@intCast(fd));
+        setupRootfs(rootfs, mounts[0..if (mount_proc) 2 else 1], &.{}, &symlinks, readonly, .{
+            .console_fd = sockets[1],
+            .masked_paths = if (readonly) &.{"/dev/pts"} else &.{},
+            .readonly_paths = if (readonly) &.{"/dev"} else &.{},
+        }) catch linux.exit_group(2);
+        if (linux.errno(linux.fcntl(sockets[1], linux.F.GETFD, 0)) != .BADF) linux.exit_group(3);
+        if (!mount_proc and linux.errno(linux.access("/proc/self/fd", linux.F_OK)) != .NOENT) linux.exit_group(4);
+        if (readonly) {
+            for ([_][*:0]const u8{ "/new", "/dev/new" }) |path| {
+                if (linux.errno(linux.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true }, 0o600)) != .ROFS)
+                    linux.exit_group(5);
+            }
+            if (linux.errno(linux.access("/dev/pts/ptmx", linux.F_OK)) != .NOENT) linux.exit_group(6);
+        }
+        var root_stat: linux.Statx = undefined;
+        var dev_stat: linux.Statx = undefined;
+        var console_stat: linux.Statx = undefined;
+        var slave_stat: linux.Statx = undefined;
+        checkResult(linux.statx(linux.AT.FDCWD, "/", 0, .BASIC_STATS, &root_stat)) catch linux.exit_group(7);
+        checkResult(linux.statx(linux.AT.FDCWD, "/dev", 0, .BASIC_STATS, &dev_stat)) catch linux.exit_group(7);
+        if (root_stat.dev_major != dev_stat.dev_major or root_stat.dev_minor != dev_stat.dev_minor)
+            linux.exit_group(8);
+        checkResult(linux.statx(linux.AT.FDCWD, "/dev/console", linux.AT.SYMLINK_NOFOLLOW, .BASIC_STATS, &console_stat)) catch linux.exit_group(9);
+        checkResult(linux.statx(1, "", linux.AT.EMPTY_PATH, .BASIC_STATS, &slave_stat)) catch linux.exit_group(9);
+        if (console_stat.mode & linux.S.IFMT != linux.S.IFCHR or
+            console_stat.ino != slave_stat.ino or
+            console_stat.dev_major != slave_stat.dev_major or console_stat.dev_minor != slave_stat.dev_minor)
+            linux.exit_group(10);
+        if (!writeAll(1, "console\n")) linux.exit_group(11);
+        var byte: [1]u8 = undefined;
+        if (!readAll(go[0], &byte)) linux.exit_group(12);
+        linux.exit_group(0);
+    }
+    closeFd(sockets[1]);
+    defer closeFd(sockets[0]);
+    var reaped = false;
+    defer if (!reaped) {
+        _ = linux.kill(pid, .KILL);
+        _ = waitChild(pid) catch {};
+    };
+    const master = try console.receiveFd(sockets[0]);
+    defer closeFd(master);
+    var output: [9]u8 = undefined;
+    try std.testing.expect(readAll(master, &output));
+    try std.testing.expectEqualStrings("console\r\n", &output);
+    try std.testing.expect(writeAll(go[1], &.{1}));
+    try std.testing.expectEqual(@as(u32, 0), try waitChild(pid));
+    reaped = true;
 }
 
 test "linux rootfs setup applies ordered mounts detaches the host root and enforces readonly" {
