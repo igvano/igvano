@@ -673,9 +673,8 @@ pub fn processCapabilities(config: Spec.Capabilities) !Backend.Capabilities {
     inline for (std.meta.fields(Backend.Capabilities)) |field| {
         for (@field(config, field.name) orelse &.{}) |name| {
             const number = try capabilityNumber(name) orelse {
-                // OCI 1.1 says runtimes SHOULD NOT fail on unknown capabilities.
-                std.debug.print("igvano: warning: ignoring unknown capability {s}\n", .{name});
-                continue;
+                std.debug.print("igvano: unknown capability {s}\n", .{name});
+                return error.InvalidConfig;
             };
             @field(result, field.name) |= @as(u64, 1) << number;
         }
@@ -723,6 +722,15 @@ test "capability names map the complete Linux set and reject malformed names" {
     };
     for (names, 0..) |name, number|
         try std.testing.expectEqual(@as(?u6, @intCast(number)), try capabilityNumber(name));
+    const caps = try processCapabilities(.{
+        .bounding = &names,
+        .effective = &names,
+        .permitted = &names,
+        .inheritable = &names,
+        .ambient = &names,
+    });
+    inline for (std.meta.fields(Backend.Capabilities)) |field|
+        try std.testing.expectEqual(@as(u64, 0x1ffffffffff), @field(caps, field.name));
     for ([_][]const u8{ "", "CHOWN", "cap_chown", "CAP_", "CAP_chown", "CAP_CHOWN\x00", "CAP_CHOWN!" }) |name|
         try std.testing.expectError(error.InvalidConfig, capabilityNumber(name));
     try std.testing.expectEqual(@as(?u6, null), try capabilityNumber("CAP_FUTURE"));
@@ -779,12 +787,12 @@ test "ambient capabilities require membership in both permitted and inheritable"
     try std.testing.expectEqual(@as(u64, 1) << 40, upper.bounding);
 }
 
-test "process capabilities skip well formed names unknown to the capability table" {
-    const caps = try processCapabilities(.{
-        .bounding = &.{ "CAP_CHOWN", "CAP_FUTURE" },
-        .ambient = &.{"CAP_FUTURE"},
-    });
-    try std.testing.expectEqual(Backend.Capabilities{ .bounding = 1 }, caps);
+test "process capabilities reject unknown names in every set" {
+    inline for (std.meta.fields(Spec.Capabilities)) |field| {
+        var config: Spec.Capabilities = .{};
+        @field(config, field.name) = &.{ "CAP_CHOWN", "CAP_FUTURE" };
+        try std.testing.expectError(error.InvalidConfig, processCapabilities(config));
+    }
 }
 
 test "process parses capabilities rlimits and supplementary groups" {
