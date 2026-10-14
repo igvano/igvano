@@ -406,12 +406,14 @@ fn loadHasProcess(allocator: std.mem.Allocator, io: std.Io, config: Config) !boo
     const json = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(32)) catch |err| switch (err) {
         // Older state directories did not capture whether a process was configured.
         error.FileNotFound => return true,
+        error.StreamTooLong => return error.InvalidState,
         else => return err,
     };
     defer allocator.free(json);
-    const parsed = try std.json.parseFromSlice(bool, allocator, json, .{});
-    defer parsed.deinit();
-    return parsed.value;
+    const value = std.mem.trim(u8, json, " \t\r\n");
+    if (std.mem.eql(u8, value, "true")) return true;
+    if (std.mem.eql(u8, value, "false")) return false;
+    return error.InvalidState;
 }
 
 fn stateHandle(allocator: std.mem.Allocator, io: std.Io, root: []const u8, state: oci.State) !Backend.Handle {
@@ -589,7 +591,10 @@ fn stopContainer(io: std.Io, backend: Backend, handle: ?Backend.Handle) !void {
             };
             const started = std.Io.Clock.awake.now(io);
             while (try backend.alive(value)) {
-                if (started.untilNow(io, .awake).nanoseconds >= std.Io.Duration.fromSeconds(1).nanoseconds) break;
+                if (started.untilNow(io, .awake).nanoseconds >= std.Io.Duration.fromSeconds(1).nanoseconds) {
+                    std.debug.print("igvano: warning: container init still alive 1s after SIGKILL\n", .{});
+                    break;
+                }
                 try std.Io.sleep(io, .fromMilliseconds(10), .awake);
             }
         }
@@ -2093,10 +2098,15 @@ test "start uses saved process presence after bundle config changes" {
     const start_result: ?anyerror = if (builtin.os.tag == .linux) null else error.NotImplemented;
     const cases = [_]struct { process: ?[]const u8, json: []const u8, failure: ?anyerror }{
         .{ .process = "true\n", .json = "garbage", .failure = start_result },
+        .{ .process = " \ttrue\r\n", .json = "garbage", .failure = start_result },
         .{ .process = "true\n", .json = "{}", .failure = start_result },
         .{ .process = "true\n", .json = "{\"ociVersion\":\"1.0.2\",\"root\":{\"path\":\"/\"}}", .failure = start_result },
         .{ .process = "false\n", .json = "{\"ociVersion\":\"1.0.2\",\"root\":{\"path\":\"/\"},\"process\":{\"args\":[\"/bin/sh\"],\"cwd\":\"/\",\"user\":{\"uid\":0,\"gid\":0}}}", .failure = error.MissingProcess },
         .{ .process = "false\n", .json = "garbage", .failure = error.MissingProcess },
+        .{ .process = " \tfalse\r\n", .json = "garbage", .failure = error.MissingProcess },
+        .{ .process = "garbage\n", .json = "garbage", .failure = error.InvalidState },
+        .{ .process = "", .json = "garbage", .failure = error.InvalidState },
+        .{ .process = "x" ** 33, .json = "garbage", .failure = error.InvalidState },
         .{ .process = null, .json = "garbage", .failure = start_result },
     };
     var implementation: TestBackend = .{};
