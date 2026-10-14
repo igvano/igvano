@@ -22,6 +22,7 @@ const Config = struct {
     pid_file: ?[]const u8 = null,
     console_socket: ?[]const u8 = null,
     signal: ?[]const u8 = null,
+    force: bool = false,
 };
 
 fn parseArgs(args: []const []const u8) !Config {
@@ -48,6 +49,7 @@ fn parseArgs(args: []const []const u8) !Config {
     var bundle: ?[]const u8 = null;
     var pid_file: ?[]const u8 = null;
     var console_socket: ?[]const u8 = null;
+    var force = false;
     if (subcommand == .create) {
         while (index < args.len and std.mem.startsWith(u8, args[index], "-")) : (index += 1) {
             if (std.mem.eql(u8, args[index], "--bundle")) {
@@ -79,6 +81,11 @@ fn parseArgs(args: []const []const u8) !Config {
             }
         }
         if (bundle == null) bundle = ".";
+    } else if (subcommand == .delete) {
+        while (index < args.len and std.mem.startsWith(u8, args[index], "-")) : (index += 1) {
+            if (!std.mem.eql(u8, args[index], "--force")) return error.UnknownOption;
+            force = true;
+        }
     }
     if (index >= args.len) return error.MissingId;
     const remaining = args.len - index;
@@ -101,6 +108,7 @@ fn parseArgs(args: []const []const u8) !Config {
         .pid_file = pid_file,
         .console_socket = console_socket,
         .signal = signal,
+        .force = force,
     };
 }
 
@@ -546,15 +554,40 @@ fn killContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, con
     try backend.kill(state.handle.?, signal);
 }
 
+fn requireDelete(status: oci.Status, force: bool) !void {
+    if (!force) try oci.requireDelete(status);
+}
+
+fn stopContainer(io: std.Io, backend: Backend, handle: ?Backend.Handle) !void {
+    if (handle) |value| {
+        if (try backend.alive(value)) {
+            backend.kill(value, 9) catch |err| switch (err) {
+                error.ProcessNotFound => {},
+                else => return err,
+            };
+            const started = std.Io.Clock.awake.now(io);
+            while (try backend.alive(value)) {
+                if (started.untilNow(io, .awake).nanoseconds >= std.Io.Duration.fromSeconds(1).nanoseconds) break;
+                try std.Io.sleep(io, .fromMilliseconds(10), .awake);
+            }
+        }
+    }
+}
+
 fn deleteContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, config: Config) !void {
     var state = try readLiveState(allocator, io, backend, config);
     defer state.deinit();
-    try oci.requireDelete(state.parsed.value.status);
+    try requireDelete(state.parsed.value.status, config.force);
+    if (config.force) try stopContainer(io, backend, state.handle);
     const hooks = loadSavedHooks(allocator, io, config) catch |err| hooks: {
         std.debug.print("igvano: warning: cannot load poststop hooks: {s}\n", .{@errorName(err)});
         break :hooks null;
     };
     defer if (hooks) |parsed| parsed.deinit();
+    try destroyContainer(allocator, io, backend, config, &state, if (hooks) |parsed| parsed.value.poststop else null);
+}
+
+fn destroyContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, config: Config, state: *LiveState, poststop: ?[]const oci.Spec.Hook) !void {
     const cgroup_path = if (state.handle) |handle|
         handle.cgroup_path
     else
@@ -572,7 +605,7 @@ fn deleteContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, c
     const path = try std.fs.path.join(allocator, &.{ config.root, config.id });
     defer allocator.free(path);
     try std.Io.Dir.cwd().deleteTree(io, path);
-    if (hooks) |parsed| warnHooks(allocator, parsed.value.poststop, state.parsed.value, "poststop");
+    warnHooks(allocator, poststop, state.parsed.value, "poststop");
 }
 
 fn stateContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, config: Config) !void {
@@ -617,7 +650,8 @@ pub fn main(init: std.process.Init) !u8 {
             error.InvalidId => "invalid container id",
         };
         std.debug.print(
-            "igvano: {s}\nUsage: igvano [--root <dir>] <state|start|delete> <id>\n" ++
+            "igvano: {s}\nUsage: igvano [--root <dir>] <state|start> <id>\n" ++
+                "       igvano [--root <dir>] delete [--force] <id>\n" ++
                 "       igvano [--root <dir>] kill <id> [signal]\n" ++
                 "       igvano [--root <dir>] create [--bundle <path>] [--pid-file <file>] [--console-socket <path>] <id>\n",
             .{message},
@@ -982,10 +1016,12 @@ test "state handle requires a nonempty starttime file" {
     try std.testing.expectEqualStrings("custom/from-state", handle.cgroup_path.?);
 }
 
-test "delete requires created and running containers to stop before removal" {
+test "delete requires stopped containers unless forced and waits after SIGKILL" {
     const TestBackend = struct {
         is_alive: bool,
         deleted: bool = false,
+        signal: ?i32 = null,
+        polls_after_kill: usize = 0,
         const vtable: Backend.VTable = .{ .create = create, .alive = alive, .kill = kill, .delete = delete };
 
         fn create(_: *anyopaque, _: Backend.CreateOptions) Backend.Error!Backend.Handle {
@@ -993,10 +1029,15 @@ test "delete requires created and running containers to stop before removal" {
         }
         fn alive(ptr: *anyopaque, _: Backend.Handle) Backend.Error!bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.signal != null) {
+                self.polls_after_kill += 1;
+                return self.polls_after_kill == 1;
+            }
             return self.is_alive;
         }
-        fn kill(_: *anyopaque, _: Backend.Handle, _: i32) Backend.Error!void {
-            return error.NotImplemented;
+        fn kill(ptr: *anyopaque, _: Backend.Handle, signal: i32) Backend.Error!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.signal = signal;
         }
         fn delete(ptr: *anyopaque, _: Backend.Handle) Backend.Error!void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -1007,35 +1048,44 @@ test "delete requires created and running containers to stop before removal" {
     defer tmp.cleanup();
     const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
     defer std.testing.allocator.free(root);
-    const config: Config = .{ .root = root, .subcommand = .delete, .id = "example" };
-    for ([_]oci.Status{ .created, .running }) |status| {
-        for ([_]bool{ true, false }) |is_alive| {
-            try tmp.dir.createDir(std.testing.io, "example", .default_dir);
-            try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "example/starttime", .data = "12345" });
-            try oci.saveState(std.testing.allocator, std.testing.io, root, .{
-                .id = "example",
-                .pid = 1234,
-                .status = status,
-                .bundle = "/bundle",
-            });
-            var implementation: TestBackend = .{ .is_alive = is_alive };
-            const backend: Backend = .{ .ptr = &implementation, .vtable = &TestBackend.vtable };
-            if (is_alive) {
-                const before = try tmp.dir.readFileAlloc(std.testing.io, "example/state.json", std.testing.allocator, .limited(4096));
-                defer std.testing.allocator.free(before);
-                try std.testing.expectError(error.InvalidStatus, deleteContainer(std.testing.allocator, std.testing.io, backend, config));
-                try std.testing.expect(!implementation.deleted);
-                const after = try tmp.dir.readFileAlloc(std.testing.io, "example/state.json", std.testing.allocator, .limited(4096));
-                defer std.testing.allocator.free(after);
-                try std.testing.expectEqualStrings(before, after);
-                const starttime = try tmp.dir.readFileAlloc(std.testing.io, "example/starttime", std.testing.allocator, .limited(32));
-                defer std.testing.allocator.free(starttime);
-                try std.testing.expectEqualStrings("12345", starttime);
-                try tmp.dir.deleteTree(std.testing.io, "example");
-            } else {
-                try deleteContainer(std.testing.allocator, std.testing.io, backend, config);
-                try std.testing.expect(implementation.deleted);
-                try std.testing.expectError(error.FileNotFound, tmp.dir.openDir(std.testing.io, "example", .{}));
+    for ([_]bool{ false, true }) |force| {
+        const config: Config = .{ .root = root, .subcommand = .delete, .id = "example", .force = force };
+        for ([_]oci.Status{ .creating, .created, .running, .stopped }) |status| {
+            for ([_]bool{ true, false }) |is_alive| {
+                try tmp.dir.createDir(std.testing.io, "example", .default_dir);
+                try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "example/starttime", .data = "12345" });
+                try oci.saveState(std.testing.allocator, std.testing.io, root, .{
+                    .id = "example",
+                    .pid = 1234,
+                    .status = status,
+                    .bundle = "/bundle",
+                });
+                var implementation: TestBackend = .{ .is_alive = is_alive };
+                const backend: Backend = .{ .ptr = &implementation, .vtable = &TestBackend.vtable };
+                if (!force and is_alive and status != .stopped) {
+                    const before = try tmp.dir.readFileAlloc(std.testing.io, "example/state.json", std.testing.allocator, .limited(4096));
+                    defer std.testing.allocator.free(before);
+                    try std.testing.expectError(error.InvalidStatus, deleteContainer(std.testing.allocator, std.testing.io, backend, config));
+                    try std.testing.expect(!implementation.deleted);
+                    try std.testing.expect(implementation.signal == null);
+                    const after = try tmp.dir.readFileAlloc(std.testing.io, "example/state.json", std.testing.allocator, .limited(4096));
+                    defer std.testing.allocator.free(after);
+                    try std.testing.expectEqualStrings(before, after);
+                    const starttime = try tmp.dir.readFileAlloc(std.testing.io, "example/starttime", std.testing.allocator, .limited(32));
+                    defer std.testing.allocator.free(starttime);
+                    try std.testing.expectEqualStrings("12345", starttime);
+                    try tmp.dir.deleteTree(std.testing.io, "example");
+                } else {
+                    try deleteContainer(std.testing.allocator, std.testing.io, backend, config);
+                    try std.testing.expect(implementation.deleted);
+                    if (force and is_alive and status != .stopped) {
+                        try std.testing.expectEqual(@as(?i32, 9), implementation.signal);
+                        try std.testing.expectEqual(@as(usize, 2), implementation.polls_after_kill);
+                    } else {
+                        try std.testing.expect(implementation.signal == null);
+                    }
+                    try std.testing.expectError(error.FileNotFound, tmp.dir.openDir(std.testing.io, "example", .{}));
+                }
             }
         }
     }
@@ -1245,6 +1295,39 @@ test "kill parsing preserves an optional positional signal" {
     const explicit_signal = try parseArgs(&.{ "igvano", "kill", "example", "TERM" });
     try std.testing.expectEqualStrings("TERM", explicit_signal.signal.?);
     try std.testing.expectError(error.UnexpectedArgument, parseArgs(&.{ "igvano", "kill", "example", "TERM", "extra" }));
+}
+
+test "argument parsing accepts force only for delete" {
+    const config = try parseArgs(&.{ "igvano", "--root", "/tmp/containers", "delete", "--force", "example" });
+    try std.testing.expectEqual(Subcommand.delete, config.subcommand);
+    try std.testing.expectEqualStrings("/tmp/containers", config.root);
+    try std.testing.expectEqualStrings("example", config.id);
+    try std.testing.expect(config.force);
+    try std.testing.expect(!(try parseArgs(&.{ "igvano", "delete", "example" })).force);
+    try std.testing.expectError(error.MissingId, parseArgs(&.{ "igvano", "delete", "--force" }));
+    try std.testing.expectError(error.UnknownOption, parseArgs(&.{ "igvano", "--force", "delete", "example" }));
+    try std.testing.expectError(error.UnknownOption, parseArgs(&.{ "igvano", "delete", "--force=true", "example" }));
+    try std.testing.expectError(error.UnexpectedArgument, parseArgs(&.{ "igvano", "delete", "example", "--force" }));
+    const rejected = [_]struct { subcommand: []const u8, err: anyerror }{
+        .{ .subcommand = "create", .err = error.UnknownOption },
+        .{ .subcommand = "state", .err = error.UnexpectedArgument },
+        .{ .subcommand = "start", .err = error.UnexpectedArgument },
+        .{ .subcommand = "kill", .err = error.InvalidId },
+    };
+    for (rejected) |case| {
+        try std.testing.expectError(case.err, parseArgs(&.{ "igvano", case.subcommand, "--force", "example" }));
+    }
+}
+
+test "forced delete accepts every lifecycle status while ordinary delete requires stopped" {
+    for ([_]oci.Status{ .creating, .created, .running, .stopped }) |status| {
+        try requireDelete(status, true);
+        if (status == .stopped) {
+            try requireDelete(status, false);
+        } else {
+            try std.testing.expectError(error.InvalidStatus, requireDelete(status, false));
+        }
+    }
 }
 
 test "signal parsing accepts Linux names, prefixes, aliases and numbers" {
