@@ -27,6 +27,7 @@ pub const Backend = struct {
         cgroup_writes: []const CgroupWrite = &.{},
         capabilities: ?Capabilities = null,
         rlimits: []const Rlimit = &.{},
+        oom_score_adj: ?i32 = null,
         devices: []const Device = &.{},
         device_symlinks: []const Symlink = &.{},
         create_hooks: []const Hook = &.{},

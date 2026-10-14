@@ -353,6 +353,9 @@ pub const LinuxBackend = struct {
                 // inherits this membership; the runtime parent stays outside.
                 writeCgroupFile(cgroup, "cgroup.procs", "0", options.cgroup_path) catch |err| failCreate(report[1], err);
                 closeFd(cgroup);
+                // Set with host privileges before entering user namespaces.
+                // Child2 inherits the adjustment across fork and exec.
+                applyOomScoreAdj(proc_dir, options.oom_score_adj) catch |err| failCreate(report[1], err);
                 joinNamespaces(joins.items) catch |err| failCreate(report[1], err);
                 // NEWUSER is unshared together with the others so it owns them.
                 if (flags != 0) checkResult(linux.unshare(flags)) catch |err| failCreate(report[1], err);
@@ -1851,6 +1854,19 @@ fn runProcess(spec: *const oci.Spec, argv: [*:null]const ?[*:0]const u8, envp: [
     execProcess(argv, envp);
 }
 
+fn applyOomScoreAdj(proc_dir: posix.fd_t, oom_score_adj: ?i32) Backend.Error!void {
+    if (comptime builtin.os.tag == .linux) {
+        const value = oom_score_adj orelse return;
+        var buffer: [12]u8 = undefined;
+        const text = std.fmt.bufPrint(&buffer, "{d}", .{value}) catch unreachable;
+        const fd = try openPath(proc_dir, "self/oom_score_adj", .{ .ACCMODE = .WRONLY, .CLOEXEC = true });
+        defer closeFd(fd);
+        if (!writeAll(fd, text)) return error.CreateFailed;
+    } else {
+        return error.NotImplemented;
+    }
+}
+
 /// Runs before readiness, without allocating. Keep privileges until limits and
 /// bounding drops finish, then retain permitted caps across the UID transition.
 // For UID 0, exec recomputes permitted/effective as inheritable | bounding (as in runc).
@@ -2383,6 +2399,56 @@ test "linux init applies uid gid and optional supplementary groups before exec" 
     }
 }
 
+test "linux init applies oomScoreAdj before exec" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const proc_dir = try openPath(linux.AT.FDCWD, "/proc", .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true });
+    defer closeFd(proc_dir);
+    const argv = [_:null]?[*:0]const u8{ "/bin/sh", "-c", "test \"$(cat /proc/self/oom_score_adj)\" = 500" };
+    const envp = [_:null]?[*:0]const u8{"PATH=/usr/bin:/bin"};
+    const pid = try forkProcess();
+    if (pid == 0) {
+        applyOomScoreAdj(proc_dir, 500) catch linux.exit_group(1);
+        execProcess(&argv, &envp);
+    }
+    try std.testing.expectEqual(@as(u32, 0), try waitChild(pid));
+}
+
+test "linux init preserves inherited oomScoreAdj when unset" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const proc_dir = try openPath(linux.AT.FDCWD, "/proc", .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true });
+    defer closeFd(proc_dir);
+    const argv = [_:null]?[*:0]const u8{ "/bin/sh", "-c", "test \"$(cat /proc/self/oom_score_adj)\" = 500" };
+    const envp = [_:null]?[*:0]const u8{"PATH=/usr/bin:/bin"};
+    const pid = try forkProcess();
+    if (pid == 0) {
+        applyOomScoreAdj(proc_dir, 500) catch linux.exit_group(2);
+        const child = forkProcess() catch linux.exit_group(2);
+        if (child == 0) {
+            applyOomScoreAdj(proc_dir, null) catch linux.exit_group(1);
+            execProcess(&argv, &envp);
+        }
+        const status = waitChild(child) catch linux.exit_group(2);
+        linux.exit_group(if (status == 0) 0 else 1);
+    }
+    try std.testing.expectEqual(@as(u32, 0), try waitChild(pid));
+}
+
+test "linux init exits nonzero instead of exec for out of range oomScoreAdj" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const proc_dir = try openPath(linux.AT.FDCWD, "/proc", .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true });
+    defer closeFd(proc_dir);
+    const argv = [_:null]?[*:0]const u8{ "/bin/sh", "-c", "exit 0" };
+    const envp = [_:null]?[*:0]const u8{};
+    for ([_]i32{ 1001, -1001 }) |value| {
+        const pid = try forkProcess();
+        if (pid == 0) {
+            applyOomScoreAdj(proc_dir, value) catch linux.exit_group(1);
+            execProcess(&argv, &envp);
+        }
+        try std.testing.expectEqual(@as(u32, 1 << 8), try waitChild(pid));
+    }
+}
+
 test "linux init exits nonzero instead of exec when it cannot apply process user" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const spec: oci.Spec = .{
@@ -2615,6 +2681,12 @@ test "linux create reports child setup failures without leaving an init" {
     options.rlimits = &.{.{ .resource = .NOFILE, .hard = std.math.maxInt(u64), .soft = 0 }};
     try std.testing.expectError(error.CreateFailed, implementation.backend().create(options));
     try std.testing.expectEqual(@as(?posix.fd_t, null), try walkCgroup(cgroup_root.fd, cgroup_path, false, &.{}));
+    options.rlimits = &.{};
+    for ([_]i32{ 1001, -1001 }) |value| {
+        options.oom_score_adj = value;
+        try std.testing.expectError(error.CreateFailed, implementation.backend().create(options));
+        try std.testing.expectEqual(@as(?posix.fd_t, null), try walkCgroup(cgroup_root.fd, cgroup_path, false, &.{}));
+    }
 }
 
 test "linux create accepts an empty rootfs and returns a live blocked init" {
@@ -2824,6 +2896,7 @@ test "linux mapped create installs maps outside init and cleans up rejected maps
             .{ .path = "/dev/zero", .kind = .character, .major = 1, .minor = 5 },
             .{ .path = "/dev/pipe", .kind = .fifo, .mode = 0o620, .uid = 1, .gid = 2 },
         },
+        .oom_score_adj = 500,
         .device_symlinks = oci.deviceSymlinks(&.{}),
         .cgroup_path = cgroup_path,
     };
@@ -2837,6 +2910,11 @@ test "linux mapped create installs maps outside init and cleans up rejected maps
         backend.delete(handle) catch {};
     }
     try std.testing.expect(try backend.alive(handle));
+    const oom_path = try std.fmt.allocPrint(std.testing.allocator, "/proc/{d}/oom_score_adj", .{handle.pid});
+    defer std.testing.allocator.free(oom_path);
+    const oom_score_adj = try ProcFile.read(oom_path, .limited(32));
+    defer std.testing.allocator.free(oom_score_adj);
+    try std.testing.expectEqualStrings("500\n", oom_score_adj);
     for ([_]struct { name: []const u8, tokens: []const []const u8 }{
         .{ .name = "uid_map", .tokens = &.{ "0", "100000", "10" } },
         .{ .name = "gid_map", .tokens = &.{ "0", "200000", "10" } },
@@ -2892,6 +2970,10 @@ test "linux mapped create installs maps outside init and cleans up rejected maps
         joined_options.spec = &joined_spec;
         joined_options.exec_fifo = joined_fifo;
         joined_options.cgroup_path = joined_cgroup;
+        // Lowering requires host CAP_SYS_RESOURCE even when joining a user
+        // namespace whose root maps to a different host UID.
+        if (caps[0].effective & (@as(u32, 1) << linux.CAP.SYS_RESOURCE) != 0)
+            joined_options.oom_score_adj = -500;
         const joined = try backend.create(joined_options);
         defer std.testing.allocator.free(joined.starttime);
         defer {
@@ -2899,6 +2981,11 @@ test "linux mapped create installs maps outside init and cleans up rejected maps
             backend.delete(joined) catch {};
         }
         try std.testing.expect(try backend.alive(joined));
+        const joined_oom_path = try std.fmt.allocPrint(std.testing.allocator, "/proc/{d}/oom_score_adj", .{joined.pid});
+        defer std.testing.allocator.free(joined_oom_path);
+        const joined_oom_score_adj = try ProcFile.read(joined_oom_path, .limited(32));
+        defer std.testing.allocator.free(joined_oom_score_adj);
+        try std.testing.expectEqualStrings(if (joined_options.oom_score_adj == -500) "-500\n" else "500\n", joined_oom_score_adj);
         const joined_reader = try openPath(linux.AT.FDCWD, joined_fifo, .{ .ACCMODE = .RDONLY, .NONBLOCK = true, .CLOEXEC = true });
         defer closeFd(joined_reader);
         var joined_poll = [_]linux.pollfd{.{ .fd = joined_reader, .events = linux.POLL.IN, .revents = 0 }};
@@ -2907,6 +2994,34 @@ test "linux mapped create installs maps outside init and cleans up rejected maps
         var acknowledgement: [1]u8 = undefined;
         try std.testing.expect(readAll(joined_reader, &acknowledgement));
         try std.testing.expectEqual(@as(u8, 1), acknowledgement[0]);
+    }
+    if (caps[0].effective & (@as(u32, 1) << linux.CAP.SYS_RESOURCE) != 0) {
+        // Identity maps isolate loss of host CAP_SYS_RESOURCE from the proc
+        // ownership failure exercised by the nonidentity maps above.
+        var lowered_spec = spec;
+        lowered_spec.linux.?.uidMappings = &.{.{ .containerID = 0, .hostID = 0, .size = 10 }};
+        lowered_spec.linux.?.gidMappings = &.{.{ .containerID = 0, .hostID = 0, .size = 10 }};
+        const lowered_fifo = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/lowered.fifo", .{absolute}, 0);
+        defer std.testing.allocator.free(lowered_fifo);
+        try checkResult(linux.mknod(lowered_fifo, linux.S.IFIFO | 0o600, 0));
+        const lowered_cgroup = try std.fmt.allocPrint(std.testing.allocator, "{s}-lowered", .{cgroup_path});
+        defer std.testing.allocator.free(lowered_cgroup);
+        var lowered_options = options;
+        lowered_options.spec = &lowered_spec;
+        lowered_options.exec_fifo = lowered_fifo;
+        lowered_options.cgroup_path = lowered_cgroup;
+        lowered_options.oom_score_adj = -500;
+        const lowered = try backend.create(lowered_options);
+        defer std.testing.allocator.free(lowered.starttime);
+        defer {
+            backend.kill(lowered, 9) catch {};
+            backend.delete(lowered) catch {};
+        }
+        const lowered_oom_path = try std.fmt.allocPrint(std.testing.allocator, "/proc/{d}/oom_score_adj", .{lowered.pid});
+        defer std.testing.allocator.free(lowered_oom_path);
+        const lowered_oom_score_adj = try ProcFile.read(lowered_oom_path, .limited(32));
+        defer std.testing.allocator.free(lowered_oom_score_adj);
+        try std.testing.expectEqualStrings("-500\n", lowered_oom_score_adj);
     }
     // Mapped root (host UID 100000) must still acknowledge start on the FIFO.
     const reader = try openPath(linux.AT.FDCWD, fifo, .{ .ACCMODE = .RDONLY, .NONBLOCK = true, .CLOEXEC = true });

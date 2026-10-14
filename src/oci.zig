@@ -237,6 +237,7 @@ pub const Spec = struct {
         cwd: []const u8,
         terminal: ?bool = null,
         noNewPrivileges: bool = false,
+        oomScoreAdj: ?i32 = null,
         user: User,
         capabilities: ?Capabilities = null,
         rlimits: ?[]const Rlimit = null,
@@ -793,6 +794,27 @@ test "process capabilities reject unknown names in every set" {
         var config: Spec.Capabilities = .{};
         @field(config, field.name) = &.{ "CAP_CHOWN", "CAP_FUTURE" };
         try std.testing.expectError(error.InvalidConfig, processCapabilities(config));
+    }
+}
+
+test "process parses oomScoreAdj without range validation" {
+    const cases = [_]struct { json_value: []const u8, expected: ?i32 }{
+        .{ .json_value = "500", .expected = 500 },
+        .{ .json_value = "100", .expected = 100 },
+        .{ .json_value = "0", .expected = 0 },
+        .{ .json_value = "-1000", .expected = -1000 },
+        .{ .json_value = "1001", .expected = 1001 },
+        .{ .json_value = "-1001", .expected = -1001 },
+        .{ .json_value = "null", .expected = null },
+    };
+    for (cases) |case| {
+        var buffer: [256]u8 = undefined;
+        const json = try std.fmt.bufPrint(&buffer,
+            \\{{"args":["/bin/sh"],"cwd":"/","user":{{"uid":0,"gid":0}},"oomScoreAdj":{s}}}
+        , .{case.json_value});
+        const parsed = try std.json.parseFromSlice(Spec.Process, std.testing.allocator, json, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(case.expected, parsed.value.oomScoreAdj);
     }
 }
 
@@ -1578,6 +1600,7 @@ test "spec defaults omitted optional fields" {
     try std.testing.expect(parsed.value.process.?.env == null);
     try std.testing.expect(parsed.value.process.?.terminal == null);
     try std.testing.expect(!parsed.value.process.?.noNewPrivileges);
+    try std.testing.expect(parsed.value.process.?.oomScoreAdj == null);
     try std.testing.expect(parsed.value.process.?.capabilities == null);
     try std.testing.expect(parsed.value.process.?.rlimits == null);
     try std.testing.expect(parsed.value.process.?.user.additionalGids == null);

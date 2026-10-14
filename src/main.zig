@@ -275,6 +275,7 @@ fn createContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, c
         .cgroup_writes = cgroup_writes,
         .capabilities = capabilities,
         .rlimits = rlimits,
+        .oom_score_adj = if (parsed.value.process) |process| process.oomScoreAdj else null,
         .devices = devices,
         .device_symlinks = oci.deviceSymlinks(mounts),
         .create_hooks = create_hooks,
@@ -1787,6 +1788,7 @@ test "create persists backend pid and absolute paths and rolls back a failed pid
                 .hard = 1024,
                 .soft = 512,
             })) return error.InvalidConfig;
+            if (options.oom_score_adj != 100) return error.InvalidConfig;
             if (options.devices.len != 6 or
                 !std.mem.eql(u8, options.devices[0].path, "/dev/null") or
                 options.devices[0].kind != .character or options.devices[0].mode != 0o600 or
@@ -1829,7 +1831,7 @@ test "create persists backend pid and absolute paths and rolls back a failed pid
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "bundle/config.json",
         .data =
-        \\{"ociVersion":"9.9.9","root":{"path":"rootfs"},"linux":{"namespaces":[{"type":"mount"}],"cgroupsPath":"/custom/test","devices":[{"path":"/dev/null","type":"c","major":1,"minor":3,"fileMode":384,"uid":1000,"gid":1001}],"resources":{"memory":{"limit":33554432},"pids":{"limit":5}}},"process":{"args":["/bin/sh"],"cwd":"/","user":{"uid":1000,"gid":1000},"capabilities":{"bounding":["CAP_CHOWN","CAP_BPF"],"effective":["CAP_CHOWN"],"permitted":["CAP_CHOWN"],"inheritable":["CAP_CHOWN"],"ambient":["CAP_CHOWN"]},"rlimits":[{"type":"RLIMIT_NOFILE","hard":1024,"soft":512}]},"mounts":[{"destination":"/a/../mnt","type":"bind","source":"source","options":["ro","rprivate"]},{"destination":"/proc","type":"proc","source":"proc","options":["nosuid","mode=755"]}],"annotations":{"org.example.description":"hello"}}
+        \\{"ociVersion":"9.9.9","root":{"path":"rootfs"},"linux":{"namespaces":[{"type":"mount"}],"cgroupsPath":"/custom/test","devices":[{"path":"/dev/null","type":"c","major":1,"minor":3,"fileMode":384,"uid":1000,"gid":1001}],"resources":{"memory":{"limit":33554432},"pids":{"limit":5}}},"process":{"args":["/bin/sh"],"cwd":"/","user":{"uid":1000,"gid":1000},"capabilities":{"bounding":["CAP_CHOWN","CAP_BPF"],"effective":["CAP_CHOWN"],"permitted":["CAP_CHOWN"],"inheritable":["CAP_CHOWN"],"ambient":["CAP_CHOWN"]},"rlimits":[{"type":"RLIMIT_NOFILE","hard":1024,"soft":512}],"oomScoreAdj":100},"mounts":[{"destination":"/a/../mnt","type":"bind","source":"source","options":["ro","rprivate"]},{"destination":"/proc","type":"proc","source":"proc","options":["nosuid","mode=755"]}],"annotations":{"org.example.description":"hello"}}
         ,
     });
     const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
