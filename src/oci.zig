@@ -213,6 +213,7 @@ pub const exec_fifo_name = "exec.fifo";
 pub const starttime_file_name = "starttime";
 pub const process_file_name = "process";
 pub const cgroup_file_name = "cgroup";
+pub const rootfs_mount_file_name = "rootfs_mount";
 pub const hooks_file_name = "hooks.json";
 pub const runtime_oci_version = "1.0.2";
 
@@ -1035,11 +1036,11 @@ pub fn validateIDMappings(mappings: []const Spec.IDMapping) error{InvalidConfig}
     }
 }
 
-/// Rootfs isolation always needs a mount namespace, even with an empty mount list.
+/// Omitted namespace types are inherited from the runtime.
 pub fn requireCreate(spec: Spec) !void {
     _ = std.SemanticVersion.parse(spec.ociVersion) catch return error.InvalidConfig;
     try validateHooks(spec.hooks);
-    const settings = spec.linux orelse return error.MissingMountNamespace;
+    const settings: Spec.Linux = spec.linux orelse .{};
     const uid_mappings: []const Spec.IDMapping = settings.uidMappings orelse &.{};
     const gid_mappings: []const Spec.IDMapping = settings.gidMappings orelse &.{};
     const namespaces = settings.namespaces orelse &.{};
@@ -1060,7 +1061,10 @@ pub fn requireCreate(spec: Spec) !void {
     } else if (uid_mappings.len > 0 or gid_mappings.len > 0) {
         return error.InvalidConfig;
     }
-    if (!has_mount) return error.MissingMountNamespace;
+    if (!has_mount and settings.rootfsPropagation != null) {
+        std.debug.print("igvano: cannot change propagation without a private mount namespace\n", .{});
+        return error.InvalidConfig;
+    }
     if (spec.root.path.len == 0) return error.InvalidConfig;
     if (spec.process) |process| {
         if (!std.mem.startsWith(u8, process.cwd, "/") or
@@ -1157,14 +1161,14 @@ test "bind mounts discard filesystem data regardless of option order" {
     try std.testing.expectEqual(@as(u32, std.os.linux.MS.PRIVATE | std.os.linux.MS.REC), bind.propagation);
 }
 
-test "create validation requires mount isolation with or without mounts" {
+test "create validation accepts inherited mount namespaces with or without mounts" {
     var spec: Spec = .{ .ociVersion = "1.0.2", .root = .{ .path = "rootfs" } };
-    try std.testing.expectError(error.MissingMountNamespace, requireCreate(spec));
+    try requireCreate(spec);
     spec.linux = .{};
-    try std.testing.expectError(error.MissingMountNamespace, requireCreate(spec));
+    try requireCreate(spec);
     spec.linux = .{ .namespaces = &.{.{ .type = .pid }} };
     spec.mounts = &.{.{ .destination = "/proc", .type = "proc" }};
-    try std.testing.expectError(error.MissingMountNamespace, requireCreate(spec));
+    try requireCreate(spec);
     spec.linux = .{ .namespaces = &.{.{ .type = .mount }} };
     try requireCreate(spec);
     spec.mounts = null;
@@ -1175,6 +1179,17 @@ test "create validation requires mount isolation with or without mounts" {
     spec.mounts = null;
     spec.process = .{ .args = &.{"/bin/sh"}, .cwd = "relative", .user = .{ .uid = 0, .gid = 0 } };
     try std.testing.expectError(error.InvalidProcess, requireCreate(spec));
+}
+
+test "create rejects explicit rootfs propagation without a mount namespace" {
+    var spec: Spec = .{
+        .ociVersion = "1.0.2",
+        .root = .{ .path = "rootfs" },
+        .linux = .{ .rootfsPropagation = .private },
+    };
+    try std.testing.expectError(error.InvalidConfig, requireCreate(spec));
+    spec.linux.?.namespaces = &.{.{ .type = .mount, .path = "/proc/123/ns/mnt" }};
+    try requireCreate(spec);
 }
 
 test "create rejects malformed OCI version strings" {

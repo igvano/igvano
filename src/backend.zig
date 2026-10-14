@@ -41,7 +41,8 @@ pub const Backend = struct {
         on_create: ?CreateCallback = null,
         masked_paths: []const []const u8 = &.{},
         readonly_paths: []const []const u8 = &.{},
-        rootfs_propagation: u32 = std.os.linux.MS.PRIVATE | std.os.linux.MS.REC,
+        /// Null preserves the default propagation in a private mount namespace.
+        rootfs_propagation: ?u32 = null,
     };
 
     pub const Hook = hooks.Hook;
@@ -115,6 +116,12 @@ pub const Backend = struct {
         starttime: []const u8,
         /// Borrowed from create options, or loaded from the runtime state directory.
         cgroup_path: ?[]const u8 = null,
+        /// Set only when the container shares the runtime's mount namespace.
+        rootfs_mount: ?[]const u8 = null,
+        /// STATX_MNT_ID_UNIQUE of the self-bind; null for old handles.
+        rootfs_mount_id: ?u64 = null,
+        /// Kernel boot ID, since unique mount IDs reset on reboot.
+        rootfs_mount_boot_id: ?[36]u8 = null,
     };
 
     pub const Error = error{
@@ -124,7 +131,6 @@ pub const Backend = struct {
         AmbientCapabilitiesRequirePermittedAndInheritable,
         InvalidProcess,
         InvalidPath,
-        MissingMountNamespace,
         PermissionDenied,
         SystemResources,
         CreateFailed,

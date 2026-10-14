@@ -255,7 +255,7 @@ fn createContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, c
             .recursive_readonly = options.recursive_readonly,
         };
     }
-    const settings = parsed.value.linux.?;
+    const settings: oci.Spec.Linux = parsed.value.linux orelse .{};
     const configured_hooks: oci.Spec.Hooks = parsed.value.hooks orelse .{};
     const create_hooks = try oci.prepareHooks(mount_allocator, configured_hooks.createContainer);
     const start_hooks = try oci.prepareHooks(mount_allocator, configured_hooks.startContainer);
@@ -363,7 +363,7 @@ fn createContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, c
         .start_hook_state = start_hook_state,
         .masked_paths = masked_paths,
         .readonly_paths = readonly_paths,
-        .rootfs_propagation = oci.rootfsPropagation(settings.rootfsPropagation),
+        .rootfs_propagation = if (settings.rootfsPropagation) |mode| oci.rootfsPropagation(mode) else null,
         .on_create = .{ .ptr = &create_context, .run = CreateContext.run },
     });
     const handle = created catch |err| return create_context.failure orelse err;
@@ -374,6 +374,7 @@ fn createContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, c
         backend.delete(handle) catch {};
     }
     state.pid = handle.pid;
+    try saveRootfsMount(allocator, io, state_dir, handle);
 
     if (console_fds) |fds| {
         const master = try backend_module.console.receiveFd(fds[0]);
@@ -419,6 +420,7 @@ const CreateContext = struct {
         const path = try std.fs.path.join(self.allocator, &.{ self.state_dir, oci.starttime_file_name });
         defer self.allocator.free(path);
         try oci.atomicWrite(self.io, path, handle.starttime);
+        try saveRootfsMount(self.allocator, self.io, self.state_dir, handle);
         try oci.saveState(self.allocator, self.io, self.root, self.state.*);
         try runHooks(self.allocator, self.hooks.createRuntime, self.state.*);
     }
@@ -503,11 +505,17 @@ fn stateHandle(allocator: std.mem.Allocator, io: std.Io, root: []const u8, state
     };
     errdefer allocator.free(starttime);
     if (starttime.len == 0) return error.InvalidState;
+    const cgroup_path = try loadCgroupPath(allocator, io, root, state.id);
+    errdefer if (cgroup_path) |value| allocator.free(value);
+    const rootfs_mount = try loadRootfsMount(allocator, io, root, state.id);
     return .{
         .id = state.id,
         .pid = pid,
         .starttime = starttime,
-        .cgroup_path = try loadCgroupPath(allocator, io, root, state.id),
+        .cgroup_path = cgroup_path,
+        .rootfs_mount = if (rootfs_mount) |mount| mount.path else null,
+        .rootfs_mount_id = if (rootfs_mount) |mount| mount.mount_id_unique else null,
+        .rootfs_mount_boot_id = if (rootfs_mount) |mount| mount.boot_id else null,
     };
 }
 
@@ -526,9 +534,62 @@ fn loadCgroupPath(allocator: std.mem.Allocator, io: std.Io, root: []const u8, id
     };
 }
 
+const RootfsMount = struct {
+    path: []const u8,
+    // Legacy reusable IDs never authorize cleanup.
+    mount_id: ?u64 = null,
+    mount_id_unique: ?u64 = null,
+    boot_id: ?[36]u8 = null,
+};
+
+fn saveRootfsMount(allocator: std.mem.Allocator, io: std.Io, state_dir: []const u8, handle: Backend.Handle) !void {
+    const mount = RootfsMount{
+        .path = handle.rootfs_mount orelse return,
+        .mount_id_unique = handle.rootfs_mount_id orelse return error.InvalidState,
+        .boot_id = handle.rootfs_mount_boot_id orelse return error.InvalidState,
+    };
+    const path = try std.fs.path.join(allocator, &.{ state_dir, oci.rootfs_mount_file_name });
+    defer allocator.free(path);
+    const json = try std.json.Stringify.valueAlloc(allocator, mount, .{});
+    defer allocator.free(json);
+    try oci.atomicWrite(io, path, json);
+}
+
+fn loadRootfsMount(allocator: std.mem.Allocator, io: std.Io, root: []const u8, id: []const u8) !?RootfsMount {
+    const path = try std.fs.path.join(allocator, &.{ root, id, oci.rootfs_mount_file_name });
+    defer allocator.free(path);
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(6 * std.fs.max_path_bytes + 128)) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        error.StreamTooLong => return error.InvalidState,
+        else => return err,
+    };
+    defer allocator.free(bytes);
+    // Older path-only records remain readable, but cannot authorize detach.
+    if (std.fs.path.isAbsolute(bytes)) {
+        if (std.mem.indexOfScalar(u8, bytes, 0) != null) return error.InvalidState;
+        return .{ .path = try allocator.dupe(u8, bytes) };
+    }
+    const parsed = std.json.parseFromSlice(RootfsMount, allocator, bytes, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidState,
+    };
+    defer parsed.deinit();
+    const mount = parsed.value;
+    if (!std.fs.path.isAbsolute(mount.path) or std.mem.indexOfScalar(u8, mount.path, 0) != null or
+        (mount.mount_id_unique orelse mount.mount_id orelse 0) == 0 or
+        (mount.mount_id_unique != null and mount.boot_id == null))
+        return error.InvalidState;
+    return .{
+        .path = try allocator.dupe(u8, mount.path),
+        .mount_id_unique = mount.mount_id_unique,
+        .boot_id = mount.boot_id,
+    };
+}
+
 fn freeStateHandle(allocator: std.mem.Allocator, handle: Backend.Handle) void {
     allocator.free(handle.starttime);
     if (handle.cgroup_path) |path| allocator.free(path);
+    if (handle.rootfs_mount) |path| allocator.free(path);
 }
 
 const LiveState = struct {
@@ -735,11 +796,25 @@ fn destroyContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, 
     defer if (state.handle == null) {
         if (cgroup_path) |path| allocator.free(path);
     };
+    const rootfs_mount = if (state.handle) |handle|
+        if (handle.rootfs_mount) |path| RootfsMount{
+            .path = path,
+            .mount_id_unique = handle.rootfs_mount_id,
+            .boot_id = handle.rootfs_mount_boot_id,
+        } else null
+    else
+        try loadRootfsMount(allocator, io, config.root, config.id);
+    defer if (state.handle == null) {
+        if (rootfs_mount) |mount| allocator.free(mount.path);
+    };
     try backend.delete(state.handle orelse .{
         .id = state.parsed.value.id,
         .pid = state.parsed.value.pid orelse 0,
         .starttime = "",
         .cgroup_path = cgroup_path,
+        .rootfs_mount = if (rootfs_mount) |mount| mount.path else null,
+        .rootfs_mount_id = if (rootfs_mount) |mount| mount.mount_id_unique else null,
+        .rootfs_mount_boot_id = if (rootfs_mount) |mount| mount.boot_id else null,
     });
     state.parsed.value.status = .stopped;
     const path = try std.fs.path.join(allocator, &.{ config.root, config.id });
@@ -837,8 +912,6 @@ fn reportError(config: Config, err: anyerror) void {
         std.debug.print("igvano: --console-socket requires terminal=true\n", .{});
     } else if (config.subcommand == .start and err == error.ProcessNotFound) {
         std.debug.print("igvano: init for '{s}' is no longer alive; start failed\n", .{config.id});
-    } else if (err == error.MissingMountNamespace) {
-        std.debug.print("igvano: {s} for '{s}' failed: requires a mount namespace (spec allows inheriting; unsupported here)\n", .{ @tagName(config.subcommand), config.id });
     } else {
         std.debug.print("igvano: {s} for '{s}' failed: {s}\n", .{ @tagName(config.subcommand), config.id, @errorName(err) });
     }
@@ -1363,6 +1436,58 @@ test "state handle requires a nonempty starttime file" {
     defer freeStateHandle(std.testing.allocator, handle);
     try std.testing.expectEqualStrings("987654321", handle.starttime);
     try std.testing.expectEqualStrings("custom/from-state", handle.cgroup_path.?);
+    try std.testing.expect(handle.rootfs_mount == null);
+    try std.testing.expect(handle.rootfs_mount_id == null);
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "example/rootfs_mount",
+        .data = "{\"path\":\"/bundle/rootfs\",\"mount_id_unique\":12345,\"boot_id\":\"00000000-0000-0000-0000-000000000000\"}",
+    });
+    const mounted_handle = try stateHandle(std.testing.allocator, std.testing.io, root, state);
+    defer freeStateHandle(std.testing.allocator, mounted_handle);
+    try std.testing.expectEqualStrings("/bundle/rootfs", mounted_handle.rootfs_mount.?);
+    try std.testing.expectEqual(@as(?u64, 12345), mounted_handle.rootfs_mount_id);
+    try std.testing.expectEqualStrings("00000000-0000-0000-0000-000000000000", &mounted_handle.rootfs_mount_boot_id.?);
+    // A reusable ID from older state must not be mistaken for a unique ID.
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "example/rootfs_mount",
+        .data = "{\"path\":\"/bundle/rootfs\",\"mount_id\":12345}",
+    });
+    const old_id_handle = try stateHandle(std.testing.allocator, std.testing.io, root, state);
+    defer freeStateHandle(std.testing.allocator, old_id_handle);
+    try std.testing.expectEqualStrings("/bundle/rootfs", old_id_handle.rootfs_mount.?);
+    try std.testing.expect(old_id_handle.rootfs_mount_id == null);
+    try std.testing.expect(old_id_handle.rootfs_mount_boot_id == null);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "example/rootfs_mount", .data = "/bundle/rootfs" });
+    const legacy_handle = try stateHandle(std.testing.allocator, std.testing.io, root, state);
+    defer freeStateHandle(std.testing.allocator, legacy_handle);
+    try std.testing.expectEqualStrings("/bundle/rootfs", legacy_handle.rootfs_mount.?);
+    try std.testing.expect(legacy_handle.rootfs_mount_id == null);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "example/rootfs_mount", .data = "relative" });
+    try std.testing.expectError(error.InvalidState, stateHandle(std.testing.allocator, std.testing.io, root, state));
+}
+
+test "loading rootfs mounts rejects invalid ownership records" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "example", .default_dir);
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer std.testing.allocator.free(root);
+    for ([_][]const u8{
+        "",
+        "{\"path\":\"relative\",\"mount_id\":12345}",
+        "{\"path\":\"/rootfs\\u0000\",\"mount_id\":12345}",
+        "{\"path\":\"/rootfs\"}",
+        "{\"path\":\"/rootfs\",\"mount_id\":null}",
+        "{\"path\":\"/rootfs\",\"mount_id\":0}",
+        "{\"path\":\"/rootfs\",\"mount_id\":-1}",
+        "{\"path\":\"/rootfs\",\"mount_id\":\"unknown\"}",
+        "{\"path\":\"/rootfs\",\"mount_id_unique\":12345}",
+        "{\"path\":\"/rootfs\",\"mount_id_unique\":12345,\"boot_id\":\"short\"}",
+        "{\"path\":\"/rootfs\",\"mount_id_unique\":0,\"boot_id\":\"00000000-0000-0000-0000-000000000000\"}",
+    }) |record| {
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "example/rootfs_mount", .data = record });
+        try std.testing.expectError(error.InvalidState, loadRootfsMount(std.testing.allocator, std.testing.io, root, "example"));
+    }
 }
 
 test "delete requires stopped containers unless forced and waits after SIGKILL" {
@@ -1440,7 +1565,7 @@ test "delete requires stopped containers unless forced and waits after SIGKILL" 
     }
 }
 
-test "delete uses the persisted cgroup path and preserves state on backend failure" {
+test "delete uses persisted cgroup and rootfs mounts and preserves state on backend failure" {
     const TestBackend = struct {
         fail_delete: bool = true,
         deleted: bool = false,
@@ -1459,6 +1584,9 @@ test "delete uses the persisted cgroup path and preserves state on backend failu
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (!std.mem.eql(u8, handle.cgroup_path orelse return error.InvalidPath, "custom/persisted"))
                 return error.InvalidPath;
+            if (!std.mem.eql(u8, handle.rootfs_mount orelse return error.InvalidPath, "/bundle/rootfs"))
+                return error.InvalidPath;
+            if (handle.rootfs_mount_id != 12345) return error.InvalidPath;
             if (self.fail_delete) return error.CgroupDeleteFailed;
             self.deleted = true;
         }
@@ -1474,6 +1602,10 @@ test "delete uses the persisted cgroup path and preserves state on backend failu
         .bundle = "/no-longer-present",
     });
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "example/cgroup", .data = "custom/persisted" });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "example/rootfs_mount",
+        .data = "{\"path\":\"/bundle/rootfs\",\"mount_id_unique\":12345,\"boot_id\":\"00000000-0000-0000-0000-000000000000\"}",
+    });
     var implementation: TestBackend = .{};
     const backend: Backend = .{ .ptr = &implementation, .vtable = &TestBackend.vtable };
     const config: Config = .{ .root = root, .subcommand = .delete, .id = "example" };
@@ -1809,14 +1941,14 @@ test "create rejects a missing bundle before creating the state directory" {
     try std.testing.expectError(error.FileNotFound, tmp.dir.openDir(std.testing.io, "example", .{}));
 }
 
-test "create rejects missing mount isolation before creating runtime state" {
+test "create rejects propagation without mount isolation before creating runtime state" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDir(std.testing.io, "bundle", .default_dir);
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "bundle/config.json",
         .data =
-        \\{"ociVersion":"1.0.2","root":{"path":"rootfs"},"mounts":[{"destination":"/proc","type":"proc"}]}
+        \\{"ociVersion":"1.0.2","root":{"path":"rootfs"},"linux":{"rootfsPropagation":"private"},"mounts":[{"destination":"/proc","type":"proc"}]}
         ,
     });
     const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
@@ -1824,7 +1956,7 @@ test "create rejects missing mount isolation before creating runtime state" {
     const bundle = try std.fs.path.join(std.testing.allocator, &.{ root, "bundle" });
     defer std.testing.allocator.free(bundle);
     var implementation: backend_module.LinuxBackend = .{};
-    try std.testing.expectError(error.MissingMountNamespace, createContainer(std.testing.allocator, std.testing.io, implementation.backend(), .{
+    try std.testing.expectError(error.InvalidConfig, createContainer(std.testing.allocator, std.testing.io, implementation.backend(), .{
         .root = root,
         .subcommand = .create,
         .id = "example",
@@ -1922,7 +2054,7 @@ test "create removes its new state directory when setup fails" {
     try std.testing.expectError(error.FileNotFound, tmp.dir.openDir(std.testing.io, "example", .{}));
 }
 
-test "create persists backend pid and absolute paths and rolls back a failed pid file" {
+test "create with inherited mount isolation persists backend resources and rolls back a failed pid file" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const TestBackend = struct {
         rootfs: [std.fs.max_path_bytes]u8 = undefined,
@@ -1988,12 +2120,18 @@ test "create persists backend pid and absolute paths and rolls back a failed pid
                 .pid = 1234,
                 .starttime = "987654321",
                 .cgroup_path = options.cgroup_path,
+                .rootfs_mount = options.rootfs,
+                .rootfs_mount_id = 12345,
+                .rootfs_mount_boot_id = "00000000-0000-0000-0000-000000000000".*,
             });
             return .{
                 .id = options.id,
                 .pid = 1234,
                 .starttime = try options.allocator.dupe(u8, "987654321"),
                 .cgroup_path = options.cgroup_path,
+                .rootfs_mount = options.rootfs,
+                .rootfs_mount_id = 12345,
+                .rootfs_mount_boot_id = "00000000-0000-0000-0000-000000000000".*,
             };
         }
 
@@ -2001,6 +2139,9 @@ test "create persists backend pid and absolute paths and rolls back a failed pid
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (!std.mem.eql(u8, handle.cgroup_path orelse return error.InvalidPath, "custom/test"))
                 return error.InvalidPath;
+            if (!std.mem.eql(u8, handle.rootfs_mount orelse return error.InvalidPath, self.rootfs[0..self.rootfs_len]))
+                return error.InvalidPath;
+            if (handle.rootfs_mount_id != 12345) return error.InvalidPath;
             self.deleted = true;
         }
 
@@ -2019,7 +2160,7 @@ test "create persists backend pid and absolute paths and rolls back a failed pid
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "bundle/config.json",
         .data =
-        \\{"ociVersion":"9.9.9","root":{"path":"rootfs"},"linux":{"namespaces":[{"type":"mount"}],"cgroupsPath":"/custom/test","devices":[{"path":"/dev/null","type":"c","major":1,"minor":3,"fileMode":384,"uid":1000,"gid":1001}],"resources":{"memory":{"limit":33554432},"pids":{"limit":5}}},"process":{"args":["/bin/sh"],"cwd":"/","user":{"uid":1000,"gid":1000},"capabilities":{"bounding":["CAP_CHOWN","CAP_BPF"],"effective":["CAP_CHOWN"],"permitted":["CAP_CHOWN"],"inheritable":["CAP_CHOWN"],"ambient":["CAP_CHOWN"]},"rlimits":[{"type":"RLIMIT_NOFILE","hard":1024,"soft":512}],"oomScoreAdj":100},"mounts":[{"destination":"/a/../mnt","type":"bind","source":"source","options":["ro","rprivate"]},{"destination":"/proc","type":"proc","source":"proc","options":["nosuid","mode=755"]}],"annotations":{"org.example.description":"hello"}}
+        \\{"ociVersion":"9.9.9","root":{"path":"rootfs"},"linux":{"cgroupsPath":"/custom/test","devices":[{"path":"/dev/null","type":"c","major":1,"minor":3,"fileMode":384,"uid":1000,"gid":1001}],"resources":{"memory":{"limit":33554432},"pids":{"limit":5}}},"process":{"args":["/bin/sh"],"cwd":"/","user":{"uid":1000,"gid":1000},"capabilities":{"bounding":["CAP_CHOWN","CAP_BPF"],"effective":["CAP_CHOWN"],"inheritable":["CAP_CHOWN"],"permitted":["CAP_CHOWN"],"ambient":["CAP_CHOWN"]},"rlimits":[{"type":"RLIMIT_NOFILE","hard":1024,"soft":512}],"oomScoreAdj":100},"mounts":[{"destination":"/a/../mnt","type":"bind","source":"source","options":["ro","rprivate"]},{"destination":"/proc","type":"proc","source":"proc","options":["nosuid","mode=755"]}],"annotations":{"org.example.description":"hello"}}
         ,
     });
     const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
@@ -2057,6 +2198,11 @@ test "create persists backend pid and absolute paths and rolls back a failed pid
     const cgroup = try tmp.dir.readFileAlloc(std.testing.io, "example/cgroup", std.testing.allocator, .limited(1024));
     defer std.testing.allocator.free(cgroup);
     try std.testing.expectEqualStrings("custom/test", cgroup);
+    const rootfs_mount = (try loadRootfsMount(std.testing.allocator, std.testing.io, root, "example")).?;
+    defer std.testing.allocator.free(rootfs_mount.path);
+    try std.testing.expectEqualStrings(expected_rootfs, rootfs_mount.path);
+    try std.testing.expectEqual(@as(?u64, 12345), rootfs_mount.mount_id_unique);
+    try std.testing.expectEqualStrings("00000000-0000-0000-0000-000000000000", &rootfs_mount.boot_id.?);
     const fifo = try tmp.dir.statFile(std.testing.io, "example/exec.fifo", .{});
     try std.testing.expectEqual(std.Io.File.Kind.named_pipe, fifo.kind);
     try std.testing.expect(!implementation.killed);
