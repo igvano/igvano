@@ -977,7 +977,11 @@ pub fn parseMountOptions(allocator: std.mem.Allocator, options: []const []const 
         try data.appendSlice(allocator, option);
     }
     // Discard filesystem data for bind mounts because the kernel ignores it.
-    if (flags & ms.BIND != 0) data.clearRetainingCapacity();
+    if (flags & ms.BIND != 0) {
+        if (data.items.len != 0)
+            std.debug.print("igvano: warning: bind mount ignores options: {s}\n", .{data.items});
+        data.clearRetainingCapacity();
+    }
     return .{
         .flags = flags,
         .propagation = propagation,
@@ -1136,6 +1140,7 @@ test "bind mounts discard filesystem data regardless of option order" {
         &.{ "rbind", "size=65536k", "ro" },
         &.{ "mode=755", "rbind", "rprivate" },
         &.{ "bind", "" },
+        &.{ "bind", "nosuid", "nosiud", "mode=755", "size=1k" },
     };
     for (cases) |options| {
         const bind = try parseMountOptions(std.testing.allocator, options, null);
