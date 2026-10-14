@@ -102,7 +102,7 @@ if [ "${1-}" = "--inside" ]; then
             END {
                 if (bailout || (status != 0 && fail == 0) ||
                     (plan > 0 && plan != pass + fail + skip) ||
-                    (plan == 0 && skip == 0 && (status != 0 || diagnostic))) fail++
+                    (fail == 0 && plan == 0 && skip == 0 && (status != 0 || diagnostic))) fail++
                 print pass + 0, fail + 0, skip + 0
             }
         ' /tmp/conformance-tap)
