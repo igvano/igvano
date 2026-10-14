@@ -2266,7 +2266,8 @@ fn runInit(
         linux.exit_group(1);
     };
     if (!writeAll(fd, &.{1})) linux.exit_group(1);
-    runProcess(spec, argv, envp) catch {
+    runProcess(spec, argv, envp) catch |err| {
+        childError("igvano: cannot execute process: ", err);
         _ = writeAll(fd, &.{0});
         linux.exit_group(1);
     };
