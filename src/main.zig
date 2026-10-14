@@ -658,12 +658,14 @@ fn startContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, co
     warnHooks(allocator, if (saved_hooks) |entries| entries.value.poststart else null, state.parsed.value, "poststart");
 }
 
-/// EOF precedes the writer's first open too; only a subsequent EOF is failure.
-fn startReadComplete(writer_seen: bool, count: usize, byte: u8) !bool {
+/// After acknowledgement, CLOEXEC closes the writer at exec; earlier EOF can
+/// precede the writer's first open or signal a failure before acknowledgement.
+fn startReadComplete(writer_seen: bool, acked: bool, count: usize, byte: u8) !bool {
     if (count == 1) {
         if (byte != 1) return error.StartFailed;
-        return true;
+        return false;
     }
+    if (acked) return true;
     if (writer_seen) return error.StartFailed;
     return false;
 }
@@ -693,25 +695,28 @@ fn waitForStart(allocator: std.mem.Allocator, io: std.Io, backend: Backend, hand
         defer _ = linux.close(fd);
         var byte: [1]u8 = undefined;
         var writer_seen = false;
+        var acked = false;
         while (true) {
             const is_alive = try backend.alive(handle);
             const result = linux.read(fd, &byte, byte.len);
             switch (linux.errno(result)) {
                 .SUCCESS => {
-                    if (try startReadComplete(writer_seen, result, if (result == 1) byte[0] else 0)) return;
+                    if (try startReadComplete(writer_seen, acked, result, if (result == 1) byte[0] else 0)) return;
+                    if (result == 1) acked = true;
                 },
                 .AGAIN => writer_seen = true,
                 .INTR => continue,
                 else => return error.StartFailed,
             }
-            // A short-lived init may exit after acknowledging start. Drain its
-            // byte before rejecting the dead process sampled above.
-            if (writer_seen) {
-                // Init opened the FIFO and may be running start hooks. Their
-                // configured deadlines govern this phase, including no deadline.
-                if (!is_alive) return error.ProcessNotFound;
-            } else {
-                try requireStartWait(is_alive, started.untilNow(io, .awake));
+            // After acknowledgement, drain to EOF or 0 even if init exited.
+            if (!acked) {
+                if (writer_seen) {
+                    // Init opened the FIFO and may be running start hooks. Their
+                    // configured deadlines govern this phase, including no deadline.
+                    if (!is_alive) return error.ProcessNotFound;
+                } else {
+                    try requireStartWait(is_alive, started.untilNow(io, .awake));
+                }
             }
             try std.Io.sleep(io, .fromMilliseconds(10), .awake);
         }
@@ -936,12 +941,20 @@ test "console socket validation matches the terminal setting" {
     }
 }
 
-test "start FIFO EOF fails only after a writer was observed" {
-    try std.testing.expect(!try startReadComplete(false, 0, 0));
-    try std.testing.expectError(error.StartFailed, startReadComplete(true, 0, 0));
-    try std.testing.expect(try startReadComplete(false, 1, 1));
-    try std.testing.expect(try startReadComplete(true, 1, 1));
-    try std.testing.expectError(error.StartFailed, startReadComplete(true, 1, 0));
+test "start FIFO EOF before acknowledgement fails only after a writer was observed" {
+    try std.testing.expect(!try startReadComplete(false, false, 0, 0));
+    try std.testing.expectError(error.StartFailed, startReadComplete(true, false, 0, 0));
+    try std.testing.expectError(error.StartFailed, startReadComplete(false, false, 1, 0));
+    try std.testing.expectError(error.StartFailed, startReadComplete(true, false, 1, 0));
+}
+
+test "start FIFO acknowledgement waits for exec" {
+    try std.testing.expect(!try startReadComplete(false, false, 1, 1));
+    try std.testing.expect(!try startReadComplete(true, false, 1, 1));
+    try std.testing.expect(try startReadComplete(false, true, 0, 0));
+    try std.testing.expect(try startReadComplete(true, true, 0, 0));
+    try std.testing.expectError(error.StartFailed, startReadComplete(false, true, 1, 0));
+    try std.testing.expectError(error.StartFailed, startReadComplete(true, true, 1, 0));
 }
 
 test "create argument parsing accepts console sockets and rejects missing values" {
@@ -1208,7 +1221,11 @@ test "linux prestart receives created state before init unblocks and poststart r
         if (linux.errno(order) != .SUCCESS) linux.exit_group(2);
         if (linux.errno(linux.write(@intCast(order), " init", 5)) != .SUCCESS) linux.exit_group(3);
         if (linux.errno(linux.write(@intCast(fd), &.{1}, 1)) != .SUCCESS) linux.exit_group(4);
-        linux.exit_group(0);
+        const argv = [_:null]?[*:0]const u8{"/bin/true"};
+        const envp = [_:null]?[*:0]const u8{};
+        _ = linux.execve("/bin/true", &argv, &envp);
+        _ = linux.write(@intCast(fd), &.{0}, 1);
+        linux.exit_group(5);
     }
     var reaped = false;
     defer if (!reaped) {
@@ -1371,11 +1388,12 @@ test "prestart failure kills init and destroys runtime state" {
     }
 }
 
-test "linux start accepts a buffered acknowledgement after init exits" {
+test "linux start drains buffered acknowledgements and exec failures after init exits" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const linux = std.os.linux;
     const TestBackend = struct {
-        writer: std.posix.fd_t,
+        writer: ?std.posix.fd_t,
+        bytes: []const u8,
         opened: bool = false,
 
         const vtable: Backend.VTable = .{ .create = unusedCreate, .alive = alive, .kill = unusedKill, .delete = unusedDelete };
@@ -1395,29 +1413,84 @@ test "linux start accepts a buffered acknowledgement after init exits" {
                 self.opened = true;
                 return true;
             }
-            // Model init writing its acknowledgement and exiting before start
-            // samples liveness. The real FIFO still holds that acknowledgement.
-            if (linux.errno(linux.write(self.writer, &.{1}, 1)) != .SUCCESS) return error.CreateFailed;
+            // Exec closes the writer even if the process exits before start
+            // samples liveness. A failed exec queues 0 before closing instead.
+            const writer = self.writer orelse return false;
+            if (linux.write(writer, self.bytes.ptr, self.bytes.len) != self.bytes.len) return error.CreateFailed;
+            _ = linux.close(writer);
+            self.writer = null;
             return false;
         }
     };
+    for ([_][]const u8{ "\x01", "\x01\x00" }) |bytes| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const fifo = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "exec.fifo" });
+        defer std.testing.allocator.free(fifo);
+        try makeExecFifo(std.testing.allocator, fifo);
+        const fifo_z = try std.testing.allocator.dupeZ(u8, fifo);
+        defer std.testing.allocator.free(fifo_z);
+        const opened = linux.open(fifo_z, .{ .ACCMODE = .RDWR, .NONBLOCK = true, .CLOEXEC = true }, 0);
+        if (linux.errno(opened) != .SUCCESS) return error.OpenFailed;
+        var implementation: TestBackend = .{ .writer = @intCast(opened), .bytes = bytes };
+        defer if (implementation.writer) |writer| {
+            _ = linux.close(writer);
+        };
+        const result = waitForStart(std.testing.allocator, std.testing.io, .{ .ptr = &implementation, .vtable = &TestBackend.vtable }, .{
+            .id = "example",
+            .pid = 1234,
+            .starttime = "12345",
+        }, fifo);
+        if (bytes.len == 1) {
+            try result;
+        } else {
+            try std.testing.expectError(error.StartFailed, result);
+        }
+    }
+}
+
+test "linux start waits for FIFO close after acknowledgement" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const linux = std.os.linux;
+    const posix = std.posix;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const fifo = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "exec.fifo" });
+    try tmp.dir.createDir(std.testing.io, "example", .default_dir);
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer std.testing.allocator.free(root);
+    const fifo = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/exec.fifo", .{root}, 0);
     defer std.testing.allocator.free(fifo);
     try makeExecFifo(std.testing.allocator, fifo);
-    const fifo_z = try std.testing.allocator.dupeZ(u8, fifo);
-    defer std.testing.allocator.free(fifo_z);
-    const opened = linux.open(fifo_z, .{ .ACCMODE = .RDWR, .NONBLOCK = true, .CLOEXEC = true }, 0);
-    if (linux.errno(opened) != .SUCCESS) return error.OpenFailed;
-    const writer: std.posix.fd_t = @intCast(opened);
-    defer _ = linux.close(writer);
-    var implementation: TestBackend = .{ .writer = writer };
-    try waitForStart(std.testing.allocator, std.testing.io, .{ .ptr = &implementation, .vtable = &TestBackend.vtable }, .{
+    const result = posix.system.fork();
+    if (posix.errno(result) != .SUCCESS) return error.ForkFailed;
+    const pid: i32 = @intCast(result);
+    if (pid == 0) {
+        const opened = linux.open(fifo, .{ .ACCMODE = .WRONLY, .CLOEXEC = true }, 0);
+        if (linux.errno(opened) != .SUCCESS) linux.exit_group(1);
+        const writer: posix.fd_t = @intCast(opened);
+        if (linux.write(writer, &.{1}, 1) != 1) linux.exit_group(2);
+        const delay: linux.timespec = .{ .sec = 0, .nsec = 200_000_000 };
+        if (linux.errno(linux.nanosleep(&delay, null)) != .SUCCESS) linux.exit_group(3);
+        // Model CLOEXEC closing the writer while the executed process lives on.
+        _ = linux.close(writer);
+        while (true) _ = linux.pause();
+    }
+    defer {
+        _ = linux.kill(pid, .KILL);
+        var status: if (builtin.link_libc) c_int else u32 = undefined;
+        _ = posix.system.waitpid(pid, &status, 0);
+    }
+    try saveTestStarttime(root, pid);
+    const starttime = try tmp.dir.readFileAlloc(std.testing.io, "example/starttime", std.testing.allocator, .limited(64));
+    defer std.testing.allocator.free(starttime);
+    var implementation: backend_module.LinuxBackend = .{};
+    const started = std.Io.Clock.awake.now(std.testing.io);
+    try waitForStart(std.testing.allocator, std.testing.io, implementation.backend(), .{
         .id = "example",
-        .pid = 1234,
-        .starttime = "12345",
+        .pid = pid,
+        .starttime = starttime,
     }, fifo);
+    try std.testing.expect(started.untilNow(std.testing.io, .awake).nanoseconds >= std.Io.Duration.fromMilliseconds(200).nanoseconds);
 }
 
 test "state handle requires a nonempty starttime file" {
@@ -2219,7 +2292,7 @@ test "create with inherited mount isolation persists backend resources and rolls
     try std.testing.expectError(error.FileNotFound, tmp.dir.openDir(std.testing.io, "other", .{}));
 }
 
-test "linux lifecycle exchanges the FIFO byte and persists running then stopped" {
+test "linux lifecycle waits for exec FIFO EOF and persists running then stopped" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const linux = std.os.linux;
     const posix = std.posix;
@@ -2261,8 +2334,11 @@ test "linux lifecycle exchanges the FIFO byte and persists running then stopped"
         if (linux.errno(input) != .SUCCESS) linux.exit_group(1);
         _ = linux.close(@intCast(input));
         if (posix.system.write(fd, &[_]u8{1}, 1) != 1) linux.exit_group(1);
-        _ = linux.close(fd);
-        while (true) _ = linux.pause();
+        const argv = [_:null]?[*:0]const u8{ "/bin/sleep", "60" };
+        const envp = [_:null]?[*:0]const u8{};
+        _ = linux.execve("/bin/sleep", &argv, &envp);
+        _ = linux.write(fd, &.{0}, 1);
+        linux.exit_group(1);
     }
     var reaped = false;
     defer if (!reaped) {

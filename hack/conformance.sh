@@ -9,6 +9,7 @@ KNOWN_UPSTREAM='linux_cgroups_*.t: cgroups/cgroups.go is v1-only ("cgroupv2 is n
 delete_resources.t: same v1-only cgroup validation.
 delete_only_create_resources.t: same v1-only cgroup validation.
 hooks.t: upstream compares against a string its own hooks never write.
+misc_props.t: annotation case execs /runtimetest, which PrepareBundle never installs; runc fails it at create.
 pidfile.t: expects kill of a stopped container to succeed, contradicting the spec and kill.t.
 process_rlimits.t: soft-NOFILE; Go >= 1.21 runtimetest raises its own soft limit to hard-1.'
 

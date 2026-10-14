@@ -2221,7 +2221,7 @@ fn runInit(
     start_hook_state: []const u8,
 ) noreturn {
     // The inherited host descriptors avoid path access to the state directory
-    // or /proc inside the container and are closed before exec.
+    // or /proc inside the container and are closed before or at exec.
     var fifo_buffer: [32]u8 = undefined;
     const fifo_name = std.fmt.bufPrintZ(&fifo_buffer, "{d}", .{fifo_fd}) catch unreachable;
     setupRootfs(rootfs, mounts, devices, symlinks, spec.root.readonly, rootfs_options) catch |err| {
@@ -2258,24 +2258,26 @@ fn runInit(
     };
     closeFd(fd_dir);
     closeFd(fifo_fd);
-    // Opening the writer unblocks start. Report success only after hooks pass,
-    // so a timeout or nonzero exit fails start without publishing "running".
+    // Opening the writer unblocks start. Acknowledge after hooks pass, then
+    // retain the CLOEXEC writer so EOF confirms exec before start succeeds.
     hooks.run(start_hooks, start_hook_state) catch |err| {
         childError("igvano: start hook failed: ", err);
         _ = writeAll(fd, &.{0});
         linux.exit_group(1);
     };
     if (!writeAll(fd, &.{1})) linux.exit_group(1);
-    closeFd(fd);
-    runProcess(spec, argv, envp);
+    runProcess(spec, argv, envp) catch {
+        _ = writeAll(fd, &.{0});
+        linux.exit_group(1);
+    };
 }
 
-fn runProcess(spec: *const oci.Spec, argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*:0]const u8) noreturn {
+fn runProcess(spec: *const oci.Spec, argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*:0]const u8) !noreturn {
     // A process-less config can be created; it cannot be started.
-    if (spec.process == null) linux.exit_group(1);
+    if (spec.process == null) return error.InvalidProcess;
     // Linux CLOSE_RANGE_CLOEXEC is 1 << 2; Zig 0.16's packed flags use 1 << 1.
-    checkResult(linux.syscall3(.close_range, 3, std.math.maxInt(u32), 1 << 2)) catch linux.exit_group(1);
-    execProcess(argv, envp);
+    try checkResult(linux.syscall3(.close_range, 3, std.math.maxInt(u32), 1 << 2));
+    return execProcess(argv, envp);
 }
 
 fn applyOomScoreAdj(proc_dir: posix.fd_t, oom_score_adj: ?i32) Backend.Error!void {
@@ -2339,12 +2341,12 @@ fn applyProcess(process: oci.Spec.Process, capabilities: ?Backend.Capabilities, 
     }
 }
 
-fn execProcess(argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*:0]const u8) noreturn {
-    const executable = argv[0] orelse linux.exit_group(1);
+fn execProcess(argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*:0]const u8) error{ExecFailed}!noreturn {
+    const executable = argv[0] orelse return error.ExecFailed;
     const name = std.mem.span(executable);
     if (std.mem.indexOfScalar(u8, name, '/') != null) {
         _ = linux.execve(executable, argv, envp);
-        linux.exit_group(1);
+        return error.ExecFailed;
     }
     var path: []const u8 = "/bin:/usr/bin";
     var index: usize = 0;
@@ -2362,10 +2364,10 @@ fn execProcess(argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*:0]con
         const candidate = if (directory.len == 0) executable else (std.fmt.bufPrintZ(&buffer, "{s}/{s}", .{ directory, name }) catch continue).ptr;
         switch (linux.errno(linux.execve(candidate, argv, envp))) {
             .NOENT, .NOTDIR, .ACCES => continue,
-            else => linux.exit_group(1),
+            else => return error.ExecFailed,
         }
     }
-    linux.exit_group(1);
+    return error.ExecFailed;
 }
 
 test "proc stat parses field 22 after comm containing spaces and closing parentheses" {
@@ -2803,7 +2805,7 @@ test "linux exec searches the process PATH and preserves explicit paths" {
         const pid = try forkProcess();
         if (pid == 0) {
             checkResult(linux.chdir(case.cwd)) catch linux.exit_group(2);
-            execProcess(&argv, case.envp);
+            execProcess(&argv, case.envp) catch linux.exit_group(1);
         }
         try std.testing.expectEqual(case.status, try waitChild(pid));
     }
@@ -2848,7 +2850,7 @@ test "linux init applies uid gid and optional supplementary groups before exec" 
             checkResult(linux.dup2(output[1], posix.STDOUT_FILENO)) catch linux.exit_group(1);
             closeFd(output[1]);
             applyProcess(spec.process.?, null, &.{}) catch linux.exit_group(1);
-            runProcess(&spec, &argv, &envp);
+            runProcess(&spec, &argv, &envp) catch linux.exit_group(1);
         }
         closeFd(output[1]);
         closeFd(ready[1]);
@@ -2869,7 +2871,7 @@ test "linux init applies oomScoreAdj before exec" {
     const pid = try forkProcess();
     if (pid == 0) {
         applyOomScoreAdj(proc_dir, 500) catch linux.exit_group(1);
-        execProcess(&argv, &envp);
+        execProcess(&argv, &envp) catch linux.exit_group(1);
     }
     try std.testing.expectEqual(@as(u32, 0), try waitChild(pid));
 }
@@ -2886,7 +2888,7 @@ test "linux init preserves inherited oomScoreAdj when unset" {
         const child = forkProcess() catch linux.exit_group(2);
         if (child == 0) {
             applyOomScoreAdj(proc_dir, null) catch linux.exit_group(1);
-            execProcess(&argv, &envp);
+            execProcess(&argv, &envp) catch linux.exit_group(1);
         }
         const status = waitChild(child) catch linux.exit_group(2);
         linux.exit_group(if (status == 0) 0 else 1);
@@ -2904,7 +2906,7 @@ test "linux init exits nonzero instead of exec for out of range oomScoreAdj" {
         const pid = try forkProcess();
         if (pid == 0) {
             applyOomScoreAdj(proc_dir, value) catch linux.exit_group(1);
-            execProcess(&argv, &envp);
+            execProcess(&argv, &envp) catch linux.exit_group(1);
         }
         try std.testing.expectEqual(@as(u32, 1 << 8), try waitChild(pid));
     }
@@ -2932,7 +2934,7 @@ test "linux init exits nonzero instead of exec when it cannot apply process user
             checkResult(linux.setuid(1000)) catch linux.exit_group(2);
         }
         applyProcess(spec.process.?, null, &.{}) catch linux.exit_group(1);
-        runProcess(&spec, &argv, &envp);
+        runProcess(&spec, &argv, &envp) catch linux.exit_group(1);
     }
     closeFd(ready[1]);
     try std.testing.expectEqual(@as(u32, 1 << 8), try waitChild(pid));
@@ -2964,7 +2966,7 @@ test "linux init marks inherited descriptors CLOEXEC and sets noNewPrivileges" {
         closeFd(ready[0]);
         checkResult(linux.dup2(ready[1], 200)) catch linux.exit_group(2);
         applyProcess(spec.process.?, null, &.{}) catch linux.exit_group(1);
-        runProcess(&spec, &argv, &envp);
+        runProcess(&spec, &argv, &envp) catch linux.exit_group(1);
     }
     closeFd(ready[1]);
     try std.testing.expectEqual(@as(u32, 0), try waitChild(pid));
@@ -3039,7 +3041,7 @@ test "linux process settings retain configured capabilities across nonzero uid a
             linux.exit_group(6);
         const argv = [_:null]?[*:0]const u8{ "/bin/sh", "-c", command };
         const envp = [_:null]?[*:0]const u8{"PATH=/usr/bin:/bin"};
-        execProcess(&argv, &envp);
+        execProcess(&argv, &envp) catch linux.exit_group(1);
     }
     try std.testing.expectEqual(@as(u32, 0), try waitChild(pid));
 }
