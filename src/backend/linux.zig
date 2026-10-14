@@ -334,7 +334,7 @@ pub const LinuxBackend = struct {
                 // Child1 can die before reporting child2's PID. Kill the entire
                 // cgroup before removing it, including any blocked init.
                 writeCgroupFile(cgroup, "cgroup.kill", "1", options.cgroup_path) catch {};
-                removeCgroup(cgroup_root.fd, options.cgroup_path) catch {};
+                removeCreatedCgroup(cgroup_root.fd, options.cgroup_path, cgroup) catch {};
             }
             for (options.cgroup_writes) |write|
                 try writeCgroupFile(cgroup, write.name, write.value, options.cgroup_path);
@@ -713,6 +713,30 @@ test "linux cgroup removal deletes nested children and preserves sibling cgroups
     try removeCgroup(root, "missing/container");
 }
 
+test "linux create cleanup preserves a replacement cgroup at the same path" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "parent/owned");
+    const base = try std.fmt.allocPrintSentinel(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path}, 0);
+    defer std.testing.allocator.free(base);
+    const root = try openPath(linux.AT.FDCWD, base, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true });
+    defer closeFd(root);
+    const original = (try walkCgroup(root, "parent/owned", false, &.{})).?;
+    defer closeFd(original);
+    try tmp.dir.deleteDir(std.testing.io, "parent/owned");
+    try removeCreatedCgroup(root, "parent/owned", original);
+
+    try tmp.dir.createDirPath(std.testing.io, "parent/owned/child/grandchild");
+    try removeCreatedCgroup(root, "parent/owned", original);
+    _ = try tmp.dir.statFile(std.testing.io, "parent/owned/child/grandchild", .{});
+
+    const replacement = (try walkCgroup(root, "parent/owned", false, &.{})).?;
+    defer closeFd(replacement);
+    try removeCreatedCgroup(root, "parent/owned", replacement);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, "parent/owned", .{}));
+}
+
 test "linux child cgroup cleanup leaves control files and symlinks untouched" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
@@ -854,6 +878,23 @@ fn cgroupPopulated(dir: posix.fd_t) Backend.Error!bool {
         }
     }
     return error.CgroupDeleteFailed;
+}
+
+fn removeCreatedCgroup(root: posix.fd_t, path: []const u8, cgroup: posix.fd_t) Backend.Error!void {
+    var owned: linux.Statx = undefined;
+    try checkResult(linux.statx(cgroup, "", linux.AT.EMPTY_PATH, .{ .INO = true }, &owned));
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const name = std.fmt.bufPrintZ(&buffer, "{s}", .{path}) catch return error.InvalidPath;
+    var current: linux.Statx = undefined;
+    const result = linux.statx(root, name, linux.AT.SYMLINK_NOFOLLOW, .{ .INO = true }, &current);
+    switch (linux.errno(result)) {
+        .NOENT, .NOTDIR => return,
+        else => try checkResult(result),
+    }
+    if (!owned.mask.INO or !current.mask.INO) return error.CgroupDeleteFailed;
+    // Forced deletion can let another container reuse this path before create unwinds.
+    if (owned.dev_major != current.dev_major or owned.dev_minor != current.dev_minor or owned.ino != current.ino) return;
+    try removeCgroup(root, path);
 }
 
 fn removeCgroup(root: posix.fd_t, path: []const u8) Backend.Error!void {
@@ -1282,7 +1323,7 @@ fn setupConsole(socket: posix.fd_t) Backend.Error!void {
             flags.F_EMPTY_PATH = true;
             flags.T_EMPTY_PATH = true;
             const moved = linux.move_mount(tree, "", target, "", flags);
-            if (linux.errno(moved) != .NOSYS) {
+            if (linux.errno(moved) != .NOSYS and linux.errno(moved) != .PERM) {
                 try checkResult(moved);
                 break :bind;
             }
