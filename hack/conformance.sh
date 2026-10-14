@@ -5,6 +5,13 @@
 # RUNTIME_TOOLS_REF overrides the runtime-tools branch, tag, or commit.
 set -eu
 
+KNOWN_UPSTREAM='linux_cgroups_*.t: cgroups/cgroups.go is v1-only ("cgroupv2 is not supported yet").
+delete_resources.t: same v1-only cgroup validation.
+delete_only_create_resources.t: same v1-only cgroup validation.
+hooks.t: upstream compares against a string its own hooks never write.
+pidfile.t: expects kill of a stopped container to succeed, contradicting the spec and kill.t.
+process_rlimits.t: soft-NOFILE; Go >= 1.21 runtimetest raises its own soft limit to hard-1.'
+
 if [ "${1-}" = "--inside" ]; then
     timeout_seconds=${CONFORMANCE_TIMEOUT:-120}
     case "$timeout_seconds" in
@@ -58,6 +65,10 @@ if [ "${1-}" = "--inside" ]; then
     # Official executables generate their own configs and unpack this archive
     # into each bundle; they find both the archive and runtimetest in cwd.
     tar -czf rootfs-amd64.tar.gz -C bundle/rootfs .
+    # PrepareBundle needs tmpfs for mknod of char 0:0; keep Go builds off tmpfs.
+    mkdir /bundles
+    mount -t tmpfs tmpfs /bundles
+    export TMPDIR=/bundles
     export RUNTIME=/usr/local/bin/igvano
     sha256sum "$RUNTIME"
     find validation -type f -name '*.t' | LC_ALL=C sort > /tmp/conformance-tests
@@ -71,8 +82,8 @@ if [ "${1-}" = "--inside" ]; then
         timeout --kill-after=5 "$timeout_seconds" "./$test" < /dev/null > /tmp/conformance-tap 2>&1 || status=$?
         cat /tmp/conformance-tap
         printf '\nExit status: %s\n' "$status"
-        # A crash, timeout, bailout, empty or incomplete TAP plan is a suite failure,
-        # even if the executable printed some passing assertions first.
+        # Some suites pass without assertions or a plan, and report failures only
+        # as YAML diagnostics. Still count crashes, bailouts and incomplete plans.
         set -- $(awk -v status="$status" '
             /^ok([ \t]|$)/ {
                 if (tolower($0) ~ /#[ \t]*(skip|todo)([ \t]|$)/) skip++; else pass++
@@ -83,17 +94,27 @@ if [ "${1-}" = "--inside" ]; then
                 next
             }
             /^1\.\.[0-9]+/ {
-                plan = $0; sub(/^1\.\./, "", plan); plan += 0; planned = 1
+                plan = $0; sub(/^1\.\./, "", plan); plan += 0
                 if (plan == 0 && tolower($0) ~ /#[ \t]*skip([ \t]|$)/) skip++
             }
             /^Bail out!/ { bailout = 1 }
+            /^  ---$/ { diagnostic = 1 }
             END {
-                if (bailout || !planned || (plan == 0 && skip == 0) || (status != 0 && fail == 0) ||
-                    (plan > 0 && plan != pass + fail + skip)) fail++
+                if (bailout || (status != 0 && fail == 0) ||
+                    (plan > 0 && plan != pass + fail + skip) ||
+                    (plan == 0 && skip == 0 && (status != 0 || diagnostic))) fail++
                 print pass + 0, fail + 0, skip + 0
             }
         ' /tmp/conformance-tap)
-        printf '%-64s %8s %8s %8s\n' "$test" "$1" "$2" "$3" >> /tmp/conformance-summary
+        label="$test"
+        while IFS=: read -r pattern reason; do
+            case "${test##*/}" in
+                $pattern) label="$test*"; break ;;
+            esac
+        done <<EOF
+$KNOWN_UPSTREAM
+EOF
+        printf '%-64s %8s %8s %8s\n' "$label" "$1" "$2" "$3" >> /tmp/conformance-summary
         total_pass=$((total_pass + $1))
         total_fail=$((total_fail + $2))
         total_skip=$((total_skip + $3))
@@ -101,6 +122,7 @@ if [ "${1-}" = "--inside" ]; then
     printf '%-64s %8s %8s %8s\n' TOTAL "$total_pass" "$total_fail" "$total_skip" >> /tmp/conformance-summary
     printf '\n'
     cat /tmp/conformance-summary
+    printf '\n* Known upstream limitations; failures remain in the FAIL count:\n%s\n' "$KNOWN_UPSTREAM"
     exit 0
 fi
 
