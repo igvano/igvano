@@ -236,6 +236,9 @@ fn createContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, c
     const cgroup_state_path = try std.fs.path.join(allocator, &.{ state_dir, oci.cgroup_file_name });
     defer allocator.free(cgroup_state_path);
     try oci.atomicWrite(io, cgroup_state_path, cgroup_path);
+    const process_path = try std.fs.path.join(allocator, &.{ state_dir, oci.process_file_name });
+    defer allocator.free(process_path);
+    try oci.atomicWrite(io, process_path, if (parsed.value.process != null) "true\n" else "false\n");
     const fifo = try std.fs.path.join(allocator, &.{ state_dir, oci.exec_fifo_name });
     defer allocator.free(fifo);
     try makeExecFifo(allocator, fifo);
@@ -396,6 +399,20 @@ fn loadSavedHooks(allocator: std.mem.Allocator, io: std.Io, config: Config) !?st
     return try std.json.parseFromSlice(oci.Spec.Hooks, allocator, json, .{ .allocate = .alloc_always });
 }
 
+fn loadHasProcess(allocator: std.mem.Allocator, io: std.Io, config: Config) !bool {
+    const path = try std.fs.path.join(allocator, &.{ config.root, config.id, oci.process_file_name });
+    defer allocator.free(path);
+    const json = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(32)) catch |err| switch (err) {
+        // Older state directories did not capture whether a process was configured.
+        error.FileNotFound => return true,
+        else => return err,
+    };
+    defer allocator.free(json);
+    const parsed = try std.json.parseFromSlice(bool, allocator, json, .{});
+    defer parsed.deinit();
+    return parsed.value;
+}
+
 fn stateHandle(allocator: std.mem.Allocator, io: std.Io, root: []const u8, state: oci.State) !Backend.Handle {
     const pid = state.pid orelse return error.InvalidState;
     if (pid <= 0) return error.InvalidState;
@@ -469,9 +486,7 @@ fn startContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, co
     var state = try readLiveState(allocator, io, backend, config);
     defer state.deinit();
     try oci.requireStart(state.parsed.value.status, true);
-    const spec = try oci.loadSpec(allocator, io, state.parsed.value.bundle);
-    defer spec.deinit();
-    try oci.requireStart(state.parsed.value.status, spec.value.process != null);
+    try oci.requireStart(state.parsed.value.status, try loadHasProcess(allocator, io, config));
     const saved_hooks = try loadSavedHooks(allocator, io, config);
     defer if (saved_hooks) |entries| entries.deinit();
     const path = try std.fs.path.join(allocator, &.{ config.root, config.id, oci.exec_fifo_name });
@@ -1994,35 +2009,133 @@ test "linux lifecycle exchanges the FIFO byte and persists running then stopped"
     try std.testing.expectError(error.FileNotFound, oci.loadState(std.testing.allocator, std.testing.io, root, "example"));
 }
 
-test "linux start rejects an absent process before opening the FIFO" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+test "start uses saved process presence after bundle config changes" {
+    const TestBackend = struct {
+        const vtable: Backend.VTable = .{ .create = create, .alive = alive, .kill = kill, .delete = delete };
+        fn create(_: *anyopaque, _: Backend.CreateOptions) Backend.Error!Backend.Handle {
+            return error.NotImplemented;
+        }
+        fn alive(_: *anyopaque, _: Backend.Handle) Backend.Error!bool {
+            return true;
+        }
+        fn kill(_: *anyopaque, _: Backend.Handle, _: i32) Backend.Error!void {
+            return error.NotImplemented;
+        }
+        fn delete(_: *anyopaque, _: Backend.Handle) Backend.Error!void {
+            return error.NotImplemented;
+        }
+    };
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDir(std.testing.io, "example", .default_dir);
     try tmp.dir.createDir(std.testing.io, "bundle", .default_dir);
-    try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = "bundle/config.json",
-        .data =
-        \\{"ociVersion":"1.0.2","root":{"path":"/"}}
-        ,
-    });
     const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
     defer std.testing.allocator.free(root);
     const bundle = try std.fs.path.join(std.testing.allocator, &.{ root, "bundle" });
     defer std.testing.allocator.free(bundle);
-    try oci.saveState(std.testing.allocator, std.testing.io, root, .{
-        .id = "example",
-        .status = .created,
-        .pid = std.os.linux.getpid(),
-        .bundle = bundle,
-    });
-    try saveTestStarttime(root, std.os.linux.getpid());
-    var implementation: backend_module.LinuxBackend = .{};
-    try std.testing.expectError(error.MissingProcess, startContainer(std.testing.allocator, std.testing.io, implementation.backend(), .{
-        .root = root,
-        .subcommand = .start,
-        .id = "example",
-    }));
+    const start_result: ?anyerror = if (builtin.os.tag == .linux) null else error.NotImplemented;
+    const cases = [_]struct { process: ?[]const u8, json: []const u8, failure: ?anyerror }{
+        .{ .process = "true\n", .json = "garbage", .failure = start_result },
+        .{ .process = "true\n", .json = "{}", .failure = start_result },
+        .{ .process = "true\n", .json = "{\"ociVersion\":\"1.0.2\",\"root\":{\"path\":\"/\"}}", .failure = start_result },
+        .{ .process = "false\n", .json = "{\"ociVersion\":\"1.0.2\",\"root\":{\"path\":\"/\"},\"process\":{\"args\":[\"/bin/sh\"],\"cwd\":\"/\",\"user\":{\"uid\":0,\"gid\":0}}}", .failure = error.MissingProcess },
+        .{ .process = "false\n", .json = "garbage", .failure = error.MissingProcess },
+        .{ .process = null, .json = "garbage", .failure = start_result },
+    };
+    var implementation: TestBackend = .{};
+    const backend: Backend = .{ .ptr = &implementation, .vtable = &TestBackend.vtable };
+    const config: Config = .{ .root = root, .subcommand = .start, .id = "example" };
+    for (cases) |case| {
+        try tmp.dir.createDir(std.testing.io, "example", .default_dir);
+        defer tmp.dir.deleteTree(std.testing.io, "example") catch {};
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "bundle/config.json", .data = case.json });
+        try oci.saveState(std.testing.allocator, std.testing.io, root, .{
+            .id = "example",
+            .status = .created,
+            .pid = 1234,
+            .bundle = bundle,
+        });
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "example/starttime", .data = "12345" });
+        if (case.process) |value|
+            try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "example/process", .data = value });
+        // A buffered acknowledgement exercises start without a real init process.
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "example/exec.fifo", .data = "\x01" });
+        if (case.failure) |failure| {
+            try std.testing.expectError(failure, startContainer(std.testing.allocator, std.testing.io, backend, config));
+        } else {
+            try startContainer(std.testing.allocator, std.testing.io, backend, config);
+            const state = try oci.loadState(std.testing.allocator, std.testing.io, root, "example");
+            defer state.deinit();
+            try std.testing.expectEqual(oci.Status.running, state.value.status);
+        }
+    }
+}
+
+test "linux start preserves process presence captured at create" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const TestBackend = struct {
+        const vtable: Backend.VTable = .{ .create = create, .alive = alive, .kill = kill, .delete = delete };
+        fn create(_: *anyopaque, options: Backend.CreateOptions) Backend.Error!Backend.Handle {
+            if (options.on_create) |callback| try callback.run(callback.ptr, .{
+                .id = options.id,
+                .pid = 1234,
+                .starttime = "12345",
+            });
+            return .{ .id = options.id, .pid = 1234, .starttime = try options.allocator.dupe(u8, "12345") };
+        }
+        fn alive(_: *anyopaque, _: Backend.Handle) Backend.Error!bool {
+            return true;
+        }
+        fn kill(_: *anyopaque, _: Backend.Handle, _: i32) Backend.Error!void {
+            return error.NotImplemented;
+        }
+        fn delete(_: *anyopaque, _: Backend.Handle) Backend.Error!void {
+            return error.NotImplemented;
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "bundle", .default_dir);
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer std.testing.allocator.free(root);
+    const bundle = try std.fs.path.join(std.testing.allocator, &.{ root, "bundle" });
+    defer std.testing.allocator.free(bundle);
+    var implementation: TestBackend = .{};
+    const backend: Backend = .{ .ptr = &implementation, .vtable = &TestBackend.vtable };
+    for ([_]bool{ false, true }) |has_process| {
+        const spec: oci.Spec = .{
+            .ociVersion = "1.0.2",
+            .root = .{ .path = "." },
+            .linux = .{ .namespaces = &.{.{ .type = .mount }} },
+            .process = if (has_process) .{ .args = &.{"/bin/sh"}, .cwd = "/", .user = .{ .uid = 0, .gid = 0 } } else null,
+        };
+        const json = try std.json.Stringify.valueAlloc(std.testing.allocator, spec, .{ .emit_null_optional_fields = false });
+        defer std.testing.allocator.free(json);
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "bundle/config.json", .data = json });
+        try createContainer(std.testing.allocator, std.testing.io, backend, .{
+            .root = root,
+            .subcommand = .create,
+            .id = "example",
+            .bundle = bundle,
+        });
+        defer tmp.dir.deleteTree(std.testing.io, "example") catch {};
+        try tmp.dir.writeFile(std.testing.io, .{
+            .sub_path = "bundle/config.json",
+            .data = if (has_process) "garbage" else
+                \\{"ociVersion":"1.0.2","root":{"path":"/"},"process":{"args":["/bin/sh"],"cwd":"/","user":{"uid":0,"gid":0}}}
+            ,
+        });
+        try tmp.dir.deleteFile(std.testing.io, "example/exec.fifo");
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "example/exec.fifo", .data = "\x01" });
+        const config: Config = .{ .root = root, .subcommand = .start, .id = "example" };
+        if (has_process) {
+            try startContainer(std.testing.allocator, std.testing.io, backend, config);
+            const state = try oci.loadState(std.testing.allocator, std.testing.io, root, "example");
+            defer state.deinit();
+            try std.testing.expectEqual(oci.Status.running, state.value.status);
+        } else {
+            try std.testing.expectError(error.MissingProcess, startContainer(std.testing.allocator, std.testing.io, backend, config));
+        }
+    }
 }
 
 test "linux state kill and delete refresh stale creating created and running states" {

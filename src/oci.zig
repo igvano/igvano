@@ -210,6 +210,7 @@ test "cgroup resource mapping frees partially allocated writes on allocation fai
 pub const state_file_name = "state.json";
 pub const exec_fifo_name = "exec.fifo";
 pub const starttime_file_name = "starttime";
+pub const process_file_name = "process";
 pub const cgroup_file_name = "cgroup";
 pub const hooks_file_name = "hooks.json";
 pub const runtime_oci_version = "1.0.2";
