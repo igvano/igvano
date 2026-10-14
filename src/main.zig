@@ -163,6 +163,61 @@ fn parseSignal(value: ?[]const u8) !i32 {
     return @intCast(@intFromEnum(signal));
 }
 
+fn openContainerLock(allocator: std.mem.Allocator, config: Config, create: bool) !?std.Io.File {
+    if (comptime builtin.os.tag != .linux) return null;
+    const path = try std.fs.path.join(allocator, &.{ config.root, config.id, oci.lock_file_name });
+    defer allocator.free(path);
+    const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{
+        .ACCMODE = .RDWR,
+        .CLOEXEC = true,
+        .CREAT = create,
+        .EXCL = create,
+    }, 0o600) catch |err| switch (err) {
+        // Older state directories have no lock file; keep their unlocked behavior.
+        error.FileNotFound => if (!create) return null else return err,
+        else => return err,
+    };
+    return .{ .handle = fd, .flags = .{ .nonblocking = false } };
+}
+
+fn lockContainer(file: std.Io.File, blocking: bool) !bool {
+    if (comptime builtin.os.tag != .linux) return true;
+    const linux = std.os.linux;
+    var lock = std.mem.zeroes(linux.Flock);
+    lock.type = linux.F.WRLCK;
+    lock.whence = linux.SEEK.SET;
+    // Record locks are not inherited by the forked init waiting on the exec FIFO.
+    // Zig 0.16's F.SETLK/SETLKW compare sizeof(usize) to 64, selecting 32-bit commands.
+    const native_fcntl = !@hasField(linux.SYS, "fcntl64");
+    const setlk: i32 = if (native_fcntl) (if (builtin.cpu.arch.isSPARC()) 8 else 6) else linux.F.SETLK;
+    const setlkw: i32 = if (native_fcntl) (if (builtin.cpu.arch.isSPARC()) 9 else 7) else linux.F.SETLKW;
+    while (true) {
+        switch (linux.errno(linux.fcntl(file.handle, if (blocking) setlkw else setlk, @intFromPtr(&lock)))) {
+            .SUCCESS => return true,
+            .INTR => continue,
+            .AGAIN, .ACCES => if (!blocking) return false else return error.LockFailed,
+            .NOLCK, .NOMEM => return error.SystemResources,
+            else => return error.LockFailed,
+        }
+    }
+}
+
+fn requireLinkedLock(io: std.Io, file: std.Io.File) !void {
+    if ((try file.stat(io)).nlink == 0) return error.FileNotFound;
+}
+
+fn deleteStateDirectory(io: std.Io, path: []const u8) !void {
+    const cwd = std.Io.Dir.cwd();
+    var dir = try cwd.openDir(io, path, .{});
+    defer dir.close(io);
+    // Remove state before lock, so callers taking the legacy path see not-found.
+    dir.deleteFile(io, oci.state_file_name) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+    try cwd.deleteTree(io, path);
+}
+
 fn createContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, config: Config) !void {
     const cwd = std.Io.Dir.cwd();
     const bundle = try cwd.realPathFileAlloc(io, config.bundle orelse ".", allocator);
@@ -231,7 +286,24 @@ fn createContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, c
         error.PathAlreadyExists => return error.ContainerExists,
         else => return err,
     };
-    errdefer cwd.deleteTree(io, state_dir) catch {};
+    var lock: ?std.Io.File = null;
+    defer if (lock) |file| file.close(io);
+    var setup_attempted = false;
+    errdefer {
+        deleteStateDirectory(io, state_dir) catch {};
+        if (lock) |file| {
+            file.close(io);
+            lock = null;
+        }
+        // Backend failures clean up init; later failures kill it before this defer.
+        if (setup_attempted) {
+            state.status = .stopped;
+            warnHooks(allocator, configured_hooks.poststop, state, "poststop");
+        }
+    }
+    lock = try openContainerLock(allocator, .{ .root = root, .id = config.id, .subcommand = .create }, true);
+    if (lock) |file| _ = try lockContainer(file, true);
+    // Setup hooks hold the lock; their own start/kill/delete wait for hook timeout, while state never blocks.
 
     const cgroup_state_path = try std.fs.path.join(allocator, &.{ state_dir, oci.cgroup_file_name });
     defer allocator.free(cgroup_state_path);
@@ -263,6 +335,7 @@ fn createContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, c
         .state = &state,
         .hooks = configured_hooks,
     };
+    setup_attempted = true;
     const created = backend.create(.{
         .allocator = allocator,
         .id = config.id,
@@ -287,13 +360,6 @@ fn createContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, c
         .rootfs_propagation = oci.rootfsPropagation(settings.rootfsPropagation),
         .on_create = .{ .ptr = &create_context, .run = CreateContext.run },
     });
-    errdefer {
-        // backend.create has now attempted container setup and cleaned up its
-        // own failures. Later failures stop init before these hooks run.
-        cwd.deleteTree(io, state_dir) catch {};
-        state.status = .stopped;
-        warnHooks(allocator, configured_hooks.poststop, state, "poststop");
-    }
     const handle = created catch |err| return create_context.failure orelse err;
     defer allocator.free(handle.starttime);
     errdefer {
@@ -466,7 +532,7 @@ const LiveState = struct {
     }
 };
 
-fn readLiveState(allocator: std.mem.Allocator, io: std.Io, backend: Backend, config: Config) !LiveState {
+fn readLiveState(allocator: std.mem.Allocator, io: std.Io, backend: Backend, config: Config, persist_recovery: bool) !LiveState {
     var parsed = try oci.loadState(allocator, io, config.root, config.id);
     errdefer parsed.deinit();
     if (!std.mem.eql(u8, parsed.value.id, config.id)) return error.InvalidState;
@@ -479,14 +545,20 @@ fn readLiveState(allocator: std.mem.Allocator, io: std.Io, backend: Backend, con
         };
         if (handle == null or !try backend.alive(handle.?)) {
             parsed.value.status = .stopped;
-            try oci.saveState(allocator, io, config.root, parsed.value);
+            if (persist_recovery) try oci.saveState(allocator, io, config.root, parsed.value);
         }
     }
     return .{ .parsed = parsed, .handle = handle, .allocator = allocator };
 }
 
 fn startContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, config: Config) !void {
-    var state = try readLiveState(allocator, io, backend, config);
+    var lock = try openContainerLock(allocator, config, false);
+    defer if (lock) |file| file.close(io);
+    if (lock) |file| {
+        _ = try lockContainer(file, true);
+        try requireLinkedLock(io, file);
+    }
+    var state = try readLiveState(allocator, io, backend, config, true);
     defer state.deinit();
     try oci.requireStart(state.parsed.value.status, true);
     try oci.requireStart(state.parsed.value.status, try loadHasProcess(allocator, io, config));
@@ -497,7 +569,7 @@ fn startContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, co
     runHooks(allocator, if (saved_hooks) |entries| entries.value.prestart else null, state.parsed.value) catch |err| {
         stopContainer(io, backend, state.handle) catch |cleanup_err|
             std.debug.print("igvano: warning: cannot stop container after prestart failure: {s}\n", .{@errorName(cleanup_err)});
-        destroyContainer(allocator, io, backend, config, &state, if (saved_hooks) |entries| entries.value.poststop else null) catch |cleanup_err|
+        destroyContainer(allocator, io, backend, config, &state, &lock, if (saved_hooks) |entries| entries.value.poststop else null) catch |cleanup_err|
             std.debug.print("igvano: warning: cannot destroy container after prestart failure: {s}\n", .{@errorName(cleanup_err)});
         return err;
     };
@@ -505,6 +577,10 @@ fn startContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, co
     state.parsed.value.status = .running;
     try oci.saveState(allocator, io, config.root, state.parsed.value);
     std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    if (lock) |file| {
+        file.close(io);
+        lock = null;
+    }
     warnHooks(allocator, if (saved_hooks) |entries| entries.value.poststart else null, state.parsed.value, "poststart");
 }
 
@@ -572,7 +648,13 @@ fn waitForStart(allocator: std.mem.Allocator, io: std.Io, backend: Backend, hand
 
 fn killContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, config: Config) !void {
     const signal = try parseSignal(config.signal);
-    const state = try readLiveState(allocator, io, backend, config);
+    const lock = try openContainerLock(allocator, config, false);
+    defer if (lock) |file| file.close(io);
+    if (lock) |file| {
+        _ = try lockContainer(file, true);
+        try requireLinkedLock(io, file);
+    }
+    const state = try readLiveState(allocator, io, backend, config, true);
     defer state.deinit();
     try oci.requireKill(state.parsed.value.status);
     try backend.kill(state.handle.?, signal);
@@ -602,7 +684,13 @@ fn stopContainer(io: std.Io, backend: Backend, handle: ?Backend.Handle) !void {
 }
 
 fn deleteContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, config: Config) !void {
-    var state = try readLiveState(allocator, io, backend, config);
+    var lock = try openContainerLock(allocator, config, false);
+    defer if (lock) |file| file.close(io);
+    if (lock) |file| {
+        _ = try lockContainer(file, true);
+        try requireLinkedLock(io, file);
+    }
+    var state = try readLiveState(allocator, io, backend, config, true);
     defer state.deinit();
     try requireDelete(state.parsed.value.status, config.force);
     if (config.force) try stopContainer(io, backend, state.handle);
@@ -611,10 +699,10 @@ fn deleteContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, c
         break :hooks null;
     };
     defer if (hooks) |parsed| parsed.deinit();
-    try destroyContainer(allocator, io, backend, config, &state, if (hooks) |parsed| parsed.value.poststop else null);
+    try destroyContainer(allocator, io, backend, config, &state, &lock, if (hooks) |parsed| parsed.value.poststop else null);
 }
 
-fn destroyContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, config: Config, state: *LiveState, poststop: ?[]const oci.Spec.Hook) !void {
+fn destroyContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, config: Config, state: *LiveState, lock: *?std.Io.File, poststop: ?[]const oci.Spec.Hook) !void {
     const cgroup_path = if (state.handle) |handle|
         handle.cgroup_path
     else
@@ -631,12 +719,22 @@ fn destroyContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, 
     state.parsed.value.status = .stopped;
     const path = try std.fs.path.join(allocator, &.{ config.root, config.id });
     defer allocator.free(path);
-    try std.Io.Dir.cwd().deleteTree(io, path);
+    try deleteStateDirectory(io, path);
+    if (lock.*) |file| {
+        file.close(io);
+        lock.* = null;
+    }
     warnHooks(allocator, poststop, state.parsed.value, "poststop");
 }
 
 fn stateContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, config: Config) !void {
-    const state = try readLiveState(allocator, io, backend, config);
+    const lock = try openContainerLock(allocator, config, false);
+    defer if (lock) |file| file.close(io);
+    const persist_recovery = if (lock) |file| try lockContainer(file, false) else true;
+    if (persist_recovery) {
+        if (lock) |file| try requireLinkedLock(io, file);
+    }
+    const state = try readLiveState(allocator, io, backend, config, persist_recovery);
     defer state.deinit();
     const json = try oci.stateJson(allocator, state.parsed.value);
     defer allocator.free(json);
@@ -1162,7 +1260,7 @@ test "prestart failure kills init and destroys runtime state" {
             .root = root,
             .id = "example",
             .subcommand = .state,
-        }));
+        }, true));
         if (comptime builtin.os.tag == .linux) {
             const input = try tmp.dir.readFileAlloc(std.testing.io, "poststop-state", std.testing.allocator, .limited(4096));
             defer std.testing.allocator.free(input);
@@ -1647,6 +1745,7 @@ test "create rejects a duplicate id without changing existing state" {
     });
     try tmp.dir.createDirPath(std.testing.io, "containers/example");
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "containers/example/state.json", .data = "existing state" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "containers/example/lock", .data = "existing lock" });
     const base = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
     defer std.testing.allocator.free(base);
     const root = try std.fs.path.join(std.testing.allocator, &.{ base, "containers" });
@@ -1663,6 +1762,9 @@ test "create rejects a duplicate id without changing existing state" {
     const state = try tmp.dir.readFileAlloc(std.testing.io, "containers/example/state.json", std.testing.allocator, .limited(1024));
     defer std.testing.allocator.free(state);
     try std.testing.expectEqualStrings("existing state", state);
+    const lock = try tmp.dir.readFileAlloc(std.testing.io, "containers/example/lock", std.testing.allocator, .limited(32));
+    defer std.testing.allocator.free(lock);
+    try std.testing.expectEqualStrings("existing lock", lock);
 }
 
 test "create rejects a missing bundle before creating the state directory" {
@@ -2061,7 +2163,7 @@ test "linux lifecycle exchanges the FIFO byte and persists running then stopped"
         }
     }
     reaped = true;
-    const stopped = try readLiveState(std.testing.allocator, std.testing.io, backend, config);
+    const stopped = try readLiveState(std.testing.allocator, std.testing.io, backend, config, true);
     defer stopped.deinit();
     try std.testing.expectEqual(oci.Status.stopped, stopped.parsed.value.status);
     const persisted = try oci.loadState(std.testing.allocator, std.testing.io, root, "example");
@@ -2241,7 +2343,7 @@ test "linux state kill and delete refresh stale creating created and running sta
             const config: Config = .{ .root = root, .subcommand = subcommand, .id = "example" };
             switch (subcommand) {
                 .state => {
-                    const state = try readLiveState(std.testing.allocator, std.testing.io, backend, config);
+                    const state = try readLiveState(std.testing.allocator, std.testing.io, backend, config, true);
                     defer state.deinit();
                     try std.testing.expectEqual(oci.Status.stopped, state.parsed.value.status);
                 },
@@ -2289,7 +2391,7 @@ test "creating state without a process identity becomes stopped and deletable" {
             .bundle = "/bundle",
         });
         const config: Config = .{ .root = root, .id = "example", .subcommand = .delete };
-        const state = try readLiveState(std.testing.allocator, std.testing.io, backend, config);
+        const state = try readLiveState(std.testing.allocator, std.testing.io, backend, config, true);
         defer state.deinit();
         try std.testing.expectEqual(oci.Status.stopped, state.parsed.value.status);
         try deleteContainer(std.testing.allocator, std.testing.io, backend, config);
@@ -2307,9 +2409,432 @@ test "creating state without a process identity becomes stopped and deletable" {
         .root = root,
         .id = "example",
         .subcommand = .state,
-    });
+    }, true);
     defer state.deinit();
     try std.testing.expectEqual(oci.Status.creating, state.parsed.value.status);
+}
+
+const LockTestBackend = struct {
+    const vtable: Backend.VTable = .{ .create = create, .alive = alive, .kill = kill, .delete = delete };
+    fn create(_: *anyopaque, _: Backend.CreateOptions) Backend.Error!Backend.Handle {
+        return error.NotImplemented;
+    }
+    fn alive(_: *anyopaque, handle: Backend.Handle) Backend.Error!bool {
+        return std.mem.eql(u8, handle.starttime, "alive");
+    }
+    fn kill(_: *anyopaque, _: Backend.Handle, _: i32) Backend.Error!void {}
+    fn delete(_: *anyopaque, _: Backend.Handle) Backend.Error!void {}
+};
+
+const LockTestProcess = struct {
+    pid: i32,
+    fd: std.posix.fd_t,
+
+    fn isHeld(path: []const u8) !bool {
+        const linux = std.os.linux;
+        const path_z = try std.testing.allocator.dupeZ(u8, path);
+        defer std.testing.allocator.free(path_z);
+        const result = linux.fork();
+        if (linux.errno(result) != .SUCCESS) return error.ForkFailed;
+        const pid: i32 = @intCast(result);
+        if (pid == 0) {
+            const opened = linux.open(path_z, .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
+            if (linux.errno(opened) != .SUCCESS) linux.exit_group(2);
+            const acquired = lockContainer(.{ .handle = @intCast(opened), .flags = .{ .nonblocking = false } }, false) catch linux.exit_group(3);
+            linux.exit_group(if (acquired) 1 else 0);
+        }
+        var status: u32 = undefined;
+        while (true) {
+            switch (linux.errno(linux.waitpid(pid, &status, 0))) {
+                .SUCCESS => break,
+                .INTR => continue,
+                else => return error.WaitFailed,
+            }
+        }
+        return switch (status) {
+            0 => true,
+            256 => false,
+            else => error.LockProbeFailed,
+        };
+    }
+
+    fn hold(path: []const u8) !LockTestProcess {
+        const linux = std.os.linux;
+        const path_z = try std.testing.allocator.dupeZ(u8, path);
+        defer std.testing.allocator.free(path_z);
+        const sockets = try backend_module.console.socketpair();
+        const result = linux.fork();
+        if (linux.errno(result) != .SUCCESS) {
+            for (sockets) |fd| _ = linux.close(fd);
+            return error.ForkFailed;
+        }
+        const pid: i32 = @intCast(result);
+        if (pid == 0) {
+            _ = linux.close(sockets[0]);
+            const opened = linux.open(path_z, .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
+            if (linux.errno(opened) != .SUCCESS) linux.exit_group(1);
+            _ = lockContainer(.{ .handle = @intCast(opened), .flags = .{ .nonblocking = false } }, true) catch linux.exit_group(2);
+            if (linux.write(sockets[1], &.{1}, 1) != 1) linux.exit_group(3);
+            var byte: [1]u8 = undefined;
+            if (linux.read(sockets[1], &byte, 1) != 1) linux.exit_group(4);
+            _ = linux.close(@intCast(opened));
+            linux.exit_group(0);
+        }
+        _ = linux.close(sockets[1]);
+        var child: LockTestProcess = .{ .pid = pid, .fd = sockets[0] };
+        errdefer child.deinit();
+        try child.expectByte();
+        return child;
+    }
+
+    fn command(config: Config, expected_error: ?anyerror) !LockTestProcess {
+        const linux = std.os.linux;
+        const sockets = try backend_module.console.socketpair();
+        const result = linux.fork();
+        if (linux.errno(result) != .SUCCESS) {
+            for (sockets) |fd| _ = linux.close(fd);
+            return error.ForkFailed;
+        }
+        const pid: i32 = @intCast(result);
+        if (pid == 0) {
+            _ = linux.close(sockets[0]);
+            if (config.subcommand == .state and linux.errno(linux.dup2(sockets[1], 1)) != .SUCCESS)
+                linux.exit_group(1);
+            if (linux.write(sockets[1], &.{1}, 1) != 1) linux.exit_group(2);
+            // Avoid using the test runner's allocator and I/O locks after fork.
+            var threaded: std.Io.Threaded = .init_single_threaded;
+            const io = threaded.io();
+            var implementation: LockTestBackend = .{};
+            const backend: Backend = .{ .ptr = &implementation, .vtable = &LockTestBackend.vtable };
+            const operation = switch (config.subcommand) {
+                .state => stateContainer(std.heap.page_allocator, io, backend, config),
+                .start => startContainer(std.heap.page_allocator, io, backend, config),
+                .kill => killContainer(std.heap.page_allocator, io, backend, config),
+                .delete => deleteContainer(std.heap.page_allocator, io, backend, config),
+                .create => unreachable,
+            };
+            if (operation) |_| {
+                if (expected_error != null) linux.exit_group(3);
+            } else |err| {
+                if (expected_error == null or err != expected_error.?) linux.exit_group(4);
+            }
+            if (linux.write(sockets[1], &.{1}, 1) != 1) linux.exit_group(5);
+            linux.exit_group(0);
+        }
+        _ = linux.close(sockets[1]);
+        var child: LockTestProcess = .{ .pid = pid, .fd = sockets[0] };
+        errdefer child.deinit();
+        try child.expectByte();
+        return child;
+    }
+
+    fn readable(self: LockTestProcess, timeout_ms: i32) !bool {
+        var poll = [_]std.posix.pollfd{.{ .fd = self.fd, .events = std.posix.POLL.IN, .revents = 0 }};
+        return try std.posix.poll(&poll, timeout_ms) != 0;
+    }
+
+    fn expectByte(self: LockTestProcess) !void {
+        try std.testing.expect(try self.readable(2000));
+        var byte: [1]u8 = undefined;
+        try std.testing.expectEqual(@as(usize, 1), try std.posix.read(self.fd, &byte));
+        try std.testing.expectEqual(@as(u8, 1), byte[0]);
+    }
+
+    fn release(self: LockTestProcess) !void {
+        try std.testing.expectEqual(@as(usize, 1), std.os.linux.write(self.fd, &.{1}, 1));
+    }
+
+    fn wait(self: *LockTestProcess) !void {
+        var status: u32 = undefined;
+        while (true) {
+            switch (std.os.linux.errno(std.os.linux.waitpid(self.pid, &status, 0))) {
+                .SUCCESS => break,
+                .INTR => continue,
+                else => return error.WaitFailed,
+            }
+        }
+        self.pid = 0;
+        try std.testing.expectEqual(@as(u32, 0), status);
+    }
+
+    fn deinit(self: *LockTestProcess) void {
+        _ = std.os.linux.close(self.fd);
+        if (self.pid != 0) {
+            _ = std.os.linux.kill(self.pid, .KILL);
+            var status: u32 = undefined;
+            while (std.os.linux.errno(std.os.linux.waitpid(self.pid, &status, 0)) == .INTR) {}
+        }
+    }
+
+    fn waitForLockFd(self: LockTestProcess, path: []const u8) !void {
+        const allocator = std.testing.allocator;
+        const proc_path = try std.fmt.allocPrint(allocator, "/proc/{d}/fd", .{self.pid});
+        defer allocator.free(proc_path);
+        var dir = try std.Io.Dir.cwd().openDir(std.testing.io, proc_path, .{ .iterate = true });
+        defer dir.close(std.testing.io);
+        const started = std.Io.Clock.awake.now(std.testing.io);
+        while (started.untilNow(std.testing.io, .awake).nanoseconds < std.Io.Duration.fromSeconds(2).nanoseconds) {
+            var iterator = dir.iterate();
+            while (try iterator.next(std.testing.io)) |entry| {
+                var buffer: [std.fs.max_path_bytes]u8 = undefined;
+                const len = dir.readLink(std.testing.io, entry.name, &buffer) catch continue;
+                if (std.mem.eql(u8, buffer[0..len], path)) return;
+            }
+            try std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake);
+        }
+        return error.LockWaitTimeout;
+    }
+};
+
+test "linux held lock lets state report stopped without persisting recovery" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "example", .default_dir);
+    const base = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer std.testing.allocator.free(base);
+    const root = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, base, std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ root, "example", "lock" });
+    defer std.testing.allocator.free(path);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "example/lock", .data = "" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "example/starttime", .data = "dead" });
+    for ([_]oci.Status{ .creating, .created, .running }) |status| {
+        try oci.saveState(std.testing.allocator, std.testing.io, root, .{
+            .id = "example",
+            .status = status,
+            .pid = if (status == .creating) null else 1234,
+            .bundle = "/bundle",
+        });
+        var holder = try LockTestProcess.hold(path);
+        defer holder.deinit();
+        const config: Config = .{ .root = root, .id = "example", .subcommand = .state };
+        var command = try LockTestProcess.command(config, null);
+        defer command.deinit();
+        var output: [4096]u8 = undefined;
+        var len: usize = 0;
+        while (true) {
+            try std.testing.expect(try command.readable(2000));
+            const count = try std.posix.read(command.fd, output[len..]);
+            if (count == 0) break;
+            len += count;
+        }
+        try command.wait();
+        try std.testing.expect(len > 1 and output[len - 1] == 1);
+        const reported = try std.json.parseFromSlice(oci.State, std.testing.allocator, output[0 .. len - 1], .{});
+        defer reported.deinit();
+        try std.testing.expectEqual(oci.Status.stopped, reported.value.status);
+        const saved = try oci.loadState(std.testing.allocator, std.testing.io, root, "example");
+        defer saved.deinit();
+        try std.testing.expectEqual(status, saved.value.status);
+        try holder.release();
+        try holder.wait();
+        var unlocked = try LockTestProcess.command(config, null);
+        defer unlocked.deinit();
+        // State output is small enough to fit in the socket before wait.
+        try unlocked.wait();
+        const recovered = try oci.loadState(std.testing.allocator, std.testing.io, root, "example");
+        defer recovered.deinit();
+        try std.testing.expectEqual(oci.Status.stopped, recovered.value.status);
+    }
+}
+
+test "linux start kill and delete wait for a held container lock" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer std.testing.allocator.free(base);
+    const root = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, base, std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ root, "example", "lock" });
+    defer std.testing.allocator.free(path);
+    for ([_]Subcommand{ .start, .kill, .delete }) |subcommand| {
+        try tmp.dir.createDirPath(std.testing.io, "example");
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "example/lock", .data = "" });
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "example/starttime", .data = "alive" });
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "example/exec.fifo", .data = "\x01" });
+        const status: oci.Status = if (subcommand == .delete) .stopped else .created;
+        try oci.saveState(std.testing.allocator, std.testing.io, root, .{
+            .id = "example",
+            .status = status,
+            .pid = 1234,
+            .bundle = "/bundle",
+        });
+        var holder = try LockTestProcess.hold(path);
+        defer holder.deinit();
+        var command = try LockTestProcess.command(.{ .root = root, .id = "example", .subcommand = subcommand }, null);
+        defer command.deinit();
+        try command.waitForLockFd(path);
+        try std.testing.expect(!try command.readable(100));
+        try holder.release();
+        try holder.wait();
+        try command.expectByte();
+        try command.wait();
+        if (subcommand == .delete) {
+            try std.testing.expectError(error.FileNotFound, oci.loadState(std.testing.allocator, std.testing.io, root, "example"));
+        } else {
+            const saved = try oci.loadState(std.testing.allocator, std.testing.io, root, "example");
+            defer saved.deinit();
+            try std.testing.expectEqual(if (subcommand == .start) oci.Status.running else status, saved.value.status);
+        }
+    }
+}
+
+test "linux lock waiters reject deleted containers even when the id is recreated" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer std.testing.allocator.free(base);
+    const root = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, base, std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ root, "example", "lock" });
+    defer std.testing.allocator.free(path);
+    for ([_]Subcommand{ .start, .kill, .delete }) |subcommand| {
+        try tmp.dir.createDir(std.testing.io, "example", .default_dir);
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "example/lock", .data = "" });
+        var holder = try LockTestProcess.hold(path);
+        defer holder.deinit();
+        var command = try LockTestProcess.command(.{ .root = root, .id = "example", .subcommand = subcommand }, error.FileNotFound);
+        defer command.deinit();
+        try command.waitForLockFd(path);
+        try tmp.dir.deleteTree(std.testing.io, "example");
+        try tmp.dir.createDir(std.testing.io, "example", .default_dir);
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "example/lock", .data = "" });
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "example/starttime", .data = "alive" });
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "example/exec.fifo", .data = "\x01" });
+        try oci.saveState(std.testing.allocator, std.testing.io, root, .{
+            .id = "example",
+            .status = if (subcommand == .delete) .stopped else .created,
+            .pid = 1234,
+            .bundle = "/bundle",
+        });
+        try holder.release();
+        try holder.wait();
+        try command.expectByte();
+        try command.wait();
+        try tmp.dir.deleteTree(std.testing.io, "example");
+    }
+}
+
+test "linux create never reuses an existing lock file" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "example", .default_dir);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "example/lock", .data = "existing lock" });
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer std.testing.allocator.free(root);
+    try std.testing.expectError(error.PathAlreadyExists, openContainerLock(std.testing.allocator, .{
+        .root = root,
+        .id = "example",
+        .subcommand = .create,
+    }, true));
+    const contents = try tmp.dir.readFileAlloc(std.testing.io, "example/lock", std.testing.allocator, .limited(32));
+    defer std.testing.allocator.free(contents);
+    try std.testing.expectEqualStrings("existing lock", contents);
+}
+
+test "linux early create failure removes state while holding the lock" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const TestIo = struct {
+        var checked = false;
+        var held = false;
+        var state_removed = false;
+
+        fn rename(userdata: ?*anyopaque, old_dir: std.Io.Dir, old_path: []const u8, new_dir: std.Io.Dir, new_path: []const u8) std.Io.Dir.RenameError!void {
+            // Fail after creating state.json, but before backend setup begins.
+            if (std.mem.eql(u8, std.fs.path.basename(new_path), oci.hooks_file_name)) return error.AccessDenied;
+            return std.testing.io.vtable.dirRename(userdata, old_dir, old_path, new_dir, new_path);
+        }
+
+        fn openDir(userdata: ?*anyopaque, dir: std.Io.Dir, path: []const u8, options: std.Io.Dir.OpenOptions) std.Io.Dir.OpenError!std.Io.Dir {
+            const opened = try std.testing.io.vtable.dirOpenDir(userdata, dir, path, options);
+            errdefer opened.close(std.testing.io);
+            if (options.iterate and std.mem.endsWith(u8, path, "/example")) {
+                checked = true;
+                var buffer: [std.fs.max_path_bytes]u8 = undefined;
+                const lock_path = std.fmt.bufPrint(&buffer, "{s}/lock", .{path}) catch return error.Unexpected;
+                held = LockTestProcess.isHeld(lock_path) catch return error.Unexpected;
+                if (opened.statFile(std.testing.io, oci.state_file_name, .{})) |_| {
+                    state_removed = false;
+                } else |err| {
+                    state_removed = err == error.FileNotFound;
+                }
+            }
+            return opened;
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "bundle", .default_dir);
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "bundle/config.json",
+        .data =
+        \\{"ociVersion":"1.0.2","root":{"path":"/"},"linux":{"namespaces":[{"type":"mount"}]},"hooks":{}}
+        ,
+    });
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer std.testing.allocator.free(root);
+    const bundle = try std.fs.path.join(std.testing.allocator, &.{ root, "bundle" });
+    defer std.testing.allocator.free(bundle);
+    var vtable = std.testing.io.vtable.*;
+    vtable.dirRename = TestIo.rename;
+    vtable.dirOpenDir = TestIo.openDir;
+    const io: std.Io = .{ .userdata = std.testing.io.userdata, .vtable = &vtable };
+    var implementation: LockTestBackend = .{};
+    try std.testing.expectError(error.AccessDenied, createContainer(std.testing.allocator, io, .{
+        .ptr = &implementation,
+        .vtable = &LockTestBackend.vtable,
+    }, .{ .root = root, .id = "example", .subcommand = .create, .bundle = bundle }));
+    try std.testing.expect(TestIo.checked);
+    try std.testing.expect(TestIo.held);
+    try std.testing.expect(TestIo.state_removed);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.openDir(std.testing.io, "example", .{}));
+}
+
+test "linux create holds a private lock until backend setup finishes" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const TestBackend = struct {
+        const vtable: Backend.VTable = .{ .create = create, .alive = LockTestBackend.alive, .kill = LockTestBackend.kill, .delete = LockTestBackend.delete };
+        fn create(_: *anyopaque, options: Backend.CreateOptions) Backend.Error!Backend.Handle {
+            var buffer: [std.fs.max_path_bytes]u8 = undefined;
+            const path = std.fmt.bufPrintZ(&buffer, "{s}/lock", .{std.fs.path.dirname(options.exec_fifo).?}) catch return error.InvalidPath;
+            if (!(LockTestProcess.isHeld(path) catch return error.CreateFailed)) return error.CreateFailed;
+            const handle: Backend.Handle = .{ .id = options.id, .pid = 1234, .starttime = "alive" };
+            if (options.on_create) |callback| try callback.run(callback.ptr, handle);
+            return .{ .id = options.id, .pid = handle.pid, .starttime = try options.allocator.dupe(u8, handle.starttime) };
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "bundle", .default_dir);
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "bundle/config.json",
+        .data =
+        \\{"ociVersion":"1.0.2","root":{"path":"/"},"linux":{"namespaces":[{"type":"mount"}]}}
+        ,
+    });
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer std.testing.allocator.free(root);
+    const bundle = try std.fs.path.join(std.testing.allocator, &.{ root, "bundle" });
+    defer std.testing.allocator.free(bundle);
+    var implementation: TestBackend = .{};
+    try createContainer(std.testing.allocator, std.testing.io, .{ .ptr = &implementation, .vtable = &TestBackend.vtable }, .{
+        .root = root,
+        .id = "example",
+        .subcommand = .create,
+        .bundle = bundle,
+    });
+    const stat = try tmp.dir.statFile(std.testing.io, "example/lock", .{});
+    try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), stat.permissions.toMode() & 0o7777);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ root, "example", "lock" });
+    defer std.testing.allocator.free(path);
+    var holder = try LockTestProcess.hold(path);
+    defer holder.deinit();
+    try holder.release();
+    try holder.wait();
 }
 
 fn saveTestStarttime(root: []const u8, pid: i32) !void {
