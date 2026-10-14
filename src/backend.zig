@@ -2,6 +2,7 @@ const std = @import("std");
 const oci = @import("oci.zig");
 
 pub const LinuxBackend = @import("backend/linux.zig").LinuxBackend;
+pub const console = @import("backend/linux.zig").console;
 pub const hooks = @import("backend/hooks.zig");
 
 pub const Backend = struct {
@@ -17,6 +18,9 @@ pub const Backend = struct {
         /// Absolute path to the FIFO created by the frontend.
         exec_fifo: []const u8,
         spec: *const oci.Spec,
+        /// Borrowed socketpair: init sends its PTY master on [1]; the caller
+        /// receives on [0]. Both ends are CLOEXEC and remain caller-owned.
+        console_fds: ?[2]std.posix.fd_t = null,
         mounts: []const Mount = &.{},
         /// Normalized path relative to the cgroup2 mount root.
         cgroup_path: []const u8 = "",
@@ -130,6 +134,8 @@ pub const Backend = struct {
         CgroupDeleteFailed,
         HookFailed,
         HookTimeout,
+        ConsoleFailed,
+        MissingDevpts,
     } || std.mem.Allocator.Error;
 
     /// Backends receive parsed values only; the frontend loads config.json and resolves paths.

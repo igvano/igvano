@@ -108,29 +108,73 @@ test "bind-mounted dev skips defaults and rejects explicit devices" {
     }
 }
 
-/// Pure translation and validation; Linux flag constants are available on macOS too.
+fn namespaceFlag(kind: @FieldType(oci.Spec.Namespace, "type")) usize {
+    return switch (kind) {
+        .pid => linux.CLONE.NEWPID,
+        .network => linux.CLONE.NEWNET,
+        .mount => linux.CLONE.NEWNS,
+        .ipc => linux.CLONE.NEWIPC,
+        .uts => linux.CLONE.NEWUTS,
+        .user => linux.CLONE.NEWUSER,
+        .cgroup => linux.CLONE.NEWCGROUP,
+        .time => linux.CLONE.NEWTIME,
+    };
+}
+
+/// Only namespaces without paths are unshared. Constants work on macOS too.
 pub fn namespaceFlags(config: ?oci.Spec.Linux) Backend.Error!usize {
     const settings = config orelse return 0;
     const namespaces = settings.namespaces orelse return 0;
     var flags: usize = 0;
     var seen: usize = 0;
     for (namespaces) |namespace| {
-        const flag: usize = switch (namespace.type) {
-            .pid => linux.CLONE.NEWPID,
-            .network => linux.CLONE.NEWNET,
-            .mount => linux.CLONE.NEWNS,
-            .ipc => linux.CLONE.NEWIPC,
-            .uts => linux.CLONE.NEWUTS,
-            .user => linux.CLONE.NEWUSER,
-            .cgroup => linux.CLONE.NEWCGROUP,
-            .time => linux.CLONE.NEWTIME,
-        };
+        const flag = namespaceFlag(namespace.type);
         if (seen & flag != 0) return error.InvalidConfig;
         seen |= flag;
-        if (namespace.path != null) return error.Unsupported;
-        flags |= flag;
+        if (namespace.path) |path| {
+            if (!std.mem.startsWith(u8, path, "/") or std.mem.indexOfScalar(u8, path, 0) != null)
+                return error.InvalidPath;
+        } else flags |= flag;
     }
     return flags;
+}
+
+const NamespaceJoin = struct {
+    flag: usize,
+    path: [:0]const u8,
+};
+
+fn validateNamespaceFd(fd: posix.fd_t, flag: usize) Backend.Error!void {
+    const result = linux.ioctl(fd, linux.IOCTL.IO(0xb7, 3), 0); // NS_GET_NSTYPE
+    switch (linux.errno(result)) {
+        .SUCCESS => if (result != flag) return error.InvalidConfig,
+        // Old kernels lack NS_GET_NSTYPE; trust the configured type. setns
+        // still validates that the descriptor refers to a namespace.
+        .NOTTY => {},
+        else => try checkResult(result),
+    }
+}
+
+/// Open every host path before entering a user or mount namespace.
+fn joinNamespaces(joins: []const NamespaceJoin) Backend.Error!void {
+    var fds: [8]posix.fd_t = @splat(-1);
+    defer for (fds) |fd| {
+        if (fd >= 0) closeFd(fd);
+    };
+    for (joins, 0..) |join, i| {
+        fds[i] = try openPath(linux.AT.FDCWD, join.path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true });
+        try validateNamespaceFd(fds[i], join.flag);
+    }
+    // runc's nsexec order: user first for capabilities in the target owner.
+    for ([_]usize{
+        linux.CLONE.NEWUSER, linux.CLONE.NEWCGROUP, linux.CLONE.NEWIPC,
+        linux.CLONE.NEWUTS,  linux.CLONE.NEWNET,    linux.CLONE.NEWPID,
+        linux.CLONE.NEWNS,   linux.CLONE.NEWTIME,
+    }) |flag| {
+        for (joins, 0..) |join, i| {
+            if (join.flag == flag) try checkResult(linux.setns(fds[i], @intCast(flag)));
+        }
+    }
 }
 
 pub const LinuxBackend = struct {
@@ -148,12 +192,16 @@ pub const LinuxBackend = struct {
     fn create(ptr: *anyopaque, options: Backend.CreateOptions) Backend.Error!Backend.Handle {
         if (comptime builtin.os.tag == .linux) {
             const flags = try namespaceFlags(options.spec.linux);
-            if (options.spec.hostname != null and flags & linux.CLONE.NEWUTS == 0)
+            var isolation_flags = flags;
+            for (if (options.spec.linux) |settings| settings.namespaces orelse &.{} else &.{}) |namespace|
+                isolation_flags |= namespaceFlag(namespace.type);
+            if (options.spec.hostname != null and isolation_flags & linux.CLONE.NEWUTS == 0)
                 return error.InvalidConfig;
             if (options.spec.process) |process| {
-                if (process.terminal orelse false) return error.Unsupported;
                 if (process.args.len == 0) return error.InvalidProcess;
             }
+            const terminal = if (options.spec.process) |process| process.terminal orelse false else false;
+            if (terminal != (options.console_fds != null)) return error.InvalidConfig;
             if (options.capabilities) |caps| {
                 if (caps.ambient & ~(caps.permitted & caps.inheritable) != 0)
                     return error.AmbientCapabilitiesRequirePermittedAndInheritable;
@@ -171,7 +219,15 @@ pub const LinuxBackend = struct {
             var arena: std.heap.ArenaAllocator = .init(options.allocator);
             defer arena.deinit();
             const allocator = arena.allocator();
+            var joins: std.ArrayList(NamespaceJoin) = .empty;
+            for (if (options.spec.linux) |settings| settings.namespaces orelse &.{} else &.{}) |namespace| {
+                if (namespace.path) |path| try joins.append(allocator, .{
+                    .flag = namespaceFlag(namespace.type),
+                    .path = try pathString(allocator, path),
+                });
+            }
             const user_namespace = flags & linux.CLONE.NEWUSER != 0;
+            const joined_user_namespace = !user_namespace and isolation_flags & linux.CLONE.NEWUSER != 0;
             // Library callers bypass frontend validation, so mapping-presence checks are intentional.
             const uid_mappings = if (user_namespace) options.spec.linux.?.uidMappings orelse return error.InvalidConfig else &.{};
             const gid_mappings = if (user_namespace) options.spec.linux.?.gidMappings orelse return error.InvalidConfig else &.{};
@@ -184,9 +240,13 @@ pub const LinuxBackend = struct {
             const rootfs = try processString(allocator, options.rootfs);
             const cwd = try processString(allocator, if (options.spec.process) |process| process.cwd else "/");
             if (!std.fs.path.isAbsolute(cwd)) return error.InvalidProcess;
-            if (flags & linux.CLONE.NEWNS == 0) return error.MissingMountNamespace;
+            if (isolation_flags & linux.CLONE.NEWNS == 0) return error.MissingMountNamespace;
             if (!std.fs.path.isAbsolute(rootfs)) return error.InvalidPath;
             try validateCgroupPath(options.cgroup_path);
+            // Joined user namespaces may map root to a different host UID.
+            // Only the outside parent can chmod this host-owned FIFO. Readers
+            // remain root-only, as when init drops to a nonzero process UID.
+            if (joined_user_namespace) try checkResult(linux.fchmodat(linux.AT.FDCWD, fifo, 0o622));
             const cgroup_root = try openCgroupRoot();
             defer closeFd(cgroup_root.fd);
             const mounts = try allocator.alloc(PreparedMount, options.mounts.len);
@@ -284,6 +344,7 @@ pub const LinuxBackend = struct {
                 return err;
             };
             if (child1 == 0) {
+                if (options.console_fds) |fds| closeFd(fds[0]);
                 closeFd(create_go[1]);
                 if (map_pipe) |fds| closeFd(fds[1]);
                 closeFd(cgroup_root.fd);
@@ -292,6 +353,7 @@ pub const LinuxBackend = struct {
                 // inherits this membership; the runtime parent stays outside.
                 writeCgroupFile(cgroup, "cgroup.procs", "0", options.cgroup_path) catch |err| failCreate(report[1], err);
                 closeFd(cgroup);
+                joinNamespaces(joins.items) catch |err| failCreate(report[1], err);
                 // NEWUSER is unshared together with the others so it owns them.
                 if (flags != 0) checkResult(linux.unshare(flags)) catch |err| failCreate(report[1], err);
                 // NEWPID affects the next fork, making child2 pid 1 inside the namespace.
@@ -311,6 +373,8 @@ pub const LinuxBackend = struct {
                         var byte: [1]u8 = undefined;
                         if (!readAll(fds[0], &byte)) linux.exit_group(1);
                         closeFd(fds[0]);
+                    }
+                    if (isolation_flags & linux.CLONE.NEWUSER != 0) {
                         // Like runc nsexec stage-2, become root in the user ns.
                         // Unmapped host-root fsuid/fsgid make may_create() fail
                         // with EOVERFLOW on filesystems mounted in this ns.
@@ -323,15 +387,18 @@ pub const LinuxBackend = struct {
                     const start_input = std.fmt.bufPrint(start_state, "{s}{d}{s}", .{
                         options.start_hook_state.prefix, host_pid, options.start_hook_state.suffix,
                     }) catch linux.exit_group(1);
-                    runInit(options.spec, capabilities, options.rlimits, flags, rootfs, mounts, devices, options.device_symlinks, cwd, fifo, argv.ptr, envp.ptr, ready[1], .{
+                    runInit(options.spec, capabilities, options.rlimits, isolation_flags, rootfs, mounts, devices, options.device_symlinks, cwd, fifo, argv.ptr, envp.ptr, ready[1], .{
                         .propagation = options.rootfs_propagation,
                         .create_hooks = create_hooks,
                         .create_hook_state = create_input,
                         .masked_paths = masked_paths,
                         .readonly_paths = readonly_paths,
                         .runtime_sync = .{ .ready_fd = ready[1], .go_fd = create_go[0] },
+                        .console_fd = if (options.console_fds) |fds| fds[1] else null,
+                        .fifo_writable = joined_user_namespace,
                     }, start_hooks, start_input);
                 }
+                if (options.console_fds) |fds| closeFd(fds[1]);
                 closeFd(create_go[0]);
                 closeFd(pid_pipe[0]);
                 var host_pid = child2;
@@ -943,6 +1010,265 @@ fn closeFd(fd: posix.fd_t) void {
     _ = posix.system.close(fd);
 }
 
+/// Linux descriptor passing, shared by init and the frontend. No allocation
+/// or std.Io machinery: these helpers also run after fork.
+pub const console = struct {
+    const Rights = extern struct {
+        header: linux.cmsghdr,
+        fd: posix.fd_t,
+    };
+    const rights_len = @sizeOf(linux.cmsghdr) + @sizeOf(posix.fd_t);
+
+    pub fn socketpair() Backend.Error![2]posix.fd_t {
+        if (comptime builtin.os.tag != .linux) return error.NotImplemented;
+        var fds: [2]posix.fd_t = undefined;
+        try checkResult(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0, &fds));
+        errdefer for (fds) |fd| closeFd(fd);
+        for (&fds) |*fd| {
+            if (fd.* <= 2) {
+                const moved = linux.fcntl(fd.*, linux.F.DUPFD_CLOEXEC, 3);
+                try checkResult(moved);
+                closeFd(fd.*);
+                fd.* = @intCast(moved);
+            }
+        }
+        return fds;
+    }
+
+    pub fn sendFd(socket: posix.fd_t, fd: posix.fd_t) Backend.Error!void {
+        if (comptime builtin.os.tag != .linux) return error.NotImplemented;
+        var rights: Rights = std.mem.zeroes(Rights);
+        rights.header = .{ .len = rights_len, .level = linux.SOL.SOCKET, .type = linux.SCM.RIGHTS };
+        rights.fd = fd;
+        const data = "ptmx";
+        const iov = [_]posix.iovec_const{.{ .base = data.ptr, .len = data.len }};
+        const message: linux.msghdr_const = .{
+            .name = null,
+            .namelen = 0,
+            .iov = &iov,
+            .iovlen = 1,
+            .control = &rights,
+            .controllen = @sizeOf(Rights),
+            .flags = 0,
+        };
+        while (true) {
+            const result = linux.sendmsg(socket, &message, linux.MSG.NOSIGNAL);
+            switch (linux.errno(result)) {
+                .SUCCESS => {
+                    if (result == 0) return error.ConsoleFailed;
+                    // Ancillary data is attached to the first byte, even when
+                    // a stream write is short. Do not send the rights twice.
+                    if (result < data.len and !writeAll(socket, data[result..])) return error.ConsoleFailed;
+                    return;
+                },
+                .INTR => continue,
+                else => return error.ConsoleFailed,
+            }
+        }
+    }
+
+    pub fn receiveFd(socket: posix.fd_t) Backend.Error!posix.fd_t {
+        if (comptime builtin.os.tag != .linux) return error.NotImplemented;
+        var rights: Rights = std.mem.zeroes(Rights);
+        var data: [4]u8 = undefined;
+        var iov = [_]posix.iovec{.{ .base = &data, .len = data.len }};
+        var message: linux.msghdr = .{
+            .name = null,
+            .namelen = 0,
+            .iov = &iov,
+            .iovlen = 1,
+            .control = &rights,
+            .controllen = @sizeOf(Rights),
+            .flags = 0,
+        };
+        const count = while (true) {
+            const result = linux.recvmsg(socket, &message, linux.MSG.CMSG_CLOEXEC | linux.MSG.WAITALL);
+            switch (linux.errno(result)) {
+                .SUCCESS => break result,
+                .INTR => continue,
+                else => return error.ConsoleFailed,
+            }
+        };
+        if (message.controllen < rights_len or rights.header.level != linux.SOL.SOCKET or
+            rights.header.type != linux.SCM.RIGHTS or rights.header.len < rights_len)
+            return error.ConsoleFailed;
+        // The aligned control buffer can hold a second fd in its padding.
+        // Close all delivered rights, including on truncated/malformed input.
+        const bytes = std.mem.asBytes(&rights);
+        const control_end = @min(message.controllen, @min(rights.header.len, bytes.len));
+        var offset: usize = rights_len;
+        while (offset + @sizeOf(posix.fd_t) <= control_end) : (offset += @sizeOf(posix.fd_t)) {
+            const extra = std.mem.bytesToValue(posix.fd_t, bytes[offset..][0..@sizeOf(posix.fd_t)]);
+            closeFd(extra);
+        }
+        errdefer closeFd(rights.fd);
+        if (rights.header.len != rights_len or message.flags & linux.MSG.CTRUNC != 0 or count == 0)
+            return error.ConsoleFailed;
+        if (count < data.len and !readAll(socket, data[count..])) return error.ConsoleFailed;
+        if (!std.mem.eql(u8, &data, "ptmx")) return error.ConsoleFailed;
+        return rights.fd;
+    }
+};
+
+test "linux SCM_RIGHTS roundtrip preserves a descriptor across forwarding" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const sockets = try console.socketpair();
+    defer for (sockets) |fd| closeFd(fd);
+    const forwarded = try console.socketpair();
+    defer for (forwarded) |fd| closeFd(fd);
+    const pipe = try makePipe();
+    defer for (pipe) |fd| closeFd(fd);
+    try console.sendFd(sockets[0], pipe[0]);
+    const received = try console.receiveFd(sockets[1]);
+    defer closeFd(received);
+    try std.testing.expect(linux.fcntl(received, linux.F.GETFD, 0) & linux.FD_CLOEXEC != 0);
+    try console.sendFd(forwarded[0], received);
+    const final = try console.receiveFd(forwarded[1]);
+    defer closeFd(final);
+    try std.testing.expect(writeAll(pipe[1], "x"));
+    var byte: [1]u8 = undefined;
+    try std.testing.expect(readAll(final, &byte));
+    try std.testing.expectEqualStrings("x", &byte);
+}
+
+test "linux console receiver rejects a message without descriptor rights and EOF" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const sockets = try console.socketpair();
+    defer closeFd(sockets[0]);
+    try std.testing.expect(writeAll(sockets[1], "ptmx"));
+    try std.testing.expectError(error.ConsoleFailed, console.receiveFd(sockets[0]));
+    closeFd(sockets[1]);
+    try std.testing.expectError(error.ConsoleFailed, console.receiveFd(sockets[0]));
+}
+
+test "linux namespace descriptors reject a mismatched configured type" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const fd = try openPath(linux.AT.FDCWD, "/proc/self/ns/net", .{ .ACCMODE = .RDONLY, .CLOEXEC = true });
+    defer closeFd(fd);
+    // Kernels without NS_GET_NSTYPE cannot exercise the type comparison.
+    if (linux.errno(linux.ioctl(fd, linux.IOCTL.IO(0xb7, 3), 0)) == .NOTTY) return error.SkipZigTest;
+    try validateNamespaceFd(fd, linux.CLONE.NEWNET);
+    try std.testing.expectError(error.InvalidConfig, validateNamespaceFd(fd, linux.CLONE.NEWUTS));
+}
+
+test "linux console setup binds its slave to dev console and sends its master" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    try requireTestMountNamespace();
+    const sockets = try console.socketpair();
+    const go = try makePipe();
+    defer for (go) |fd| closeFd(fd);
+    const pid = try forkProcess();
+    if (pid == 0) {
+        closeFd(sockets[0]);
+        checkResult(linux.unshare(linux.CLONE.NEWNS)) catch linux.exit_group(1);
+        checkResult(linux.mount(null, "/", null, linux.MS.PRIVATE | linux.MS.REC, 0)) catch linux.exit_group(1);
+        checkResult(linux.mount("tmpfs", "/dev", "tmpfs", linux.MS.NOSUID, 0)) catch linux.exit_group(1);
+        checkResult(linux.mkdir("/dev/pts", 0o755)) catch linux.exit_group(1);
+        checkResult(linux.mount("devpts", "/dev/pts", "devpts", linux.MS.NOSUID | linux.MS.NOEXEC, @intFromPtr("newinstance,ptmxmode=666,mode=620"))) catch linux.exit_group(1);
+        checkResult(linux.symlink("pts/ptmx", "/dev/ptmx")) catch linux.exit_group(1);
+        setupConsole(sockets[1]) catch linux.exit_group(1);
+        closeFd(sockets[1]);
+        var console_stat: linux.Statx = undefined;
+        var slave_stat: linux.Statx = undefined;
+        checkResult(linux.statx(linux.AT.FDCWD, "/dev/console", linux.AT.SYMLINK_NOFOLLOW, .BASIC_STATS, &console_stat)) catch linux.exit_group(1);
+        checkResult(linux.statx(1, "", linux.AT.EMPTY_PATH, .BASIC_STATS, &slave_stat)) catch linux.exit_group(1);
+        if (console_stat.mode & linux.S.IFMT != linux.S.IFCHR or
+            console_stat.ino != slave_stat.ino or
+            console_stat.dev_major != slave_stat.dev_major or console_stat.dev_minor != slave_stat.dev_minor)
+            linux.exit_group(1);
+        var session: i32 = undefined;
+        for (0..3) |fd| {
+            checkResult(linux.ioctl(@intCast(fd), linux.T.IOCGSID, @intFromPtr(&session))) catch linux.exit_group(1);
+            if (session != linux.getpid()) linux.exit_group(1);
+            if (linux.fcntl(@intCast(fd), linux.F.GETFD, 0) != 0) linux.exit_group(1);
+        }
+        if (!writeAll(1, "console\n")) linux.exit_group(1);
+        var byte: [1]u8 = undefined;
+        if (!readAll(go[0], &byte)) linux.exit_group(1);
+        linux.exit_group(0);
+    }
+    closeFd(sockets[1]);
+    defer closeFd(sockets[0]);
+    var reaped = false;
+    defer if (!reaped) {
+        _ = linux.kill(pid, .KILL);
+        _ = waitChild(pid) catch {};
+    };
+    const master = try console.receiveFd(sockets[0]);
+    defer closeFd(master);
+    var output: [9]u8 = undefined;
+    try std.testing.expect(readAll(master, &output));
+    try std.testing.expectEqualStrings("console\r\n", &output);
+    try std.testing.expect(writeAll(go[1], &.{1}));
+    try std.testing.expectEqual(@as(u32, 0), try waitChild(pid));
+    reaped = true;
+}
+
+fn setupConsole(socket: posix.fd_t) Backend.Error!void {
+    const pts = consolePath("/dev/pts", .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true }) catch
+        return error.MissingDevpts;
+    defer closeFd(pts);
+    var fs: [32]usize = undefined;
+    try checkResult(linux.syscall2(.fstatfs, @intCast(pts), @intFromPtr(&fs)));
+    if (fs[0] != 0x1cd1) return error.MissingDevpts; // DEVPTS_SUPER_MAGIC
+    const master = try consolePath("/dev/ptmx", .{ .ACCMODE = .RDWR, .NOCTTY = true, .CLOEXEC = true });
+    defer closeFd(master);
+    var unlock: i32 = 0;
+    try checkResult(linux.ioctl(master, linux.T.IOCSPTLCK, @intFromPtr(&unlock)));
+    const slave_flags: linux.O = .{ .ACCMODE = .RDWR, .NOCTTY = true, .CLOEXEC = true };
+    var slave_path_buffer: [32]u8 = undefined;
+    var slave_path: ?[:0]const u8 = null;
+    const opened_slave: posix.fd_t = peer: {
+        const result = linux.ioctl(master, linux.T.IOCGPTPEER, @as(u32, @bitCast(slave_flags)));
+        switch (linux.errno(result)) {
+            .SUCCESS => break :peer @intCast(result),
+            .NOTTY, .INVAL, .NOSYS => {
+                var number: u32 = undefined;
+                try checkResult(linux.ioctl(master, linux.T.IOCGPTN, @intFromPtr(&number)));
+                const path = std.fmt.bufPrintZ(&slave_path_buffer, "/dev/pts/{d}", .{number}) catch return error.ConsoleFailed;
+                slave_path = path;
+                break :peer try openPath(linux.AT.FDCWD, path, slave_flags);
+            },
+            else => return error.ConsoleFailed,
+        }
+    };
+    const slave = try consoleAboveStdio(opened_slave);
+    defer closeFd(slave);
+    const root = try consolePath("/", .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true });
+    defer closeFd(root);
+    const target = try consoleAboveStdio(try mountDestination(root, "/dev/console", true, true));
+    defer closeFd(target);
+    var source_buffer: [64]u8 = undefined;
+    var target_buffer: [64]u8 = undefined;
+    try checkResult(linux.mount(slave_path orelse fdPath(&source_buffer, slave), fdPath(&target_buffer, target), null, linux.MS.BIND, 0));
+    try checkResult(linux.setsid());
+    try checkResult(linux.ioctl(slave, linux.T.IOCSCTTY, 0));
+    for (0..3) |fd| {
+        try checkResult(linux.dup2(slave, @intCast(fd)));
+        // dup2(fd, fd) preserves CLOEXEC when stdio was initially closed.
+        try checkResult(linux.fcntl(@intCast(fd), linux.F.SETFD, 0));
+    }
+    try console.sendFd(socket, master);
+}
+
+fn consoleAboveStdio(fd: posix.fd_t) Backend.Error!posix.fd_t {
+    if (fd > 2) return fd;
+    defer closeFd(fd);
+    const moved = linux.fcntl(fd, linux.F.DUPFD_CLOEXEC, 3);
+    try checkResult(moved);
+    return @intCast(moved);
+}
+
+fn consolePath(path: [*:0]const u8, flags: linux.O) Backend.Error!posix.fd_t {
+    return consoleAboveStdio(try openPath(linux.AT.FDCWD, path, flags));
+}
+
+fn childError(message: []const u8, err: anyerror) void {
+    _ = writeAll(2, message);
+    _ = writeAll(2, @errorName(err));
+    _ = writeAll(2, "\n");
+}
+
 fn mappedRootID(mappings: []const oci.Spec.IDMapping) Backend.Error!u32 {
     for (mappings) |mapping| {
         if (mapping.containerID == 0 and mapping.size > 0) return mapping.hostID;
@@ -1316,6 +1642,8 @@ fn setupDevices(root_fd: posix.fd_t, devices: []const PreparedDevice, symlinks: 
 }
 
 const RootfsOptions = struct {
+    console_fd: ?posix.fd_t = null,
+    fifo_writable: bool = false,
     propagation: u32 = linux.MS.PRIVATE | linux.MS.REC,
     create_hooks: []const hooks.Prepared = &.{},
     create_hook_state: []const u8 = "",
@@ -1458,9 +1786,16 @@ fn runInit(
     var fifo_buffer: [32]u8 = undefined;
     const fifo_name = std.fmt.bufPrintZ(&fifo_buffer, "{d}", .{fifo_path}) catch unreachable;
     setupRootfs(rootfs, mounts, devices, symlinks, spec.root.readonly, rootfs_options) catch |err| {
-        std.debug.print("igvano: cannot prepare rootfs: {s}\n", .{@errorName(err)});
+        childError("igvano: cannot prepare rootfs: ", err);
         linux.exit_group(1);
     };
+    if (rootfs_options.console_fd) |socket| {
+        setupConsole(socket) catch |err| {
+            childError("igvano: cannot set up console (requires devpts mounted at /dev/pts): ", err);
+            linux.exit_group(1);
+        };
+        closeFd(socket);
+    }
     if (flags & linux.CLONE.NEWUTS != 0) {
         if (spec.hostname) |hostname| {
             // Zig 0.16 has no sethostname wrapper.
@@ -1470,10 +1805,10 @@ fn runInit(
     checkResult(linux.chdir(cwd)) catch linux.exit_group(1);
     if (spec.process) |process| {
         // Allow write-only reopen after setuid while keeping readers root-only.
-        if (process.user.uid != 0)
+        if (process.user.uid != 0 and !rootfs_options.fifo_writable)
             checkResult(linux.fchmodat(fd_dir, fifo_name, 0o622)) catch linux.exit_group(1);
         applyProcess(process, capabilities, rlimits) catch |err| {
-            std.debug.print("igvano: cannot apply process settings: {s}\n", .{@errorName(err)});
+            childError("igvano: cannot apply process settings: ", err);
             linux.exit_group(1);
         };
     }
@@ -1494,7 +1829,7 @@ fn runInit(
     // Opening the writer unblocks start. Report success only after hooks pass,
     // so a timeout or nonzero exit fails start without publishing "running".
     hooks.run(start_hooks, start_hook_state) catch |err| {
-        std.debug.print("igvano: start hook failed: {s}\n", .{@errorName(err)});
+        childError("igvano: start hook failed: ", err);
         _ = writeAll(fd, &.{0});
         linux.exit_group(1);
     };
@@ -1704,7 +2039,7 @@ test "linux liveness rejects an unreaped zombie even though kill zero succeeds" 
     try std.testing.expectError(error.ProcessNotFound, backend.kill(handle, 15));
 }
 
-test "linux create rejects hostname without UTS isolation and unsupported terminals" {
+test "linux create rejects hostname without UTS isolation and terminals without a console" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     var spec: oci.Spec = .{
         .ociVersion = "1.0.2",
@@ -1723,7 +2058,7 @@ test "linux create rejects hostname without UTS isolation and unsupported termin
     try std.testing.expectError(error.InvalidConfig, backend.create(options));
     spec.hostname = null;
     spec.process = .{ .args = &.{"/bin/sh"}, .cwd = "/", .terminal = true, .user = .{ .uid = 0, .gid = 0 } };
-    try std.testing.expectError(error.Unsupported, backend.create(options));
+    try std.testing.expectError(error.InvalidConfig, backend.create(options));
 }
 
 test "linux create requires mount isolation for library callers too" {
@@ -1879,18 +2214,29 @@ test "namespace flags reject duplicate types" {
     );
 }
 
-test "namespace flags reject joins including existing user namespaces" {
-    try std.testing.expectError(error.Unsupported, namespaceFlags(.{
+test "namespace flags exclude joins including existing user namespaces" {
+    try std.testing.expectEqual(@as(usize, 0), try namespaceFlags(.{
         .namespaces = &.{.{ .type = .network, .path = "/proc/1234/ns/net" }},
     }));
-    try std.testing.expectError(error.Unsupported, namespaceFlags(.{
-        .namespaces = &.{.{ .type = .user, .path = "/proc/1234/ns/user" }},
+    try std.testing.expectEqual(@as(usize, linux.CLONE.NEWNS), try namespaceFlags(.{
+        .namespaces = &.{ .{ .type = .mount }, .{ .type = .user, .path = "/proc/1234/ns/user" } },
     }));
     const mappings: []const oci.Spec.IDMapping = &.{.{ .containerID = 0, .hostID = 1000, .size = 1 }};
     try std.testing.expectEqual(@as(usize, linux.CLONE.NEWUSER | linux.CLONE.NEWNS), try namespaceFlags(.{
         .namespaces = &.{ .{ .type = .user }, .{ .type = .mount } },
         .uidMappings = mappings,
         .gidMappings = mappings,
+    }));
+}
+
+test "namespace paths reject empty relative and NUL paths and duplicate joins" {
+    for ([_][]const u8{ "", "relative", "/proc/1/ns/net\x00" }) |path| {
+        try std.testing.expectError(error.InvalidPath, namespaceFlags(.{
+            .namespaces = &.{.{ .type = .network, .path = path }},
+        }));
+    }
+    try std.testing.expectError(error.InvalidConfig, namespaceFlags(.{
+        .namespaces = &.{ .{ .type = .network, .path = "/proc/1/ns/net" }, .{ .type = .network } },
     }));
 }
 
@@ -2522,6 +2868,41 @@ test "linux mapped create installs maps outside init and cleans up rejected maps
     }
     const fifo_stat = try tmp.dir.statFile(std.testing.io, "exec.fifo", .{});
     try std.testing.expectEqual(@as(posix.mode_t, 0o600), fifo_stat.permissions.toMode() & 0o7777);
+    {
+        // Reuse this mapped user namespace while creating fresh mount/PID
+        // namespaces. Root's host UID differs from the runtime's UID.
+        const user_path = try std.fmt.allocPrint(std.testing.allocator, "/proc/{d}/ns/user", .{handle.pid});
+        defer std.testing.allocator.free(user_path);
+        const joined_fifo = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/joined.fifo", .{absolute}, 0);
+        defer std.testing.allocator.free(joined_fifo);
+        try checkResult(linux.mknod(joined_fifo, linux.S.IFIFO | 0o600, 0));
+        const joined_cgroup = try std.fmt.allocPrint(std.testing.allocator, "{s}-joined", .{cgroup_path});
+        defer std.testing.allocator.free(joined_cgroup);
+        var joined_spec = spec;
+        joined_spec.linux.?.namespaces = &.{ .{ .type = .mount }, .{ .type = .user, .path = user_path }, .{ .type = .pid } };
+        joined_spec.linux.?.uidMappings = null;
+        joined_spec.linux.?.gidMappings = null;
+        var joined_options = options;
+        joined_options.id = "joined";
+        joined_options.spec = &joined_spec;
+        joined_options.exec_fifo = joined_fifo;
+        joined_options.cgroup_path = joined_cgroup;
+        const joined = try backend.create(joined_options);
+        defer std.testing.allocator.free(joined.starttime);
+        defer {
+            backend.kill(joined, 9) catch {};
+            backend.delete(joined) catch {};
+        }
+        try std.testing.expect(try backend.alive(joined));
+        const joined_reader = try openPath(linux.AT.FDCWD, joined_fifo, .{ .ACCMODE = .RDONLY, .NONBLOCK = true, .CLOEXEC = true });
+        defer closeFd(joined_reader);
+        var joined_poll = [_]linux.pollfd{.{ .fd = joined_reader, .events = linux.POLL.IN, .revents = 0 }};
+        try checkResult(linux.poll(&joined_poll, 1, 2000));
+        try std.testing.expect(joined_poll[0].revents & linux.POLL.IN != 0);
+        var acknowledgement: [1]u8 = undefined;
+        try std.testing.expect(readAll(joined_reader, &acknowledgement));
+        try std.testing.expectEqual(@as(u8, 1), acknowledgement[0]);
+    }
     // Mapped root (host UID 100000) must still acknowledge start on the FIFO.
     const reader = try openPath(linux.AT.FDCWD, fifo, .{ .ACCMODE = .RDONLY, .NONBLOCK = true, .CLOEXEC = true });
     defer closeFd(reader);

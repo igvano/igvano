@@ -367,7 +367,7 @@ pub fn validateHooks(configured: ?Spec.Hooks) error{InvalidConfig}!void {
         for (@field(hooks, field.name) orelse &.{}) |hook| {
             if (!std.mem.startsWith(u8, hook.path, "/") or
                 std.mem.indexOfScalar(u8, hook.path, 0) != null or
-                (hook.timeout != null and hook.timeout.? == 0)) return error.InvalidConfig;
+                hook.timeout == 0) return error.InvalidConfig;
             for (hook.args orelse &.{}) |arg|
                 if (std.mem.indexOfScalar(u8, arg, 0) != null) return error.InvalidConfig;
             for (hook.env orelse &.{}) |env|
@@ -1010,10 +1010,7 @@ pub fn requireCreate(spec: Spec) !void {
     var has_user = false;
     for (namespaces) |namespace| {
         if (namespace.type == .mount) has_mount = true;
-        if (namespace.type == .user) {
-            if (namespace.path != null) return error.Unsupported;
-            has_user = true;
-        }
+        if (namespace.type == .user and namespace.path == null) has_user = true;
     }
     if (has_user) {
         for ([_][]const Spec.IDMapping{ uid_mappings, gid_mappings }) |mappings| {
@@ -1146,7 +1143,7 @@ test "create rejects malformed OCI version strings" {
     }
 }
 
-test "create accepts user namespaces with UID and GID mappings and rejects joins" {
+test "create accepts new user namespaces with maps and joins without maps" {
     var spec: Spec = .{
         .ociVersion = "1.0.2",
         .root = .{ .path = "rootfs" },
@@ -1158,7 +1155,10 @@ test "create accepts user namespaces with UID and GID mappings and rejects joins
     };
     try requireCreate(spec);
     spec.linux.?.namespaces = &.{ .{ .type = .mount }, .{ .type = .user, .path = "/proc/1/ns/user" } };
-    try std.testing.expectError(error.Unsupported, requireCreate(spec));
+    try std.testing.expectError(error.InvalidConfig, requireCreate(spec));
+    spec.linux.?.uidMappings = null;
+    spec.linux.?.gidMappings = null;
+    try requireCreate(spec);
 }
 
 test "create rejects mappings without a user namespace and missing user namespace maps" {
