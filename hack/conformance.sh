@@ -54,6 +54,8 @@ linux_cgroups_relative_blkio.t: reads blkio.weight, removed with CFQ in Linux 5.
     command -v timeout >/dev/null
     runtime_tools_ref=${RUNTIME_TOOLS_REF:-master}
     work=$(mktemp -d /tmp/igvano-conformance.XXXXXX)
+    # User-namespace containers' mapped root must traverse the bundle path.
+    chmod 0755 "$work"
     # Timed-out upstream suites can leave nested mounts busy. Detach the
     # task-owned tmpfs before removing the workspace, including its submounts.
     trap 'if ! mountpoint -q "$work/bundles" || umount -l "$work/bundles"; then rm -rf "$work"; fi' 0
