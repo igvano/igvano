@@ -2144,7 +2144,7 @@ fn applyV1Writes(allocator: std.mem.Allocator, hierarchies: []const V1Hierarchy,
 fn killV1Members(dir: posix.fd_t, freezer: ?posix.fd_t) Backend.Error!void {
     const allocator = std.heap.page_allocator;
     // Thaw even after a freeze timeout or a failed read/signal.
-    errdefer if (freezer) |fd| writeCgroupFile(fd, "freezer.state", "THAWED", "") catch {};
+    defer if (freezer) |fd| writeCgroupFile(fd, "freezer.state", "THAWED", "") catch {};
     if (freezer) |fd| {
         try writeCgroupFile(fd, "freezer.state", "FROZEN", "");
         const delay: linux.timespec = .{ .sec = 0, .nsec = 10_000_000 };
@@ -2153,9 +2153,11 @@ fn killV1Members(dir: posix.fd_t, freezer: ?posix.fd_t) Backend.Error!void {
             defer allocator.free(state);
             if (std.mem.eql(u8, std.mem.trim(u8, state, " \t\n"), "FROZEN")) break;
             _ = linux.nanosleep(&delay, null);
-        } else return error.CgroupDeleteFailed;
+        } else {
+            writeCgroupFile(fd, "freezer.state", "THAWED", "") catch {};
+        }
     }
-    // ponytail: without a mounted freezer, PID reuse between reading
+    // ponytail: without a frozen cgroup, PID reuse between reading
     // cgroup.procs and kill can signal an unrelated host process. This is the
     // safety ceiling of the fallback; pidfds would pin each process identity.
     const text = try readCgroupFile(allocator, dir, "cgroup.procs");
@@ -2169,7 +2171,6 @@ fn killV1Members(dir: posix.fd_t, freezer: ?posix.fd_t) Backend.Error!void {
             else => return error.CgroupDeleteFailed,
         }
     }
-    if (freezer) |fd| try writeCgroupFile(fd, "freezer.state", "THAWED", "");
 }
 
 fn removeV1Cgroups(hierarchies: []const V1Hierarchy, path: []const u8) Backend.Error!void {
