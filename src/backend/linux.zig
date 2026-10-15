@@ -13,6 +13,434 @@ const OPEN_TREE_CLONE: u32 = 1;
 const OPEN_TREE_CLOEXEC: u32 = 1 << @bitOffsetOf(linux.O, "CLOEXEC");
 
 const Write = struct { name: []const u8, value: []const u8 };
+const CgroupMode = enum { unified, legacy };
+const V1Write = struct {
+    controller: []const u8,
+    name: []const u8,
+    value: []const u8,
+    fallback: ?[]const u8 = null,
+    optional: bool = false,
+};
+
+/// Controller and fallback names are static; the caller owns name and value.
+fn appendV1Write(allocator: std.mem.Allocator, writes: *std.ArrayList(V1Write), controller: []const u8, name: []const u8, value: []u8, fallback: ?[]const u8, optional: bool) Backend.Error!void {
+    errdefer allocator.free(value);
+    const owned_name = try allocator.dupe(u8, name);
+    errdefer allocator.free(owned_name);
+    try writes.append(allocator, .{ .controller = controller, .name = owned_name, .value = value, .fallback = fallback, .optional = optional });
+}
+
+fn freeV1Writes(allocator: std.mem.Allocator, writes: []const V1Write) void {
+    for (writes) |write| {
+        allocator.free(write.name);
+        allocator.free(write.value);
+    }
+    allocator.free(writes);
+}
+
+fn v1Limit(allocator: std.mem.Allocator, limit: i64) Backend.Error![]u8 {
+    if (limit < -1) return error.InvalidConfig;
+    return std.fmt.allocPrint(allocator, "{d}", .{limit});
+}
+
+/// Pure legacy mapping, including the devices that rootfs setup will create.
+/// Memory/memsw order is finalized by the writer after reading the current limit.
+fn v1Writes(allocator: std.mem.Allocator, resources: Resources, devices: []const Backend.Device) Backend.Error![]V1Write {
+    if (resources.unified.len != 0) return error.InvalidConfig;
+    var writes: std.ArrayList(V1Write) = .empty;
+    defer writes.deinit(allocator);
+    errdefer for (writes.items) |write| {
+        allocator.free(write.name);
+        allocator.free(write.value);
+    };
+    if (resources.memory) |memory| {
+        inline for (.{
+            .{ "limit", "memory.limit_in_bytes" },
+            .{ "reservation", "memory.soft_limit_in_bytes" },
+            .{ "swap", "memory.memsw.limit_in_bytes" },
+            .{ "kernel", "memory.kmem.limit_in_bytes" },
+            .{ "kernel_tcp", "memory.kmem.tcp.limit_in_bytes" },
+        }) |field| {
+            if (@field(memory, field[0])) |value| {
+                if (value != 0)
+                    try appendV1Write(allocator, &writes, "memory", field[1], try v1Limit(allocator, value), null, false);
+            }
+        }
+        if (memory.swappiness) |value| {
+            if (value > 100) return error.InvalidConfig;
+            try appendV1Write(allocator, &writes, "memory", "memory.swappiness", try std.fmt.allocPrint(allocator, "{d}", .{value}), null, false);
+        }
+        if (memory.disable_oom_killer orelse false)
+            try appendV1Write(allocator, &writes, "memory", "memory.oom_control", try allocator.dupe(u8, "1"), null, false);
+        if (memory.limit != null and memory.swap != null and memory.swap.? > 0 and
+            (memory.limit.? == -1 or memory.swap.? < memory.limit.?)) return error.InvalidConfig;
+    }
+    if (resources.cpu) |cpu| {
+        if (cpu.shares) |value| {
+            _ = try cpuWeight(value);
+            if (value != 0)
+                try appendV1Write(allocator, &writes, "cpu", "cpu.shares", try std.fmt.allocPrint(allocator, "{d}", .{value}), null, false);
+        }
+        inline for (.{
+            .{ "period", "cpu.cfs_period_us" },
+            .{ "quota", "cpu.cfs_quota_us" },
+            .{ "realtime_period", "cpu.rt_period_us" },
+            .{ "realtime_runtime", "cpu.rt_runtime_us" },
+        }) |field| {
+            if (@field(cpu, field[0])) |value| {
+                if (value < 0 and value != -1) return error.InvalidConfig;
+                if (value != 0)
+                    try appendV1Write(allocator, &writes, "cpu", field[1], try std.fmt.allocPrint(allocator, "{d}", .{value}), null, false);
+            }
+        }
+        if (cpu.cpus) |value|
+            try appendV1Write(allocator, &writes, "cpuset", "cpuset.cpus", try allocator.dupe(u8, value), null, false);
+        if (cpu.mems) |value|
+            try appendV1Write(allocator, &writes, "cpuset", "cpuset.mems", try allocator.dupe(u8, value), null, false);
+    }
+    if (resources.pids) |pids| {
+        if (pids.limit) |value| {
+            if (value != 0)
+                try appendV1Write(allocator, &writes, "pids", "pids.max", try cgroupLimit(allocator, value), null, false);
+        }
+    }
+    if (resources.block_io) |block| {
+        inline for (.{ .{ "weight", "blkio.weight", @as(?[]const u8, "blkio.bfq.weight"), false }, .{ "leaf_weight", "blkio.leaf_weight", @as(?[]const u8, null), true } }) |field| {
+            if (@field(block, field[0])) |value| {
+                _ = try ioWeight(value);
+                if (value != 0)
+                    try appendV1Write(allocator, &writes, "blkio", field[1], try std.fmt.allocPrint(allocator, "{d}", .{value}), field[2], field[3]);
+            }
+        }
+        for (block.weight_device) |device| {
+            if (device.major < 0 or device.minor < 0) return error.InvalidConfig;
+            inline for (.{ .{ "weight", "blkio.weight_device", @as(?[]const u8, "blkio.bfq.weight_device"), false }, .{ "leaf_weight", "blkio.leaf_weight_device", @as(?[]const u8, null), true } }) |field| {
+                if (@field(device, field[0])) |value| {
+                    _ = try ioWeight(value);
+                    if (value != 0)
+                        try appendV1Write(allocator, &writes, "blkio", field[1], try std.fmt.allocPrint(allocator, "{d}:{d} {d}", .{ device.major, device.minor, value }), field[2], field[3]);
+                }
+            }
+        }
+        inline for (.{
+            .{ "throttle_read_bps", "blkio.throttle.read_bps_device" },
+            .{ "throttle_write_bps", "blkio.throttle.write_bps_device" },
+            .{ "throttle_read_iops", "blkio.throttle.read_iops_device" },
+            .{ "throttle_write_iops", "blkio.throttle.write_iops_device" },
+        }) |field| {
+            for (@field(block, field[0])) |device| {
+                if (device.major < 0 or device.minor < 0) return error.InvalidConfig;
+                try appendV1Write(allocator, &writes, "blkio", field[1], try std.fmt.allocPrint(allocator, "{d}:{d} {d}", .{ device.major, device.minor, device.rate }), null, false);
+            }
+        }
+    }
+    for (resources.hugepage_limits) |page| {
+        if (page.page_size.len == 0 or std.mem.indexOfAny(u8, page.page_size, "/\x00") != null) return error.InvalidConfig;
+        const name = try std.fmt.allocPrint(allocator, "hugetlb.{s}.limit_in_bytes", .{page.page_size});
+        defer allocator.free(name);
+        try appendV1Write(allocator, &writes, "hugetlb", name, try std.fmt.allocPrint(allocator, "{d}", .{page.limit}), null, false);
+    }
+    if (resources.network) |network| {
+        if (network.class_id) |value|
+            try appendV1Write(allocator, &writes, "net_cls", "net_cls.classid", try std.fmt.allocPrint(allocator, "{d}", .{value}), null, false);
+        for (network.priorities) |priority| {
+            if (priority.name.len == 0 or std.mem.indexOfAny(u8, priority.name, " \t\n\x00") != null) return error.InvalidConfig;
+            try appendV1Write(allocator, &writes, "net_prio", "net_prio.ifpriomap", try std.fmt.allocPrint(allocator, "{s} {d}", .{ priority.name, priority.priority }), null, false);
+        }
+    }
+    for (resources.devices) |rule| {
+        if (rule.access.len == 0) return error.InvalidConfig;
+        for (rule.access) |access| {
+            if (std.mem.indexOfScalar(u8, "rwm", access) == null) return error.InvalidConfig;
+        }
+        var major_buffer: [24]u8 = undefined;
+        var minor_buffer: [24]u8 = undefined;
+        const major = if (rule.major) |value| try v1DeviceNumber(&major_buffer, value) else "*";
+        const minor = if (rule.minor) |value| try v1DeviceNumber(&minor_buffer, value) else "*";
+        const kind: u8 = switch (rule.kind) {
+            .all => 'a',
+            .block => 'b',
+            .char => 'c',
+        };
+        try appendV1Write(allocator, &writes, "devices", if (rule.allow) "devices.allow" else "devices.deny", try std.fmt.allocPrint(allocator, "{c} {s}:{s} {s}", .{ kind, major, minor, rule.access }), null, false);
+    }
+    for ([_][]const u8{ "c 1:3 rwm", "c 1:5 rwm", "c 1:7 rwm", "c 1:8 rwm", "c 1:9 rwm", "c 5:0 rwm", "c 5:2 rwm", "c 136:* rwm" }) |value|
+        try appendV1Write(allocator, &writes, "devices", "devices.allow", try allocator.dupe(u8, value), null, false);
+    for (devices) |device| {
+        if (device.kind == .fifo) continue;
+        try appendV1Write(allocator, &writes, "devices", "devices.allow", try std.fmt.allocPrint(allocator, "{c} {d}:{d} rwm", .{ @as(u8, if (device.kind == .character) 'c' else 'b'), device.major, device.minor }), null, false);
+    }
+    return writes.toOwnedSlice(allocator);
+}
+
+fn v1DeviceNumber(buffer: []u8, value: i64) Backend.Error![]const u8 {
+    if (value == -1) return "*";
+    if (value < 0) return error.InvalidConfig;
+    return std.fmt.bufPrint(buffer, "{d}", .{value}) catch return error.InvalidConfig;
+}
+
+fn v1MemorySwapFirst(limit: i64, current_memsw: u64) bool {
+    return (if (limit == -1) std.math.maxInt(u64) else @as(u64, @intCast(limit))) > current_memsw;
+}
+
+const V1Hierarchy = struct {
+    mountpoint: []const u8,
+    controllers: []const []const u8,
+    root: ?posix.fd_t = null,
+    leaf: ?posix.fd_t = null,
+
+    fn has(self: V1Hierarchy, controller: []const u8) bool {
+        for (self.controllers) |name| {
+            if (std.mem.eql(u8, name, controller)) return true;
+        }
+        return false;
+    }
+};
+
+fn freeV1Hierarchies(allocator: std.mem.Allocator, hierarchies: []const V1Hierarchy) void {
+    for (hierarchies) |hierarchy| {
+        if (comptime builtin.os.tag == .linux) {
+            if (hierarchy.leaf) |fd| closeFd(fd);
+            if (hierarchy.root) |fd| closeFd(fd);
+        }
+        for (hierarchy.controllers) |name| allocator.free(name);
+        allocator.free(hierarchy.controllers);
+        allocator.free(hierarchy.mountpoint);
+    }
+    allocator.free(hierarchies);
+}
+
+/// Ignore named hierarchies and the hybrid unified mount. Comounts are one entry.
+fn v1Hierarchies(allocator: std.mem.Allocator, text: []const u8) Backend.Error![]V1Hierarchy {
+    var result: std.ArrayList(V1Hierarchy) = .empty;
+    defer result.deinit(allocator);
+    errdefer {
+        for (result.items) |hierarchy| {
+            for (hierarchy.controllers) |name| allocator.free(name);
+            allocator.free(hierarchy.controllers);
+            allocator.free(hierarchy.mountpoint);
+        }
+    }
+    var lines = std.mem.tokenizeScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        const separator = std.mem.indexOf(u8, line, " - ") orelse return error.CreateFailed;
+        var fields = std.mem.tokenizeScalar(u8, line[separator + 3 ..], ' ');
+        if (!std.mem.eql(u8, fields.next() orelse return error.CreateFailed, "cgroup")) continue;
+        _ = fields.next() orelse return error.CreateFailed;
+        const options = fields.next() orelse return error.CreateFailed;
+        var mount_options = std.mem.tokenizeScalar(u8, options, ',');
+        var named = false;
+        while (mount_options.next()) |option| {
+            if (std.mem.startsWith(u8, option, "name=")) named = true;
+        }
+        if (named) continue;
+        var controllers: std.ArrayList([]const u8) = .empty;
+        defer controllers.deinit(allocator);
+        errdefer for (controllers.items) |name| allocator.free(name);
+        var names = std.mem.tokenizeScalar(u8, options, ',');
+        while (names.next()) |name| {
+            // Only kernel controllers; rw, relatime, xattr, release_agent etc.
+            // are mount options rather than subsystem names.
+            for ([_][]const u8{ "cpu", "cpuacct", "cpuset", "memory", "devices", "pids", "blkio", "hugetlb", "net_cls", "net_prio", "freezer", "perf_event", "rdma", "misc", "debug" }) |controller| {
+                if (std.mem.eql(u8, name, controller)) {
+                    const owned = try allocator.dupe(u8, name);
+                    errdefer allocator.free(owned);
+                    try controllers.append(allocator, owned);
+                    break;
+                }
+            }
+        }
+        if (controllers.items.len == 0) continue;
+        const mount = try MountInfo.parse(line);
+        var buffer: [std.fs.max_path_bytes]u8 = undefined;
+        const mountpoint = try allocator.dupe(u8, try mountinfoPath(&buffer, mount.mountpoint));
+        errdefer allocator.free(mountpoint);
+        const owned_controllers = try controllers.toOwnedSlice(allocator);
+        errdefer {
+            for (owned_controllers) |name| allocator.free(name);
+            allocator.free(owned_controllers);
+        }
+        // Bind mounts can expose the same hierarchy more than once.
+        var duplicate = false;
+        for (result.items) |existing| {
+            if (existing.has(owned_controllers[0])) duplicate = true;
+        }
+        if (duplicate) {
+            for (owned_controllers) |name| allocator.free(name);
+            allocator.free(owned_controllers);
+            allocator.free(mountpoint);
+            continue;
+        }
+        try result.append(allocator, .{ .mountpoint = mountpoint, .controllers = owned_controllers });
+    }
+    return result.toOwnedSlice(allocator);
+}
+
+test "v1 writes preserve native memory limits and CPU ordering" {
+    const writes = try v1Writes(std.testing.allocator, .{
+        .memory = .{ .limit = -1, .reservation = 32, .swap = -1, .kernel = 64, .kernel_tcp = 128, .swappiness = 50, .disable_oom_killer = true },
+        .cpu = .{ .shares = 1024, .period = 100000, .quota = 50000, .realtime_period = 1000000, .realtime_runtime = 950000, .cpus = "0-2,4", .mems = "0,2" },
+        .pids = .{ .limit = -1 },
+    }, &.{});
+    defer freeV1Writes(std.testing.allocator, writes);
+    try std.testing.expectEqualDeep(&[_]V1Write{
+        .{ .controller = "memory", .name = "memory.limit_in_bytes", .value = "-1" },
+        .{ .controller = "memory", .name = "memory.soft_limit_in_bytes", .value = "32" },
+        .{ .controller = "memory", .name = "memory.memsw.limit_in_bytes", .value = "-1" },
+        .{ .controller = "memory", .name = "memory.kmem.limit_in_bytes", .value = "64" },
+        .{ .controller = "memory", .name = "memory.kmem.tcp.limit_in_bytes", .value = "128" },
+        .{ .controller = "memory", .name = "memory.swappiness", .value = "50" },
+        .{ .controller = "memory", .name = "memory.oom_control", .value = "1" },
+        .{ .controller = "cpu", .name = "cpu.shares", .value = "1024" },
+        .{ .controller = "cpu", .name = "cpu.cfs_period_us", .value = "100000" },
+        .{ .controller = "cpu", .name = "cpu.cfs_quota_us", .value = "50000" },
+        .{ .controller = "cpu", .name = "cpu.rt_period_us", .value = "1000000" },
+        .{ .controller = "cpu", .name = "cpu.rt_runtime_us", .value = "950000" },
+        .{ .controller = "cpuset", .name = "cpuset.cpus", .value = "0-2,4" },
+        .{ .controller = "cpuset", .name = "cpuset.mems", .value = "0,2" },
+        .{ .controller = "pids", .name = "pids.max", .value = "max" },
+    }, writes[0 .. writes.len - 8]);
+}
+
+test "v1 writes retain block IO weights with BFQ alternatives and separate throttle devices" {
+    const writes = try v1Writes(std.testing.allocator, .{ .block_io = .{
+        .weight = 100,
+        .leaf_weight = 200,
+        .weight_device = &.{.{ .major = 8, .minor = 0, .weight = 300, .leaf_weight = 400 }},
+        .throttle_read_bps = &.{ .{ .major = 8, .minor = 0, .rate = 1000 }, .{ .major = 8, .minor = 1, .rate = 2000 } },
+        .throttle_write_bps = &.{.{ .major = 8, .minor = 0, .rate = 3000 }},
+        .throttle_read_iops = &.{.{ .major = 8, .minor = 0, .rate = 40 }},
+        .throttle_write_iops = &.{.{ .major = 8, .minor = 1, .rate = 50 }},
+    } }, &.{});
+    defer freeV1Writes(std.testing.allocator, writes);
+    try std.testing.expectEqualDeep(&[_]V1Write{
+        .{ .controller = "blkio", .name = "blkio.weight", .value = "100", .fallback = "blkio.bfq.weight" },
+        .{ .controller = "blkio", .name = "blkio.leaf_weight", .value = "200", .optional = true },
+        .{ .controller = "blkio", .name = "blkio.weight_device", .value = "8:0 300", .fallback = "blkio.bfq.weight_device" },
+        .{ .controller = "blkio", .name = "blkio.leaf_weight_device", .value = "8:0 400", .optional = true },
+        .{ .controller = "blkio", .name = "blkio.throttle.read_bps_device", .value = "8:0 1000" },
+        .{ .controller = "blkio", .name = "blkio.throttle.read_bps_device", .value = "8:1 2000" },
+        .{ .controller = "blkio", .name = "blkio.throttle.write_bps_device", .value = "8:0 3000" },
+        .{ .controller = "blkio", .name = "blkio.throttle.read_iops_device", .value = "8:0 40" },
+        .{ .controller = "blkio", .name = "blkio.throttle.write_iops_device", .value = "8:1 50" },
+    }, writes[0 .. writes.len - 8]);
+}
+
+test "v1 writes map hugepages network and ordered device rules before allowed devices" {
+    const writes = try v1Writes(std.testing.allocator, .{
+        .hugepage_limits = &.{ .{ .page_size = "2MB", .limit = 4194304 }, .{ .page_size = "1GB", .limit = 0 } },
+        .network = .{ .class_id = 1048577, .priorities = &.{ .{ .name = "eth0", .priority = 2 }, .{ .name = "lo", .priority = 3 } } },
+        .devices = &.{
+            .{ .allow = false },
+            .{ .allow = true, .kind = .block, .major = 8, .minor = 0, .access = "rw" },
+            .{ .allow = false, .kind = .char, .major = 10, .access = "m" },
+        },
+    }, &.{
+        .{ .path = "/disk", .kind = .block, .major = 8, .minor = 1 },
+        .{ .path = "/dev/custom", .kind = .character, .major = 10, .minor = 200 },
+        .{ .path = "/pipe", .kind = .fifo },
+    });
+    defer freeV1Writes(std.testing.allocator, writes);
+    try std.testing.expectEqualDeep(&[_]V1Write{
+        .{ .controller = "hugetlb", .name = "hugetlb.2MB.limit_in_bytes", .value = "4194304" },
+        .{ .controller = "hugetlb", .name = "hugetlb.1GB.limit_in_bytes", .value = "0" },
+        .{ .controller = "net_cls", .name = "net_cls.classid", .value = "1048577" },
+        .{ .controller = "net_prio", .name = "net_prio.ifpriomap", .value = "eth0 2" },
+        .{ .controller = "net_prio", .name = "net_prio.ifpriomap", .value = "lo 3" },
+        .{ .controller = "devices", .name = "devices.deny", .value = "a *:* rwm" },
+        .{ .controller = "devices", .name = "devices.allow", .value = "b 8:0 rw" },
+        .{ .controller = "devices", .name = "devices.deny", .value = "c 10:* m" },
+        .{ .controller = "devices", .name = "devices.allow", .value = "c 1:3 rwm" },
+        .{ .controller = "devices", .name = "devices.allow", .value = "c 1:5 rwm" },
+        .{ .controller = "devices", .name = "devices.allow", .value = "c 1:7 rwm" },
+        .{ .controller = "devices", .name = "devices.allow", .value = "c 1:8 rwm" },
+        .{ .controller = "devices", .name = "devices.allow", .value = "c 1:9 rwm" },
+        .{ .controller = "devices", .name = "devices.allow", .value = "c 5:0 rwm" },
+        .{ .controller = "devices", .name = "devices.allow", .value = "c 5:2 rwm" },
+        .{ .controller = "devices", .name = "devices.allow", .value = "c 136:* rwm" },
+        .{ .controller = "devices", .name = "devices.allow", .value = "b 8:1 rwm" },
+        .{ .controller = "devices", .name = "devices.allow", .value = "c 10:200 rwm" },
+    }, writes);
+}
+
+test "v1 memory ordering raises memsw first only when the new limit exceeds current memsw" {
+    try std.testing.expect(v1MemorySwapFirst(64, 32));
+    try std.testing.expect(!v1MemorySwapFirst(64, 64));
+    try std.testing.expect(!v1MemorySwapFirst(32, 64));
+    try std.testing.expect(v1MemorySwapFirst(-1, 64));
+}
+
+test "v1 hierarchy discovery excludes named and unified mounts and combines controllers" {
+    const text =
+        \\1 0 0:1 / /sys/fs/cgroup rw - tmpfs tmpfs rw
+        \\2 1 0:2 / /sys/fs/cgroup/cpu,cpuacct rw - cgroup cgroup rw,cpu,cpuacct
+        \\3 1 0:3 / /sys/fs/cgroup/net\040class rw shared:1 - cgroup cgroup rw,net_cls,net_prio
+        \\4 1 0:4 / /sys/fs/cgroup/systemd rw - cgroup cgroup rw,xattr,name=systemd
+        \\5 1 0:5 / /sys/fs/cgroup/unified rw - cgroup2 cgroup rw
+        \\6 1 0:6 / /sys/fs/cgroup/memory rw - cgroup memory rw,memory
+    ;
+    const hierarchies = try v1Hierarchies(std.testing.allocator, text);
+    defer freeV1Hierarchies(std.testing.allocator, hierarchies);
+    try std.testing.expectEqual(@as(usize, 3), hierarchies.len);
+    try std.testing.expectEqualStrings("/sys/fs/cgroup/cpu,cpuacct", hierarchies[0].mountpoint);
+    try std.testing.expectEqualDeep(&[_][]const u8{ "cpu", "cpuacct" }, hierarchies[0].controllers);
+    try std.testing.expectEqualStrings("/sys/fs/cgroup/net class", hierarchies[1].mountpoint);
+    try std.testing.expectEqualDeep(&[_][]const u8{ "net_cls", "net_prio" }, hierarchies[1].controllers);
+    try std.testing.expectEqualDeep(&[_][]const u8{"memory"}, hierarchies[2].controllers);
+}
+
+test "cgroup mode detects unified and legacy roots" {
+    try std.testing.expectEqual(CgroupMode.unified, try cgroupMode(0x63677270));
+    try std.testing.expectEqual(CgroupMode.legacy, try cgroupMode(0x01021994));
+    try std.testing.expectError(error.Unsupported, cgroupMode(0x27e0eb));
+}
+
+test "v1 mapping rejects unified and malformed resources and preserves wildcard numbers" {
+    for ([_]Resources{
+        .{ .unified = &.{.{ .key = "memory.max", .value = "32" }} },
+        .{ .memory = .{ .limit = -2 } },
+        .{ .memory = .{ .limit = 128, .swap = 64 } },
+        .{ .memory = .{ .swappiness = 101 } },
+        .{ .cpu = .{ .shares = 1 } },
+        .{ .cpu = .{ .quota = -2 } },
+        .{ .block_io = .{ .weight = 9 } },
+        .{ .hugepage_limits = &.{.{ .page_size = "../2MB", .limit = 1 }} },
+        .{ .network = .{ .priorities = &.{.{ .name = "eth0\n1", .priority = 1 }} } },
+        .{ .devices = &.{.{ .allow = true, .major = -2 }} },
+        .{ .devices = &.{.{ .allow = true, .access = "x" }} },
+    }) |resources|
+        try std.testing.expectError(error.InvalidConfig, v1Writes(std.testing.allocator, resources, &.{}));
+    const writes = try v1Writes(std.testing.allocator, .{ .devices = &.{.{ .allow = true, .kind = .char, .major = -1, .minor = -1 }} }, &.{});
+    defer freeV1Writes(std.testing.allocator, writes);
+    try std.testing.expectEqualStrings("c *:* rwm", writes[0].value);
+    const unset = try v1Writes(std.testing.allocator, .{ .memory = .{ .limit = 0, .swap = 0, .disable_oom_killer = false }, .cpu = .{ .shares = 0, .period = 0, .quota = 0 }, .pids = .{ .limit = 0 } }, &.{});
+    defer freeV1Writes(std.testing.allocator, unset);
+    try std.testing.expectEqual(@as(usize, 8), unset.len);
+}
+
+test "v1 mapping and hierarchy discovery release partial allocations" {
+    const AllocationTest = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            const writes = try v1Writes(allocator, .{
+                .memory = .{ .limit = 64, .reservation = 32, .swap = 128, .kernel = 1, .kernel_tcp = 2, .swappiness = 0, .disable_oom_killer = true },
+                .cpu = .{ .shares = 1024, .period = 100000, .quota = -1, .realtime_period = 1000000, .realtime_runtime = -1, .cpus = "0", .mems = "0" },
+                .pids = .{ .limit = 32 },
+                .block_io = .{ .weight = 100, .leaf_weight = 200, .weight_device = &.{.{ .major = 8, .minor = 0, .weight = 100, .leaf_weight = 200 }}, .throttle_read_bps = &.{.{ .major = 8, .minor = 0, .rate = 100 }} },
+                .hugepage_limits = &.{.{ .page_size = "2MB", .limit = 1 }},
+                .network = .{ .class_id = 1, .priorities = &.{.{ .name = "lo", .priority = 0 }} },
+                .devices = &.{.{ .allow = false }},
+            }, &.{.{ .path = "/disk", .kind = .block, .major = 8, .minor = 0 }});
+            defer freeV1Writes(allocator, writes);
+            const hierarchies = try v1Hierarchies(allocator,
+                \\1 0 0:1 / /sys/fs/cgroup/cpu rw - cgroup cgroup rw,cpu,cpuacct
+                \\2 0 0:1 / /copy rw - cgroup cgroup rw,cpu,cpuacct
+                \\3 0 0:2 / /sys/fs/cgroup/memory rw - cgroup cgroup rw,memory
+            );
+            defer freeV1Hierarchies(allocator, hierarchies);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, AllocationTest.run, .{});
+}
 
 /// Pure cgroup v2 mapping. The caller owns the slice and both strings.
 fn v2Writes(allocator: std.mem.Allocator, resources: Resources) Backend.Error![]Write {
@@ -535,7 +963,10 @@ test "locked atime modes are inherited only when absent and conflicts are reject
 /// Pure filesystem selection; mount flags, including read-only, stay unchanged.
 pub fn cgroupMountType(mount_type: []const u8, host_fs_type: usize) Backend.Error![]const u8 {
     if (!std.mem.eql(u8, mount_type, "cgroup") and !std.mem.eql(u8, mount_type, "cgroup2")) return mount_type;
-    if (host_fs_type != 0x63677270) return error.Unsupported; // CGROUP2_SUPER_MAGIC
+    if (host_fs_type != 0x63677270) {
+        std.debug.print("igvano: mounting cgroup v1 hierarchies inside the container is not implemented yet\n", .{});
+        return error.Unsupported;
+    }
     return "cgroup2";
 }
 
@@ -825,9 +1256,17 @@ pub const LinuxBackend = struct {
             const start_state = try allocator.alloc(u8, options.start_hook_state.prefix.len + 20 + options.start_hook_state.suffix.len);
             const masked_paths = try preparePaths(allocator, options.masked_paths);
             const readonly_paths = try preparePaths(allocator, options.readonly_paths);
-            const cgroup_writes = try v2Writes(allocator, options.resources);
-            defer freeWrites(allocator, cgroup_writes);
-            const ignored_fields = try v2IgnoredFields(allocator, options.resources);
+            const cgroup_writes: []const Write = if (cgroup_root.mode == .unified) try v2Writes(allocator, options.resources) else &.{};
+            defer if (cgroup_root.mode == .unified) freeWrites(allocator, cgroup_writes);
+            if (cgroup_root.mode == .legacy and options.resources.unified.len != 0) {
+                std.debug.print("igvano: unified resources require cgroup v2\n", .{});
+                return error.InvalidConfig;
+            }
+            const v1_writes: []const V1Write = if (cgroup_root.mode == .legacy) try v1Writes(allocator, options.resources, options.devices) else &.{};
+            defer if (cgroup_root.mode == .legacy) freeV1Writes(allocator, v1_writes);
+            const hierarchies: []V1Hierarchy = if (cgroup_root.mode == .legacy) try openV1Hierarchies(allocator) else &.{};
+            defer if (cgroup_root.mode == .legacy) freeV1Hierarchies(allocator, hierarchies);
+            const ignored_fields = if (cgroup_root.mode == .unified) try v2IgnoredFields(allocator, options.resources) else try allocator.dupe(u8, "");
             defer allocator.free(ignored_fields);
             if (ignored_fields.len != 0)
                 std.debug.print("igvano: warning: cgroup v2 has no equivalent for: {s}; ignoring\n", .{ignored_fields});
@@ -840,21 +1279,29 @@ pub const LinuxBackend = struct {
             // traversing the private state directory as a mapped user.
             const fifo_fd = try openPath(linux.AT.FDCWD, fifo, .{ .PATH = true, .NOFOLLOW = true, .CLOEXEC = true });
             defer closeFd(fifo_fd);
-            const cgroup = (try walkCgroup(cgroup_root.fd, options.cgroup_path, true, cgroup_writes)).?;
-            defer closeFd(cgroup);
+            const cgroup: ?posix.fd_t = if (cgroup_root.mode == .unified) (try walkCgroup(cgroup_root.fd, options.cgroup_path, true, cgroup_writes)).? else null;
+            defer if (cgroup) |fd| closeFd(fd);
             var rootfs_mount_id: ?u64 = null;
             errdefer {
                 // Child1 can die before reporting child2's PID. Kill the entire
                 // cgroup before removing it, including any blocked init.
-                writeCgroupFile(cgroup, "cgroup.kill", "1", options.cgroup_path) catch {};
-                removeCreatedCgroup(cgroup_root.fd, options.cgroup_path, cgroup) catch {};
+                if (cgroup) |fd| {
+                    writeCgroupFile(fd, "cgroup.kill", "1", options.cgroup_path) catch {};
+                    removeCreatedCgroup(cgroup_root.fd, options.cgroup_path, fd) catch {};
+                } else for (hierarchies) |hierarchy| {
+                    if (hierarchy.leaf) |fd| removeV1Cgroup(hierarchy.root.?, options.cgroup_path, fd) catch {};
+                }
                 if (rootfs_mount_before) |before| detachRootfs(rootfs, if (rootfs_mount_id) |id|
                     .{ .created = id }
                 else
                     .{ .before_create = before }) catch {};
             }
+            for (hierarchies) |*hierarchy|
+                hierarchy.leaf = (try walkV1Cgroup(allocator, hierarchy.root.?, options.cgroup_path, true, hierarchy.has("cpuset"))).?;
             for (cgroup_writes) |write|
-                try writeCgroupFile(cgroup, write.name, write.value, options.cgroup_path);
+                try writeCgroupFile(cgroup.?, write.name, write.value, options.cgroup_path);
+            if (cgroup_root.mode == .legacy)
+                try applyV1Writes(allocator, hierarchies, v1_writes, options.resources, options.devices, options.cgroup_path);
             // getpid() in child2 may be 1. Child1 supplies its host PID for
             // opaque hook input; buffers and JSON fragments were prepared above.
             const pid_pipe = try makePipe();
@@ -895,8 +1342,14 @@ pub const LinuxBackend = struct {
                 closeFd(report[0]);
                 // Join before NEWCGROUP snapshots the namespace root. Child2
                 // inherits this membership; the runtime parent stays outside.
-                writeCgroupFile(cgroup, "cgroup.procs", "0", options.cgroup_path) catch |err| failCreate(report[1], err);
-                closeFd(cgroup);
+                if (cgroup) |fd| {
+                    writeCgroupFile(fd, "cgroup.procs", "0", options.cgroup_path) catch |err| failCreate(report[1], err);
+                    closeFd(fd);
+                } else for (hierarchies) |hierarchy| {
+                    writeCgroupFile(hierarchy.leaf.?, "cgroup.procs", "0", options.cgroup_path) catch |err| failCreate(report[1], err);
+                    closeFd(hierarchy.leaf.?);
+                    closeFd(hierarchy.root.?);
+                }
                 // Set with host privileges before entering user namespaces.
                 // Child2 inherits the adjustment across fork and exec.
                 applyOomScoreAdj(proc_dir, options.oom_score_adj) catch |err| failCreate(report[1], err);
@@ -1166,6 +1619,16 @@ pub const LinuxBackend = struct {
                 try validateCgroupPath(path);
                 const root = try openCgroupRoot();
                 defer closeFd(root.fd);
+                if (root.mode == .legacy) {
+                    const allocator = std.heap.page_allocator;
+                    const hierarchies = try openV1Hierarchies(allocator);
+                    defer freeV1Hierarchies(allocator, hierarchies);
+                    for (hierarchies) |*hierarchy| {
+                        hierarchy.leaf = try walkV1Cgroup(allocator, hierarchy.root.?, path, false, false);
+                        if (hierarchy.leaf) |fd| try removeV1Cgroup(hierarchy.root.?, path, fd);
+                    }
+                    break :cgroup_cleanup;
+                }
                 const cgroup = (try walkCgroup(root.fd, path, false, &.{})) orelse break :cgroup_cleanup;
                 defer closeFd(cgroup);
                 // kill targets init only. delete terminates any remaining descendants.
@@ -1437,7 +1900,15 @@ fn validateCgroupPath(path: []const u8) Backend.Error!void {
     }
 }
 
-fn openCgroupRoot() Backend.Error!struct { fd: posix.fd_t, fs_type: usize } {
+fn cgroupMode(fs_type: usize) Backend.Error!CgroupMode {
+    return switch (fs_type) {
+        0x63677270 => .unified, // CGROUP2_SUPER_MAGIC
+        0x01021994 => .legacy, // TMPFS_MAGIC
+        else => error.Unsupported,
+    };
+}
+
+fn openCgroupRoot() Backend.Error!struct { fd: posix.fd_t, fs_type: usize, mode: CgroupMode } {
     const opened = linux.openat(linux.AT.FDCWD, "/sys/fs/cgroup", .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .NOFOLLOW = true, .CLOEXEC = true }, 0);
     switch (linux.errno(opened)) {
         .SUCCESS => {},
@@ -1449,11 +1920,279 @@ fn openCgroupRoot() Backend.Error!struct { fd: posix.fd_t, fs_type: usize } {
     // Zig has no statfs wrapper. f_type is the first native word of Linux statfs.
     var fs: [32]usize = undefined;
     try checkResult(linux.syscall2(.fstatfs, @intCast(root), @intFromPtr(&fs)));
-    if (fs[0] != 0x63677270) {
-        std.debug.print("igvano: cgroups require cgroup2 at /sys/fs/cgroup; legacy and hybrid hosts are unsupported\n", .{});
+    const mode = cgroupMode(fs[0]) catch {
+        std.debug.print("igvano: unsupported cgroup filesystem at /sys/fs/cgroup\n", .{});
         return error.Unsupported;
+    };
+    // ponytail: hybrid hosts use v1 only, without systemd-unified membership,
+    // like runc's fs driver without systemd.
+    return .{ .fd = root, .fs_type = fs[0], .mode = mode };
+}
+
+fn openV1Hierarchies(allocator: std.mem.Allocator) Backend.Error![]V1Hierarchy {
+    const text = try readMountinfo(allocator);
+    defer allocator.free(text);
+    const hierarchies = try v1Hierarchies(allocator, text);
+    errdefer freeV1Hierarchies(allocator, hierarchies);
+    const host_root = try openPath(linux.AT.FDCWD, "/", .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true });
+    defer closeFd(host_root);
+    for (hierarchies) |*hierarchy| {
+        if (!std.mem.startsWith(u8, hierarchy.mountpoint, "/")) return error.InvalidPath;
+        // Pin every component of the mount path too, rather than trusting a
+        // final NOFOLLOW on a path containing unpinned parent directories.
+        hierarchy.root = (try walkCgroup(host_root, hierarchy.mountpoint[1..], false, &.{})) orelse return error.CreateFailed;
+        var fs: [32]usize = undefined;
+        try checkResult(linux.syscall2(.fstatfs, @intCast(hierarchy.root.?), @intFromPtr(&fs)));
+        if (fs[0] != 0x27e0eb) return error.Unsupported; // CGROUP_SUPER_MAGIC
     }
-    return .{ .fd = root, .fs_type = fs[0] };
+    return hierarchies;
+}
+
+fn readCgroupFile(allocator: std.mem.Allocator, dir: posix.fd_t, filename: [:0]const u8) Backend.Error![]u8 {
+    const fd = try openPath(dir, filename, .{ .ACCMODE = .RDONLY, .NOFOLLOW = true, .CLOEXEC = true });
+    defer closeFd(fd);
+    var text: std.ArrayList(u8) = .empty;
+    errdefer text.deinit(allocator);
+    var buffer: [4096]u8 = undefined;
+    while (true) {
+        const result = linux.read(fd, &buffer, buffer.len);
+        switch (linux.errno(result)) {
+            .SUCCESS => {},
+            .INTR => continue,
+            else => return error.CgroupWriteFailed,
+        }
+        if (result == 0) return text.toOwnedSlice(allocator);
+        try text.appendSlice(allocator, buffer[0..result]);
+    }
+}
+
+fn seedV1Cpuset(allocator: std.mem.Allocator, parent: posix.fd_t, child: posix.fd_t, path: []const u8) Backend.Error!void {
+    for ([_][:0]const u8{ "cpuset.cpus", "cpuset.mems" }) |name| {
+        const existing = try readCgroupFile(allocator, child, name);
+        defer allocator.free(existing);
+        if (std.mem.trim(u8, existing, " \t\n").len != 0) continue;
+        const inherited = try readCgroupFile(allocator, parent, name);
+        defer allocator.free(inherited);
+        try writeCgroupFile(child, name, std.mem.trim(u8, inherited, " \t\n"), path);
+    }
+}
+
+/// Seed each newly created cpuset directory before descending into its child.
+fn walkV1Cgroup(allocator: std.mem.Allocator, root: posix.fd_t, path: []const u8, create: bool, cpuset: bool) Backend.Error!?posix.fd_t {
+    try validateCgroupPath(path);
+    var current = try openPath(root, ".", .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true });
+    errdefer closeFd(current);
+    var components = std.mem.tokenizeScalar(u8, path, '/');
+    while (components.next()) |component| {
+        var buffer: [256]u8 = undefined;
+        const name = std.fmt.bufPrintZ(&buffer, "{s}", .{component}) catch return error.InvalidPath;
+        var created = false;
+        if (create) {
+            const result = linux.mkdirat(current, name, 0o755);
+            switch (linux.errno(result)) {
+                .SUCCESS => created = true,
+                .EXIST => if (components.peek() == null) {
+                    std.debug.print("igvano: cgroup '{s}' already exists\n", .{path});
+                    return error.CreateFailed;
+                },
+                else => try checkResult(result),
+            }
+        }
+        const opened = linux.openat(current, name, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .NOFOLLOW = true, .CLOEXEC = true }, 0);
+        switch (linux.errno(opened)) {
+            .SUCCESS => {},
+            .NOENT => {
+                if (create) return error.CreateFailed;
+                closeFd(current);
+                return null;
+            },
+            else => try checkResult(opened),
+        }
+        const child: posix.fd_t = @intCast(opened);
+        errdefer closeFd(child);
+        errdefer if (created and components.peek() == null) removeV1Cgroup(root, path, child) catch {};
+        if (created and cpuset) try seedV1Cpuset(allocator, current, child, path);
+        closeFd(current);
+        current = child;
+    }
+    return current;
+}
+
+/// Keep errno available for BFQ fallbacks and deprecated kmem handling.
+fn tryV1Write(dir: posix.fd_t, filename: []const u8, value: []const u8) linux.E {
+    var buffer: [256]u8 = undefined;
+    const name = std.fmt.bufPrintZ(&buffer, "{s}", .{filename}) catch return .INVAL;
+    const fd: posix.fd_t = open: while (true) {
+        const result = linux.openat(dir, name, .{ .ACCMODE = .WRONLY, .NOFOLLOW = true, .CLOEXEC = true }, 0);
+        switch (linux.errno(result)) {
+            .SUCCESS => break :open @intCast(result),
+            .INTR => continue,
+            else => |err| return err,
+        }
+    };
+    defer closeFd(fd);
+    while (true) {
+        const result = linux.write(fd, value.ptr, value.len);
+        const err = linux.errno(result);
+        if (err == .INTR) continue;
+        if (err == .SUCCESS and result != value.len) return .IO;
+        return err;
+    }
+}
+
+fn writeV1Resource(dir: posix.fd_t, write: V1Write, path: []const u8, kmem_warned: *bool) Backend.Error!void {
+    var name = write.name;
+    var err = tryV1Write(dir, name, write.value);
+    if (err == .NOENT) {
+        if (write.fallback) |fallback| {
+            name = fallback;
+            err = tryV1Write(dir, name, write.value);
+        }
+    }
+    if (err == .SUCCESS) return;
+    if (err == .NOENT and write.optional) {
+        std.debug.print("igvano: warning: cgroup v1 {s} is unavailable; ignoring\n", .{name});
+        return;
+    }
+    if (std.mem.startsWith(u8, name, "memory.kmem.") and (err == .NOENT or err == .OPNOTSUPP or err == .INVAL)) {
+        if (!kmem_warned.*) std.debug.print("igvano: warning: kernel rejects deprecated cgroup v1 kmem limits; ignoring\n", .{});
+        kmem_warned.* = true;
+        return;
+    }
+    std.debug.print("igvano: cgroup '{s}' cannot write {s} = '{s}': {s}\n", .{ path, name, write.value, @tagName(err) });
+    return error.CgroupWriteFailed;
+}
+
+test "linux v1 ignores missing deprecated kmem files but requires other memory files" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try std.fmt.allocPrintSentinel(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path}, 0);
+    defer std.testing.allocator.free(base);
+    const root = try openPath(linux.AT.FDCWD, base, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true });
+    defer closeFd(root);
+    var kmem_warned = false;
+    for ([_][]const u8{ "memory.kmem.limit_in_bytes", "memory.kmem.tcp.limit_in_bytes" }) |name| {
+        try writeV1Resource(root, .{ .controller = "memory", .name = name, .value = "64" }, "test", &kmem_warned);
+        try std.testing.expect(kmem_warned);
+    }
+    try std.testing.expectError(error.CgroupWriteFailed, writeV1Resource(root, .{
+        .controller = "memory",
+        .name = "memory.limit_in_bytes",
+        .value = "64",
+    }, "test", &kmem_warned));
+}
+
+fn requiredV1Controller(controller: []const u8, resources: Resources, devices: []const Backend.Device) bool {
+    if (std.mem.eql(u8, controller, "memory") or std.mem.eql(u8, controller, "pids")) return true;
+    if (std.mem.eql(u8, controller, "devices")) {
+        if (resources.devices.len != 0) return true;
+        for (devices) |device| {
+            if (device.required and device.kind != .fifo) return true;
+        }
+    }
+    return false;
+}
+
+fn applyV1Writes(allocator: std.mem.Allocator, hierarchies: []const V1Hierarchy, writes: []const V1Write, resources: Resources, devices: []const Backend.Device, path: []const u8) Backend.Error!void {
+    // Warn once per missing controller, including controllers with many writes.
+    for (writes, 0..) |write, index| {
+        var mounted = false;
+        for (hierarchies) |hierarchy| {
+            if (hierarchy.has(write.controller)) mounted = true;
+        }
+        if (mounted) continue;
+        if (requiredV1Controller(write.controller, resources, devices)) {
+            std.debug.print("igvano: cgroup v1 controller {s} is required but not mounted\n", .{write.controller});
+            return error.CgroupWriteFailed;
+        }
+        var warned = false;
+        for (writes[0..index]) |previous| {
+            if (std.mem.eql(u8, previous.controller, write.controller)) warned = true;
+        }
+        if (!warned) std.debug.print("igvano: warning: cgroup v1 controller {s} is not mounted; ignoring\n", .{write.controller});
+    }
+    var kmem_warned = false;
+    for (hierarchies) |hierarchy| {
+        var swap_first: ?usize = null;
+        var limit_write: ?usize = null;
+        var swap_write: ?usize = null;
+        if (hierarchy.has("memory")) {
+            for (writes, 0..) |write, index| {
+                if (std.mem.eql(u8, write.name, "memory.limit_in_bytes")) limit_write = index;
+                if (std.mem.eql(u8, write.name, "memory.memsw.limit_in_bytes")) swap_write = index;
+            }
+            if (limit_write != null and swap_write != null) {
+                const current = try readCgroupFile(allocator, hierarchy.leaf.?, "memory.memsw.limit_in_bytes");
+                defer allocator.free(current);
+                const memsw = std.fmt.parseInt(u64, std.mem.trim(u8, current, " \t\n"), 10) catch return error.CgroupWriteFailed;
+                if (v1MemorySwapFirst(resources.memory.?.limit.?, memsw)) swap_first = swap_write;
+            }
+        }
+        for (writes, 0..) |write, index| {
+            if (!hierarchy.has(write.controller)) continue;
+            if (swap_first) |swap| {
+                if (index == swap) continue;
+                if (index == limit_write.?) try writeV1Resource(hierarchy.leaf.?, writes[swap], path, &kmem_warned);
+            }
+            try writeV1Resource(hierarchy.leaf.?, write, path, &kmem_warned);
+        }
+    }
+}
+
+fn killV1Members(dir: posix.fd_t) Backend.Error!void {
+    const allocator = std.heap.page_allocator;
+    const text = try readCgroupFile(allocator, dir, "cgroup.procs");
+    defer allocator.free(text);
+    var pids = std.mem.tokenizeAny(u8, text, " \t\n");
+    while (pids.next()) |text_pid| {
+        const pid = std.fmt.parseInt(i32, text_pid, 10) catch return error.CgroupDeleteFailed;
+        if (pid <= 0) return error.CgroupDeleteFailed;
+        switch (linux.errno(linux.kill(pid, .KILL))) {
+            .SUCCESS, .SRCH => {},
+            else => return error.CgroupDeleteFailed,
+        }
+    }
+}
+
+/// Only remove our leaf, checking identity against the pinned fd on every retry.
+fn removeV1Cgroup(root: posix.fd_t, path: []const u8, owned_fd: posix.fd_t) Backend.Error!void {
+    try validateCgroupPath(path);
+    const parent = if (std.fs.path.dirname(path)) |parent_path|
+        (try walkCgroup(root, parent_path, false, &.{})) orelse return
+    else
+        try openPath(root, ".", .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true });
+    defer closeFd(parent);
+    var buffer: [256]u8 = undefined;
+    const name = std.fmt.bufPrintZ(&buffer, "{s}", .{std.fs.path.basename(path)}) catch return error.InvalidPath;
+    var owned: linux.Statx = undefined;
+    try checkResult(linux.statx(owned_fd, "", linux.AT.EMPTY_PATH, .{ .INO = true }, &owned));
+    const delay: linux.timespec = .{ .sec = 0, .nsec = 10_000_000 };
+    for (0..50) |_| {
+        const opened = linux.openat(parent, name, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .NOFOLLOW = true, .CLOEXEC = true }, 0);
+        switch (linux.errno(opened)) {
+            .SUCCESS => {},
+            .NOENT => return,
+            .INTR => continue,
+            else => return error.CgroupDeleteFailed,
+        }
+        const leaf: posix.fd_t = @intCast(opened);
+        defer closeFd(leaf);
+        var current: linux.Statx = undefined;
+        try checkResult(linux.statx(leaf, "", linux.AT.EMPTY_PATH, .{ .INO = true }, &current));
+        if (!owned.mask.INO or !current.mask.INO) return error.CgroupDeleteFailed;
+        if (owned.dev_major != current.dev_major or owned.dev_minor != current.dev_minor or owned.ino != current.ino) return;
+        try killV1Members(leaf);
+        const result = linux.unlinkat(parent, name, linux.AT.REMOVEDIR);
+        switch (linux.errno(result)) {
+            .SUCCESS, .NOENT => return,
+            .INTR => continue,
+            .BUSY, .NOTEMPTY => _ = linux.nanosleep(&delay, null),
+            else => return error.CgroupDeleteFailed,
+        }
+    }
+    std.debug.print("igvano: cgroup '{s}' is still busy after waiting for members to exit\n", .{path});
+    return error.CgroupDeleteFailed;
 }
 
 test "backend cgroup paths must name a normalized child directory" {
@@ -1461,6 +2200,228 @@ test "backend cgroup paths must name a normalized child directory" {
     for ([_][]const u8{ "", "/", "/custom", "..", "a/../b", "a/./b", "a//b", "a/", "a\x00b" }) |path| {
         try std.testing.expectError(error.InvalidPath, validateCgroupPath(path));
     }
+}
+
+fn cleanupV1TestHierarchies(hierarchies: []const V1Hierarchy, path: []const u8) void {
+    for (hierarchies) |hierarchy| {
+        if (hierarchy.leaf) |fd| removeV1Cgroup(hierarchy.root.?, path, fd) catch {};
+        if (std.fs.path.dirname(path)) |parent| {
+            const fd = (walkCgroup(hierarchy.root.?, parent, false, &.{}) catch null) orelse continue;
+            defer closeFd(fd);
+            removeV1Cgroup(hierarchy.root.?, parent, fd) catch {};
+        }
+    }
+}
+
+test "linux v1 creates seeds writes joins and deletes each hierarchy" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const root = openCgroupRoot() catch return error.SkipZigTest;
+    closeFd(root.fd);
+    if (root.mode != .legacy) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const hierarchies = try openV1Hierarchies(allocator);
+    defer freeV1Hierarchies(allocator, hierarchies);
+    if (hierarchies.len == 0) return error.SkipZigTest;
+    const path = try std.fmt.allocPrint(allocator, "igvano-v1-test-{d}/leaf", .{linux.getpid()});
+    defer allocator.free(path);
+    defer cleanupV1TestHierarchies(hierarchies, path);
+    for (hierarchies) |*hierarchy| {
+        hierarchy.leaf = (walkV1Cgroup(allocator, hierarchy.root.?, path, true, hierarchy.has("cpuset")) catch |err| switch (err) {
+            error.PermissionDenied => return error.SkipZigTest,
+            else => return err,
+        }).?;
+        try std.testing.expectError(error.CreateFailed, walkV1Cgroup(allocator, hierarchy.root.?, path, true, hierarchy.has("cpuset")));
+        if (hierarchy.has("cpuset")) {
+            const parent = (try walkCgroup(hierarchy.root.?, std.fs.path.dirname(path).?, false, &.{})).?;
+            defer closeFd(parent);
+            for ([_][:0]const u8{ "cpuset.cpus", "cpuset.mems" }) |name| {
+                const inherited = try readCgroupFile(allocator, hierarchy.root.?, name);
+                defer allocator.free(inherited);
+                const intermediate = try readCgroupFile(allocator, parent, name);
+                defer allocator.free(intermediate);
+                const leaf = try readCgroupFile(allocator, hierarchy.leaf.?, name);
+                defer allocator.free(leaf);
+                try std.testing.expect(std.mem.trim(u8, leaf, "\n").len != 0);
+                try std.testing.expectEqualStrings(inherited, intermediate);
+                try std.testing.expectEqualStrings(inherited, leaf);
+            }
+        }
+    }
+    // A forced concurrent delete/recreate must not make cleanup remove the
+    // replacement. Hold the old descriptor so its inode cannot be reused.
+    const first = &hierarchies[0];
+    const original = first.leaf.?;
+    try removeV1Cgroup(first.root.?, path, original);
+    first.leaf = (try walkV1Cgroup(allocator, first.root.?, path, true, first.has("cpuset"))).?;
+    defer closeFd(original);
+    try removeV1Cgroup(first.root.?, path, original);
+    const replacement = (try walkCgroup(first.root.?, path, false, &.{})).?;
+    closeFd(replacement);
+
+    const resources: Resources = .{
+        .memory = .{ .limit = 67108864, .reservation = 33554432, .swap = 134217728, .swappiness = 50 },
+        .cpu = .{ .shares = 1024, .period = 100000, .quota = 50000 },
+        .pids = .{ .limit = 32 },
+        .block_io = .{ .weight = 100 },
+        .hugepage_limits = &.{.{ .page_size = "2MB", .limit = 4194304 }},
+        .network = .{ .class_id = 1048577, .priorities = &.{.{ .name = "lo", .priority = 2 }} },
+        .devices = &.{.{ .allow = false }},
+    };
+    const writes = try v1Writes(allocator, resources, &.{});
+    defer freeV1Writes(allocator, writes);
+    try applyV1Writes(allocator, hierarchies, writes, resources, &.{}, path);
+    for (hierarchies) |hierarchy| {
+        const cases = [_]struct { controller: []const u8, name: [:0]const u8, value: []const u8 }{
+            .{ .controller = "memory", .name = "memory.limit_in_bytes", .value = "67108864" },
+            .{ .controller = "memory", .name = "memory.memsw.limit_in_bytes", .value = "134217728" },
+            .{ .controller = "cpu", .name = "cpu.shares", .value = "1024" },
+            .{ .controller = "cpu", .name = "cpu.cfs_period_us", .value = "100000" },
+            .{ .controller = "cpu", .name = "cpu.cfs_quota_us", .value = "50000" },
+            .{ .controller = "pids", .name = "pids.max", .value = "32" },
+            .{ .controller = "hugetlb", .name = "hugetlb.2MB.limit_in_bytes", .value = "4194304" },
+        };
+        for (cases) |case| {
+            if (!hierarchy.has(case.controller)) continue;
+            const value = try readCgroupFile(allocator, hierarchy.leaf.?, case.name);
+            defer allocator.free(value);
+            try std.testing.expectEqualStrings(case.value, std.mem.trim(u8, value, "\n"));
+        }
+        if (hierarchy.has("memory")) {
+            // Exercise both orders against a real kernel constraint: lower
+            // limit+memsw, then raise limit beyond the current memsw.
+            const lower: Resources = .{ .memory = .{ .limit = 33554432, .swap = 67108864 } };
+            const lower_writes = try v1Writes(allocator, lower, &.{});
+            defer freeV1Writes(allocator, lower_writes);
+            try applyV1Writes(allocator, hierarchies, lower_writes, lower, &.{}, path);
+            const higher: Resources = .{ .memory = .{ .limit = 100663296, .swap = 134217728 } };
+            const higher_writes = try v1Writes(allocator, higher, &.{});
+            defer freeV1Writes(allocator, higher_writes);
+            try applyV1Writes(allocator, hierarchies, higher_writes, higher, &.{}, path);
+        }
+    }
+    const pipe = try makePipe();
+    defer closeFd(pipe[0]);
+    var writer: ?posix.fd_t = pipe[1];
+    defer if (writer) |fd| closeFd(fd);
+    const child = try forkProcess();
+    if (child == 0) {
+        closeFd(pipe[0]);
+        for (hierarchies) |hierarchy|
+            writeCgroupFile(hierarchy.leaf.?, "cgroup.procs", "0", path) catch linux.exit_group(1);
+        if (!writeAll(pipe[1], &.{1})) linux.exit_group(2);
+        const delay: linux.timespec = .{ .sec = 60, .nsec = 0 };
+        while (true) _ = linux.nanosleep(&delay, null);
+    }
+    closeFd(pipe[1]);
+    writer = null;
+    var reaped = false;
+    defer if (!reaped) {
+        _ = linux.kill(child, .KILL);
+        _ = waitChild(child) catch {};
+    };
+    var byte: [1]u8 = undefined;
+    try std.testing.expect(readAll(pipe[0], &byte));
+    var pid_buffer: [24]u8 = undefined;
+    const pid_line = try std.fmt.bufPrint(&pid_buffer, "{d}\n", .{child});
+    for (hierarchies) |hierarchy| {
+        const members = try readCgroupFile(allocator, hierarchy.leaf.?, "cgroup.procs");
+        defer allocator.free(members);
+        try std.testing.expect(std.mem.indexOf(u8, members, pid_line) != null);
+    }
+    var backend: LinuxBackend = .{};
+    try backend.backend().delete(.{ .id = "v1-test", .pid = child, .starttime = "", .cgroup_path = path });
+    try std.testing.expectEqual(@as(u32, 9), try waitChild(child));
+    reaped = true;
+    for (hierarchies) |hierarchy|
+        try std.testing.expectEqual(@as(?posix.fd_t, null), try walkCgroup(hierarchy.root.?, path, false, &.{}));
+    try backend.backend().delete(.{ .id = "v1-test", .pid = 0, .starttime = "", .cgroup_path = path });
+}
+
+test "linux v1 container allowlist opens dev null while a denied device fails" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const root = openCgroupRoot() catch return error.SkipZigTest;
+    closeFd(root.fd);
+    if (root.mode != .legacy) return error.SkipZigTest;
+    try requireTestMountNamespace();
+    // Confirm the probe device works before testing the cgroup denial.
+    const probe = openPath(linux.AT.FDCWD, "/dev/loop-control", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }) catch return error.SkipZigTest;
+    closeFd(probe);
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "rootfs/dev");
+    const base = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer allocator.free(base);
+    const absolute = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, base, allocator);
+    defer allocator.free(absolute);
+    const rootfs = try std.fmt.allocPrint(allocator, "{s}/rootfs", .{absolute});
+    defer allocator.free(rootfs);
+    const fifo = try std.fmt.allocPrintSentinel(allocator, "{s}/exec.fifo", .{absolute}, 0);
+    defer allocator.free(fifo);
+    try checkResult(linux.mknod(fifo, linux.S.IFIFO | 0o600, 0));
+    const denied = try std.fmt.allocPrintSentinel(allocator, "{s}/dev/denied", .{rootfs}, 0);
+    defer allocator.free(denied);
+    try checkResult(linux.mknod(denied, linux.S.IFCHR | 0o600, (10 << 8) | 237));
+    const path = try std.fmt.allocPrint(allocator, "igvano-v1-devices-{d}", .{linux.getpid()});
+    defer allocator.free(path);
+    const devices = try oci.prepareDevices(allocator, null);
+    defer oci.freeDevices(allocator, devices);
+    const spec: oci.Spec = .{
+        .ociVersion = "1.0.2",
+        .root = .{ .path = "rootfs" },
+        .linux = .{ .namespaces = &.{.{ .type = .mount }} },
+    };
+    var implementation: LinuxBackend = .{};
+    const backend = implementation.backend();
+    const handle = try backend.create(.{
+        .allocator = allocator,
+        .id = "v1-devices",
+        .rootfs = rootfs,
+        .exec_fifo = fifo,
+        .spec = &spec,
+        .cgroup_path = path,
+        .devices = devices,
+        .mounts = &.{
+            .{ .destination = "/bin", .source = "/bin", .type = null, .flags = linux.MS.BIND | linux.MS.RDONLY, .propagation = 0, .data = "" },
+            .{ .destination = "/lib", .source = "/lib", .type = null, .flags = linux.MS.BIND | linux.MS.RDONLY, .propagation = 0, .data = "" },
+        },
+        .resources = .{ .devices = &.{.{ .allow = false }} },
+        .start_hooks = &.{.{
+            .path = "/bin/sh",
+            .args = &.{ "sh", "-c", "exec 3< /dev/null || exit 1; if (exec 4< /dev/denied) 2>/dev/null; then exit 2; fi; exit 0" },
+            .timeout_seconds = 2,
+        }},
+    });
+    defer allocator.free(handle.starttime);
+    defer backend.delete(handle) catch {};
+    try std.testing.expect(try backend.alive(handle));
+    const reader = try openPath(linux.AT.FDCWD, fifo, .{ .ACCMODE = .RDONLY, .CLOEXEC = true });
+    defer closeFd(reader);
+    var byte: [1]u8 = undefined;
+    try std.testing.expect(readAll(reader, &byte));
+    try std.testing.expectEqual(@as(u8, 1), byte[0]);
+    // Delete must rediscover hierarchies even when the saved init PID is gone.
+    try backend.delete(.{ .id = handle.id, .pid = 0, .starttime = "", .cgroup_path = path });
+    try std.testing.expect(!try backend.alive(handle));
+}
+
+test "linux v1 missing optional controllers are ignored and required limits fail" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const root = openCgroupRoot() catch return error.SkipZigTest;
+    closeFd(root.fd);
+    if (root.mode != .legacy) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    for ([_]Resources{
+        .{ .memory = .{ .limit = 64 } }, .{ .pids = .{ .limit = 32 } }, .{ .devices = &.{.{ .allow = false }} },
+    }) |resources| {
+        const writes = try v1Writes(allocator, resources, &.{});
+        defer freeV1Writes(allocator, writes);
+        try std.testing.expectError(error.CgroupWriteFailed, applyV1Writes(allocator, &.{}, writes, resources, &.{}, "missing"));
+    }
+    const resources: Resources = .{ .cpu = .{ .shares = 1024 }, .block_io = .{ .weight = 100 } };
+    const writes = try v1Writes(allocator, resources, &.{});
+    defer freeV1Writes(allocator, writes);
+    try applyV1Writes(allocator, &.{}, writes, resources, &.{}, "missing");
 }
 
 test "linux cgroup creation reuses parents but rejects existing leaves" {
@@ -3097,6 +4058,10 @@ test "linux create rejects a cwd missing from the resolved rootfs" {
     if (comptime builtin.os.tag == .linux) {
         try requireTestMountNamespace();
         const cgroup_root = openCgroupRoot() catch return error.SkipZigTest;
+        if (cgroup_root.mode != .unified) {
+            closeFd(cgroup_root.fd);
+            return error.SkipZigTest;
+        }
         closeFd(cgroup_root.fd);
     }
     var tmp = std.testing.tmpDir(.{});
@@ -3579,6 +4544,10 @@ test "linux create reports child setup failures without leaving an init" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     try requireTestMountNamespace();
     const cgroup_root = openCgroupRoot() catch return error.SkipZigTest;
+    if (cgroup_root.mode != .unified) {
+        closeFd(cgroup_root.fd);
+        return error.SkipZigTest;
+    }
     defer closeFd(cgroup_root.fd);
     const cgroup_path = try std.fmt.allocPrint(std.testing.allocator, "igvano/example-{d}", .{linux.getpid()});
     defer std.testing.allocator.free(cgroup_path);
@@ -3629,6 +4598,10 @@ test "linux create accepts an empty rootfs and returns a live blocked init" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     try requireTestMountNamespace();
     const cgroup_root = openCgroupRoot() catch return error.SkipZigTest;
+    if (cgroup_root.mode != .unified) {
+        closeFd(cgroup_root.fd);
+        return error.SkipZigTest;
+    }
     defer closeFd(cgroup_root.fd);
     const cgroup_path = try std.fmt.allocPrint(std.testing.allocator, "igvano-test-{d}", .{linux.getpid()});
     defer std.testing.allocator.free(cgroup_path);
@@ -3765,6 +4738,10 @@ test "linux mapped init acknowledges start without path access to its private st
     }
     if (try waitChild(namespace_probe) != 0) return error.SkipZigTest;
     const cgroup_root = openCgroupRoot() catch return error.SkipZigTest;
+    if (cgroup_root.mode != .unified) {
+        closeFd(cgroup_root.fd);
+        return error.SkipZigTest;
+    }
     defer closeFd(cgroup_root.fd);
     const cgroup_path = try std.fmt.allocPrint(std.testing.allocator, "igvano-private-fifo-test-{d}", .{linux.getpid()});
     defer std.testing.allocator.free(cgroup_path);
@@ -3850,6 +4827,10 @@ test "linux mapped create installs maps outside init and cleans up rejected maps
     }
     if (try waitChild(namespace_probe) != 0) return error.SkipZigTest;
     const cgroup_root = openCgroupRoot() catch return error.SkipZigTest;
+    if (cgroup_root.mode != .unified) {
+        closeFd(cgroup_root.fd);
+        return error.SkipZigTest;
+    }
     defer closeFd(cgroup_root.fd);
     const cgroup_path = try std.fmt.allocPrint(std.testing.allocator, "igvano-mapped-test-{d}", .{linux.getpid()});
     defer std.testing.allocator.free(cgroup_path);
@@ -4171,6 +5152,10 @@ test "linux inherited mount namespace creates starts and detaches rootfs on dele
     try requireTestUniqueMountIds();
     if (linux.errno(linux.access("/bin/sh", linux.X_OK)) != .SUCCESS) return error.SkipZigTest;
     const cgroup_root = openCgroupRoot() catch return error.SkipZigTest;
+    if (cgroup_root.mode != .unified) {
+        closeFd(cgroup_root.fd);
+        return error.SkipZigTest;
+    }
     defer closeFd(cgroup_root.fd);
     const cgroup_path = try std.fmt.allocPrint(std.testing.allocator, "igvano-inherited-test-{d}", .{linux.getpid()});
     defer std.testing.allocator.free(cgroup_path);

@@ -22,7 +22,7 @@ pub const Backend = struct {
         /// receives on [0]. Both ends are CLOEXEC and remain caller-owned.
         console_fds: ?[2]std.posix.fd_t = null,
         mounts: []const Mount = &.{},
-        /// Normalized path relative to the cgroup2 mount root.
+        /// Normalized path relative to each cgroup hierarchy's mount root.
         cgroup_path: []const u8 = "",
         resources: Resources = .{},
         capabilities: ?Capabilities = null,
