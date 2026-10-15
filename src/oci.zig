@@ -501,19 +501,22 @@ pub fn resolveCgroupPath(allocator: std.mem.Allocator, configured: ?[]const u8, 
 
 const Backend = @import("backend.zig").Backend;
 
-/// A joined IPC/network namespace must differ from the runtime's namespace.
+/// A joined IPC/network/UTS namespace must differ from the runtime's namespace.
 fn sysctlNamespace(config: Spec.Linux, kind: @FieldType(Spec.Namespace, "type")) bool {
     for (config.namespaces orelse &.{}) |namespace| {
         if (namespace.type != kind) continue;
         const path = namespace.path orelse return true;
-        if (kind == .uts) return true;
         if (comptime @import("builtin").os.tag == .linux) {
             const linux = std.os.linux;
             var buffer: [std.fs.max_path_bytes]u8 = undefined;
             const target = std.fmt.bufPrintZ(&buffer, "{s}", .{path}) catch return false;
             var own: linux.Statx = undefined;
             var joined: linux.Statx = undefined;
-            const own_path: [*:0]const u8 = if (kind == .ipc) "/proc/self/ns/ipc" else "/proc/self/ns/net";
+            const own_path: [*:0]const u8 = switch (kind) {
+                .ipc => "/proc/self/ns/ipc",
+                .uts => "/proc/self/ns/uts",
+                else => "/proc/self/ns/net",
+            };
             if (linux.errno(linux.statx(linux.AT.FDCWD, own_path, 0, .{ .INO = true }, &own)) != .SUCCESS or
                 linux.errno(linux.statx(linux.AT.FDCWD, target, 0, .{ .INO = true }, &joined)) != .SUCCESS or
                 !own.mask.INO or !joined.mask.INO) return false;
@@ -605,15 +608,10 @@ test "OCI sysctl validation requires the matching namespace" {
                 try std.testing.expectError(error.InvalidConfig, validateSysctls(config));
             }
         }
-        if (case.kind == .uts) {
-            // UTS sysctls require a configured UTS namespace, including joins.
-            try validateSysctls(.{ .sysctl = sysctl, .namespaces = &.{.{ .type = .uts, .path = "/proc/self/ns/uts" }} });
-        } else {
-            try std.testing.expectError(error.InvalidConfig, validateSysctls(.{
-                .sysctl = sysctl,
-                .namespaces = &.{.{ .type = case.kind, .path = "/proc/self/ns/missing" }},
-            }));
-        }
+        try std.testing.expectError(error.InvalidConfig, validateSysctls(.{
+            .sysctl = sysctl,
+            .namespaces = &.{.{ .type = case.kind, .path = "/proc/self/ns/missing" }},
+        }));
     }
 }
 
@@ -638,12 +636,16 @@ test "OCI sysctls reject host settings traversal and invalid values" {
     }
 }
 
-test "OCI IPC and network sysctls reject joining the runtime namespace" {
+test "OCI IPC network and UTS sysctls reject joining the runtime namespace" {
     if (comptime @import("builtin").os.tag != .linux) return error.SkipZigTest;
     for ([_]struct { key: []const u8, kind: @FieldType(Spec.Namespace, "type"), path: []const u8 }{
         .{ .key = "kernel.msgmax", .kind = .ipc, .path = "/proc/self/ns/ipc" },
         .{ .key = "net.ipv4.ip_forward", .kind = .network, .path = "/proc/self/ns/net" },
         .{ .key = "net.ipv4.ip_forward", .kind = .network, .path = "/proc/thread-self/ns/net" },
+        .{ .key = "kernel.hostname", .kind = .uts, .path = "/proc/self/ns/uts" },
+        .{ .key = "kernel.hostname", .kind = .uts, .path = "/proc/thread-self/ns/uts" },
+        .{ .key = "kernel.domainname", .kind = .uts, .path = "/proc/self/ns/uts" },
+        .{ .key = "kernel.domainname", .kind = .uts, .path = "/proc/thread-self/ns/uts" },
     }) |case| {
         var sysctl: std.json.ArrayHashMap([]const u8) = .{};
         defer sysctl.deinit(std.testing.allocator);
