@@ -256,6 +256,7 @@ fn createContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, c
         };
     }
     const settings: oci.Spec.Linux = parsed.value.linux orelse .{};
+    const sysctls = try oci.prepareSysctls(mount_allocator, settings);
     const configured_hooks: oci.Spec.Hooks = parsed.value.hooks orelse .{};
     const create_hooks = try oci.prepareHooks(mount_allocator, configured_hooks.createContainer);
     const start_hooks = try oci.prepareHooks(mount_allocator, configured_hooks.startContainer);
@@ -363,6 +364,7 @@ fn createContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, c
         .start_hook_state = start_hook_state,
         .masked_paths = masked_paths,
         .readonly_paths = readonly_paths,
+        .sysctls = sysctls,
         .rootfs_propagation = if (settings.rootfsPropagation) |mode| oci.rootfsPropagation(mode) else null,
         .on_create = .{ .ptr = &create_context, .run = CreateContext.run },
     });

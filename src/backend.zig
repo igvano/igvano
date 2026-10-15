@@ -41,6 +41,7 @@ pub const Backend = struct {
         on_create: ?CreateCallback = null,
         masked_paths: []const []const u8 = &.{},
         readonly_paths: []const []const u8 = &.{},
+        sysctls: []const Sysctl = &.{},
         /// Null preserves the default propagation in a private mount namespace.
         rootfs_propagation: ?u32 = null,
     };
@@ -73,6 +74,8 @@ pub const Backend = struct {
         path: [:0]const u8,
         target: [:0]const u8,
     };
+
+    pub const Sysctl = struct { key: []const u8, value: []const u8 };
 
     /// Capability names and rlimit types have been translated by the frontend.
     pub const Capabilities = struct {
@@ -202,6 +205,7 @@ pub const Backend = struct {
         HookTimeout,
         ConsoleFailed,
         MissingDevpts,
+        MissingProcfs,
     } || std.mem.Allocator.Error;
 
     /// Backends receive parsed values only; the frontend loads config.json and resolves paths.
