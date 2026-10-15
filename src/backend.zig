@@ -24,7 +24,7 @@ pub const Backend = struct {
         mounts: []const Mount = &.{},
         /// Normalized path relative to the cgroup2 mount root.
         cgroup_path: []const u8 = "",
-        cgroup_writes: []const CgroupWrite = &.{},
+        resources: Resources = .{},
         capabilities: ?Capabilities = null,
         rlimits: []const Rlimit = &.{},
         oom_score_adj: ?i32 = null,
@@ -89,9 +89,68 @@ pub const Backend = struct {
         soft: u64,
     };
 
-    pub const CgroupWrite = struct {
-        name: []const u8,
-        value: []const u8,
+    /// Hierarchy-independent resource settings. All slices are caller-owned.
+    pub const Resources = struct {
+        memory: ?Memory = null,
+        cpu: ?Cpu = null,
+        pids: ?Pids = null,
+        block_io: ?BlockIO = null,
+        hugepage_limits: []const HugepageLimit = &.{},
+        network: ?Network = null,
+        devices: []const DeviceRule = &.{},
+        unified: []const Unified = &.{},
+
+        pub const Memory = struct {
+            /// -1 represents unlimited for signed memory limits.
+            limit: ?i64 = null,
+            reservation: ?i64 = null,
+            swap: ?i64 = null,
+            kernel: ?i64 = null,
+            kernel_tcp: ?i64 = null,
+            swappiness: ?u64 = null,
+            disable_oom_killer: ?bool = null,
+        };
+        pub const Cpu = struct {
+            shares: ?u64 = null,
+            quota: ?i64 = null,
+            period: ?u64 = null,
+            realtime_runtime: ?i64 = null,
+            realtime_period: ?u64 = null,
+            cpus: ?[]const u8 = null,
+            mems: ?[]const u8 = null,
+        };
+        pub const Pids = struct { limit: ?i64 = null };
+        pub const BlockIO = struct {
+            weight: ?u16 = null,
+            leaf_weight: ?u16 = null,
+            weight_device: []const WeightDevice = &.{},
+            throttle_read_bps: []const ThrottleDevice = &.{},
+            throttle_write_bps: []const ThrottleDevice = &.{},
+            throttle_read_iops: []const ThrottleDevice = &.{},
+            throttle_write_iops: []const ThrottleDevice = &.{},
+        };
+        pub const WeightDevice = struct {
+            major: i64,
+            minor: i64,
+            weight: ?u16 = null,
+            leaf_weight: ?u16 = null,
+        };
+        pub const ThrottleDevice = struct { major: i64, minor: i64, rate: u64 };
+        pub const HugepageLimit = struct { page_size: []const u8, limit: u64 };
+        pub const Network = struct {
+            class_id: ?u32 = null,
+            priorities: []const Priority = &.{},
+        };
+        pub const Priority = struct { name: []const u8, priority: u32 };
+        pub const DeviceRule = struct {
+            allow: bool,
+            kind: enum { all, block, char } = .all,
+            /// Null represents a wildcard device number.
+            major: ?i64 = null,
+            minor: ?i64 = null,
+            access: []const u8 = "rwm",
+        };
+        pub const Unified = struct { key: []const u8, value: []const u8 };
     };
 
     /// Mount options and destinations have already been translated by the frontend.

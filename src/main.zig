@@ -265,8 +265,8 @@ fn createContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, c
     defer oci.freeDevices(allocator, devices);
     const cgroup_path = try oci.resolveCgroupPath(allocator, settings.cgroupsPath, config.id);
     defer allocator.free(cgroup_path);
-    const cgroup_writes = try oci.cgroupWrites(allocator, settings.resources);
-    defer oci.freeCgroupWrites(allocator, cgroup_writes);
+    const resources = try oci.cgroupResources(allocator, settings.resources);
+    defer oci.freeCgroupResources(allocator, resources);
     const capabilities = if (parsed.value.process) |process|
         if (process.capabilities) |caps| try oci.processCapabilities(caps) else null
     else
@@ -351,7 +351,7 @@ fn createContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, c
         .console_fds = console_fds,
         .mounts = mounts,
         .cgroup_path = cgroup_path,
-        .cgroup_writes = cgroup_writes,
+        .resources = resources,
         .capabilities = capabilities,
         .rlimits = rlimits,
         .oom_score_adj = if (parsed.value.process) |process| process.oomScoreAdj else null,
@@ -2161,12 +2161,9 @@ test "create with inherited mount isolation persists backend resources and rolls
                 proc.flags != std.os.linux.MS.NOSUID or !std.mem.eql(u8, proc.data, "mode=755"))
                 return error.InvalidConfig;
             self.mounts_checked = true;
-            if (!std.mem.eql(u8, options.cgroup_path, "custom/test") or options.cgroup_writes.len != 2)
-                return error.InvalidConfig;
-            if (!std.mem.eql(u8, options.cgroup_writes[0].name, "memory.max") or
-                !std.mem.eql(u8, options.cgroup_writes[0].value, "33554432") or
-                !std.mem.eql(u8, options.cgroup_writes[1].name, "pids.max") or
-                !std.mem.eql(u8, options.cgroup_writes[1].value, "5"))
+            if (!std.mem.eql(u8, options.cgroup_path, "custom/test") or
+                options.resources.memory == null or options.resources.memory.?.limit != 33554432 or
+                options.resources.pids == null or options.resources.pids.?.limit != 5)
                 return error.InvalidConfig;
             const caps = options.capabilities orelse return error.InvalidConfig;
             if (!std.meta.eql(caps, Backend.Capabilities{

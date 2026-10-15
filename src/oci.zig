@@ -1,5 +1,68 @@
 const std = @import("std");
 
+test "OCI resources parse every supported resource field" {
+    const parsed = try std.json.parseFromSlice(Spec.Resources, std.testing.allocator,
+        \\{"memory":{"limit":64,"reservation":32,"swap":128,"kernel":-1,"kernelTCP":16,"swappiness":50,"disableOOMKiller":false},
+        \\"cpu":{"shares":1024,"quota":50000,"period":100000,"realtimeRuntime":-1,"realtimePeriod":1000000,"cpus":"0-2","mems":"0"},
+        \\"pids":{"limit":32},
+        \\"blockIO":{"weight":100,"leafWeight":200,"weightDevice":[{"major":8,"minor":0,"weight":300,"leafWeight":400}],
+        \\"throttleReadBpsDevice":[{"major":8,"minor":0,"rate":1000}],"throttleWriteBpsDevice":[{"major":8,"minor":1,"rate":2000}],
+        \\"throttleReadIOPSDevice":[{"major":8,"minor":2,"rate":30}],"throttleWriteIOPSDevice":[{"major":8,"minor":3,"rate":40}]},
+        \\"hugepageLimits":[{"pageSize":"2MB","limit":4194304}],
+        \\"network":{"classID":123,"priorities":[{"name":"eth0","priority":7}]},
+        \\"devices":[{"allow":false},{"allow":true,"type":"c","major":1,"minor":3,"access":"rw"}],
+        \\"unified":{"memory.high":"48","cpu.max":"max 200000"}}
+    , .{});
+    defer parsed.deinit();
+    const resources = try cgroupResources(std.testing.allocator, parsed.value);
+    defer freeCgroupResources(std.testing.allocator, resources);
+    try std.testing.expectEqualDeep(Backend.Resources.Memory{
+        .limit = 64,
+        .reservation = 32,
+        .swap = 128,
+        .kernel = -1,
+        .kernel_tcp = 16,
+        .swappiness = 50,
+        .disable_oom_killer = false,
+    }, resources.memory.?);
+    try std.testing.expectEqualDeep(Backend.Resources.Cpu{
+        .shares = 1024,
+        .quota = 50000,
+        .period = 100000,
+        .realtime_runtime = -1,
+        .realtime_period = 1000000,
+        .cpus = "0-2",
+        .mems = "0",
+    }, resources.cpu.?);
+    try std.testing.expectEqual(@as(?i64, 32), resources.pids.?.limit);
+    const block = resources.block_io.?;
+    try std.testing.expectEqual(@as(?u16, 100), block.weight);
+    try std.testing.expectEqual(@as(?u16, 200), block.leaf_weight);
+    try std.testing.expectEqualDeep(Backend.Resources.WeightDevice{
+        .major = 8,
+        .minor = 0,
+        .weight = 300,
+        .leaf_weight = 400,
+    }, block.weight_device[0]);
+    try std.testing.expectEqualDeep(Backend.Resources.ThrottleDevice{ .major = 8, .minor = 0, .rate = 1000 }, block.throttle_read_bps[0]);
+    try std.testing.expectEqualDeep(Backend.Resources.ThrottleDevice{ .major = 8, .minor = 1, .rate = 2000 }, block.throttle_write_bps[0]);
+    try std.testing.expectEqualDeep(Backend.Resources.ThrottleDevice{ .major = 8, .minor = 2, .rate = 30 }, block.throttle_read_iops[0]);
+    try std.testing.expectEqualDeep(Backend.Resources.ThrottleDevice{ .major = 8, .minor = 3, .rate = 40 }, block.throttle_write_iops[0]);
+    try std.testing.expectEqualDeep(Backend.Resources.HugepageLimit{ .page_size = "2MB", .limit = 4194304 }, resources.hugepage_limits[0]);
+    try std.testing.expectEqual(@as(?u32, 123), resources.network.?.class_id);
+    try std.testing.expectEqualDeep(Backend.Resources.Priority{ .name = "eth0", .priority = 7 }, resources.network.?.priorities[0]);
+    try std.testing.expectEqualDeep(Backend.Resources.DeviceRule{ .allow = false }, resources.devices[0]);
+    try std.testing.expectEqualDeep(Backend.Resources.DeviceRule{
+        .allow = true,
+        .kind = .char,
+        .major = 1,
+        .minor = 3,
+        .access = "rw",
+    }, resources.devices[1]);
+    try std.testing.expectEqualDeep(Backend.Resources.Unified{ .key = "memory.high", .value = "48" }, resources.unified[0]);
+    try std.testing.expectEqualDeep(Backend.Resources.Unified{ .key = "cpu.max", .value = "max 200000" }, resources.unified[1]);
+}
+
 test "hooks parse all lifecycle stages and preserve their optional settings" {
     const parsed = try std.json.parseFromSlice(Spec, std.testing.allocator,
         \\{"ociVersion":"1.0.2","root":{"path":"rootfs"},"hooks":{
@@ -87,58 +150,20 @@ test "cgroup paths are relative to the mount root and reject escapes" {
     try std.testing.expectError(error.InvalidConfig, resolveCgroupPath(std.testing.allocator, null, "../outside"));
 }
 
-test "cpu shares map to cgroup2 weights without underflow or overflow" {
-    const cases = [_]struct { shares: u64, weight: u64 }{
-        .{ .shares = 0, .weight = 0 },
-        .{ .shares = 2, .weight = 1 },
-        .{ .shares = 1024, .weight = 39 },
-        .{ .shares = 262144, .weight = 10000 },
-    };
-    for (cases) |case| try std.testing.expectEqual(case.weight, try cpuWeight(case.shares));
-    for ([_]u64{ 1, 262145, std.math.maxInt(u64) }) |shares| {
-        try std.testing.expectError(error.InvalidConfig, cpuWeight(shares));
-    }
-}
-
-test "OCI resources parse and map to cgroup2 writes" {
+test "OCI resources retain typed limits without hierarchy mapping" {
     const parsed = try std.json.parseFromSlice(Spec.Linux, std.testing.allocator,
         \\{"cgroupsPath":"/custom/example","resources":{"memory":{"limit":67108864},"cpu":{"quota":50000,"period":100000,"shares":1024},"pids":{"limit":32},"devices":[]}}
     , .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
     try std.testing.expectEqualStrings("/custom/example", parsed.value.cgroupsPath.?);
-    const writes = try cgroupWrites(std.testing.allocator, parsed.value.resources);
-    defer freeCgroupWrites(std.testing.allocator, writes);
-    const expected = [_]struct { name: []const u8, value: []const u8 }{
-        .{ .name = "memory.max", .value = "67108864" },
-        .{ .name = "cpu.max", .value = "50000 100000" },
-        .{ .name = "cpu.weight", .value = "39" },
-        .{ .name = "pids.max", .value = "32" },
-    };
-    try std.testing.expectEqual(expected.len, writes.len);
-    for (expected, writes) |want, actual| {
-        try std.testing.expectEqualStrings(want.name, actual.name);
-        try std.testing.expectEqualStrings(want.value, actual.value);
-    }
+    const resources = try cgroupResources(std.testing.allocator, parsed.value.resources);
+    defer freeCgroupResources(std.testing.allocator, resources);
+    try std.testing.expectEqual(@as(?i64, 67108864), resources.memory.?.limit);
+    try std.testing.expectEqualDeep(Backend.Resources.Cpu{ .quota = 50000, .period = 100000, .shares = 1024 }, resources.cpu.?);
+    try std.testing.expectEqual(@as(?i64, 32), resources.pids.?.limit);
 }
 
-test "cgroup writes preserve unlimited values and CPU defaults" {
-    const cases = [_]struct { json: []const u8, name: []const u8, value: []const u8 }{
-        .{ .json = "{\"memory\":{\"limit\":-1}}", .name = "memory.max", .value = "max" },
-        .{ .json = "{\"pids\":{\"limit\":-1}}", .name = "pids.max", .value = "max" },
-        .{ .json = "{\"cpu\":{\"quota\":-1,\"period\":200000}}", .name = "cpu.max", .value = "max 200000" },
-        .{ .json = "{\"cpu\":{\"period\":200000}}", .name = "cpu.max", .value = "max 200000" },
-        .{ .json = "{\"cpu\":{\"quota\":50000}}", .name = "cpu.max", .value = "50000 100000" },
-        .{ .json = "{\"cpu\":{\"quota\":0,\"period\":0}}", .name = "cpu.max", .value = "max 100000" },
-    };
-    for (cases) |case| {
-        const parsed = try std.json.parseFromSlice(Spec.Resources, std.testing.allocator, case.json, .{});
-        defer parsed.deinit();
-        const writes = try cgroupWrites(std.testing.allocator, parsed.value);
-        defer freeCgroupWrites(std.testing.allocator, writes);
-        try std.testing.expectEqual(@as(usize, 1), writes.len);
-        try std.testing.expectEqualStrings(case.name, writes[0].name);
-        try std.testing.expectEqualStrings(case.value, writes[0].value);
-    }
+test "cgroup resources preserve zero unlimited and omitted settings" {
     for ([_]?Spec.Resources{
         null,
         .{},
@@ -148,31 +173,91 @@ test "cgroup writes preserve unlimited values and CPU defaults" {
         .{ .pids = .{ .limit = 0 } },
         .{ .memory = .{ .limit = 0 }, .pids = .{ .limit = 0 } },
     }) |resources| {
-        const writes = try cgroupWrites(std.testing.allocator, resources);
-        defer freeCgroupWrites(std.testing.allocator, writes);
-        try std.testing.expectEqual(@as(usize, 0), writes.len);
+        const converted = try cgroupResources(std.testing.allocator, resources);
+        defer freeCgroupResources(std.testing.allocator, converted);
+        try std.testing.expectEqual(@as(usize, 0), converted.devices.len);
+        try std.testing.expectEqual(@as(usize, 0), converted.unified.len);
+        try std.testing.expectEqual(if (resources) |r| if (r.memory) |m| m.limit else null else null, if (converted.memory) |m| m.limit else null);
     }
+    const resources = try cgroupResources(std.testing.allocator, .{
+        .memory = .{ .limit = -1, .reservation = -1, .swap = -1, .kernel = -1, .kernelTCP = -1 },
+        .cpu = .{ .quota = -1, .realtimeRuntime = -1 },
+        .pids = .{ .limit = -1 },
+    });
+    defer freeCgroupResources(std.testing.allocator, resources);
+    try std.testing.expectEqual(@as(?i64, -1), resources.memory.?.swap);
+    try std.testing.expectEqual(@as(?i64, -1), resources.cpu.?.quota);
+    try std.testing.expectEqual(@as(?i64, -1), resources.pids.?.limit);
+}
+
+test "cgroup resource validation rejects invalid signed limits and cpu shares" {
     for ([_]Spec.Resources{
         .{ .memory = .{ .limit = -2 } },
         .{ .pids = .{ .limit = -2 } },
         .{ .cpu = .{ .quota = -2 } },
         .{ .cpu = .{ .shares = 1 } },
         .{ .memory = .{ .limit = 64 }, .cpu = .{ .shares = 1 } },
+        .{ .memory = .{ .reservation = -2 } },
+        .{ .memory = .{ .swap = -2 } },
+        .{ .memory = .{ .kernel = -2 } },
+        .{ .memory = .{ .kernelTCP = -2 } },
+        .{ .cpu = .{ .realtimeRuntime = -2 } },
+        .{ .cpu = .{ .shares = 262145 } },
+        .{ .cpu = .{ .shares = std.math.maxInt(u64) } },
     }) |resources| {
-        try std.testing.expectError(error.InvalidConfig, cgroupWrites(std.testing.allocator, resources));
+        try std.testing.expectError(error.InvalidConfig, cgroupResources(std.testing.allocator, resources));
     }
 }
 
-test "zero memory and pids limits are unset without suppressing other resources" {
-    const parsed = try std.json.parseFromSlice(Spec.Resources, std.testing.allocator,
-        \\{"memory":{"limit":0},"pids":{"limit":0},"cpu":{"shares":1024}}
-    , .{});
-    defer parsed.deinit();
-    const writes = try cgroupWrites(std.testing.allocator, parsed.value);
-    defer freeCgroupWrites(std.testing.allocator, writes);
-    try std.testing.expectEqual(@as(usize, 1), writes.len);
-    try std.testing.expectEqualStrings("cpu.weight", writes[0].name);
-    try std.testing.expectEqualStrings("39", writes[0].value);
+test "cgroup resources validate device types access and wildcard numbers" {
+    for ([_][]const u8{ "a", "b", "c" }, [_]@FieldType(Backend.Resources.DeviceRule, "kind"){ .all, .block, .char }) |kind, expected| {
+        const resources = try cgroupResources(std.testing.allocator, .{ .devices = &.{
+            .{ .allow = true, .type = kind, .major = -1, .minor = -1, .access = "mrw" },
+        } });
+        defer freeCgroupResources(std.testing.allocator, resources);
+        try std.testing.expectEqual(expected, resources.devices[0].kind);
+        try std.testing.expectEqual(@as(?i64, null), resources.devices[0].major);
+        try std.testing.expectEqual(@as(?i64, null), resources.devices[0].minor);
+    }
+    for ([_]Spec.Resources.DeviceRule{
+        .{ .allow = true, .type = "" },
+        .{ .allow = true, .type = "char" },
+        .{ .allow = true, .access = "rx" },
+        .{ .allow = true, .access = "r\x00" },
+        .{ .allow = true, .major = -2 },
+        .{ .allow = true, .minor = -2 },
+    }) |device| {
+        try std.testing.expectError(error.InvalidConfig, cgroupResources(std.testing.allocator, .{ .devices = &.{device} }));
+    }
+}
+
+test "cgroup resources reject unsafe unified names and empty hugepage sizes" {
+    for ([_][]const u8{ "", ".", "..", "/memory.max", "a/b", "a\x00b" }) |key| {
+        var unified: std.json.ArrayHashMap([]const u8) = .{};
+        defer unified.map.deinit(std.testing.allocator);
+        try unified.map.put(std.testing.allocator, key, "1");
+        try std.testing.expectError(error.InvalidConfig, cgroupResources(std.testing.allocator, .{ .unified = unified }));
+    }
+    try std.testing.expectError(error.InvalidConfig, cgroupResources(std.testing.allocator, .{
+        .hugepageLimits = &.{.{ .pageSize = "", .limit = 1 }},
+    }));
+}
+
+test "cgroup resources validate block device numbers and weight ranges" {
+    for ([_]Spec.Resources{
+        .{ .blockIO = .{ .weight = 9 } },
+        .{ .blockIO = .{ .leafWeight = 1001 } },
+        .{ .blockIO = .{ .weightDevice = &.{.{ .major = -1, .minor = 0 }} } },
+        .{ .blockIO = .{ .weightDevice = &.{.{ .major = 8, .minor = -1 }} } },
+        .{ .blockIO = .{ .weightDevice = &.{.{ .major = 8, .minor = 0, .weight = 1 }} } },
+        .{ .blockIO = .{ .weightDevice = &.{.{ .major = 8, .minor = 0, .leafWeight = 1001 }} } },
+        .{ .blockIO = .{ .throttleReadBpsDevice = &.{.{ .major = -1, .minor = 0, .rate = 1 }} } },
+        .{ .blockIO = .{ .throttleWriteBpsDevice = &.{.{ .major = 8, .minor = -1, .rate = 1 }} } },
+        .{ .blockIO = .{ .throttleReadIOPSDevice = &.{.{ .major = -1, .minor = 0, .rate = 1 }} } },
+        .{ .blockIO = .{ .throttleWriteIOPSDevice = &.{.{ .major = 8, .minor = -1, .rate = 1 }} } },
+    }) |resources| {
+        try std.testing.expectError(error.InvalidConfig, cgroupResources(std.testing.allocator, resources));
+    }
 }
 
 test "bind mount recursive read-only options are explicit and ordered" {
@@ -192,16 +277,27 @@ test "bind mount recursive read-only options are explicit and ordered" {
     }
 }
 
-test "cgroup resource mapping frees partially allocated writes on allocation failure" {
+test "cgroup resource conversion frees partially allocated arrays on allocation failure" {
     const AllocationTest = struct {
         fn run(allocator: std.mem.Allocator) !void {
-            const writes = try cgroupWrites(allocator, .{
-                .memory = .{ .limit = 67108864 },
-                .cpu = .{ .quota = 50000, .period = 100000, .shares = 1024 },
-                .pids = .{ .limit = 32 },
+            var unified: std.json.ArrayHashMap([]const u8) = .{};
+            defer unified.map.deinit(allocator);
+            try unified.map.put(allocator, "memory.high", "32");
+            const resources = try cgroupResources(allocator, .{
+                .blockIO = .{
+                    .weightDevice = &.{.{ .major = 8, .minor = 0, .weight = 100 }},
+                    .throttleReadBpsDevice = &.{.{ .major = 8, .minor = 0, .rate = 1 }},
+                    .throttleWriteBpsDevice = &.{.{ .major = 8, .minor = 0, .rate = 2 }},
+                    .throttleReadIOPSDevice = &.{.{ .major = 8, .minor = 0, .rate = 3 }},
+                    .throttleWriteIOPSDevice = &.{.{ .major = 8, .minor = 0, .rate = 4 }},
+                },
+                .hugepageLimits = &.{.{ .pageSize = "2MB", .limit = 1 }},
+                .network = .{ .priorities = &.{.{ .name = "eth0", .priority = 1 }} },
+                .devices = &.{.{ .allow = false }},
+                .unified = unified,
             });
-            defer freeCgroupWrites(allocator, writes);
-            try std.testing.expectEqual(@as(usize, 4), writes.len);
+            defer freeCgroupResources(allocator, resources);
+            try std.testing.expectEqual(@as(usize, 1), resources.devices.len);
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, AllocationTest.run, .{});
@@ -316,14 +412,60 @@ pub const Spec = struct {
         memory: ?Memory = null,
         cpu: ?Cpu = null,
         pids: ?Pids = null,
+        blockIO: ?BlockIO = null,
+        hugepageLimits: ?[]const HugepageLimit = null,
+        network: ?Network = null,
+        devices: ?[]const DeviceRule = null,
+        unified: ?std.json.ArrayHashMap([]const u8) = null,
 
-        pub const Memory = struct { limit: ?i64 = null };
+        pub const Memory = struct {
+            limit: ?i64 = null,
+            reservation: ?i64 = null,
+            swap: ?i64 = null,
+            kernel: ?i64 = null,
+            kernelTCP: ?i64 = null,
+            swappiness: ?u64 = null,
+            disableOOMKiller: ?bool = null,
+        };
         pub const Cpu = struct {
             quota: ?i64 = null,
             period: ?u64 = null,
             shares: ?u64 = null,
+            realtimeRuntime: ?i64 = null,
+            realtimePeriod: ?u64 = null,
+            cpus: ?[]const u8 = null,
+            mems: ?[]const u8 = null,
         };
-        pub const Pids = struct { limit: i64 };
+        pub const Pids = struct { limit: ?i64 = null };
+        pub const BlockIO = struct {
+            weight: ?u16 = null,
+            leafWeight: ?u16 = null,
+            weightDevice: ?[]const WeightDevice = null,
+            throttleReadBpsDevice: ?[]const ThrottleDevice = null,
+            throttleWriteBpsDevice: ?[]const ThrottleDevice = null,
+            throttleReadIOPSDevice: ?[]const ThrottleDevice = null,
+            throttleWriteIOPSDevice: ?[]const ThrottleDevice = null,
+        };
+        pub const WeightDevice = struct {
+            major: i64,
+            minor: i64,
+            weight: ?u16 = null,
+            leafWeight: ?u16 = null,
+        };
+        pub const ThrottleDevice = struct { major: i64, minor: i64, rate: u64 };
+        pub const HugepageLimit = struct { pageSize: []const u8, limit: u64 };
+        pub const Network = struct {
+            classID: ?u32 = null,
+            priorities: ?[]const Priority = null,
+        };
+        pub const Priority = struct { name: []const u8, priority: u32 };
+        pub const DeviceRule = struct {
+            allow: bool,
+            type: []const u8 = "a",
+            major: ?i64 = null,
+            minor: ?i64 = null,
+            access: []const u8 = "rwm",
+        };
     };
 
     pub const Namespace = struct {
@@ -356,15 +498,7 @@ pub fn resolveCgroupPath(allocator: std.mem.Allocator, configured: ?[]const u8, 
     return allocator.dupe(u8, normalized[1..]);
 }
 
-/// Zero shares means unset; the remaining OCI range maps to [1, 10000].
-pub fn cpuWeight(shares: u64) !u64 {
-    if (shares == 0) return 0;
-    if (shares < 2 or shares > 262144) return error.InvalidConfig;
-    return 1 + ((shares - 2) * 9999) / 262142;
-}
-
 const Backend = @import("backend.zig").Backend;
-const CgroupWrite = Backend.CgroupWrite;
 
 pub fn validateHooks(configured: ?Spec.Hooks) error{InvalidConfig}!void {
     const hooks = configured orelse return;
@@ -854,57 +988,151 @@ test "rlimit preparation rejects invalid names inverted limits and duplicates wi
     try std.testing.expectEqual(@as(usize, 0), omitted.len);
 }
 
-/// The caller owns the slice and each value; filenames are static strings.
-pub fn cgroupWrites(allocator: std.mem.Allocator, resources: ?Spec.Resources) ![]CgroupWrite {
-    var writes: std.ArrayList(CgroupWrite) = .empty;
-    defer writes.deinit(allocator);
-    errdefer for (writes.items) |write| allocator.free(write.value);
-    if (resources) |settings| {
-        if (settings.memory) |memory| {
-            if (memory.limit) |limit| {
-                if (limit != 0)
-                    try appendCgroupWrite(allocator, &writes, "memory.max", try cgroupLimit(allocator, limit));
-            }
+/// Translate and validate OCI resources without selecting a cgroup hierarchy.
+/// Arrays are caller-owned; strings are borrowed from the parsed spec.
+pub fn cgroupResources(allocator: std.mem.Allocator, configured: ?Spec.Resources) !Backend.Resources {
+    const settings = configured orelse return .{};
+    var resources: Backend.Resources = .{};
+    errdefer freeCgroupResources(allocator, resources);
+    if (settings.memory) |memory| {
+        inline for (.{ "limit", "reservation", "swap", "kernel", "kernelTCP" }) |field|
+            try validateResourceLimit(@field(memory, field));
+        resources.memory = .{
+            .limit = memory.limit,
+            .reservation = memory.reservation,
+            .swap = memory.swap,
+            .kernel = memory.kernel,
+            .kernel_tcp = memory.kernelTCP,
+            .swappiness = memory.swappiness,
+            .disable_oom_killer = memory.disableOOMKiller,
+        };
+    }
+    if (settings.cpu) |cpu| {
+        try validateResourceLimit(cpu.quota);
+        try validateResourceLimit(cpu.realtimeRuntime);
+        if (cpu.shares) |shares|
+            if (shares != 0 and (shares < 2 or shares > 262144)) return error.InvalidConfig;
+        resources.cpu = .{
+            .shares = cpu.shares,
+            .quota = cpu.quota,
+            .period = cpu.period,
+            .realtime_runtime = cpu.realtimeRuntime,
+            .realtime_period = cpu.realtimePeriod,
+            .cpus = cpu.cpus,
+            .mems = cpu.mems,
+        };
+    }
+    if (settings.pids) |pids| {
+        try validateResourceLimit(pids.limit);
+        resources.pids = .{ .limit = pids.limit };
+    }
+    if (settings.blockIO) |block| {
+        try validateResourceWeight(block.weight);
+        try validateResourceWeight(block.leafWeight);
+        resources.block_io = .{ .weight = block.weight, .leaf_weight = block.leafWeight };
+        const weights = block.weightDevice orelse &.{};
+        const translated = try allocator.alloc(Backend.Resources.WeightDevice, weights.len);
+        resources.block_io.?.weight_device = translated;
+        for (weights, translated) |entry, *device| {
+            if (entry.major < 0 or entry.minor < 0) return error.InvalidConfig;
+            try validateResourceWeight(entry.weight);
+            try validateResourceWeight(entry.leafWeight);
+            device.* = .{
+                .major = entry.major,
+                .minor = entry.minor,
+                .weight = entry.weight,
+                .leaf_weight = entry.leafWeight,
+            };
         }
-        if (settings.cpu) |cpu| {
-            const quota = cpu.quota orelse -1;
-            if (quota < -1) return error.InvalidConfig;
-            const period = if ((cpu.period orelse 0) == 0) 100000 else cpu.period.?;
-            if (cpu.quota != null or cpu.period != null) {
-                const value = if (quota <= 0)
-                    try std.fmt.allocPrint(allocator, "max {d}", .{period})
-                else
-                    try std.fmt.allocPrint(allocator, "{d} {d}", .{ quota, period });
-                try appendCgroupWrite(allocator, &writes, "cpu.max", value);
-            }
-            if (cpu.shares) |shares| {
-                const weight = try cpuWeight(shares);
-                if (weight != 0)
-                    try appendCgroupWrite(allocator, &writes, "cpu.weight", try std.fmt.allocPrint(allocator, "{d}", .{weight}));
-            }
-        }
-        if (settings.pids) |pids| {
-            if (pids.limit != 0)
-                try appendCgroupWrite(allocator, &writes, "pids.max", try cgroupLimit(allocator, pids.limit));
+        resources.block_io.?.throttle_read_bps = try resourceThrottleDevices(allocator, block.throttleReadBpsDevice);
+        resources.block_io.?.throttle_write_bps = try resourceThrottleDevices(allocator, block.throttleWriteBpsDevice);
+        resources.block_io.?.throttle_read_iops = try resourceThrottleDevices(allocator, block.throttleReadIOPSDevice);
+        resources.block_io.?.throttle_write_iops = try resourceThrottleDevices(allocator, block.throttleWriteIOPSDevice);
+    }
+    const hugepages = settings.hugepageLimits orelse &.{};
+    const translated_pages = try allocator.alloc(Backend.Resources.HugepageLimit, hugepages.len);
+    resources.hugepage_limits = translated_pages;
+    for (hugepages, translated_pages) |entry, *page| {
+        if (entry.pageSize.len == 0) return error.InvalidConfig;
+        page.* = .{ .page_size = entry.pageSize, .limit = entry.limit };
+    }
+    if (settings.network) |network| {
+        resources.network = .{ .class_id = network.classID };
+        const priorities = network.priorities orelse &.{};
+        const translated = try allocator.alloc(Backend.Resources.Priority, priorities.len);
+        resources.network.?.priorities = translated;
+        for (priorities, translated) |entry, *priority|
+            priority.* = .{ .name = entry.name, .priority = entry.priority };
+    }
+    const devices = settings.devices orelse &.{};
+    const translated_devices = try allocator.alloc(Backend.Resources.DeviceRule, devices.len);
+    resources.devices = translated_devices;
+    for (devices, translated_devices) |entry, *device| {
+        const kind: @FieldType(Backend.Resources.DeviceRule, "kind") = if (std.mem.eql(u8, entry.type, "a"))
+            .all
+        else if (std.mem.eql(u8, entry.type, "b"))
+            .block
+        else if (std.mem.eql(u8, entry.type, "c"))
+            .char
+        else
+            return error.InvalidConfig;
+        for (entry.access) |access|
+            if (access != 'r' and access != 'w' and access != 'm') return error.InvalidConfig;
+        try validateResourceLimit(entry.major);
+        try validateResourceLimit(entry.minor);
+        device.* = .{
+            .allow = entry.allow,
+            .kind = kind,
+            .major = if (entry.major == -1) null else entry.major,
+            .minor = if (entry.minor == -1) null else entry.minor,
+            .access = entry.access,
+        };
+    }
+    if (settings.unified) |unified| {
+        const translated = try allocator.alloc(Backend.Resources.Unified, unified.map.count());
+        resources.unified = translated;
+        for (unified.map.keys(), unified.map.values(), translated) |key, value, *entry| {
+            if (key.len == 0 or std.mem.indexOfAny(u8, key, "/\x00") != null or
+                std.mem.eql(u8, key, ".") or std.mem.eql(u8, key, "..")) return error.InvalidConfig;
+            entry.* = .{ .key = key, .value = value };
         }
     }
-    return writes.toOwnedSlice(allocator);
+    return resources;
 }
 
-fn cgroupLimit(allocator: std.mem.Allocator, limit: i64) ![]u8 {
-    if (limit < -1) return error.InvalidConfig;
-    if (limit == -1) return allocator.dupe(u8, "max");
-    return std.fmt.allocPrint(allocator, "{d}", .{limit});
+fn validateResourceLimit(value: ?i64) error{InvalidConfig}!void {
+    if (value) |limit|
+        if (limit < -1) return error.InvalidConfig;
 }
 
-fn appendCgroupWrite(allocator: std.mem.Allocator, writes: *std.ArrayList(CgroupWrite), name: []const u8, value: []u8) !void {
-    errdefer allocator.free(value);
-    try writes.append(allocator, .{ .name = name, .value = value });
+fn validateResourceWeight(value: ?u16) error{InvalidConfig}!void {
+    if (value) |weight|
+        if (weight != 0 and (weight < 10 or weight > 1000)) return error.InvalidConfig;
 }
 
-pub fn freeCgroupWrites(allocator: std.mem.Allocator, writes: []const CgroupWrite) void {
-    for (writes) |write| allocator.free(write.value);
-    allocator.free(writes);
+fn resourceThrottleDevices(allocator: std.mem.Allocator, configured: ?[]const Spec.Resources.ThrottleDevice) ![]Backend.Resources.ThrottleDevice {
+    const entries = configured orelse &.{};
+    const devices = try allocator.alloc(Backend.Resources.ThrottleDevice, entries.len);
+    errdefer allocator.free(devices);
+    for (entries, devices) |entry, *device| {
+        if (entry.major < 0 or entry.minor < 0) return error.InvalidConfig;
+        device.* = .{ .major = entry.major, .minor = entry.minor, .rate = entry.rate };
+    }
+    return devices;
+}
+
+pub fn freeCgroupResources(allocator: std.mem.Allocator, resources: Backend.Resources) void {
+    if (resources.block_io) |block| {
+        allocator.free(block.weight_device);
+        allocator.free(block.throttle_read_bps);
+        allocator.free(block.throttle_write_bps);
+        allocator.free(block.throttle_read_iops);
+        allocator.free(block.throttle_write_iops);
+    }
+    allocator.free(resources.hugepage_limits);
+    if (resources.network) |network| allocator.free(network.priorities);
+    allocator.free(resources.devices);
+    allocator.free(resources.unified);
 }
 
 /// Linux mount constants are available on every build host; this performs no I/O.
