@@ -1,5 +1,5 @@
 #!/bin/sh
-# Run from any directory. Requires Nix and Docker on the host.
+# Run from any directory. Requires Nix and Docker (or CONFORMANCE_VM with Lima).
 # CONFORMANCE_LOG defaults to .zig-cache/conformance.log.
 # CONFORMANCE_IMAGE and CONFORMANCE_TIMEOUT override the Go image and seconds/test.
 # RUNTIME_TOOLS_REF overrides the runtime-tools branch, tag, or commit.
@@ -36,14 +36,21 @@ if [ "${1-}" = "--inside" ]; then
             echo "Unable to empty the cgroup namespace root for conformance tests" >&2
             exit 1
         fi
+    else
+        # The v2-only validation limitations do not apply to a v1 VM.
+        KNOWN_UPSTREAM=$(printf '%s\n' "$KNOWN_UPSTREAM" | sed '/v1-only/d')
     fi
 
     apt-get update
     apt-get install -y --no-install-recommends busybox-static
     command -v timeout >/dev/null
     runtime_tools_ref=${RUNTIME_TOOLS_REF:-master}
-    git init /tmp/runtime-tools
-    cd /tmp/runtime-tools
+    work=$(mktemp -d /tmp/igvano-conformance.XXXXXX)
+    # Timed-out upstream suites can leave nested mounts busy. Detach the
+    # task-owned tmpfs before removing the workspace, including its submounts.
+    trap 'if ! mountpoint -q "$work/bundles" || umount -l "$work/bundles"; then rm -rf "$work"; fi' 0
+    git init "$work/runtime-tools"
+    cd "$work/runtime-tools"
     git remote add origin https://github.com/opencontainers/runtime-tools.git
     git fetch --depth 1 origin "$runtime_tools_ref"
     git checkout --detach FETCH_HEAD
@@ -66,11 +73,11 @@ if [ "${1-}" = "--inside" ]; then
     ./oci-runtime-tool generate --output bundle/config.json
     # Official executables generate their own configs and unpack this archive
     # into each bundle; they find both the archive and runtimetest in cwd.
-    tar -czf rootfs-amd64.tar.gz -C bundle/rootfs .
+    tar -czf "rootfs-$(go env GOARCH).tar.gz" -C bundle/rootfs .
     # PrepareBundle needs tmpfs for mknod of char 0:0; keep Go builds off tmpfs.
-    mkdir /bundles
-    mount -t tmpfs tmpfs /bundles
-    export TMPDIR=/bundles
+    mkdir "$work/bundles"
+    mount -t tmpfs tmpfs "$work/bundles"
+    export TMPDIR="$work/bundles"
     export RUNTIME=/usr/local/bin/igvano
     sha256sum "$RUNTIME"
     find validation -type f -name '*.t' | LC_ALL=C sort > /tmp/conformance-tests
@@ -135,6 +142,26 @@ printf 'Running conformance harness; full log: %s\n' "$log"
 status=0
 (
     cd "$repo"
+    if [ -n "${CONFORMANCE_VM:-}" ]; then
+        vm=$CONFORMANCE_VM
+        case "$(limactl shell "$vm" uname -m)" in
+            aarch64) arch=aarch64 ;;
+            x86_64) arch=x86_64 ;;
+            *) echo "Unsupported VM architecture" >&2; exit 1 ;;
+        esac
+        nix develop -c zig build "-Dtarget=$arch-linux-musl" || exit "$?"
+        # Lima mounts HOME, so keep immutable inputs there for the VM run.
+        snapshot=$(mktemp -d "$HOME/.igvano-conformance.XXXXXX") || exit "$?"
+        trap 'rm -rf "$snapshot"' 0
+        cp "$repo/zig-out/bin/igvano" "$snapshot/igvano" || exit "$?"
+        cp "$repo/hack/conformance.sh" "$snapshot/conformance.sh" || exit "$?"
+        limactl shell "$vm" sudo install -m 0755 "$snapshot/igvano" /usr/local/bin/igvano || exit "$?"
+        limactl shell "$vm" sudo env "PATH=/usr/local/go/bin:$PATH" \
+            "CONFORMANCE_TIMEOUT=${CONFORMANCE_TIMEOUT:-120}" \
+            "RUNTIME_TOOLS_REF=${RUNTIME_TOOLS_REF:-master}" \
+            sh "$snapshot/conformance.sh" --inside
+        exit "$?"
+    fi
     nix develop -c zig build -Dtarget=x86_64-linux-musl || exit "$?"
     # Snapshot inputs under the shared repo, so rebuilding cannot change a
     # running validation container or reuse a previously mounted binary inode.
