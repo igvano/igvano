@@ -24,7 +24,7 @@ if [ "${1-}" = "--inside" ]; then
         exit 1
     fi
 
-    if [ -f /sys/fs/cgroup/cgroup.controllers ]; then
+    if [ -f /sys/fs/cgroup/cgroup.controllers ] && [ -f /.dockerenv ]; then
         # Empty Docker's cgroup namespace root so controllers can be enabled.
         mkdir -p /sys/fs/cgroup/init
         # Snapshot the PIDs before moving them; short-lived processes may exit.
@@ -36,9 +36,17 @@ if [ "${1-}" = "--inside" ]; then
             echo "Unable to empty the cgroup namespace root for conformance tests" >&2
             exit 1
         fi
-    else
-        # The v2-only validation limitations do not apply to a v1 VM.
+    elif [ ! -f /sys/fs/cgroup/cgroup.controllers ]; then
+        # Upstream's v1-only cgroup validations can pass on a v1 host.
         KNOWN_UPSTREAM=$(printf '%s\n' "$KNOWN_UPSTREAM" | sed '/v1-only/d')
+        KNOWN_UPSTREAM="$KNOWN_UPSTREAM
+linux_cgroups_pids.t: compares *int64 pointers (runtime-spec v1.3 made pids.limit a pointer); always false.
+linux_cgroups_relative_pids.t: compares *int64 pointers (runtime-spec v1.3 made pids.limit a pointer); always false.
+delete_resources.t: compares *int64 pointers (runtime-spec v1.3 made pids.limit a pointer); always false.
+linux_cgroups_memory.t: kernel >= 5.16 rejects memory.kmem.limit_in_bytes writes.
+linux_cgroups_relative_memory.t: kernel >= 5.16 rejects memory.kmem.limit_in_bytes writes.
+linux_cgroups_blkio.t: reads blkio.weight, removed with CFQ in Linux 5.0 (BFQ exposes blkio.bfq.weight).
+linux_cgroups_relative_blkio.t: reads blkio.weight, removed with CFQ in Linux 5.0 (BFQ exposes blkio.bfq.weight)."
     fi
 
     apt-get update
@@ -103,8 +111,9 @@ if [ "${1-}" = "--inside" ]; then
                 next
             }
             /^1\.\.[0-9]+/ {
-                plan = $0; sub(/^1\.\./, "", plan); plan += 0
-                if (plan == 0 && tolower($0) ~ /#[ \t]*skip([ \t]|$)/) skip++
+                document_plan = $0; sub(/^1\.\./, "", document_plan); document_plan += 0
+                plan += document_plan
+                if (document_plan == 0 && tolower($0) ~ /#[ \t]*skip([ \t]|$)/) skip++
             }
             /^Bail out!/ { bailout = 1 }
             /^  ---$/ { diagnostic = 1 }
@@ -156,7 +165,7 @@ status=0
         cp "$repo/zig-out/bin/igvano" "$snapshot/igvano" || exit "$?"
         cp "$repo/hack/conformance.sh" "$snapshot/conformance.sh" || exit "$?"
         limactl shell "$vm" sudo install -m 0755 "$snapshot/igvano" /usr/local/bin/igvano || exit "$?"
-        limactl shell "$vm" sudo env "PATH=/usr/local/go/bin:$PATH" \
+        limactl shell "$vm" sudo env "PATH=/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
             "CONFORMANCE_TIMEOUT=${CONFORMANCE_TIMEOUT:-120}" \
             "RUNTIME_TOOLS_REF=${RUNTIME_TOOLS_REF:-master}" \
             sh "$snapshot/conformance.sh" --inside
