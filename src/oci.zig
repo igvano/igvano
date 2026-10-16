@@ -926,7 +926,7 @@ test "seccomp accepts all spec architecture names and ignores unimplemented ABIs
     }
 }
 
-test "seccomp Docker default profile fits the kernel limit and exercises long jumps" {
+test "seccomp Docker default profile stays below 2500 instructions and exercises long jumps" {
     const seccomp = Backend.seccomp;
     const testing = @import("test/seccomp.zig");
     const parsed = try std.json.parseFromSlice(Spec.Seccomp, std.testing.allocator, @embedFile("backend/testdata/docker-default.json"), .{});
@@ -936,7 +936,8 @@ test "seccomp Docker default profile fits the kernel limit and exercises long ju
     for ([_]seccomp.Arch{ .x86_64, .aarch64 }) |host| {
         const program = try seccomp.compile(std.testing.allocator, config, host);
         defer std.testing.allocator.free(program.filters);
-        try std.testing.expect(program.filters.len <= seccomp.max_insns);
+        std.debug.print("Docker seccomp {s}: {d} instructions\n", .{ @tagName(host), program.filters.len });
+        try std.testing.expect(program.filters.len <= 2500);
         var long_jump = false;
         for (program.filters) |instruction| {
             if (instruction.code == 0x05 and instruction.k > 255) long_jump = true;
@@ -955,6 +956,19 @@ test "seccomp Docker default profile fits the kernel limit and exercises long ju
         // The compat block's architecture dispatch uses the long JA.
         const compat: seccomp.Arch = if (host == .x86_64) .x86 else .arm;
         try std.testing.expectEqual(@as(u32, 0x7fff0000), try testing.interpret(program.filters, .{ .nr = 3, .arch = compat.audit() }));
+        for (config.architectures) |arch| {
+            if (!arch.runnable(host)) continue;
+            const base: u32 = if (arch == .x32) 0x40000000 else 0;
+            var maximum: u32 = base;
+            for (config.rules) |rule| {
+                if (rule.arch == arch) maximum = @max(maximum, rule.number);
+            }
+            var data: testing.Data = .{ .arch = arch.audit() };
+            for (0..maximum - base + 11) |number| {
+                data.nr = base + @as(u32, @intCast(number));
+                try std.testing.expectEqual(testing.evaluate(config, arch, data), try testing.interpret(program.filters, data));
+            }
+        }
     }
 }
 

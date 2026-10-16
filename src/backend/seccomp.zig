@@ -80,6 +80,8 @@ pub fn compile(allocator: std.mem.Allocator, config: Config, host: Arch) Error!P
     defer builder.code.deinit(allocator);
     var failures: std.ArrayList(usize) = .empty;
     defer failures.deinit(allocator);
+    var returns: std.ArrayList(ReturnJump) = .empty;
+    defer returns.deinit(allocator);
     var arches: [5]Arch = undefined;
     var targets: [5]usize = undefined;
     var count: usize = 0;
@@ -107,12 +109,14 @@ pub fn compile(allocator: std.mem.Allocator, config: Config, host: Arch) Error!P
     const default = config.default_action.encode(config.default_errno_ret);
     for (arches[0..count], targets[0..count]) |arch, target| {
         builder.patch(target);
+        returns.clearRetainingCapacity();
+        var nr_loaded = false;
         // runc's patchbpf/enosys_linux.go: permissive defaults (including
         // TRACE, whose tracer handles future syscalls) do not get a stub.
         // Count every named rule, regardless of its action or conditions.
         switch (config.default_action) {
             .allow, .log, .trace => {},
-            else => {
+            else => if (default != Action.errno.encode(38)) {
                 var maximum: u32 = 0;
                 for (config.rules) |rule| {
                     if (rule.arch == arch) maximum = @max(maximum, rule.number);
@@ -123,29 +127,75 @@ pub fn compile(allocator: std.mem.Allocator, config: Config, host: Arch) Error!P
                     try builder.emit(0x25, maximum);
                     builder.code.items[builder.code.items.len - 1].jf = 1;
                     try builder.emit(0x06, Action.errno.encode(38)); // Linux ENOSYS.
+                    nr_loaded = true;
                 }
             },
         }
-        for (config.rules) |rule| {
+        var rule_index: usize = 0;
+        while (rule_index < config.rules.len) {
+            const rule = config.rules[rule_index];
+            rule_index += 1;
             if (rule.arch != arch) continue;
             failures.clearRetainingCapacity();
-            try builder.emit(0x20, 0); // Reload nr after argument loads.
+            if (!nr_loaded) {
+                try builder.emit(0x20, 0); // Reload nr after argument loads.
+                nr_loaded = true;
+            }
+            const action = rule.action.encode(rule.errno_ret);
             if (rule.args.len == 0) {
-                // This rule only skips one RET; no long-jump trampoline needed.
+                // Preserve order: only merge consecutive unconditional rules
+                // with identical return data within this ABI.
+                const start = builder.code.items.len;
                 try builder.emit(0x15, rule.number);
+                var comparisons: usize = 1;
+                while (rule_index < config.rules.len and comparisons < 256) {
+                    const next = config.rules[rule_index];
+                    if (next.arch != arch) {
+                        rule_index += 1;
+                        continue;
+                    }
+                    if (next.args.len != 0 or next.action.encode(next.errno_ret) != action) break;
+                    try builder.emit(0x15, next.number);
+                    comparisons += 1;
+                    rule_index += 1;
+                }
+                // A chain reaches a nearby JA to the shared action RET.
+                // Split at 256 comparisons to keep every conditional jump u8.
+                for (builder.code.items[start..], 0..) |*instruction, i|
+                    instruction.jt = @intCast(comparisons - i - 1);
                 builder.code.items[builder.code.items.len - 1].jf = 1;
-                try builder.emit(0x06, rule.action.encode(rule.errno_ret));
+                try builder.returnAction(action, &returns);
                 continue;
             }
             try builder.require(0x15, rule.number, true, &failures);
             for (rule.args) |arg| try builder.argument(arg, arch, &failures);
-            try builder.emit(0x06, rule.action.encode(rule.errno_ret));
+            nr_loaded = false;
+            try builder.returnAction(action, &returns);
             for (failures.items) |failure| builder.patch(failure);
         }
-        try builder.emit(0x06, default);
+        try builder.returnAction(default, &returns);
+        // Sorting only the return fixups leaves the rules' first-match order
+        // intact and emits one RET for each distinct encoded action.
+        std.mem.sort(ReturnJump, returns.items, {}, ReturnJump.lessThan);
+        var index: usize = 0;
+        while (index < returns.items.len) {
+            const action = returns.items[index].action;
+            while (index < returns.items.len and returns.items[index].action == action) : (index += 1)
+                builder.patch(returns.items[index].index);
+            try builder.emit(0x06, action);
+        }
     }
     return .{ .filters = try builder.code.toOwnedSlice(allocator), .flags = config.flags };
 }
+
+const ReturnJump = struct {
+    index: usize,
+    action: u32,
+
+    fn lessThan(_: void, a: ReturnJump, b: ReturnJump) bool {
+        return a.action < b.action;
+    }
+};
 
 const Builder = struct {
     allocator: std.mem.Allocator,
@@ -164,6 +214,10 @@ const Builder = struct {
 
     fn patch(self: *Builder, index: usize) void {
         self.code.items[index].k = @intCast(self.code.items.len - index - 1);
+    }
+
+    fn returnAction(self: *Builder, action: u32, returns: *std.ArrayList(ReturnJump)) Error!void {
+        try returns.append(self.allocator, .{ .index = try self.jump(), .action = action });
     }
 
     fn require(self: *Builder, code: u16, k: u32, want: bool, failures: *std.ArrayList(usize)) Error!void {
@@ -302,6 +356,89 @@ test "seccomp ENOSYS stub follows runc default action conditions" {
         defer std.testing.allocator.free(program.filters);
         try std.testing.expectEqual(@as(u32, 0x00050001), try interpret(program.filters, .{ .nr = 1000 }));
         try std.testing.expectEqual(@as(u32, 0x00050001), try interpret(program.filters, .{ .arch = 0x40000003, .nr = 1000 }));
+    }
+}
+
+test "seccomp default ENOSYS needs no extra ENOSYS stub" {
+    const program = try compile(std.testing.allocator, .{
+        .default_action = .errno,
+        .default_errno_ret = 38,
+        .architectures = &.{.aarch64},
+        .rules = &.{.{ .arch = .aarch64, .number = 10, .action = .allow }},
+    }, .aarch64);
+    defer std.testing.allocator.free(program.filters);
+    var enosys_returns: usize = 0;
+    for (program.filters) |instruction| {
+        if (instruction.code == 0x06 and instruction.k == 0x00050026) enosys_returns += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), enosys_returns);
+    try std.testing.expectEqual(@as(u32, 0x00050026), try interpret(program.filters, .{ .arch = Arch.aarch64.audit(), .nr = 11 }));
+}
+
+test "seccomp optimized chains match ordered rules across every ABI and argument boundaries" {
+    const testing = @import("../test/seccomp.zig");
+    const arches = [_]Arch{ .x86_64, .x86, .x32, .aarch64, .arm };
+    var rules: std.ArrayList(Rule) = .empty;
+    defer rules.deinit(std.testing.allocator);
+    for (arches) |arch| {
+        const base: u32 = if (arch == .x32) 0x40000000 else 0;
+        try rules.appendSlice(std.testing.allocator, &.{
+            .{ .arch = arch, .number = base + 1, .action = .allow },
+            .{ .arch = arch, .number = base + 3, .action = .errno, .errno_ret = 13, .args = &.{.{ .index = 0, .value = 0x100000001, .op = .eq }} },
+            .{ .arch = arch, .number = base + 3, .action = .allow },
+            .{ .arch = arch, .number = base + 4, .action = .trace, .errno_ret = 42, .args = &.{.{ .index = 0, .value = 0xff, .value_two = 2, .op = .masked_eq }} },
+            .{ .arch = arch, .number = base + 5, .action = .errno, .errno_ret = 0 },
+            .{ .arch = arch, .number = base + 4, .action = .errno, .errno_ret = 42 },
+            .{ .arch = arch, .number = base + 5, .action = .trap },
+        });
+        inline for ([_]Op{ .ne, .lt, .le, .gt, .ge }, 0..) |op, index| {
+            try rules.append(std.testing.allocator, .{
+                .arch = arch,
+                .number = base + 6 + @as(u32, @intCast(index)),
+                .action = .trap,
+                .args = &.{.{ .index = 0, .value = 0x100000001, .op = op }},
+            });
+            try rules.append(std.testing.allocator, .{
+                .arch = arch,
+                .number = base + 6 + @as(u32, @intCast(index)),
+                .action = .errno,
+                .errno_ret = 7,
+            });
+        }
+    }
+    // More than 256 consecutive comparisons, with foreign-ABI rules interleaved.
+    for (20..340) |number| for (arches) |arch| {
+        const base: u32 = if (arch == .x32) 0x40000000 else 0;
+        try rules.append(std.testing.allocator, .{ .arch = arch, .number = base + @as(u32, @intCast(number)), .action = .allow });
+    };
+    for (arches) |arch| {
+        const base: u32 = if (arch == .x32) 0x40000000 else 0;
+        try rules.appendSlice(std.testing.allocator, &.{
+            .{ .arch = arch, .number = base + 100, .action = .kill_thread },
+            .{ .arch = arch, .number = base + 400, .action = .errno, .errno_ret = 13, .args = &.{
+                .{ .index = 0, .value = 0x100000001, .op = .ne },
+                .{ .index = 1, .value = 1, .op = .eq },
+            } },
+            .{ .arch = arch, .number = base + 401, .action = .trace, .errno_ret = 0 },
+            .{ .arch = arch, .number = base + 400, .action = .allow },
+        });
+    }
+    const values = [_]u64{ 0, 1, 2, 0xffffffff, 0x100000000, 0x100000001, 0x100000002, 0xffffffffffffffff };
+    for ([_]Arch{ .x86_64, .aarch64 }) |host| {
+        const config: Config = .{ .default_action = .errno, .architectures = &arches, .rules = rules.items };
+        const program = try compile(std.testing.allocator, config, host);
+        defer std.testing.allocator.free(program.filters);
+        for (arches) |arch| {
+            if (!arch.runnable(host)) continue;
+            const base: u32 = if (arch == .x32) 0x40000000 else 0;
+            for (values) |value| for ([_]u64{ 0, 1 }) |second| {
+                var data: TestData = .{ .arch = arch.audit(), .args = .{ value, second, 0, 0, 0, 0 } };
+                for (0..412) |number| {
+                    data.nr = base + @as(u32, @intCast(number));
+                    try std.testing.expectEqual(testing.evaluate(config, arch, data), try interpret(program.filters, data));
+                }
+            };
+        }
     }
 }
 
@@ -458,7 +595,7 @@ test "seccomp compat comparisons truncate values and ignore argument high words"
 }
 
 test "seccomp oversized filters and invalid argument indices fail before installation" {
-    var rules: [1400]Rule = undefined;
+    var rules: [max_insns]Rule = undefined;
     for (&rules, 0..) |*rule, number| rule.* = .{ .arch = .x86_64, .number = @intCast(number), .action = .allow };
     try std.testing.expectError(error.FilterTooLarge, compile(std.testing.allocator, .{
         .default_action = .errno,
@@ -475,7 +612,7 @@ test "seccomp oversized filters and invalid argument indices fail before install
     try std.testing.expectError(error.FilterTooLarge, compile(std.testing.allocator, .{
         .default_action = .errno,
         .architectures = &.{ .x86, .x86_64 },
-        .rules = rules[0..1364],
+        .rules = &rules,
     }, .x86_64));
 }
 

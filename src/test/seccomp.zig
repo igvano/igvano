@@ -39,3 +39,39 @@ pub fn interpret(filters: anytype, data: Data) !u32 {
     }
     return error.InvalidJump;
 }
+
+/// Evaluate the rules in order, independently of the BPF compiler.
+pub fn evaluate(config: anytype, arch: anytype, data: Data) u32 {
+    var maximum: u32 = 0;
+    rules: for (config.rules) |rule| {
+        if (rule.arch != arch) continue;
+        maximum = @max(maximum, rule.number);
+        if (rule.number != data.nr) continue;
+        for (rule.args) |arg| {
+            var value = data.args[arg.index];
+            var expected = arg.value;
+            var expected_two = arg.value_two;
+            if (arch == .x86 or arch == .x32 or arch == .arm) {
+                value = @as(u32, @truncate(value));
+                expected = @as(u32, @truncate(expected));
+                expected_two = @as(u32, @truncate(expected_two));
+            }
+            const matches = switch (arg.op) {
+                .eq => value == expected,
+                .ne => value != expected,
+                .lt => value < expected,
+                .le => value <= expected,
+                .gt => value > expected,
+                .ge => value >= expected,
+                .masked_eq => value & expected == expected_two,
+            };
+            if (!matches) continue :rules;
+        }
+        return rule.action.encode(rule.errno_ret);
+    }
+    switch (config.default_action) {
+        .allow, .log, .trace => {},
+        else => if (maximum != 0 and data.nr > maximum) return 0x00050026,
+    }
+    return config.default_action.encode(config.default_errno_ret);
+}

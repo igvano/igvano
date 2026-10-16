@@ -52,20 +52,22 @@ pub fn timeoutExpired(timeout_seconds: ?u64, elapsed_ns: u128) bool {
 /// No allocator or std.Io calls after fork. Memfds supply stdin and capture
 /// output without blocking the deadline on a full pipe or inheriting closed stdio.
 pub fn run(entries: []const Prepared, state: []const u8) Error!void {
-    if (entries.len == 0) return;
-    if (comptime builtin.os.tag != .linux) return error.NotImplemented;
-    @import("linux.zig").closeExecFrom(3, null) catch return error.SystemResources;
-    return runWithCloexecFds(entries, state);
+    return runHooks(entries, state, true);
 }
 
 /// Init has already swept inherited descriptors before seccomp. Every fd
 /// created below is CLOEXEC except the hook child's intentional stdio copies.
+/// NNP=false start hooks must avoid sweeping under the installed filter.
 pub fn runWithCloexecFds(entries: []const Prepared, state: []const u8) Error!void {
+    return runHooks(entries, state, false);
+}
+
+fn runHooks(entries: []const Prepared, state: []const u8, sweep: bool) Error!void {
     if (entries.len == 0) return;
     if (comptime builtin.os.tag != .linux) return error.NotImplemented;
     for (entries, 0..) |hook, index| {
         var reported = false;
-        runOne(hook, state, index, &reported) catch |err| {
+        runOne(hook, state, index, &reported, sweep) catch |err| {
             // Only memfd setup can fail before runOne's diagnostic errdefer.
             if (!reported)
                 reportDiagnostic("error running hook #{d}: {s}, stdout: , stderr: ", .{ index, @errorName(err) });
@@ -128,7 +130,7 @@ fn reportFailure(index: usize, err: Error, status: u32, output: std.posix.fd_t, 
     reportDiagnostic("error running hook #{d}: {s}, stdout: {s}, stderr: {s}", .{ index, reason, stdout, stderr });
 }
 
-fn runOne(hook: Prepared, state: []const u8, index: usize, reported: *bool) Error!void {
+fn runOne(hook: Prepared, state: []const u8, index: usize, reported: *bool, sweep: bool) Error!void {
     const input = try createMemfd("igvano-hook-stdin");
     defer _ = linux.close(input);
     // ponytail: Captured hook output is unbounded, like runc's buffers; the
@@ -162,6 +164,7 @@ fn runOne(hook: Prepared, state: []const u8, index: usize, reported: *bool) Erro
     if (pid == 0) {
         for ([_]std.posix.fd_t{ input, output, errors }, 0..) |fd, target|
             if (linux.errno(linux.dup2(fd, @intCast(target))) != .SUCCESS) linux.exit_group(1);
+        if (sweep) @import("linux.zig").closeExecFrom(3, null) catch linux.exit_group(1);
         _ = linux.execve(hook.path, hook.argv.ptr, hook.envp.ptr);
         linux.exit_group(1);
     }
@@ -200,6 +203,28 @@ test "hook timeout expires at its deadline and an omitted timeout never expires"
     try std.testing.expect(timeoutExpired(1, 1_000_000_000));
     try std.testing.expect(timeoutExpired(1, 1_000_000_001));
     try std.testing.expect(!timeoutExpired(std.math.maxInt(u64), std.math.maxInt(u64)));
+}
+
+test "linux hooks close inherited fds at exec without changing caller flags" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const source = linux.open("/dev/null", .{}, 0);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(source));
+    defer _ = linux.close(@intCast(source));
+    const copied = linux.fcntl(@intCast(source), linux.F.DUPFD, 100);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(copied));
+    const fd: std.posix.fd_t = @intCast(copied);
+    defer _ = linux.close(fd);
+    try std.testing.expectEqual(@as(usize, 0), linux.fcntl(fd, linux.F.GETFD, 0));
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const command = try std.fmt.allocPrint(arena.allocator(), "test ! -e /proc/self/fd/{d}", .{fd});
+    const entries = try prepare(arena.allocator(), &.{.{
+        .path = "/bin/sh",
+        .args = &.{ "sh", "-c", command },
+        .timeout_seconds = 2,
+    }});
+    try run(entries, "{}\n");
+    try std.testing.expectEqual(@as(usize, 0), linux.fcntl(fd, linux.F.GETFD, 0));
 }
 
 test "linux hook execution uses explicit argv environment and state stdin" {
