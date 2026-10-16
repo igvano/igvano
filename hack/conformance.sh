@@ -51,6 +51,32 @@ linux_cgroups_relative_blkio.t: reads blkio.weight, removed with CFQ in Linux 5.
 
     apt-get update
     apt-get install -y --no-install-recommends busybox-static
+    if [ "$(cat /sys/module/apparmor/parameters/enabled 2>/dev/null || true)" = Y ]; then
+        apt-get install -y --no-install-recommends apparmor
+        # Docker shares the Colima VM's kernel. Its privileged container can
+        # load host profiles once securityfs is visible; Lima runs here as root.
+        if [ ! -d /sys/kernel/security/apparmor ]; then
+            mount -t securityfs securityfs /sys/kernel/security
+        fi
+        apparmor_parser -r <<'EOF'
+profile acme_secure_profile flags=(attach_disconnected,mediate_deleted) {
+    file,
+    capability,
+    network,
+    mount,
+    umount,
+    pivot_root,
+    ptrace,
+    signal,
+    unix,
+    dbus,
+}
+EOF
+        printf 'Loaded AppArmor conformance profile: acme_secure_profile\n'
+    else
+        KNOWN_UPSTREAM="$KNOWN_UPSTREAM
+linux_process_apparmor_profile.t: environment limitation: AppArmor is not enabled on the host kernel."
+    fi
     command -v timeout >/dev/null
     runtime_tools_ref=${RUNTIME_TOOLS_REF:-master}
     work=$(mktemp -d /tmp/igvano-conformance.XXXXXX)
@@ -142,7 +168,7 @@ EOF
     printf '%-64s %8s %8s %8s\n' TOTAL "$total_pass" "$total_fail" "$total_skip" >> /tmp/conformance-summary
     printf '\n'
     cat /tmp/conformance-summary
-    printf '\n* Known upstream limitations; failures remain in the FAIL count:\n%s\n' "$KNOWN_UPSTREAM"
+    printf '\n* Known upstream and environment limitations; failures remain in the FAIL count:\n%s\n' "$KNOWN_UPSTREAM"
     exit 0
 fi
 
