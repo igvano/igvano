@@ -116,20 +116,39 @@ test "linux path restrictions parse ordered string lists and propagation modes" 
     try std.testing.expectEqualStrings("/proc/sys", parsed.value.readonlyPaths.?[0]);
     try std.testing.expectEqual(Spec.Propagation.slave, parsed.value.rootfsPropagation.?);
     const ms = std.os.linux.MS;
-    const cases = [_]struct { mode: ?Spec.Propagation, expected: u32 }{
-        .{ .mode = null, .expected = ms.PRIVATE | ms.REC },
-        .{ .mode = .shared, .expected = ms.SHARED | ms.REC },
-        .{ .mode = .slave, .expected = ms.SLAVE | ms.REC },
-        .{ .mode = .private, .expected = ms.PRIVATE | ms.REC },
-        .{ .mode = .unbindable, .expected = ms.UNBINDABLE | ms.REC },
+    try std.testing.expectEqual(@as(u32, ms.PRIVATE | ms.REC), rootfsPropagation(null));
+    const cases = [_]struct { mode: []const u8, expected: u32 }{
+        .{ .mode = "shared", .expected = ms.SHARED },
+        .{ .mode = "rshared", .expected = ms.SHARED | ms.REC },
+        .{ .mode = "slave", .expected = ms.SLAVE },
+        .{ .mode = "rslave", .expected = ms.SLAVE | ms.REC },
+        .{ .mode = "private", .expected = ms.PRIVATE },
+        .{ .mode = "rprivate", .expected = ms.PRIVATE | ms.REC },
+        .{ .mode = "unbindable", .expected = ms.UNBINDABLE },
+        .{ .mode = "runbindable", .expected = ms.UNBINDABLE | ms.REC },
     };
-    for (cases) |case| try std.testing.expectEqual(case.expected, rootfsPropagation(case.mode));
+    for (cases) |case| {
+        const json = try std.fmt.allocPrint(std.testing.allocator, "{{\"rootfsPropagation\":\"{s}\"}}", .{case.mode});
+        defer std.testing.allocator.free(json);
+        const spec = try std.json.parseFromSlice(Spec.Linux, std.testing.allocator, json, .{});
+        defer spec.deinit();
+        try std.testing.expectEqual(case.expected, rootfsPropagation(spec.value.rootfsPropagation));
+    }
     try std.testing.expectError(error.InvalidEnumTag, std.json.parseFromSlice(Spec.Linux, std.testing.allocator,
-        \\{"rootfsPropagation":"rshared"}
+        \\{"rootfsPropagation":"unknown"}
     , .{}));
     try std.testing.expectError(error.UnexpectedToken, std.json.parseFromSlice(Spec.Linux, std.testing.allocator,
         \\{"maskedPaths":[1]}
     , .{}));
+}
+
+test "process accepts an AppArmor profile" {
+    const parsed = try std.json.parseFromSlice(Spec.Process, std.testing.allocator,
+        \\{"args":["/probe"],"cwd":"/","user":{"uid":0,"gid":0},"apparmorProfile":"igvano-deny-write"}
+    , .{});
+    defer parsed.deinit();
+    try validateProcess(parsed.value);
+    try std.testing.expectEqualStrings("igvano-deny-write", parsed.value.apparmorProfile.?);
 }
 
 test "cgroup paths are relative to the mount root and reject escapes" {
@@ -338,6 +357,7 @@ pub const Spec = struct {
         cwd: []const u8,
         terminal: ?bool = null,
         noNewPrivileges: bool = false,
+        apparmorProfile: ?[]const u8 = null,
         oomScoreAdj: ?i32 = null,
         user: User,
         capabilities: ?Capabilities = null,
@@ -403,7 +423,7 @@ pub const Spec = struct {
         pub const Arg = struct { index: u32, value: u64, valueTwo: u64 = 0, op: []const u8 };
     };
 
-    pub const Propagation = enum { shared, slave, private, unbindable };
+    pub const Propagation = enum { shared, rshared, slave, rslave, private, rprivate, unbindable, runbindable };
 
     pub const Hook = struct {
         path: []const u8,
@@ -1139,12 +1159,17 @@ pub fn prepareHooks(allocator: std.mem.Allocator, configured: ?[]const Spec.Hook
 
 pub fn rootfsPropagation(mode: ?Spec.Propagation) u32 {
     const ms = std.os.linux.MS;
-    return ms.REC | @as(u32, switch (mode orelse .private) {
+    // runc uses the same mapping for rootfs and individual mounts.
+    return switch (mode orelse .rprivate) {
         .shared => ms.SHARED,
+        .rshared => ms.SHARED | ms.REC,
         .slave => ms.SLAVE,
+        .rslave => ms.SLAVE | ms.REC,
         .private => ms.PRIVATE,
+        .rprivate => ms.PRIVATE | ms.REC,
         .unbindable => ms.UNBINDABLE,
-    });
+        .runbindable => ms.UNBINDABLE | ms.REC,
+    };
 }
 
 const default_devices = [_]Backend.Device{
@@ -1936,6 +1961,9 @@ pub fn validateProcess(process: Spec.Process) !void {
         if (std.mem.indexOfScalar(u8, arg, 0) != null) return error.InvalidProcess;
     }
     for (process.env orelse &.{}) |entry| try validateEnv(entry);
+    if (process.apparmorProfile) |profile| {
+        if (std.mem.indexOfScalar(u8, profile, 0) != null) return error.InvalidProcess;
+    }
     if (process.oomScoreAdj) |value| {
         if (value < -1000 or value > 1000) return error.InvalidConfig;
     }
@@ -2255,7 +2283,7 @@ pub fn featuresJson(allocator: std.mem.Allocator) ![]u8 {
                 .knownFlags = seccomp_flags.keys(),
                 .supportedFlags = seccomp_flags.keys(),
             },
-            .apparmor = .{ .enabled = false },
+            .apparmor = .{ .enabled = true },
             .selinux = .{ .enabled = false },
             .intelRdt = .{ .enabled = false },
             .mountExtensions = .{ .idmap = .{ .enabled = false } },
@@ -2338,7 +2366,8 @@ test "features JSON reports parser tables and disables unimplemented isolation" 
             defer freeSeccomp(allocator, prepared);
         }
     }
-    for ([_][]const u8{ "apparmor", "selinux", "intelRdt" }) |name|
+    try std.testing.expect(linux.get("apparmor").?.object.get("enabled").?.bool);
+    for ([_][]const u8{ "selinux", "intelRdt" }) |name|
         try std.testing.expect(!linux.get(name).?.object.get("enabled").?.bool);
     try std.testing.expect(!linux.get("mountExtensions").?.object.get("idmap").?.object.get("enabled").?.bool);
 }

@@ -1363,6 +1363,7 @@ pub const LinuxBackend = struct {
         var arena: std.heap.ArenaAllocator = .init(options.allocator);
         defer arena.deinit();
         const allocator = arena.allocator();
+        const apparmor_command = try prepareAppArmor(allocator, options.apparmor_profile);
         const seccomp_program = if (options.seccomp) |config|
             seccomp.compile(allocator, config, seccomp.Arch.native() orelse return error.Unsupported) catch |err| {
                 if (err == error.OutOfMemory) return error.OutOfMemory;
@@ -1510,6 +1511,7 @@ pub const LinuxBackend = struct {
                     childError("cannot set up exec console: ", err);
                     failCreate(ready[1], err);
                 };
+                applyAppArmor(apparmor_command) catch |err| failCreate(ready[1], err);
                 // Retain CAP_SYS_ADMIN for installation when NNP is false,
                 // matching init's ordering before dropping process privileges.
                 if (!process.no_new_privileges) {
@@ -1599,6 +1601,7 @@ pub const LinuxBackend = struct {
             var arena: std.heap.ArenaAllocator = .init(options.allocator);
             defer arena.deinit();
             const allocator = arena.allocator();
+            const apparmor_command = try prepareAppArmor(allocator, options.apparmor_profile);
             const seccomp_program = if (options.seccomp) |config|
                 seccomp.compile(allocator, config, seccomp.Arch.native() orelse return error.Unsupported) catch |err| {
                     if (err == error.OutOfMemory) return error.OutOfMemory;
@@ -1867,7 +1870,7 @@ pub const LinuxBackend = struct {
                         .runtime_sync = .{ .ready_fd = ready[1], .go_fd = create_go[0] },
                         .console_fd = if (options.console_fds) |fds| fds[1] else null,
                         .fifo_writable = joined_user_namespace,
-                    }, start_hooks, start_input, seccomp_program);
+                    }, start_hooks, start_input, apparmor_command, seccomp_program);
                 }
                 closeFd(fifo_fd);
                 if (options.console_fds) |fds| closeFd(fds[1]);
@@ -4961,16 +4964,18 @@ fn applyPathRestrictions(masked: []const [:0]const u8, readonly: []const [:0]con
     }
 }
 
-/// Like runc, walk up to the containing mount. Only that mount must be
-/// private for pivot_root; inherited submounts retain their peer groups.
-fn makeRootfsParentPrivate(rootfs: [:0]const u8, step: *RootfsStep) Backend.Error!void {
+/// Like runc, make the containing mount slave when requested, otherwise private.
+/// Only that mount must stop being shared; submounts retain their peer groups.
+fn makeRootfsParentUnshared(rootfs: [:0]const u8, propagation: u32, step: *RootfsStep) Backend.Error!void {
+    const flags: u32 = if (propagation & linux.MS.SLAVE != 0) linux.MS.SLAVE else linux.MS.PRIVATE;
+    const operation: []const u8 = if (flags == linux.MS.SLAVE) "mount parent slave propagation" else "mount parent private propagation";
     var buffer: [std.fs.max_path_bytes]u8 = undefined;
     if (rootfs.len >= buffer.len) return error.InvalidPath;
     @memcpy(buffer[0..rootfs.len], rootfs);
     var end = rootfs.len;
     while (true) {
         buffer[end] = 0;
-        const result = linux.mount(null, buffer[0..end :0], null, linux.MS.PRIVATE, 0);
+        const result = linux.mount(null, buffer[0..end :0], null, flags, 0);
         switch (linux.errno(result)) {
             .SUCCESS => return,
             .INVAL => {
@@ -4979,9 +4984,9 @@ fn makeRootfsParentPrivate(rootfs: [:0]const u8, step: *RootfsStep) Backend.Erro
             },
             else => {
                 // Report before this stack-backed parent path goes out of scope.
-                step.* = .{ .operation = "mount parent private propagation", .path = "" };
+                step.* = .{ .operation = operation, .path = "" };
                 var message: [std.fs.max_path_bytes + 80]u8 = undefined;
-                const text = std.fmt.bufPrint(&message, "cannot prepare rootfs: mount parent private propagation {s}: ", .{buffer[0..end]}) catch unreachable;
+                const text = std.fmt.bufPrint(&message, "cannot prepare rootfs: {s} {s}: ", .{ operation, buffer[0..end] }) catch unreachable;
                 checkResult(result) catch |err| {
                     childError(text, err);
                     // The enclosing setupRootfs diagnostic was already emitted.
@@ -5002,15 +5007,12 @@ fn setupRootfs(rootfs: [:0]const u8, mounts: []const PreparedMount, devices: []c
     errdefer |err| if (step.operation.len != 0) step.report(err);
     if (options.private_mount_namespace)
         try checkResult(linux.mount(null, "/", null, options.propagation, 0));
-    // Shared parents prevent pivot_root; make only the containing mount private.
-    // Unbindable sources require temporary recursive private propagation.
+    // Shared parents prevent pivot_root and leak the rootfs self-bind.
+    // Making only the parent bindable also preserves runc's unbindable-submount pruning.
     const restore_propagation = options.private_mount_namespace and options.propagation & (ms.SHARED | ms.UNBINDABLE) != 0;
-    if (options.private_mount_namespace and options.propagation & ms.UNBINDABLE != 0) {
-        step.operation = "mount private propagation";
-        try checkResult(linux.mount(null, "/", null, ms.PRIVATE | ms.REC, 0));
-    } else if (options.private_mount_namespace and options.propagation & ms.SHARED != 0) {
-        step = .{ .operation = "mount parent private propagation", .path = rootfs };
-        try makeRootfsParentPrivate(rootfs, &step);
+    if (options.private_mount_namespace) {
+        step = .{ .operation = "mount parent propagation", .path = rootfs };
+        try makeRootfsParentUnshared(rootfs, options.propagation, &step);
     }
     step = .{ .operation = "bind", .source = rootfs, .path = rootfs };
     try checkResult(linux.mount(rootfs, rootfs, null, ms.BIND | ms.REC, 0));
@@ -5126,6 +5128,7 @@ fn runInit(
     rootfs_options: RootfsOptions,
     start_hooks: []const hooks.Prepared,
     start_hook_state: []const u8,
+    apparmor_command: ?[]const u8,
     seccomp_program: ?seccomp.Program,
 ) noreturn {
     // The inherited host descriptors avoid path access to the state directory
@@ -5141,6 +5144,7 @@ fn runInit(
     }
     setupRootfs(rootfs, mounts, devices, symlinks, spec.root.readonly, rootfs_options) catch |err| failCreate(ready_fd, err);
     checkResult(linux.chdir(cwd)) catch |err| failCreate(ready_fd, err);
+    applyAppArmor(apparmor_command) catch |err| failCreate(ready_fd, err);
     if (spec.process) |process| {
         // Allow write-only reopen after setuid while keeping readers root-only.
         if (process.user.uid != 0 and !rootfs_options.fifo_writable)
@@ -5201,6 +5205,78 @@ fn runProcess(spec: *const oci.Spec, executable: ?[*:0]const u8, argv: [*:null]c
         if (seccomp_program) |program| try installSeccomp(program);
     }
     return execResolved(executable orelse return error.InvalidProcess, argv, envp);
+}
+
+pub fn apparmorEnabled() bool {
+    if (comptime builtin.os.tag != .linux) return false;
+    // Match runc's host probe, before the container hides /sys.
+    if (linux.errno(linux.access("/sys/kernel/security/apparmor", linux.F_OK)) != .SUCCESS) return false;
+    const fd = openPath(linux.AT.FDCWD, "/sys/module/apparmor/parameters/enabled", .{ .CLOEXEC = true }) catch return false;
+    defer closeFd(fd);
+    var enabled: [1]u8 = undefined;
+    return readAll(fd, &enabled) and enabled[0] == 'Y';
+}
+
+test "AppArmor profile preparation ignores empty profiles and rejects unavailable enforcement" {
+    try std.testing.expect(try prepareAppArmor(std.testing.allocator, null) == null);
+    try std.testing.expect(try prepareAppArmor(std.testing.allocator, "") == null);
+    try std.testing.expectError(error.InvalidProcess, prepareAppArmor(std.testing.allocator, "bad\x00profile"));
+    if (!apparmorEnabled()) {
+        defer last_diagnostic_len = 0;
+        try std.testing.expectError(error.Unsupported, prepareAppArmor(std.testing.allocator, "igvano-deny-write"));
+        try std.testing.expectEqualStrings("apparmor profile specified but apparmor is not enabled", last_diagnostic[0..last_diagnostic_len]);
+    } else {
+        const command = (try prepareAppArmor(std.testing.allocator, "igvano-deny-write")).?;
+        defer std.testing.allocator.free(command);
+        try std.testing.expectEqualStrings("exec igvano-deny-write", command);
+    }
+}
+
+fn prepareAppArmor(allocator: std.mem.Allocator, profile: ?[]const u8) Backend.Error!?[]const u8 {
+    const name = profile orelse return null;
+    if (name.len == 0) return null;
+    if (std.mem.indexOfScalar(u8, name, 0) != null) return error.InvalidProcess;
+    if (!apparmorEnabled()) {
+        reportDiagnostic("apparmor profile specified but apparmor is not enabled", .{});
+        return error.Unsupported;
+    }
+    // One write is one AppArmor command; prepare the entire buffer before fork.
+    return try std.fmt.allocPrint(allocator, "exec {s}", .{name});
+}
+
+fn applyAppArmor(command: ?[]const u8) Backend.Error!void {
+    const text = command orelse return;
+    const profile = text["exec ".len..];
+    var unknown_profile = false;
+    errdefer |err| reportDiagnostic("unable to apply apparmor profile {s}: {s}", .{
+        profile, if (unknown_profile) "profile not loaded" else @errorName(err),
+    });
+    // Open after pivot_root/chroot: this procfs resolves the init/exec child's
+    // own thread, even after entering a PID namespace. No host fd is retained.
+    // Verify procfs so a regular file at /proc cannot silently bypass confinement.
+    const proc = try openPath(linux.AT.FDCWD, "/proc", .{ .PATH = true, .DIRECTORY = true, .NOFOLLOW = true, .CLOEXEC = true });
+    defer closeFd(proc);
+    var fs: [32]usize = undefined;
+    try checkResult(linux.syscall2(.fstatfs, @intCast(proc), @intFromPtr(&fs)));
+    if (fs[0] != 0x9fa0) return error.MissingProcfs;
+    for ([_][*:0]const u8{ "thread-self/attr/apparmor/exec", "self/attr/apparmor/exec", "self/attr/exec" }) |path| {
+        const opened = linux.openat(proc, path, .{ .ACCMODE = .WRONLY, .CLOEXEC = true }, 0);
+        if (linux.errno(opened) == .NOENT) continue;
+        try checkResult(opened);
+        const fd: posix.fd_t = @intCast(opened);
+        defer closeFd(fd);
+        try checkResult(linux.syscall2(.fstatfs, @intCast(fd), @intFromPtr(&fs)));
+        if (fs[0] != 0x9fa0) return error.MissingProcfs;
+        while (true) {
+            const result = linux.write(fd, text.ptr, text.len);
+            if (linux.errno(result) == .INTR) continue;
+            unknown_profile = linux.errno(result) == .NOENT;
+            try checkResult(result);
+            if (result != text.len) return error.CreateFailed;
+            return;
+        }
+    }
+    return error.MissingProcfs;
 }
 
 fn installSeccomp(program: seccomp.Program) Backend.Error!void {
@@ -6017,7 +6093,7 @@ test "linux init rejects missing directory and non-executable args before create
         if (pid == 0) {
             closeFd(ready[0]);
             checkResult(linux.unshare(linux.CLONE.NEWNS)) catch linux.exit_group(2);
-            runInit(&spec, null, &.{}, linux.CLONE.NEWNS, rootfs_z, &.{}, &.{}, &.{}, "/", -1, -1, &argv, &envp, ready[1], .{}, &.{}, "", null);
+            runInit(&spec, null, &.{}, linux.CLONE.NEWNS, rootfs_z, &.{}, &.{}, &.{}, "/", -1, -1, &argv, &envp, ready[1], .{}, &.{}, "", null, null);
         }
         closeFd(ready[1]);
         var response: CreateResponse = .{};

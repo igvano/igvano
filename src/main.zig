@@ -323,6 +323,7 @@ fn prepareProcess(allocator: std.mem.Allocator, process: oci.Spec.Process, socke
         .capabilities = if (process.capabilities) |caps| try oci.processCapabilities(caps) else null,
         .rlimits = try oci.processRlimits(allocator, process.rlimits),
         .no_new_privileges = process.noNewPrivileges,
+        .apparmor_profile = process.apparmorProfile,
         .oom_score_adj = process.oomScoreAdj,
     };
 }
@@ -578,6 +579,7 @@ fn createContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, c
         .capabilities = if (process_options) |options| options.capabilities else null,
         .rlimits = if (process_options) |options| options.rlimits else &.{},
         .oom_score_adj = if (process_options) |options| options.oom_score_adj else null,
+        .apparmor_profile = if (process_options) |options| options.apparmor_profile else null,
         .devices = devices,
         .device_symlinks = oci.deviceSymlinks(mounts),
         .create_hooks = create_hooks,
@@ -969,7 +971,7 @@ fn execContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, con
         },
         else => return err,
     };
-    const process = if (config.process_file) |path| process: {
+    var process: oci.Spec.Process = if (config.process_file) |path| process: {
         const json = try std.Io.Dir.cwd().readFileAlloc(io, path, process_allocator, .limited(1 << 20));
         const parsed = try std.json.parseFromSlice(oci.Spec.Process, process_allocator, json, .{
             .allocate = .alloc_always,
@@ -980,6 +982,12 @@ fn execContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, con
         const spec = saved_spec orelse return error.FileNotFound;
         break :process try execProcessConfig(process_allocator, spec.value.process orelse return error.MissingProcess, config);
     };
+    // Like runc, an omitted or empty exec profile inherits the container default.
+    if (process.apparmorProfile == null or process.apparmorProfile.?.len == 0) {
+        if (saved_spec) |spec| {
+            if (spec.value.process) |inherited| process.apparmorProfile = inherited.apparmorProfile;
+        }
+    }
     try oci.validateProcess(process);
     var options = try prepareProcess(process_allocator, process, config.console_socket);
     const seccomp = seccomp: {
@@ -1584,6 +1592,7 @@ test "exec command overrides inherit process settings and replace environment ke
         .cwd = "/",
         .user = .{ .uid = 0, .gid = 1002, .additionalGids = &.{42} },
         .noNewPrivileges = true,
+        .apparmorProfile = "igvano-default",
         .oomScoreAdj = 100,
         .capabilities = .{ .bounding = &.{"CAP_CHOWN"} },
         .rlimits = &.{.{ .type = "RLIMIT_NOFILE", .hard = 1024, .soft = 512 }},
@@ -1597,6 +1606,7 @@ test "exec command overrides inherit process settings and replace environment ke
     try std.testing.expectEqual(@as(u32, 1001), process.user.gid);
     try std.testing.expectEqual(@as(u32, 42), process.user.additionalGids.?[0]);
     try std.testing.expect(process.noNewPrivileges);
+    try std.testing.expectEqualStrings("igvano-default", process.apparmorProfile.?);
     try std.testing.expectEqual(original.oomScoreAdj, process.oomScoreAdj);
     try std.testing.expectEqualStrings("CAP_CHOWN", process.capabilities.?.bounding.?[0]);
     try std.testing.expectEqual(original.rlimits.?[0].hard, process.rlimits.?[0].hard);
@@ -1649,6 +1659,7 @@ test "process validation and typed translation serve create and exec" {
         .capabilities = .{ .bounding = &.{"CAP_CHOWN"} },
         .rlimits = &.{.{ .type = "RLIMIT_NOFILE", .hard = 1024, .soft = 512 }},
         .noNewPrivileges = true,
+        .apparmorProfile = "igvano-deny-write",
         .oomScoreAdj = 50,
     };
     const options = try prepareProcess(std.testing.allocator, process, null);
@@ -1657,12 +1668,16 @@ test "process validation and typed translation serve create and exec" {
     try std.testing.expectEqual(@as(u64, 512), options.rlimits[0].soft);
     try std.testing.expectEqual(@as(u32, 42), options.additional_gids[0]);
     try std.testing.expect(options.no_new_privileges);
+    try std.testing.expectEqualStrings("igvano-deny-write", options.apparmor_profile.?);
     try std.testing.expectEqual(@as(?i32, 50), options.oom_score_adj);
     var invalid = process;
     invalid.env = &.{"NO_EQUALS"};
     try std.testing.expectError(error.InvalidProcess, oci.validateProcess(invalid));
     invalid = process;
     invalid.args = &.{"bad\x00arg"};
+    try std.testing.expectError(error.InvalidProcess, oci.validateProcess(invalid));
+    invalid = process;
+    invalid.apparmorProfile = "bad\x00profile";
     try std.testing.expectError(error.InvalidProcess, oci.validateProcess(invalid));
     invalid = process;
     invalid.terminal = true;
@@ -1791,6 +1806,269 @@ fn testSeccompLifecycle(base: []const u8) !void {
             reaped = true;
             try std.testing.expectEqual(@as(u8, 0), status);
         }
+    }
+}
+
+test "linux AppArmor confines init and exec with inherited and explicit profiles" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (!backend_module.apparmorEnabled()) return error.SkipZigTest;
+    if (std.os.linux.prctl(@intFromEnum(std.os.linux.PR.GET_NO_NEW_PRIVS), 0, 0, 0, 0) != 0)
+        return error.SkipZigTest;
+    try runIsolatedSecurityTest(testAppArmorLifecycle);
+}
+
+test "linux rshared and rslave binds propagate mounts after container start" {
+    try runIsolatedSecurityTest(testPropagationLifecycle);
+}
+
+fn runIsolatedSecurityTest(comptime run: fn ([]const u8) anyerror!void) !void {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const linux = std.os.linux;
+    if (linux.geteuid() != 0) return error.SkipZigTest;
+    if (linux.errno(linux.access("/sys/fs/cgroup/cgroup.controllers", linux.F_OK)) == .SUCCESS and
+        linux.errno(linux.access("/sys/fs/cgroup", linux.W_OK)) != .SUCCESS)
+        return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer std.testing.allocator.free(base);
+    const absolute = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, base, std.testing.allocator);
+    defer std.testing.allocator.free(absolute);
+    const forked = linux.fork();
+    if (linux.errno(forked) != .SUCCESS) return error.SystemResources;
+    const child: i32 = @intCast(forked);
+    if (child == 0) {
+        if (linux.errno(linux.unshare(linux.CLONE.NEWNS)) != .SUCCESS) linux.exit_group(77);
+        if (linux.errno(linux.mount(null, "/", null, linux.MS.PRIVATE | linux.MS.REC, 0)) != .SUCCESS)
+            linux.exit_group(1);
+        run(absolute) catch |err| {
+            if (err == error.SkipZigTest) linux.exit_group(77);
+            std.debug.print("security lifecycle test: {s}\n", .{@errorName(err)});
+            if (@errorReturnTrace()) |trace| std.debug.dumpErrorReturnTrace(trace);
+            linux.exit_group(1);
+        };
+        linux.exit_group(0);
+    }
+    const status = try waitExec(child);
+    if (status == 77) return error.SkipZigTest;
+    try std.testing.expectEqual(@as(u8, 0), status);
+}
+
+fn testAppArmorLifecycle(base: []const u8) !void {
+    const linux = std.os.linux;
+    const parser = parser: {
+        for ([_][:0]const u8{ "/usr/sbin/apparmor_parser", "/sbin/apparmor_parser", "/usr/bin/apparmor_parser" }) |path| {
+            if (linux.errno(linux.access(path, linux.X_OK)) == .SUCCESS) break :parser path;
+        }
+        return error.SkipZigTest;
+    };
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    // process.run allocates spawn buffers through the I/O implementation.
+    threaded.allocator = std.heap.page_allocator;
+    const io = threaded.io();
+    var arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const cwd = std.Io.Dir.cwd();
+    const probe_path = std.testing.environ.getPosix("IGVANO_SECCOMP_PROBE") orelse return error.MissingSeccompProbe;
+    const probe = try cwd.realPathFileAlloc(io, probe_path, allocator);
+    const profile = try std.fmt.allocPrint(allocator, "igvano-deny-write-{d}", .{linux.getpid()});
+    const override = try std.fmt.allocPrint(allocator, "{s}-exec", .{profile});
+    const profile_path = try std.fs.path.join(allocator, &.{ base, "apparmor-profile" });
+    var policy: std.Io.Writer.Allocating = .init(allocator);
+    defer policy.deinit();
+    // Permit runtime liveness, signaling and procfs reads, as cri-tools' base
+    // abstraction does; the profile's deliberate restriction is the write.
+    for ([_][]const u8{ profile, override }) |name|
+        try policy.writer.print("profile {s} flags=(attach_disconnected,mediate_deleted) {{\n  file,\n  signal (receive) peer=unconfined,\n  ptrace (readby) peer=unconfined,\n  deny /tmp/denied w,\n}}\n", .{name});
+    try cwd.writeFile(io, .{ .sub_path = profile_path, .data = policy.written() });
+    const loaded = try std.process.run(allocator, io, .{ .argv = &.{ parser, "-r", profile_path } });
+    if (loaded.term != .exited or loaded.term.exited != 0) {
+        std.debug.print("apparmor_parser: {s}\n", .{loaded.stderr});
+        return error.ProfileLoadFailed;
+    }
+    defer {
+        const removed = std.process.run(allocator, io, .{ .argv = &.{ parser, "-R", profile_path } }) catch null;
+        if (removed) |result| {
+            if (result.term != .exited or result.term.exited != 0)
+                std.debug.print("apparmor_parser cleanup: {s}\n", .{result.stderr});
+        }
+    }
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.prctl(@intFromEnum(linux.PR.SET_CHILD_SUBREAPER), 1, 0, 0, 0)));
+    for ([_]bool{ false, true }) |nnp| {
+        const id: []const u8 = if (nnp) "apparmor-nnp" else "apparmor";
+        const bundle = try std.fs.path.join(allocator, &.{ base, id });
+        const rootfs = try std.fs.path.join(allocator, &.{ bundle, "rootfs" });
+        const root = try std.fs.path.join(allocator, &.{ base, "state" });
+        try cwd.createDirPath(io, try std.fs.path.join(allocator, &.{ rootfs, "tmp" }));
+        // Pre-create a writable file so failure cannot be mistaken for a missing parent.
+        try cwd.writeFile(io, .{ .sub_path = try std.fs.path.join(allocator, &.{ rootfs, "tmp/denied" }), .data = "" });
+        const nnp_arg: []const u8 = if (nnp) "true" else "false";
+        const spec: oci.Spec = .{
+            .ociVersion = "1.0.2",
+            .root = .{ .path = "rootfs" },
+            .process = .{
+                .args = &.{ "/probe", nnp_arg, "apparmor", profile },
+                .cwd = "/",
+                .noNewPrivileges = nnp,
+                .apparmorProfile = profile,
+                .user = .{ .uid = 0, .gid = 0 },
+                .capabilities = .{},
+            },
+            .mounts = &.{
+                .{ .destination = "/probe", .source = probe, .type = "bind", .options = &.{ "bind", "ro" } },
+                .{ .destination = "/proc", .source = "proc", .type = "proc" },
+            },
+            .linux = .{
+                .cgroupsPath = try std.fmt.allocPrint(allocator, "igvano-{d}-{s}", .{ linux.getpid(), id }),
+                .namespaces = &.{ .{ .type = .mount }, .{ .type = .pid } },
+                .seccomp = .{ .defaultAction = "SCMP_ACT_ALLOW" },
+            },
+        };
+        try cwd.writeFile(io, .{
+            .sub_path = try std.fs.path.join(allocator, &.{ bundle, "config.json" }),
+            .data = try std.json.Stringify.valueAlloc(allocator, spec, .{ .emit_null_optional_fields = false }),
+        });
+        var implementation: backend_module.LinuxBackend = .{};
+        const backend = implementation.backend();
+        var config: Config = .{ .root = root, .id = id, .subcommand = .create, .bundle = bundle };
+        try createContainer(allocator, io, backend, config);
+        defer {
+            config.subcommand = .delete;
+            config.force = true;
+            deleteContainer(allocator, io, backend, config) catch {};
+        }
+        const saved = try oci.loadState(allocator, io, root, id);
+        const pid = saved.value.pid.?;
+        var reaped = false;
+        defer if (!reaped) {
+            _ = linux.kill(pid, .KILL);
+            _ = waitExec(pid) catch {};
+        };
+        config.subcommand = .exec;
+        config.exec_args = spec.process.?.args;
+        try std.testing.expectEqual(@as(u8, 0), try execContainer(allocator, io, backend, config));
+        config.process_file = try std.fs.path.join(allocator, &.{ bundle, "process.json" });
+        // --process without a profile must still use the container's profile.
+        var process = spec.process.?;
+        for ([_]?[]const u8{ null, "", override }) |name| {
+            process.apparmorProfile = name;
+            process.args = &.{ "/probe", nnp_arg, "apparmor", if (name == null or name.?.len == 0) profile else override };
+            try cwd.writeFile(io, .{
+                .sub_path = config.process_file.?,
+                .data = try std.json.Stringify.valueAlloc(allocator, process, .{ .emit_null_optional_fields = false }),
+            });
+            try std.testing.expectEqual(@as(u8, 0), try execContainer(allocator, io, backend, config));
+        }
+        process.apparmorProfile = try std.fmt.allocPrint(allocator, "{s}-not-loaded", .{profile});
+        try cwd.writeFile(io, .{
+            .sub_path = config.process_file.?,
+            .data = try std.json.Stringify.valueAlloc(allocator, process, .{ .emit_null_optional_fields = false }),
+        });
+        try std.testing.expectError(error.CreateFailed, execContainer(allocator, io, backend, config));
+        try std.testing.expect(std.mem.indexOf(u8, last_backend_detail.?, "profile not loaded") != null);
+        config.subcommand = .start;
+        try startContainer(allocator, io, backend, config);
+        const status = try waitExec(pid);
+        reaped = true;
+        try std.testing.expectEqual(@as(u8, 0), status);
+    }
+}
+
+fn testPropagationLifecycle(base: []const u8) !void {
+    const linux = std.os.linux;
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    const io = threaded.io();
+    var arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const cwd = std.Io.Dir.cwd();
+    const probe_path = std.testing.environ.getPosix("IGVANO_SECCOMP_PROBE") orelse return error.MissingSeccompProbe;
+    const probe = try cwd.realPathFileAlloc(io, probe_path, allocator);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.prctl(@intFromEnum(linux.PR.SET_CHILD_SUBREAPER), 1, 0, 0, 0)));
+    const cases = [_]struct { root: oci.Spec.Propagation, mount: oci.Spec.Propagation }{
+        .{ .root = .rshared, .mount = .rshared },
+        .{ .root = .rslave, .mount = .rslave },
+        .{ .root = .shared, .mount = .rshared },
+        .{ .root = .slave, .mount = .rslave },
+        .{ .root = .private, .mount = .rshared },
+    };
+    for (cases) |case| {
+        const id = @tagName(case.root);
+        const bundle = try std.fs.path.join(allocator, &.{ base, id });
+        const bundle_z = try allocator.dupeZ(u8, bundle);
+        const rootfs = try std.fs.path.join(allocator, &.{ bundle, "rootfs" });
+        const root = try std.fs.path.join(allocator, &.{ base, "state" });
+        const source = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}/source", .{ base, id }, 0);
+        const host_mount = try std.fmt.allocPrintSentinel(allocator, "{s}/from-host", .{source}, 0);
+        const container_mount = try std.fmt.allocPrintSentinel(allocator, "{s}/from-container", .{source}, 0);
+        const host_data = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}/host-data", .{ base, id }, 0);
+        for ([_][]const u8{ rootfs, host_mount, container_mount, host_data }) |path| try cwd.createDirPath(io, path);
+        try cwd.writeFile(io, .{
+            .sub_path = try std.fs.path.join(allocator, &.{ host_data, "flag" }),
+            .data = "host",
+        });
+        // A shared containing mount exercises runc's parent-mount isolation,
+        // including plain propagation flags that leave submount peers intact.
+        try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.mount(bundle_z, bundle_z, null, linux.MS.BIND, 0)));
+        defer _ = linux.umount2(bundle_z, linux.MNT.DETACH);
+        try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.mount(null, bundle_z, null, linux.MS.SHARED, 0)));
+        try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.mount(source, source, null, linux.MS.BIND | linux.MS.REC, 0)));
+        defer _ = linux.umount2(source, linux.MNT.DETACH);
+        try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.mount(null, source, null, linux.MS.SHARED | linux.MS.REC, 0)));
+        const spec: oci.Spec = .{
+            .ociVersion = "1.0.2",
+            .root = .{ .path = "rootfs" },
+            .process = .{
+                .args = &.{ "/probe", "true", "propagation-init" },
+                .cwd = "/",
+                .noNewPrivileges = true,
+                .user = .{ .uid = 0, .gid = 0 },
+            },
+            .mounts = &.{
+                .{ .destination = "/probe", .source = probe, .type = "bind", .options = &.{ "bind", "ro" } },
+                .{ .destination = "/proc", .source = "proc", .type = "proc" },
+                .{ .destination = "/volume", .source = source, .type = "bind", .options = &.{ "rbind", @tagName(case.mount) } },
+            },
+            .linux = .{
+                .rootfsPropagation = case.root,
+                .cgroupsPath = try std.fmt.allocPrint(allocator, "igvano-propagation-{d}-{s}", .{ linux.getpid(), id }),
+                .namespaces = &.{ .{ .type = .mount }, .{ .type = .pid } },
+            },
+        };
+        try cwd.writeFile(io, .{
+            .sub_path = try std.fs.path.join(allocator, &.{ bundle, "config.json" }),
+            .data = try std.json.Stringify.valueAlloc(allocator, spec, .{ .emit_null_optional_fields = false }),
+        });
+        var implementation: backend_module.LinuxBackend = .{};
+        const backend = implementation.backend();
+        var config: Config = .{ .root = root, .id = id, .subcommand = .create, .bundle = bundle };
+        try createContainer(allocator, io, backend, config);
+        defer {
+            config.subcommand = .delete;
+            config.force = true;
+            deleteContainer(allocator, io, backend, config) catch {};
+        }
+        const saved = try oci.loadState(allocator, io, root, id);
+        const pid = saved.value.pid.?;
+        defer {
+            _ = linux.kill(pid, .KILL);
+            _ = waitExec(pid) catch {};
+        }
+        config.subcommand = .start;
+        try startContainer(allocator, io, backend, config);
+        // The source was already bound into the running container.
+        try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.mount(host_data, host_mount, null, linux.MS.BIND, 0)));
+        defer _ = linux.umount2(host_mount, linux.MNT.DETACH);
+        config.subcommand = .exec;
+        config.exec_args = &.{ "/probe", "true", "propagation-host" };
+        try std.testing.expectEqual(@as(u8, 0), try execContainer(allocator, io, backend, config));
+        config.exec_args = &.{ "/probe", "true", "propagation-container" };
+        try std.testing.expectEqual(@as(u8, 0), try execContainer(allocator, io, backend, config));
+        const flag = try std.fmt.allocPrintSentinel(allocator, "{s}/flag", .{container_mount}, 0);
+        try std.testing.expectEqual(if (case.mount == .rshared) linux.E.SUCCESS else linux.E.NOENT, linux.errno(linux.access(flag, linux.F_OK)));
+        if (case.mount == .rshared)
+            try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.umount2(container_mount, linux.MNT.DETACH)));
     }
 }
 

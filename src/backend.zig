@@ -2,6 +2,7 @@ const std = @import("std");
 const oci = @import("oci.zig");
 
 pub const LinuxBackend = @import("backend/linux.zig").LinuxBackend;
+pub const apparmorEnabled = @import("backend/linux.zig").apparmorEnabled;
 pub const console = @import("backend/linux.zig").console;
 pub const hooks = @import("backend/hooks.zig");
 
@@ -45,6 +46,7 @@ pub const Backend = struct {
         sysctls: []const Sysctl = &.{},
         /// Null preserves the default propagation in a private mount namespace.
         rootfs_propagation: ?u32 = null,
+        apparmor_profile: ?[]const u8 = null,
         seccomp: ?Backend.seccomp.Config = null,
     };
 
@@ -61,6 +63,7 @@ pub const Backend = struct {
         capabilities: ?Capabilities = null,
         rlimits: []const Rlimit = &.{},
         no_new_privileges: bool = false,
+        apparmor_profile: ?[]const u8 = null,
         oom_score_adj: ?i32 = null,
         console_fds: ?[2]std.posix.fd_t = null,
         cgroup_path: []const u8 = "",
