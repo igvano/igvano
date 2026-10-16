@@ -382,6 +382,25 @@ pub const Spec = struct {
         maskedPaths: ?[]const []const u8 = null,
         readonlyPaths: ?[]const []const u8 = null,
         rootfsPropagation: ?Propagation = null,
+        seccomp: ?Seccomp = null,
+    };
+
+    pub const Seccomp = struct {
+        defaultAction: []const u8,
+        defaultErrnoRet: ?u32 = null,
+        architectures: ?[]const []const u8 = null,
+        flags: ?[]const []const u8 = null,
+        listenerPath: ?[]const u8 = null,
+        listenerMetadata: ?[]const u8 = null,
+        syscalls: ?[]const Syscall = null,
+
+        pub const Syscall = struct {
+            names: []const []const u8,
+            action: []const u8,
+            errnoRet: ?u32 = null,
+            args: ?[]const Arg = null,
+        };
+        pub const Arg = struct { index: u32, value: u64, valueTwo: u64 = 0, op: []const u8 };
     };
 
     pub const Propagation = enum { shared, slave, private, unbindable };
@@ -503,6 +522,305 @@ pub fn resolveCgroupPath(allocator: std.mem.Allocator, configured: ?[]const u8, 
 }
 
 const Backend = @import("backend.zig").Backend;
+
+pub fn prepareSeccomp(allocator: std.mem.Allocator, configured: ?Spec.Seccomp) !?Backend.seccomp.Config {
+    const config = configured orelse return null;
+    const seccomp = Backend.seccomp;
+    if (config.listenerPath != null)
+        return seccompInvalid("seccomp notify is not supported", .{});
+    const default_action = try seccompAction(config.defaultAction);
+    if (config.defaultErrnoRet != null and default_action != .errno and default_action != .trace)
+        return seccompInvalid("seccomp defaultErrnoRet is not supported by {s}", .{config.defaultAction});
+    const default_errno = try seccompErrno(config.defaultErrnoRet);
+    var flags: u32 = 0;
+    for (config.flags orelse &.{}) |flag| {
+        if (std.mem.eql(u8, flag, "SECCOMP_FILTER_FLAG_LOG")) {
+            flags |= 2;
+        } else if (std.mem.eql(u8, flag, "SECCOMP_FILTER_FLAG_SPEC_ALLOW")) {
+            flags |= 4;
+        } else if (std.mem.eql(u8, flag, "SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV")) {
+            // Meaningless without notify, which igvano rejects.
+            continue;
+        } else if (std.mem.eql(u8, flag, "SECCOMP_FILTER_FLAG_TSYNC")) {
+            // Like runc, init/exec are single-threaded at installation.
+            continue;
+        } else return seccompInvalid("unsupported seccomp flag: {s}", .{flag});
+    }
+    var arches: std.ArrayList(seccomp.Arch) = .empty;
+    defer arches.deinit(allocator);
+    // Like seccomp_init, retain the native ABI when additional ABIs are named.
+    try arches.append(allocator, seccomp.Arch.native() orelse
+        return seccompInvalid("seccomp is unsupported on this architecture", .{}));
+    for (config.architectures orelse &.{}) |name| {
+        if (std.mem.eql(u8, name, "SCMP_ARCH_NATIVE")) continue;
+        // Recognize the ABI listed by containerd/Docker profiles. Until it is
+        // implemented, the compiler sends x32 syscall numbers to bad-arch KILL.
+        if (std.mem.eql(u8, name, "SCMP_ARCH_X32")) continue;
+        const arch = seccomp_arches.get(name) orelse
+            return seccompInvalid("unknown seccomp architecture: {s}", .{name});
+        if (std.mem.indexOfScalar(seccomp.Arch, arches.items, arch) == null)
+            try arches.append(allocator, arch);
+    }
+    var rules: std.ArrayList(seccomp.Rule) = .empty;
+    defer rules.deinit(allocator);
+    errdefer for (rules.items) |rule| allocator.free(rule.args);
+    var args: std.ArrayList(seccomp.Arg) = .empty;
+    defer args.deinit(allocator);
+    for (config.syscalls orelse &.{}) |syscall| {
+        const action = try seccompAction(syscall.action);
+        if (syscall.errnoRet != null and action != .errno and action != .trace)
+            return seccompInvalid("seccomp errnoRet is not supported by {s}", .{syscall.action});
+        const errno_ret = try seccompErrno(syscall.errnoRet);
+        args.clearRetainingCapacity();
+        for (syscall.args orelse &.{}) |arg| {
+            if (arg.index >= 6) return seccompInvalid("seccomp argument index must be less than 6", .{});
+            try args.append(allocator, .{
+                .index = arg.index,
+                .value = arg.value,
+                .value_two = arg.valueTwo,
+                .op = seccomp_ops.get(arg.op) orelse
+                    return seccompInvalid("unknown seccomp operator: {s}", .{arg.op}),
+            });
+        }
+        for (arches.items) |arch| for (syscall.names) |name| {
+            const number = seccompSyscall(arch, name) orelse continue;
+            const owned_args = try allocator.dupe(seccomp.Arg, args.items);
+            errdefer allocator.free(owned_args);
+            try rules.append(allocator, .{ .arch = arch, .number = number, .action = action, .errno_ret = errno_ret, .args = owned_args });
+        };
+    }
+    const owned_arches = try arches.toOwnedSlice(allocator);
+    errdefer allocator.free(owned_arches);
+    return .{
+        .default_action = default_action,
+        .default_errno_ret = default_errno,
+        .architectures = owned_arches,
+        .flags = flags,
+        .rules = try rules.toOwnedSlice(allocator),
+    };
+}
+
+pub fn freeSeccomp(allocator: std.mem.Allocator, config: ?Backend.seccomp.Config) void {
+    const value = config orelse return;
+    for (value.rules) |rule| allocator.free(rule.args);
+    allocator.free(value.rules);
+    allocator.free(value.architectures);
+}
+
+fn seccompInvalid(comptime fmt: []const u8, args: anytype) error{InvalidConfig} {
+    std.debug.print("igvano: " ++ fmt ++ "\n", args);
+    return error.InvalidConfig;
+}
+
+fn seccompAction(name: []const u8) error{InvalidConfig}!Backend.seccomp.Action {
+    if (std.mem.eql(u8, name, "SCMP_ACT_NOTIFY"))
+        return seccompInvalid("seccomp notify is not supported", .{});
+    return seccomp_actions.get(name) orelse seccompInvalid("unknown seccomp action: {s}", .{name});
+}
+
+fn seccompErrno(value: ?u32) error{InvalidConfig}!?u16 {
+    const number = value orelse return null;
+    if (number > std.math.maxInt(u16))
+        return seccompInvalid("seccomp return data must fit in 16 bits", .{});
+    return @intCast(number);
+}
+
+const seccomp_actions = std.StaticStringMap(Backend.seccomp.Action).initComptime(.{
+    .{ "SCMP_ACT_KILL", .kill_thread },          .{ "SCMP_ACT_KILL_THREAD", .kill_thread },
+    .{ "SCMP_ACT_KILL_PROCESS", .kill_process }, .{ "SCMP_ACT_TRAP", .trap },
+    .{ "SCMP_ACT_ERRNO", .errno },               .{ "SCMP_ACT_TRACE", .trace },
+    .{ "SCMP_ACT_LOG", .log },                   .{ "SCMP_ACT_ALLOW", .allow },
+});
+const seccomp_arches = std.StaticStringMap(Backend.seccomp.Arch).initComptime(.{
+    .{ "SCMP_ARCH_X86_64", .x86_64 },   .{ "SCMP_ARCH_X86", .x86 },
+    .{ "SCMP_ARCH_AARCH64", .aarch64 }, .{ "SCMP_ARCH_ARM", .arm },
+});
+const seccomp_ops = std.StaticStringMap(Backend.seccomp.Op).initComptime(.{
+    .{ "SCMP_CMP_EQ", .eq },               .{ "SCMP_CMP_NE", .ne }, .{ "SCMP_CMP_LT", .lt },
+    .{ "SCMP_CMP_LE", .le },               .{ "SCMP_CMP_GT", .gt }, .{ "SCMP_CMP_GE", .ge },
+    .{ "SCMP_CMP_MASKED_EQ", .masked_eq },
+});
+
+fn syscallMap(comptime Syscalls: type, comptime aliases: []const struct { []const u8, []const u8 }) std.StaticStringMap(u32) {
+    @setEvalBranchQuota(200000);
+    const fields = @typeInfo(Syscalls).@"enum".fields;
+    var entries: [fields.len + aliases.len]struct { []const u8, u32 } = undefined;
+    var len: usize = 0;
+    for (fields) |field| {
+        // Aliased enum spellings are not syscall names on this ABI.
+        for (aliases) |alias| {
+            if (std.mem.eql(u8, field.name, alias[1])) break;
+        } else {
+            entries[len] = .{ field.name, @intCast(field.value) };
+            len += 1;
+        }
+    }
+    for (aliases) |alias| {
+        entries[len] = .{ alias[0], @intCast(@intFromEnum(@field(Syscalls, alias[1]))) };
+        len += 1;
+    }
+    return .initComptime(entries[0..len]);
+}
+
+// OCI/libseccomp name -> Zig enum spelling, scoped to each ABI.
+const seccomp_syscalls_x64 = syscallMap(std.os.linux.syscalls.X64, &.{
+    .{ "newfstatat", "fstatat64" },
+    .{ "_sysctl", "sysctl" },
+});
+const seccomp_syscalls_x86 = syscallMap(std.os.linux.syscalls.X86, &.{
+    .{ "_llseek", "llseek" },
+    .{ "_newselect", "newselect" },
+    .{ "_sysctl", "sysctl" },
+});
+const seccomp_syscalls_arm64 = syscallMap(std.os.linux.syscalls.Arm64, &.{
+    .{ "newfstatat", "fstatat64" },
+});
+const seccomp_syscalls_arm = syscallMap(std.os.linux.syscalls.Arm, &.{
+    .{ "_llseek", "llseek" },
+    .{ "_newselect", "newselect" },
+    .{ "_sysctl", "sysctl" },
+    .{ "arm_fadvise64_64", "fadvise64_64" },
+    .{ "arm_sync_file_range", "sync_file_range" },
+    .{ "sync_file_range2", "sync_file_range" },
+});
+
+fn seccompSyscall(arch: Backend.seccomp.Arch, name: []const u8) ?u32 {
+    return switch (arch) {
+        .x86_64 => seccomp_syscalls_x64.get(name),
+        .x86 => seccomp_syscalls_x86.get(name),
+        .aarch64 => seccomp_syscalls_arm64.get(name),
+        .arm => seccomp_syscalls_arm.get(name),
+    };
+}
+
+test "seccomp syscall lookup uses ABI-specific OCI names" {
+    const cases = [_]struct { arch: Backend.seccomp.Arch, name: []const u8, number: ?u32 }{
+        .{ .arch = .x86_64, .name = "newfstatat", .number = 262 },
+        .{ .arch = .aarch64, .name = "newfstatat", .number = 79 },
+        .{ .arch = .x86, .name = "_llseek", .number = 140 },
+        .{ .arch = .arm, .name = "_llseek", .number = 140 },
+        .{ .arch = .x86, .name = "_newselect", .number = 142 },
+        .{ .arch = .arm, .name = "_newselect", .number = 142 },
+        .{ .arch = .x86_64, .name = "_sysctl", .number = 156 },
+        .{ .arch = .x86, .name = "_sysctl", .number = 149 },
+        .{ .arch = .arm, .name = "_sysctl", .number = 149 },
+        .{ .arch = .arm, .name = "arm_fadvise64_64", .number = 270 },
+        .{ .arch = .arm, .name = "arm_sync_file_range", .number = 341 },
+        .{ .arch = .arm, .name = "sync_file_range2", .number = 341 },
+        .{ .arch = .x86, .name = "fstatat64", .number = 300 },
+        .{ .arch = .arm, .name = "fstatat64", .number = 327 },
+        .{ .arch = .x86, .name = "fadvise64_64", .number = 272 },
+        .{ .arch = .x86_64, .name = "sync_file_range", .number = 277 },
+        .{ .arch = .aarch64, .name = "sync_file_range", .number = 84 },
+        .{ .arch = .x86_64, .name = "fstatat64", .number = null },
+        .{ .arch = .aarch64, .name = "fstatat64", .number = null },
+        .{ .arch = .x86, .name = "newfstatat", .number = null },
+        .{ .arch = .arm, .name = "newfstatat", .number = null },
+        .{ .arch = .x86, .name = "llseek", .number = null },
+        .{ .arch = .arm, .name = "llseek", .number = null },
+        .{ .arch = .x86, .name = "newselect", .number = null },
+        .{ .arch = .arm, .name = "newselect", .number = null },
+        .{ .arch = .x86_64, .name = "sysctl", .number = null },
+        .{ .arch = .x86, .name = "sysctl", .number = null },
+        .{ .arch = .arm, .name = "sysctl", .number = null },
+        .{ .arch = .arm, .name = "fadvise64_64", .number = null },
+        .{ .arch = .arm, .name = "sync_file_range", .number = null },
+    };
+    for (cases) |case|
+        try std.testing.expectEqual(case.number, seccompSyscall(case.arch, case.name));
+    for ([_]Backend.seccomp.Arch{ .x86_64, .x86, .aarch64, .arm }) |arch|
+        try std.testing.expectEqual(@as(?u32, null), seccompSyscall(arch, "riscv_hwprobe"));
+}
+
+test "seccomp translation resolves syscall numbers per ABI and skips unknown names" {
+    const parsed = try std.json.parseFromSlice(Spec.Seccomp, std.testing.allocator,
+        \\{"defaultAction":"SCMP_ACT_ERRNO","defaultErrnoRet":13,
+        \\ "architectures":["SCMP_ARCH_X86_64","SCMP_ARCH_X86","SCMP_ARCH_X32"],
+        \\ "flags":["SECCOMP_FILTER_FLAG_LOG","SECCOMP_FILTER_FLAG_SPEC_ALLOW","SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV","SECCOMP_FILTER_FLAG_TSYNC"],
+        \\ "syscalls":[{"names":["mkdir","not_a_syscall"],"action":"SCMP_ACT_ALLOW",
+        \\ "args":[{"index":0,"value":4294967296,"valueTwo":1,"op":"SCMP_CMP_MASKED_EQ"}]}]}
+    , .{});
+    defer parsed.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const translated = (try prepareSeccomp(arena.allocator(), parsed.value)).?;
+    try std.testing.expectEqual(@as(u32, 6), translated.flags);
+    try std.testing.expectEqual(@as(u32, 0x0005000d), translated.default_action.encode(translated.default_errno_ret));
+    var found_x64 = false;
+    var found_x86 = false;
+    for (translated.rules) |rule| {
+        try std.testing.expectEqual(@as(u64, 4294967296), rule.args[0].value);
+        try std.testing.expectEqual(@as(u64, 1), rule.args[0].value_two);
+        try std.testing.expectEqual(Backend.seccomp.Op.masked_eq, rule.args[0].op);
+        switch (rule.arch) {
+            .x86_64 => {
+                try std.testing.expectEqual(@as(u32, 83), rule.number);
+                found_x64 = true;
+            },
+            .x86 => {
+                try std.testing.expectEqual(@as(u32, 39), rule.number);
+                found_x86 = true;
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(found_x64 and found_x86);
+    try std.testing.expectEqual(@as(?u32, 34), seccompSyscall(.aarch64, "mkdirat"));
+    try std.testing.expectEqual(@as(?u32, 323), seccompSyscall(.arm, "mkdirat"));
+}
+
+test "seccomp rejects unsupported or unknown schema values even for unknown syscalls" {
+    const cases = [_]Spec.Seccomp{
+        .{ .defaultAction = "unknown" },
+        .{ .defaultAction = "SCMP_ACT_NOTIFY" },
+        .{ .defaultAction = "SCMP_ACT_ALLOW", .listenerPath = "/listener" },
+        .{ .defaultAction = "SCMP_ACT_ALLOW", .architectures = &.{"SCMP_ARCH_UNKNOWN"} },
+        .{ .defaultAction = "SCMP_ACT_ALLOW", .flags = &.{"SECCOMP_FILTER_FLAG_NEW_LISTENER"} },
+        .{ .defaultAction = "SCMP_ACT_ALLOW", .flags = &.{"unknown"} },
+        .{ .defaultAction = "SCMP_ACT_ALLOW", .defaultErrnoRet = 5 },
+        .{ .defaultAction = "SCMP_ACT_ALLOW", .defaultErrnoRet = 65536 },
+        .{ .defaultAction = "SCMP_ACT_ALLOW", .syscalls = &.{.{ .names = &.{"unknown"}, .action = "SCMP_ACT_KILL", .errnoRet = 1 }} },
+        .{ .defaultAction = "SCMP_ACT_ALLOW", .syscalls = &.{.{ .names = &.{"unknown"}, .action = "unknown" }} },
+        .{ .defaultAction = "SCMP_ACT_ALLOW", .syscalls = &.{.{ .names = &.{"unknown"}, .action = "SCMP_ACT_NOTIFY" }} },
+        .{ .defaultAction = "SCMP_ACT_ALLOW", .syscalls = &.{.{ .names = &.{"unknown"}, .action = "SCMP_ACT_ALLOW", .args = &.{.{ .index = 0, .value = 0, .op = "unknown" }} }} },
+        .{ .defaultAction = "SCMP_ACT_ALLOW", .syscalls = &.{.{ .names = &.{"mkdir"}, .action = "SCMP_ACT_ERRNO", .args = &.{.{ .index = 6, .value = 0, .op = "SCMP_CMP_EQ" }} }} },
+    };
+    for (cases) |config| {
+        var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+        defer arena.deinit();
+        try std.testing.expectError(error.InvalidConfig, prepareSeccomp(arena.allocator(), config));
+    }
+    try std.testing.expect((try prepareSeccomp(std.testing.allocator, null)) == null);
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expect((try prepareSeccomp(arena.allocator(), .{ .defaultAction = "SCMP_ACT_ALLOW" })).?.architectures.len == 1);
+    try std.testing.expect((try prepareSeccomp(arena.allocator(), .{
+        .defaultAction = "SCMP_ACT_ALLOW",
+        .architectures = &.{"SCMP_ARCH_NATIVE"},
+    })).?.architectures.len == 1);
+    try std.testing.expect((try prepareSeccomp(arena.allocator(), .{
+        .defaultAction = "SCMP_ACT_ALLOW",
+        .architectures = &.{"SCMP_ARCH_X32"},
+    })).?.architectures.len == 1);
+}
+
+test "seccomp translation cleans up partial rules on allocation failure" {
+    const Check = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            const config = try prepareSeccomp(allocator, .{
+                .defaultAction = "SCMP_ACT_ERRNO",
+                .architectures = &.{ "SCMP_ARCH_X86_64", "SCMP_ARCH_X86", "SCMP_ARCH_ARM", "SCMP_ARCH_AARCH64" },
+                .syscalls = &.{.{
+                    .names = &.{ "mkdirat", "personality", "unknown" },
+                    .action = "SCMP_ACT_ALLOW",
+                    .args = &.{ .{ .index = 0, .value = 0, .op = "SCMP_CMP_EQ" }, .{ .index = 1, .value = 0x100000000, .op = "SCMP_CMP_LT" } },
+                }},
+            });
+            defer freeSeccomp(allocator, config);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+}
 
 /// A joined IPC/network/UTS namespace must differ from the runtime's namespace.
 fn sysctlNamespace(config: Spec.Linux, kind: @FieldType(Spec.Namespace, "type")) bool {

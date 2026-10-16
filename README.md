@@ -38,8 +38,14 @@ Note: Nix flakes only see files tracked by git — `git add` new files before
 nix develop -c zig build test
 
 # one file's tests directly
-nix develop -c zig test src/main.zig
+nix develop -c zig test --dep igvano -Mroot=src/main.zig -Migvano=src/lib.zig
 ```
+
+The Linux seccomp lifecycle test needs a static probe. `zig build test` builds
+it automatically. For direct or cross-compiled test runs, build
+`src/test/seccomp-probe.zig` with `zig build-exe` for the same target and set
+`IGVANO_SECCOMP_PROBE` to its path on the test host (default:
+`zig-out/bin/seccomp-probe`).
 
 Running real containers needs Linux. On macOS, cross-compile and use a
 privileged container (Docker/colima work):

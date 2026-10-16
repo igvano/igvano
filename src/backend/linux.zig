@@ -6,6 +6,7 @@ const Backend = @import("../backend.zig").Backend;
 const Resources = Backend.Resources;
 const oci = @import("../oci.zig");
 const hooks = @import("hooks.zig");
+const seccomp = @import("seccomp.zig");
 
 const ST_NOATIME: usize = 1024;
 const ST_RELATIME: usize = 4096; // Unlike MS_RELATIME.
@@ -1362,6 +1363,14 @@ pub const LinuxBackend = struct {
         var arena: std.heap.ArenaAllocator = .init(options.allocator);
         defer arena.deinit();
         const allocator = arena.allocator();
+        const seccomp_program = if (options.seccomp) |config|
+            seccomp.compile(allocator, config, seccomp.Arch.native() orelse return error.Unsupported) catch |err| {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
+                reportDiagnostic("cannot compile seccomp filter: {s} (maximum 4096 instructions)", .{@errorName(err)});
+                return error.InvalidConfig;
+            }
+        else
+            null;
         const cwd = try pathString(allocator, options.cwd);
         const argv = try allocator.allocSentinel(?[*:0]const u8, options.argv.len, null);
         for (options.argv, 0..) |arg, i| argv[i] = (try processString(allocator, arg)).ptr;
@@ -1501,12 +1510,25 @@ pub const LinuxBackend = struct {
                     childError("cannot set up exec console: ", err);
                     failCreate(ready[1], err);
                 };
+                // Retain CAP_SYS_ADMIN for installation when NNP is false,
+                // matching init's ordering before dropping process privileges.
+                if (!process.no_new_privileges) {
+                    if (seccomp_program) |program|
+                        installSeccomp(program) catch |err| failCreate(ready[1], err);
+                }
                 applyProcessSettings(process) catch |err| {
                     childError("cannot apply exec process settings: ", err);
                     failCreate(ready[1], err);
                 };
+                var executable_buffer: [std.fs.max_path_bytes]u8 = undefined;
+                const executable = resolveExecutable(argv.ptr, envp.ptr, &executable_buffer) catch
+                    failCreate(ready[1], error.CreateFailed);
                 checkResult(linux.syscall3(.close_range, 3, std.math.maxInt(u32), 1 << 2)) catch |err| failCreate(ready[1], err);
-                execProcess(argv.ptr, envp.ptr) catch {
+                if (process.no_new_privileges) {
+                    if (seccomp_program) |program|
+                        installSeccomp(program) catch |err| failCreate(ready[1], err);
+                }
+                execResolved(executable, argv.ptr, envp.ptr) catch {
                     failCreate(ready[1], error.CreateFailed);
                 };
             }
@@ -1577,6 +1599,14 @@ pub const LinuxBackend = struct {
             var arena: std.heap.ArenaAllocator = .init(options.allocator);
             defer arena.deinit();
             const allocator = arena.allocator();
+            const seccomp_program = if (options.seccomp) |config|
+                seccomp.compile(allocator, config, seccomp.Arch.native() orelse return error.Unsupported) catch |err| {
+                    if (err == error.OutOfMemory) return error.OutOfMemory;
+                    reportDiagnostic("cannot compile seccomp filter: {s} (maximum 4096 instructions)", .{@errorName(err)});
+                    return error.InvalidConfig;
+                }
+            else
+                null;
             var joins: std.ArrayList(NamespaceJoin) = .empty;
             for (if (options.spec.linux) |settings| settings.namespaces orelse &.{} else &.{}) |namespace| {
                 if (namespace.path) |path| try joins.append(allocator, .{
@@ -1837,7 +1867,7 @@ pub const LinuxBackend = struct {
                         .runtime_sync = .{ .ready_fd = ready[1], .go_fd = create_go[0] },
                         .console_fd = if (options.console_fds) |fds| fds[1] else null,
                         .fifo_writable = joined_user_namespace,
-                    }, start_hooks, start_input);
+                    }, start_hooks, start_input, seccomp_program);
                 }
                 closeFd(fifo_fd);
                 if (options.console_fds) |fds| closeFd(fds[1]);
@@ -5096,6 +5126,7 @@ fn runInit(
     rootfs_options: RootfsOptions,
     start_hooks: []const hooks.Prepared,
     start_hook_state: []const u8,
+    seccomp_program: ?seccomp.Program,
 ) noreturn {
     // The inherited host descriptors avoid path access to the state directory
     // or /proc inside the container and are closed before or at exec.
@@ -5114,6 +5145,13 @@ fn runInit(
         // Allow write-only reopen after setuid while keeping readers root-only.
         if (process.user.uid != 0 and !rootfs_options.fifo_writable)
             checkResult(linux.fchmodat(fd_dir, fifo_name, 0o622)) catch |err| failCreate(ready_fd, err);
+        // Without NNP the kernel requires CAP_SYS_ADMIN, which applyProcess
+        // may drop. Do not change the OCI noNewPrivileges setting.
+        // With NNP=true, install after startContainer hooks (unfiltered); NNP=false hooks run filtered, intentionally.
+        if (!process.noNewPrivileges) {
+            if (seccomp_program) |program|
+                installSeccomp(program) catch |err| failCreate(ready_fd, err);
+        }
         applyProcess(process, capabilities, rlimits) catch |err| {
             childError("cannot apply process settings: ", err);
             failCreate(ready_fd, err);
@@ -5146,19 +5184,34 @@ fn runInit(
         linux.exit_group(1);
     };
     if (!writeAll(fd, &.{1})) linux.exit_group(1);
-    runProcess(spec, executable, argv, envp) catch |err| {
+    runProcess(spec, executable, argv, envp, seccomp_program) catch |err| {
         if (err != error.ExecFailed) childError("cannot execute process: ", err);
         _ = writeAll(fd, &.{0});
         linux.exit_group(1);
     };
 }
 
-fn runProcess(spec: *const oci.Spec, executable: ?[*:0]const u8, argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*:0]const u8) !noreturn {
+fn runProcess(spec: *const oci.Spec, executable: ?[*:0]const u8, argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*:0]const u8, seccomp_program: ?seccomp.Program) !noreturn {
     // A process-less config can be created; it cannot be started.
     if (spec.process == null) return error.InvalidProcess;
     // Linux CLOSE_RANGE_CLOEXEC is 1 << 2; Zig 0.16's packed flags use 1 << 1.
     try checkResult(linux.syscall3(.close_range, 3, std.math.maxInt(u32), 1 << 2));
+    // With NNP=true, install after startContainer hooks (unfiltered); NNP=false hooks run filtered, intentionally.
+    if (spec.process.?.noNewPrivileges) {
+        if (seccomp_program) |program| try installSeccomp(program);
+    }
     return execResolved(executable orelse return error.InvalidProcess, argv, envp);
+}
+
+fn installSeccomp(program: seccomp.Program) Backend.Error!void {
+    const result = seccomp.install(program);
+    if (result != .SUCCESS) {
+        var errno_buffer: [16]u8 = undefined;
+        const errno_name = std.enums.tagName(linux.E, result) orelse
+            (std.fmt.bufPrint(&errno_buffer, "{d}", .{@intFromEnum(result)}) catch unreachable);
+        reportDiagnostic("cannot install seccomp filter: E{s}", .{errno_name});
+        return error.CreateFailed;
+    }
 }
 
 fn applyOomScoreAdj(proc_dir: posix.fd_t, oom_score_adj: ?i32) Backend.Error!void {
@@ -5279,7 +5332,10 @@ fn resolveExecutable(argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*
 fn execResolved(executable: [*:0]const u8, argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*:0]const u8) error{ExecFailed}!noreturn {
     const err = linux.errno(linux.execve(executable, argv, envp));
     // Linux's errno tags omit the E prefix used by runtime diagnostics.
-    reportDiagnostic("cannot execute process: E{s}", .{@tagName(err)});
+    var errno_buffer: [16]u8 = undefined;
+    const errno_name = std.enums.tagName(linux.E, err) orelse
+        (std.fmt.bufPrint(&errno_buffer, "{d}", .{@intFromEnum(err)}) catch unreachable);
+    reportDiagnostic("cannot execute process: E{s}", .{errno_name});
     return error.ExecFailed;
 }
 
@@ -5961,7 +6017,7 @@ test "linux init rejects missing directory and non-executable args before create
         if (pid == 0) {
             closeFd(ready[0]);
             checkResult(linux.unshare(linux.CLONE.NEWNS)) catch linux.exit_group(2);
-            runInit(&spec, null, &.{}, linux.CLONE.NEWNS, rootfs_z, &.{}, &.{}, &.{}, "/", -1, -1, &argv, &envp, ready[1], .{}, &.{}, "");
+            runInit(&spec, null, &.{}, linux.CLONE.NEWNS, rootfs_z, &.{}, &.{}, &.{}, "/", -1, -1, &argv, &envp, ready[1], .{}, &.{}, "", null);
         }
         closeFd(ready[1]);
         var response: CreateResponse = .{};
@@ -6017,7 +6073,7 @@ test "linux init applies uid gid and optional supplementary groups before exec" 
             applyProcess(spec.process.?, null, &.{}) catch linux.exit_group(1);
             var executable_buffer: [std.fs.max_path_bytes]u8 = undefined;
             const executable = resolveExecutable(&argv, &envp, &executable_buffer) catch linux.exit_group(1);
-            runProcess(&spec, executable, &argv, &envp) catch linux.exit_group(1);
+            runProcess(&spec, executable, &argv, &envp, null) catch linux.exit_group(1);
         }
         closeFd(output[1]);
         closeFd(ready[1]);
@@ -6101,7 +6157,7 @@ test "linux init exits nonzero instead of exec when it cannot apply process user
             checkResult(linux.setuid(1000)) catch linux.exit_group(2);
         }
         applyProcess(spec.process.?, null, &.{}) catch linux.exit_group(1);
-        runProcess(&spec, argv[0], &argv, &envp) catch linux.exit_group(1);
+        runProcess(&spec, argv[0], &argv, &envp, null) catch linux.exit_group(1);
     }
     closeFd(ready[1]);
     try std.testing.expectEqual(@as(u32, 1 << 8), try waitChild(pid));
@@ -6133,7 +6189,7 @@ test "linux init marks inherited descriptors CLOEXEC and sets noNewPrivileges" {
         closeFd(ready[0]);
         checkResult(linux.dup2(ready[1], 200)) catch linux.exit_group(2);
         applyProcess(spec.process.?, null, &.{}) catch linux.exit_group(1);
-        runProcess(&spec, argv[0], &argv, &envp) catch linux.exit_group(1);
+        runProcess(&spec, argv[0], &argv, &envp, null) catch linux.exit_group(1);
     }
     closeFd(ready[1]);
     try std.testing.expectEqual(@as(u32, 0), try waitChild(pid));

@@ -477,6 +477,8 @@ fn createContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, c
         };
     }
     const settings: oci.Spec.Linux = parsed.value.linux orelse .{};
+    const seccomp_config = try oci.prepareSeccomp(allocator, settings.seccomp);
+    defer oci.freeSeccomp(allocator, seccomp_config);
     const sysctls = try oci.prepareSysctls(mount_allocator, settings);
     const configured_hooks: oci.Spec.Hooks = parsed.value.hooks orelse .{};
     const create_hooks = try oci.prepareHooks(mount_allocator, configured_hooks.createContainer);
@@ -586,6 +588,7 @@ fn createContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, c
         .readonly_paths = readonly_paths,
         .sysctls = sysctls,
         .rootfs_propagation = if (settings.rootfsPropagation) |mode| oci.rootfsPropagation(mode) else null,
+        .seccomp = seccomp_config,
         .on_create = .{ .ptr = &create_context, .run = CreateContext.run },
     });
     const handle = backendResult(backend, created) catch |err| {
@@ -956,6 +959,16 @@ fn execContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, con
     var arena: std.heap.ArenaAllocator = .init(allocator);
     defer arena.deinit();
     const process_allocator = arena.allocator();
+    const saved_bundle = try std.fs.path.join(process_allocator, &.{ config.root, config.id });
+    // Legacy containers did not snapshot config.json at create.
+    const saved_spec: ?std.json.Parsed(oci.Spec) = oci.loadSpec(process_allocator, io, saved_bundle) catch |err| switch (err) {
+        error.FileNotFound => oci.loadSpec(process_allocator, io, state.parsed.value.bundle) catch |bundle_err| switch (bundle_err) {
+            // Legacy containers created before seccomp support can exec --process without either config.
+            error.FileNotFound => if (config.process_file != null) null else return bundle_err,
+            else => return bundle_err,
+        },
+        else => return err,
+    };
     const process = if (config.process_file) |path| process: {
         const json = try std.Io.Dir.cwd().readFileAlloc(io, path, process_allocator, .limited(1 << 20));
         const parsed = try std.json.parseFromSlice(oci.Spec.Process, process_allocator, json, .{
@@ -964,16 +977,12 @@ fn execContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, con
         });
         break :process parsed.value;
     } else process: {
-        const saved_bundle = try std.fs.path.join(process_allocator, &.{ config.root, config.id });
-        // Legacy containers did not snapshot config.json at create.
-        const parsed = oci.loadSpec(process_allocator, io, saved_bundle) catch |err| switch (err) {
-            error.FileNotFound => try oci.loadSpec(process_allocator, io, state.parsed.value.bundle),
-            else => return err,
-        };
-        break :process try execProcessConfig(process_allocator, parsed.value.process orelse return error.MissingProcess, config);
+        const spec = saved_spec orelse return error.FileNotFound;
+        break :process try execProcessConfig(process_allocator, spec.value.process orelse return error.MissingProcess, config);
     };
     try oci.validateProcess(process);
     var options = try prepareProcess(process_allocator, process, config.console_socket);
+    options.seccomp = try oci.prepareSeccomp(process_allocator, if (saved_spec) |spec| if (spec.value.linux) |settings| settings.seccomp else null else null);
     options.cgroup_path = state.handle.?.cgroup_path orelse return error.InvalidState;
     options.console_fds = if (config.console_socket != null) try backend_module.console.socketpair() else null;
     defer if (options.console_fds) |fds| for (fds) |fd| {
@@ -1653,6 +1662,131 @@ test "process validation and typed translation serve create and exec" {
     invalid = process;
     invalid.terminal = true;
     try std.testing.expectError(error.MissingConsoleSocket, prepareProcess(std.testing.allocator, invalid, null));
+}
+
+test "linux seccomp create exec and start enforce filters with and without noNewPrivileges" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const linux = std.os.linux;
+    if (linux.geteuid() != 0) return error.SkipZigTest;
+    // An inherited NNP bit cannot be cleared for the false case.
+    if (linux.prctl(@intFromEnum(linux.PR.GET_NO_NEW_PRIVS), 0, 0, 0, 0) != 0)
+        return error.SkipZigTest;
+    if (linux.errno(linux.access("/sys/fs/cgroup/cgroup.controllers", linux.F_OK)) == .SUCCESS and
+        linux.errno(linux.access("/sys/fs/cgroup", linux.W_OK)) != .SUCCESS)
+        return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer std.testing.allocator.free(base);
+    const absolute = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, base, std.testing.allocator);
+    defer std.testing.allocator.free(absolute);
+    const forked = linux.fork();
+    if (linux.errno(forked) != .SUCCESS) return error.SystemResources;
+    const child: i32 = @intCast(forked);
+    if (child == 0) {
+        if (linux.errno(linux.unshare(linux.CLONE.NEWNS)) != .SUCCESS) linux.exit_group(77);
+        if (linux.errno(linux.mount(null, "/", null, linux.MS.PRIVATE | linux.MS.REC, 0)) != .SUCCESS)
+            linux.exit_group(1);
+        testSeccompLifecycle(absolute) catch |err| {
+            std.debug.print("seccomp lifecycle test: {s}\n", .{@errorName(err)});
+            linux.exit_group(1);
+        };
+        linux.exit_group(0);
+    }
+    const status = try waitExec(child);
+    if (status == 77) return error.SkipZigTest;
+    try std.testing.expectEqual(@as(u8, 0), status);
+}
+
+fn testSeccompLifecycle(base: []const u8) !void {
+    const linux = std.os.linux;
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    const io = threaded.io();
+    var arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const cwd = std.Io.Dir.cwd();
+    const probe_path = std.testing.environ.getPosix("IGVANO_SECCOMP_PROBE") orelse "zig-out/bin/seccomp-probe";
+    const probe = try cwd.realPathFileAlloc(io, probe_path, allocator);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.prctl(@intFromEnum(linux.PR.SET_CHILD_SUBREAPER), 1, 0, 0, 0)));
+    const docker = try std.json.parseFromSlice(oci.Spec.Seccomp, allocator, @embedFile("backend/testdata/docker-default.json"), .{});
+    const restricted: oci.Spec.Seccomp = .{
+        .defaultAction = "SCMP_ACT_ALLOW",
+        .syscalls = &.{
+            .{ .names = &.{ "mkdir", "mkdirat" }, .action = "SCMP_ACT_ERRNO", .errnoRet = 1 },
+            .{ .names = &.{"personality"}, .action = "SCMP_ACT_ERRNO", .args = &.{.{ .index = 0, .value = 0, .op = "SCMP_CMP_NE" }} },
+        },
+    };
+    for ([_]oci.Spec.Seccomp{ restricted, docker.value }, 0..) |profile, profile_index| {
+        for ([_]bool{ false, true }) |nnp| {
+            const id = try std.fmt.allocPrint(allocator, "seccomp-{d}-{s}", .{ profile_index, if (nnp) "true" else "false" });
+            const bundle = try std.fs.path.join(allocator, &.{ base, id });
+            const rootfs = try std.fs.path.join(allocator, &.{ bundle, "rootfs" });
+            const root = try std.fs.path.join(allocator, &.{ base, "state" });
+            try cwd.createDirPath(io, try std.fs.path.join(allocator, &.{ rootfs, "tmp" }));
+            const cgroup = try std.fmt.allocPrint(allocator, "igvano-seccomp-{d}-{s}", .{ linux.getpid(), id });
+            const nnp_arg: []const u8 = if (nnp) "true" else "false";
+            const spec: oci.Spec = .{
+                .ociVersion = "1.0.2",
+                .root = .{ .path = "rootfs" },
+                .process = .{
+                    .args = &.{ "probe", nnp_arg, if (profile_index == 0) "restricted" else "docker" },
+                    .env = &.{"PATH=/"},
+                    .cwd = "/",
+                    .noNewPrivileges = nnp,
+                    .user = .{ .uid = 0, .gid = 0 },
+                    // Installing the false case after this drop would fail.
+                    .capabilities = .{},
+                },
+                .mounts = &.{
+                    .{ .destination = "/probe", .source = probe, .type = "bind", .options = &.{ "bind", "ro" } },
+                    .{ .destination = "/proc", .source = "proc", .type = "proc" },
+                },
+                .linux = .{ .cgroupsPath = cgroup, .namespaces = &.{ .{ .type = .mount }, .{ .type = .pid } }, .seccomp = profile },
+                .hooks = if (profile_index == 0) .{ .startContainer = &.{.{
+                    .path = "/probe",
+                    .args = &.{ "/probe", nnp_arg, "hook" },
+                    .timeout = 2,
+                }} } else null,
+            };
+            try cwd.writeFile(io, .{
+                .sub_path = try std.fs.path.join(allocator, &.{ bundle, "config.json" }),
+                .data = try std.json.Stringify.valueAlloc(allocator, spec, .{ .emit_null_optional_fields = false }),
+            });
+            var implementation: backend_module.LinuxBackend = .{};
+            const backend = implementation.backend();
+            var config: Config = .{ .root = root, .id = id, .subcommand = .create, .bundle = bundle };
+            try createContainer(allocator, io, backend, config);
+            defer {
+                config.subcommand = .delete;
+                config.force = true;
+                deleteContainer(allocator, io, backend, config) catch {};
+            }
+            const saved = try oci.loadState(allocator, io, root, id);
+            const pid = saved.value.pid.?;
+            var reaped = false;
+            defer if (!reaped) {
+                _ = linux.kill(pid, .KILL);
+                _ = waitExec(pid) catch {};
+            };
+            // Exec must enforce the saved policy even before init is started,
+            // both with inherited process settings and an explicit --process.
+            config.subcommand = .exec;
+            config.exec_args = spec.process.?.args;
+            try std.testing.expectEqual(@as(u8, 0), try execContainer(allocator, io, backend, config));
+            config.process_file = try std.fs.path.join(allocator, &.{ bundle, "process.json" });
+            try cwd.writeFile(io, .{
+                .sub_path = config.process_file.?,
+                .data = try std.json.Stringify.valueAlloc(allocator, spec.process.?, .{ .emit_null_optional_fields = false }),
+            });
+            try std.testing.expectEqual(@as(u8, 0), try execContainer(allocator, io, backend, config));
+            config.subcommand = .start;
+            try startContainer(allocator, io, backend, config);
+            const status = try waitExec(pid);
+            reaped = true;
+            try std.testing.expectEqual(@as(u8, 0), status);
+        }
+    }
 }
 
 test "linux exec update ps pause resume and forced delete obey the live container lifecycle" {

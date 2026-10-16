@@ -6,6 +6,7 @@ pub const console = @import("backend/linux.zig").console;
 pub const hooks = @import("backend/hooks.zig");
 
 pub const Backend = struct {
+    pub const seccomp = @import("backend/seccomp.zig");
     ptr: *anyopaque,
     vtable: *const VTable,
 
@@ -44,6 +45,7 @@ pub const Backend = struct {
         sysctls: []const Sysctl = &.{},
         /// Null preserves the default propagation in a private mount namespace.
         rootfs_propagation: ?u32 = null,
+        seccomp: ?Backend.seccomp.Config = null,
     };
 
     pub const Hook = hooks.Hook;
@@ -62,6 +64,7 @@ pub const Backend = struct {
         oom_score_adj: ?i32 = null,
         console_fds: ?[2]std.posix.fd_t = null,
         cgroup_path: []const u8 = "",
+        seccomp: ?Backend.seccomp.Config = null,
     };
 
     pub const CreateCallback = struct {
