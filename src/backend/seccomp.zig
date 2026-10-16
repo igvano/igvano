@@ -108,7 +108,7 @@ pub fn compile(allocator: std.mem.Allocator, config: Config, host: Arch) Error!P
             failures.clearRetainingCapacity();
             try builder.emit(0x20, 0); // Reload nr after argument loads.
             try builder.require(0x15, rule.number, true, &failures);
-            for (rule.args) |arg| try builder.argument(arg, &failures);
+            for (rule.args) |arg| try builder.argument(arg, arch, &failures);
             try builder.emit(0x06, rule.action.encode(rule.errno_ret));
             for (failures.items) |failure| builder.patch(failure);
         }
@@ -150,12 +150,23 @@ const Builder = struct {
         return .{ try self.jump(), try self.jump() };
     }
 
-    fn argument(self: *Builder, arg: Arg, failures: *std.ArrayList(usize)) Error!void {
+    fn argument(self: *Builder, arg: Arg, arch: Arch, failures: *std.ArrayList(usize)) Error!void {
         // All supported native/compat ABIs use little-endian seccomp_data.
         const low = 16 + arg.index * 8;
         const high = low + 4;
         const hi: u32 = @truncate(arg.value >> 32);
         const lo: u32 = @truncate(arg.value);
+        if (arch == .x86 or arch == .arm) {
+            // libseccomp truncates both operands for 32-bit ABIs.
+            try self.emit(0x20, low);
+            if (arg.op == .masked_eq) try self.emit(0x54, lo);
+            try self.require(switch (arg.op) {
+                .eq, .ne, .masked_eq => 0x15,
+                .lt, .ge => 0x35,
+                .le, .gt => 0x25,
+            }, if (arg.op == .masked_eq) @truncate(arg.value_two) else lo, arg.op != .ne and arg.op != .lt and arg.op != .le, failures);
+            return;
+        }
         try self.emit(0x20, high);
         switch (arg.op) {
             .eq, .masked_eq => {
@@ -207,44 +218,8 @@ pub fn install(program: Program) std.os.linux.E {
     return linux.errno(result);
 }
 
-// A deliberately small interpreter, independent of the compiler's branch logic.
-const TestData = extern struct {
-    nr: u32 = 7,
-    arch: u32 = 0xc000003e,
-    ip: u64 = 0,
-    args: [6]u64 = @splat(0),
-};
-
-fn interpret(filters: []const Filter, data: TestData) !u32 {
-    var pc: usize = 0;
-    var accumulator: u32 = 0;
-    const bytes = std.mem.asBytes(&data);
-    while (pc < filters.len) {
-        const instruction = filters[pc];
-        pc += 1;
-        switch (instruction.code) {
-            0x20 => {
-                if (instruction.k % 4 != 0 or instruction.k > bytes.len - 4) return error.InvalidLoad;
-                accumulator = std.mem.readInt(u32, bytes[instruction.k..][0..4], builtin.cpu.arch.endian());
-            },
-            0x05 => pc += instruction.k,
-            0x15, 0x25, 0x35, 0x45 => {
-                const matched = switch (instruction.code) {
-                    0x15 => accumulator == instruction.k,
-                    0x25 => accumulator > instruction.k,
-                    0x35 => accumulator >= instruction.k,
-                    0x45 => accumulator & instruction.k != 0,
-                    else => unreachable,
-                };
-                pc += if (matched) instruction.jt else instruction.jf;
-            },
-            0x54 => accumulator &= instruction.k,
-            0x06 => return instruction.k,
-            else => return error.InvalidInstruction,
-        }
-    }
-    return error.InvalidJump;
-}
+const TestData = @import("../test/seccomp.zig").Data;
+const interpret = @import("../test/seccomp.zig").interpret;
 
 test "seccomp dispatch rejects foreign architectures and x32 and preserves default errno" {
     const program = try compile(std.testing.allocator, .{
@@ -337,6 +312,40 @@ test "seccomp conditions are ANDed and alternative rules are ORed" {
     try std.testing.expectEqual(@as(u32, 0x7fff0000), try interpret(program.filters, data));
 }
 
+test "seccomp compat comparisons truncate values and ignore argument high words" {
+    for ([_]Arch{ .x86_64, .aarch64 }) |host| {
+        const compat: Arch = if (host == .x86_64) .x86 else .arm;
+        for ([_]Op{ .eq, .ne, .lt, .le, .gt, .ge, .masked_eq }) |op| {
+            const program = try compile(std.testing.allocator, .{
+                .default_action = .allow,
+                .architectures = &.{ host, compat },
+                .rules = &.{.{
+                    .arch = compat,
+                    .number = 7,
+                    .action = .errno,
+                    .errno_ret = 42,
+                    .args = &.{.{ .index = 0, .value = 0xffffffffffffffff, .value_two = 0xffffffffffffffff, .op = op }},
+                }},
+            }, host);
+            defer std.testing.allocator.free(program.filters);
+            for ([_]u64{ 0, 0xfffffffe, 0xffffffff, 0xffffffffffffffff }) |value| {
+                const low: u32 = @truncate(value);
+                const matches = switch (op) {
+                    .eq, .masked_eq, .ge => low == 0xffffffff,
+                    .ne, .lt => low != 0xffffffff,
+                    .le => true,
+                    .gt => false,
+                };
+                var data: TestData = .{ .arch = compat.audit() };
+                data.args[0] = value;
+                try std.testing.expectEqual(@as(u32, if (matches) 0x0005002a else 0x7fff0000), try interpret(program.filters, data));
+                data.arch = host.audit();
+                try std.testing.expectEqual(@as(u32, 0x7fff0000), try interpret(program.filters, data));
+            }
+        }
+    }
+}
+
 test "seccomp oversized filters and invalid argument indices fail before installation" {
     var rules: [1100]Rule = undefined;
     for (&rules, 0..) |*rule, number| rule.* = .{ .arch = .x86_64, .number = @intCast(number), .action = .allow };
@@ -357,37 +366,6 @@ test "seccomp oversized filters and invalid argument indices fail before install
         .architectures = &.{ .x86, .x86_64 },
         .rules = rules[0..1022],
     }, .x86_64));
-}
-
-test "seccomp Docker default profile fits the kernel limit and exercises long jumps" {
-    const oci = @import("../oci.zig");
-    const parsed = try std.json.parseFromSlice(oci.Spec.Seccomp, std.testing.allocator, @embedFile("testdata/docker-default.json"), .{});
-    defer parsed.deinit();
-    const config = (try oci.prepareSeccomp(std.testing.allocator, parsed.value)).?;
-    defer oci.freeSeccomp(std.testing.allocator, config);
-    for ([_]Arch{ .x86_64, .aarch64 }) |host| {
-        const program = try compile(std.testing.allocator, config, host);
-        defer std.testing.allocator.free(program.filters);
-        try std.testing.expect(program.filters.len <= 4096);
-        var long_jump = false;
-        for (program.filters) |instruction| {
-            if (instruction.code == 0x05 and instruction.k > 255) long_jump = true;
-        }
-        try std.testing.expect(long_jump);
-        const numbers = if (host == .x86_64) [_]u32{ 0, 257, 59, 436, 332, 135, 250 } else [_]u32{ 63, 56, 221, 436, 291, 92, 219 };
-        // Includes the syscalls needed between the early installation and exec:
-        // read, openat, execve, close_range, statx, personality, keyctl.
-        for (numbers[0..5]) |nr|
-            try std.testing.expectEqual(@as(u32, 0x7fff0000), try interpret(program.filters, .{ .nr = nr, .arch = host.audit() }));
-        try std.testing.expectEqual(@as(u32, 0x00050001), try interpret(program.filters, .{ .nr = numbers[6], .arch = host.audit() }));
-        var personality: TestData = .{ .nr = numbers[5], .arch = host.audit() };
-        try std.testing.expectEqual(@as(u32, 0x7fff0000), try interpret(program.filters, personality));
-        personality.args[0] = 1;
-        try std.testing.expectEqual(@as(u32, 0x00050001), try interpret(program.filters, personality));
-        // The compat block's architecture dispatch uses the long JA.
-        const compat: Arch = if (host == .x86_64) .x86 else .arm;
-        try std.testing.expectEqual(@as(u32, 0x7fff0000), try interpret(program.filters, .{ .nr = 3, .arch = compat.audit() }));
-    }
 }
 
 test "seccomp compiler frees partial code and jump fixups on allocation failure" {

@@ -43,9 +43,27 @@ pub fn build(b: *std.Build) void {
     });
     const exe_tests = b.addTest(.{ .root_module = root_module });
     const run_exe_tests = b.addRunArtifact(exe_tests);
-    run_exe_tests.step.dependOn(&b.addInstallArtifact(probe, .{}).step);
-    run_exe_tests.setEnvironmentVariable("IGVANO_SECCOMP_PROBE", b.getInstallPath(.bin, "seccomp-probe"));
+    const probe_path = b.allocator.create(ProbePath) catch @panic("OOM");
+    probe_path.* = .{
+        .step = std.Build.Step.init(.{ .id = .custom, .name = "Set seccomp probe path", .owner = b, .makeFn = ProbePath.make }),
+        .run = run_exe_tests,
+        .path = probe.getEmittedBin(),
+    };
+    probe_path.path.addStepDependencies(&probe_path.step);
+    run_exe_tests.step.dependOn(&probe_path.step);
     const test_step = b.step("test", "Run library and executable tests");
     test_step.dependOn(&b.addRunArtifact(library_tests).step);
     test_step.dependOn(&run_exe_tests.step);
 }
+
+// The emitted path is only available after compilation, before the test run.
+const ProbePath = struct {
+    step: std.Build.Step,
+    run: *std.Build.Step.Run,
+    path: std.Build.LazyPath,
+
+    fn make(step: *std.Build.Step, _: std.Build.Step.MakeOptions) !void {
+        const self: *ProbePath = @fieldParentPtr("step", step);
+        self.run.setEnvironmentVariable("IGVANO_SECCOMP_PROBE", self.path.getPath2(step.owner, step));
+    }
+};

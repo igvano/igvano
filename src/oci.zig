@@ -533,31 +533,18 @@ pub fn prepareSeccomp(allocator: std.mem.Allocator, configured: ?Spec.Seccomp) !
         return seccompInvalid("seccomp defaultErrnoRet is not supported by {s}", .{config.defaultAction});
     const default_errno = try seccompErrno(config.defaultErrnoRet);
     var flags: u32 = 0;
-    for (config.flags orelse &.{}) |flag| {
-        if (std.mem.eql(u8, flag, "SECCOMP_FILTER_FLAG_LOG")) {
-            flags |= 2;
-        } else if (std.mem.eql(u8, flag, "SECCOMP_FILTER_FLAG_SPEC_ALLOW")) {
-            flags |= 4;
-        } else if (std.mem.eql(u8, flag, "SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV")) {
-            // Meaningless without notify, which igvano rejects.
-            continue;
-        } else if (std.mem.eql(u8, flag, "SECCOMP_FILTER_FLAG_TSYNC")) {
-            // Like runc, init/exec are single-threaded at installation.
-            continue;
-        } else return seccompInvalid("unsupported seccomp flag: {s}", .{flag});
-    }
+    for (config.flags orelse &.{}) |flag|
+        flags |= seccomp_flags.get(flag) orelse
+            return seccompInvalid("unsupported seccomp flag: {s}", .{flag});
     var arches: std.ArrayList(seccomp.Arch) = .empty;
     defer arches.deinit(allocator);
     // Like seccomp_init, retain the native ABI when additional ABIs are named.
     try arches.append(allocator, seccomp.Arch.native() orelse
         return seccompInvalid("seccomp is unsupported on this architecture", .{}));
     for (config.architectures orelse &.{}) |name| {
-        if (std.mem.eql(u8, name, "SCMP_ARCH_NATIVE")) continue;
-        // Recognize the ABI listed by containerd/Docker profiles. Until it is
-        // implemented, the compiler sends x32 syscall numbers to bad-arch KILL.
-        if (std.mem.eql(u8, name, "SCMP_ARCH_X32")) continue;
-        const arch = seccomp_arches.get(name) orelse
-            return seccompInvalid("unknown seccomp architecture: {s}", .{name});
+        // Known but unimplemented ABIs are ignored; x32 still gets bad-arch KILL.
+        const arch = (seccomp_arches.get(name) orelse
+            return seccompInvalid("unknown seccomp architecture: {s}", .{name})) orelse continue;
         if (std.mem.indexOfScalar(seccomp.Arch, arches.items, arch) == null)
             try arches.append(allocator, arch);
     }
@@ -572,8 +559,12 @@ pub fn prepareSeccomp(allocator: std.mem.Allocator, configured: ?Spec.Seccomp) !
             return seccompInvalid("seccomp errnoRet is not supported by {s}", .{syscall.action});
         const errno_ret = try seccompErrno(syscall.errnoRet);
         args.clearRetainingCapacity();
+        var indices: [6]bool = @splat(false);
+        var repeated_index = false;
         for (syscall.args orelse &.{}) |arg| {
             if (arg.index >= 6) return seccompInvalid("seccomp argument index must be less than 6", .{});
+            repeated_index = repeated_index or indices[arg.index];
+            indices[arg.index] = true;
             try args.append(allocator, .{
                 .index = arg.index,
                 .value = arg.value,
@@ -584,9 +575,13 @@ pub fn prepareSeccomp(allocator: std.mem.Allocator, configured: ?Spec.Seccomp) !
         }
         for (arches.items) |arch| for (syscall.names) |name| {
             const number = seccompSyscall(arch, name) orelse continue;
-            const owned_args = try allocator.dupe(seccomp.Arg, args.items);
-            errdefer allocator.free(owned_args);
-            try rules.append(allocator, .{ .arch = arch, .number = number, .action = action, .errno_ret = errno_ret, .args = owned_args });
+            // runc/libseccomp split every condition into an OR rule if any index repeats.
+            for (0..if (repeated_index) args.items.len else 1) |i| {
+                const conditions = if (repeated_index) args.items[i..][0..1] else args.items;
+                const owned_args = try allocator.dupe(seccomp.Arg, conditions);
+                errdefer allocator.free(owned_args);
+                try rules.append(allocator, .{ .arch = arch, .number = number, .action = action, .errno_ret = errno_ret, .args = owned_args });
+            }
         };
     }
     const owned_arches = try arches.toOwnedSlice(allocator);
@@ -631,14 +626,44 @@ const seccomp_actions = std.StaticStringMap(Backend.seccomp.Action).initComptime
     .{ "SCMP_ACT_ERRNO", .errno },               .{ "SCMP_ACT_TRACE", .trace },
     .{ "SCMP_ACT_LOG", .log },                   .{ "SCMP_ACT_ALLOW", .allow },
 });
-const seccomp_arches = std.StaticStringMap(Backend.seccomp.Arch).initComptime(.{
-    .{ "SCMP_ARCH_X86_64", .x86_64 },   .{ "SCMP_ARCH_X86", .x86 },
-    .{ "SCMP_ARCH_AARCH64", .aarch64 }, .{ "SCMP_ARCH_ARM", .arm },
+const seccomp_arches = std.StaticStringMap(?Backend.seccomp.Arch).initComptime(.{
+    .{ "SCMP_ARCH_NATIVE", Backend.seccomp.Arch.native() },
+    .{ "SCMP_ARCH_X86_64", .x86_64 },
+    .{ "SCMP_ARCH_X86", .x86 },
+    .{ "SCMP_ARCH_AARCH64", .aarch64 },
+    .{ "SCMP_ARCH_ARM", .arm },
+    .{ "SCMP_ARCH_X32", null },
+    .{ "SCMP_ARCH_MIPS", null },
+    .{ "SCMP_ARCH_MIPS64", null },
+    .{ "SCMP_ARCH_MIPS64N32", null },
+    .{ "SCMP_ARCH_MIPSEL", null },
+    .{ "SCMP_ARCH_MIPSEL64", null },
+    .{ "SCMP_ARCH_MIPSEL64N32", null },
+    .{ "SCMP_ARCH_PPC", null },
+    .{ "SCMP_ARCH_PPC64", null },
+    .{ "SCMP_ARCH_PPC64LE", null },
+    .{ "SCMP_ARCH_S390", null },
+    .{ "SCMP_ARCH_S390X", null },
+    .{ "SCMP_ARCH_PARISC", null },
+    .{ "SCMP_ARCH_PARISC64", null },
+    .{ "SCMP_ARCH_RISCV64", null },
+    .{ "SCMP_ARCH_LOONGARCH64", null },
+    .{ "SCMP_ARCH_M68K", null },
+    .{ "SCMP_ARCH_SH", null },
+    .{ "SCMP_ARCH_SHEB", null },
 });
 const seccomp_ops = std.StaticStringMap(Backend.seccomp.Op).initComptime(.{
     .{ "SCMP_CMP_EQ", .eq },               .{ "SCMP_CMP_NE", .ne }, .{ "SCMP_CMP_LT", .lt },
     .{ "SCMP_CMP_LE", .le },               .{ "SCMP_CMP_GT", .gt }, .{ "SCMP_CMP_GE", .ge },
     .{ "SCMP_CMP_MASKED_EQ", .masked_eq },
+});
+const seccomp_flags = std.StaticStringMap(u32).initComptime(.{
+    .{ "SECCOMP_FILTER_FLAG_LOG", 2 },
+    .{ "SECCOMP_FILTER_FLAG_SPEC_ALLOW", 4 },
+    // Meaningless without notify, which igvano rejects.
+    .{ "SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV", 0 },
+    // Like runc, init/exec are single-threaded at installation.
+    .{ "SECCOMP_FILTER_FLAG_TSYNC", 0 },
 });
 
 fn syscallMap(comptime Syscalls: type, comptime aliases: []const struct { []const u8, []const u8 }) std.StaticStringMap(u32) {
@@ -804,6 +829,108 @@ test "seccomp rejects unsupported or unknown schema values even for unknown sysc
     })).?.architectures.len == 1);
 }
 
+test "seccomp repeated argument indices deny personality alternatives" {
+    const seccomp = Backend.seccomp;
+    const testing = @import("test/seccomp.zig");
+    // A repeated index makes every condition an alternative, including index 1.
+    // Distinct indices in the second syscall still form a conjunction.
+    const config = (try prepareSeccomp(std.testing.allocator, .{
+        .defaultAction = "SCMP_ACT_ALLOW",
+        .architectures = &.{ "SCMP_ARCH_X86_64", "SCMP_ARCH_X86", "SCMP_ARCH_AARCH64", "SCMP_ARCH_ARM" },
+        .syscalls = &.{
+            .{ .names = &.{"personality"}, .action = "SCMP_ACT_ERRNO", .errnoRet = 42, .args = &.{
+                .{ .index = 0, .value = 8, .op = "SCMP_CMP_EQ" },
+                .{ .index = 0, .value = 0x40000, .op = "SCMP_CMP_EQ" },
+                .{ .index = 1, .value = 99, .op = "SCMP_CMP_EQ" },
+            } },
+            .{ .names = &.{"mkdirat"}, .action = "SCMP_ACT_ERRNO", .errnoRet = 13, .args = &.{
+                .{ .index = 0, .value = 8, .op = "SCMP_CMP_EQ" },
+                .{ .index = 1, .value = 99, .op = "SCMP_CMP_EQ" },
+            } },
+        },
+    })).?;
+    defer freeSeccomp(std.testing.allocator, config);
+    for ([_]seccomp.Arch{ .x86_64, .aarch64 }) |host| {
+        const program = try seccomp.compile(std.testing.allocator, config, host);
+        defer std.testing.allocator.free(program.filters);
+        for ([_]seccomp.Arch{ host, if (host == .x86_64) .x86 else .arm }) |arch| {
+            var data: testing.Data = .{ .arch = arch.audit(), .nr = seccompSyscall(arch, "personality").? };
+            for ([_]u64{ 8, 0x40000 }) |value| {
+                data.args[0] = value;
+                try std.testing.expectEqual(@as(u32, 0x0005002a), try testing.interpret(program.filters, data));
+            }
+            data.args[0] = 0;
+            try std.testing.expectEqual(@as(u32, 0x7fff0000), try testing.interpret(program.filters, data));
+            data.args[1] = 99;
+            try std.testing.expectEqual(@as(u32, 0x0005002a), try testing.interpret(program.filters, data));
+            data.nr = seccompSyscall(arch, "mkdirat").?;
+            try std.testing.expectEqual(@as(u32, 0x7fff0000), try testing.interpret(program.filters, data));
+            data.args[0] = 8;
+            try std.testing.expectEqual(@as(u32, 0x0005000d), try testing.interpret(program.filters, data));
+            data.args[1] = 0;
+            try std.testing.expectEqual(@as(u32, 0x7fff0000), try testing.interpret(program.filters, data));
+        }
+    }
+}
+
+test "seccomp accepts all spec architecture names and ignores unimplemented ABIs" {
+    const names = [_][]const u8{
+        "SCMP_ARCH_X86",     "SCMP_ARCH_X86_64",   "SCMP_ARCH_X32",         "SCMP_ARCH_ARM",
+        "SCMP_ARCH_AARCH64", "SCMP_ARCH_MIPS",     "SCMP_ARCH_MIPS64",      "SCMP_ARCH_MIPS64N32",
+        "SCMP_ARCH_MIPSEL",  "SCMP_ARCH_MIPSEL64", "SCMP_ARCH_MIPSEL64N32", "SCMP_ARCH_PPC",
+        "SCMP_ARCH_PPC64",   "SCMP_ARCH_PPC64LE",  "SCMP_ARCH_S390",        "SCMP_ARCH_S390X",
+        "SCMP_ARCH_PARISC",  "SCMP_ARCH_PARISC64", "SCMP_ARCH_RISCV64",     "SCMP_ARCH_LOONGARCH64",
+        "SCMP_ARCH_M68K",    "SCMP_ARCH_SH",       "SCMP_ARCH_SHEB",        "SCMP_ARCH_NATIVE",
+    };
+    for (names) |name| {
+        const config = (try prepareSeccomp(std.testing.allocator, .{
+            .defaultAction = "SCMP_ACT_ALLOW",
+            .architectures = &.{name},
+            .syscalls = &.{.{ .names = &.{"personality"}, .action = "SCMP_ACT_ERRNO" }},
+        })).?;
+        defer freeSeccomp(std.testing.allocator, config);
+        const native = Backend.seccomp.Arch.native().?;
+        const program = try Backend.seccomp.compile(std.testing.allocator, config, native);
+        defer std.testing.allocator.free(program.filters);
+        if (std.mem.eql(u8, name, "SCMP_ARCH_NATIVE") or
+            (!std.mem.eql(u8, name, "SCMP_ARCH_X86") and !std.mem.eql(u8, name, "SCMP_ARCH_X86_64") and
+                !std.mem.eql(u8, name, "SCMP_ARCH_ARM") and !std.mem.eql(u8, name, "SCMP_ARCH_AARCH64")))
+            try std.testing.expectEqualSlices(Backend.seccomp.Arch, &.{native}, config.architectures);
+    }
+}
+
+test "seccomp Docker default profile fits the kernel limit and exercises long jumps" {
+    const seccomp = Backend.seccomp;
+    const testing = @import("test/seccomp.zig");
+    const parsed = try std.json.parseFromSlice(Spec.Seccomp, std.testing.allocator, @embedFile("backend/testdata/docker-default.json"), .{});
+    defer parsed.deinit();
+    const config = (try prepareSeccomp(std.testing.allocator, parsed.value)).?;
+    defer freeSeccomp(std.testing.allocator, config);
+    for ([_]seccomp.Arch{ .x86_64, .aarch64 }) |host| {
+        const program = try seccomp.compile(std.testing.allocator, config, host);
+        defer std.testing.allocator.free(program.filters);
+        try std.testing.expect(program.filters.len <= seccomp.max_insns);
+        var long_jump = false;
+        for (program.filters) |instruction| {
+            if (instruction.code == 0x05 and instruction.k > 255) long_jump = true;
+        }
+        try std.testing.expect(long_jump);
+        const numbers = if (host == .x86_64) [_]u32{ 0, 257, 59, 436, 332, 135, 250 } else [_]u32{ 63, 56, 221, 436, 291, 92, 219 };
+        // Includes the syscalls needed between the early installation and exec:
+        // read, openat, execve, close_range, statx, personality, keyctl.
+        for (numbers[0..5]) |nr|
+            try std.testing.expectEqual(@as(u32, 0x7fff0000), try testing.interpret(program.filters, .{ .nr = nr, .arch = host.audit() }));
+        try std.testing.expectEqual(@as(u32, 0x00050001), try testing.interpret(program.filters, .{ .nr = numbers[6], .arch = host.audit() }));
+        var personality: testing.Data = .{ .nr = numbers[5], .arch = host.audit() };
+        try std.testing.expectEqual(@as(u32, 0x7fff0000), try testing.interpret(program.filters, personality));
+        personality.args[0] = 1;
+        try std.testing.expectEqual(@as(u32, 0x00050001), try testing.interpret(program.filters, personality));
+        // The compat block's architecture dispatch uses the long JA.
+        const compat: seccomp.Arch = if (host == .x86_64) .x86 else .arm;
+        try std.testing.expectEqual(@as(u32, 0x7fff0000), try testing.interpret(program.filters, .{ .nr = 3, .arch = compat.audit() }));
+    }
+}
+
 test "seccomp translation cleans up partial rules on allocation failure" {
     const Check = struct {
         fn run(allocator: std.mem.Allocator) !void {
@@ -813,7 +940,11 @@ test "seccomp translation cleans up partial rules on allocation failure" {
                 .syscalls = &.{.{
                     .names = &.{ "mkdirat", "personality", "unknown" },
                     .action = "SCMP_ACT_ALLOW",
-                    .args = &.{ .{ .index = 0, .value = 0, .op = "SCMP_CMP_EQ" }, .{ .index = 1, .value = 0x100000000, .op = "SCMP_CMP_LT" } },
+                    .args = &.{
+                        .{ .index = 0, .value = 0, .op = "SCMP_CMP_EQ" },
+                        .{ .index = 0, .value = 8, .op = "SCMP_CMP_EQ" },
+                        .{ .index = 1, .value = 0x100000000, .op = "SCMP_CMP_LT" },
+                    },
                 }},
             });
             defer freeSeccomp(allocator, config);
@@ -2116,7 +2247,14 @@ pub fn featuresJson(allocator: std.mem.Allocator) ![]u8 {
             .namespaces = std.meta.fieldNames(@FieldType(Spec.Namespace, "type")),
             .capabilities = &capability_names,
             .cgroup = .{ .v1 = true, .v2 = true, .systemd = false, .systemdUser = false, .rdma = false },
-            .seccomp = .{ .enabled = false },
+            .seccomp = .{
+                .enabled = true,
+                .actions = seccomp_actions.keys(),
+                .operators = seccomp_ops.keys(),
+                .archs = seccomp_arches.keys(),
+                .knownFlags = seccomp_flags.keys(),
+                .supportedFlags = seccomp_flags.keys(),
+            },
             .apparmor = .{ .enabled = false },
             .selinux = .{ .enabled = false },
             .intelRdt = .{ .enabled = false },
@@ -2168,7 +2306,39 @@ test "features JSON reports parser tables and disables unimplemented isolation" 
     try std.testing.expect(cgroup.get("v2").?.bool);
     for ([_][]const u8{ "systemd", "systemdUser", "rdma" }) |name|
         try std.testing.expect(!cgroup.get(name).?.bool);
-    for ([_][]const u8{ "seccomp", "apparmor", "selinux", "intelRdt" }) |name|
+    const seccomp = linux.get("seccomp").?.object;
+    try std.testing.expect(seccomp.get("enabled").?.bool);
+    const lists = [_]struct { name: []const u8, count: usize }{
+        .{ .name = "actions", .count = 8 },
+        .{ .name = "operators", .count = 7 },
+        .{ .name = "archs", .count = 24 },
+        .{ .name = "knownFlags", .count = 4 },
+        .{ .name = "supportedFlags", .count = 4 },
+    };
+    for (lists) |list| {
+        const reported = seccomp.get(list.name).?.array.items;
+        try std.testing.expectEqual(list.count, reported.len);
+        for (reported) |item| {
+            var profile: Spec.Seccomp = .{ .defaultAction = "SCMP_ACT_ALLOW" };
+            if (std.mem.eql(u8, list.name, "actions")) {
+                try std.testing.expect(!std.mem.eql(u8, item.string, "SCMP_ACT_NOTIFY"));
+                profile.defaultAction = item.string;
+            } else if (std.mem.eql(u8, list.name, "operators")) {
+                profile.syscalls = &.{.{ .names = &.{"personality"}, .action = "SCMP_ACT_ERRNO", .args = &.{.{
+                    .index = 0,
+                    .value = 1,
+                    .op = item.string,
+                }} }};
+            } else if (std.mem.eql(u8, list.name, "archs")) {
+                profile.architectures = &.{item.string};
+            } else {
+                profile.flags = &.{item.string};
+            }
+            const prepared = try prepareSeccomp(allocator, profile);
+            defer freeSeccomp(allocator, prepared);
+        }
+    }
+    for ([_][]const u8{ "apparmor", "selinux", "intelRdt" }) |name|
         try std.testing.expect(!linux.get(name).?.object.get("enabled").?.bool);
     try std.testing.expect(!linux.get("mountExtensions").?.object.get("idmap").?.object.get("enabled").?.bool);
 }

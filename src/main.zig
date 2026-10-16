@@ -982,7 +982,12 @@ fn execContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, con
     };
     try oci.validateProcess(process);
     var options = try prepareProcess(process_allocator, process, config.console_socket);
-    options.seccomp = try oci.prepareSeccomp(process_allocator, if (saved_spec) |spec| if (spec.value.linux) |settings| settings.seccomp else null else null);
+    const seccomp = seccomp: {
+        const spec = saved_spec orelse break :seccomp null;
+        const settings = spec.value.linux orelse break :seccomp null;
+        break :seccomp settings.seccomp;
+    };
+    options.seccomp = try oci.prepareSeccomp(process_allocator, seccomp);
     options.cgroup_path = state.handle.?.cgroup_path orelse return error.InvalidState;
     options.console_fds = if (config.console_socket != null) try backend_module.console.socketpair() else null;
     defer if (options.console_fds) |fds| for (fds) |fd| {
@@ -1706,7 +1711,7 @@ fn testSeccompLifecycle(base: []const u8) !void {
     defer arena.deinit();
     const allocator = arena.allocator();
     const cwd = std.Io.Dir.cwd();
-    const probe_path = std.testing.environ.getPosix("IGVANO_SECCOMP_PROBE") orelse "zig-out/bin/seccomp-probe";
+    const probe_path = std.testing.environ.getPosix("IGVANO_SECCOMP_PROBE") orelse return error.MissingSeccompProbe;
     const probe = try cwd.realPathFileAlloc(io, probe_path, allocator);
     try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.prctl(@intFromEnum(linux.PR.SET_CHILD_SUBREAPER), 1, 0, 0, 0)));
     const docker = try std.json.parseFromSlice(oci.Spec.Seccomp, allocator, @embedFile("backend/testdata/docker-default.json"), .{});
