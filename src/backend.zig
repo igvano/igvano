@@ -237,6 +237,7 @@ pub const Backend = struct {
         kill: *const fn (ptr: *anyopaque, handle: Handle, signal: i32) Error!void,
         /// Signal every cgroup member, even after init exits.
         killAll: *const fn (ptr: *anyopaque, handle: Handle, signal: i32) Error!void,
+        update: *const fn (ptr: *anyopaque, handle: Handle, resources: Resources) Error!void = noUpdate,
         /// The caller owns the returned host PIDs, including descendant cgroups.
         pids: *const fn (ptr: *anyopaque, handle: Handle, allocator: std.mem.Allocator) Error![]i32 = noPids,
         freeze: *const fn (ptr: *anyopaque, handle: Handle) Error!void = noFreeze,
@@ -256,6 +257,10 @@ pub const Backend = struct {
         }
 
         fn noPids(_: *anyopaque, _: Handle, _: std.mem.Allocator) Error![]i32 {
+            return error.NotImplemented;
+        }
+
+        fn noUpdate(_: *anyopaque, _: Handle, _: Resources) Error!void {
             return error.NotImplemented;
         }
 
@@ -289,6 +294,10 @@ pub const Backend = struct {
 
     pub fn killAll(self: Backend, handle: Handle, signal: i32) Error!void {
         return self.vtable.killAll(self.ptr, handle, signal);
+    }
+
+    pub fn update(self: Backend, handle: Handle, resources: Resources) Error!void {
+        return self.vtable.update(self.ptr, handle, resources);
     }
 
     pub fn pids(self: Backend, handle: Handle, allocator: std.mem.Allocator) Error![]i32 {

@@ -97,7 +97,8 @@ fn v1Limit(allocator: std.mem.Allocator, limit: i64) Backend.Error![]u8 {
 
 /// Pure legacy mapping, including the devices that rootfs setup will create.
 /// Memory/memsw order is finalized by the writer after reading the current limit.
-fn v1Writes(allocator: std.mem.Allocator, resources: Resources, devices: []const Backend.Device) Backend.Error![]V1Write {
+// Null devices selects update: replace an explicit ruleset, leave an omitted one alone.
+fn v1Writes(allocator: std.mem.Allocator, resources: Resources, devices: ?[]const Backend.Device) Backend.Error![]V1Write {
     if (resources.unified.len != 0) return error.InvalidConfig;
     var writes: std.ArrayList(V1Write) = .empty;
     defer writes.deinit(allocator);
@@ -200,6 +201,8 @@ fn v1Writes(allocator: std.mem.Allocator, resources: Resources, devices: []const
             try appendV1Write(allocator, &writes, "net_prio", "net_prio.ifpriomap", try std.fmt.allocPrint(allocator, "{s} {d}", .{ priority.name, priority.priority }), null, false);
         }
     }
+    if (devices == null and resources.devices.len != 0)
+        try appendV1Write(allocator, &writes, "devices", "devices.deny", try allocator.dupe(u8, "a *:* rwm"), null, false);
     for (resources.devices) |rule| {
         if (rule.access.len == 0) return error.InvalidConfig;
         for (rule.access) |access| {
@@ -216,9 +219,11 @@ fn v1Writes(allocator: std.mem.Allocator, resources: Resources, devices: []const
         };
         try appendV1Write(allocator, &writes, "devices", if (rule.allow) "devices.allow" else "devices.deny", try std.fmt.allocPrint(allocator, "{c} {s}:{s} {s}", .{ kind, major, minor, rule.access }), null, false);
     }
-    for ([_][]const u8{ "c 1:3 rwm", "c 1:5 rwm", "c 1:7 rwm", "c 1:8 rwm", "c 1:9 rwm", "c 5:0 rwm", "c 5:2 rwm", "c 136:* rwm" }) |value|
-        try appendV1Write(allocator, &writes, "devices", "devices.allow", try allocator.dupe(u8, value), null, false);
-    for (devices) |device| {
+    if (devices != null or resources.devices.len != 0) {
+        for ([_][]const u8{ "c 1:3 rwm", "c 1:5 rwm", "c 1:7 rwm", "c 1:8 rwm", "c 1:9 rwm", "c 5:0 rwm", "c 5:2 rwm", "c 136:* rwm" }) |value|
+            try appendV1Write(allocator, &writes, "devices", "devices.allow", try allocator.dupe(u8, value), null, false);
+    }
+    for (devices orelse &.{}) |device| {
         if (device.kind == .fifo) continue;
         try appendV1Write(allocator, &writes, "devices", "devices.allow", try std.fmt.allocPrint(allocator, "{c} {d}:{d} rwm", .{ @as(u8, if (device.kind == .character) 'c' else 'b'), device.major, device.minor }), null, false);
     }
@@ -468,6 +473,41 @@ test "v1 mapping rejects unified and malformed resources and preserves wildcard 
     const unset = try v1Writes(std.testing.allocator, .{ .memory = .{ .limit = 0, .swap = 0, .disable_oom_killer = false }, .cpu = .{ .shares = 0, .period = 0, .quota = 0 }, .pids = .{ .limit = 0 } }, &.{});
     defer freeV1Writes(std.testing.allocator, unset);
     try std.testing.expectEqual(@as(usize, 8), unset.len);
+}
+
+test "linux update requires a persisted cgroup path" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var implementation: LinuxBackend = .{};
+    const backend = implementation.backend();
+    try std.testing.expectError(error.Unsupported, backend.update(.{
+        .id = "example",
+        .pid = 1,
+        .starttime = "1",
+    }, .{ .memory = .{ .limit = 67108864 } }));
+    try std.testing.expect(std.mem.indexOf(u8, backend.diagnostic().?, "no cgroup") != null);
+}
+
+test "resource updates write only requested limits and replace explicit v1 device rules" {
+    const resources: Resources = .{ .cpu = .{ .shares = 512 } };
+    const v1 = try v1Writes(std.testing.allocator, resources, null);
+    defer freeV1Writes(std.testing.allocator, v1);
+    try std.testing.expectEqual(@as(usize, 1), v1.len);
+    try std.testing.expectEqualStrings("cpu.shares", v1[0].name);
+    try std.testing.expectEqualStrings("512", v1[0].value);
+    const v2 = try v2Writes(std.testing.allocator, resources);
+    defer freeWrites(std.testing.allocator, v2);
+    try std.testing.expectEqual(@as(usize, 1), v2.len);
+    try std.testing.expectEqualStrings("cpu.weight", v2[0].name);
+    try std.testing.expectEqualStrings("20", v2[0].value);
+    const devices = try v1Writes(std.testing.allocator, .{
+        .devices = &.{.{ .allow = true, .kind = .block, .major = 8, .minor = 0, .access = "rw" }},
+    }, null);
+    defer freeV1Writes(std.testing.allocator, devices);
+    try std.testing.expectEqualStrings("devices.deny", devices[0].name);
+    try std.testing.expectEqualStrings("a *:* rwm", devices[0].value);
+    try std.testing.expectEqualStrings("devices.allow", devices[1].name);
+    try std.testing.expectEqualStrings("b 8:0 rw", devices[1].value);
+    try std.testing.expectEqualStrings("c 1:3 rwm", devices[2].value);
 }
 
 test "v1 mapping and hierarchy discovery release partial allocations" {
@@ -1286,6 +1326,7 @@ pub const LinuxBackend = struct {
         .alive = alive,
         .kill = kill,
         .killAll = killAll,
+        .update = update,
         .pids = pids,
         .freeze = freeze,
         .thaw = thaw,
@@ -2068,6 +2109,84 @@ pub const LinuxBackend = struct {
             try killV2Members(cgroup, signal, path);
         } else {
             return error.NotImplemented;
+        }
+    }
+
+    fn update(_: *anyopaque, handle: Backend.Handle, resources: Resources) Backend.Error!void {
+        last_diagnostic_len = 0;
+        if (comptime builtin.os.tag != .linux) return error.NotImplemented;
+        const path = handle.cgroup_path orelse {
+            reportDiagnostic("container '{s}' has no cgroup to update", .{handle.id});
+            return error.Unsupported;
+        };
+        try validateCgroupPath(path);
+        const allocator = std.heap.page_allocator;
+        const root = try openCgroupRoot();
+        defer closeFd(root.fd);
+        if (root.mode == .legacy) {
+            if (resources.unified.len != 0) {
+                reportDiagnostic("unified resources require cgroup v2", .{});
+                return error.InvalidConfig;
+            }
+            const writes = try v1Writes(allocator, resources, null);
+            defer freeV1Writes(allocator, writes);
+            const hierarchies = try openV1Hierarchies(allocator);
+            defer freeV1Hierarchies(allocator, hierarchies);
+            for (hierarchies) |*hierarchy|
+                hierarchy.leaf = (try walkV1Cgroup(allocator, hierarchy.root.?, path, false, false)) orelse return error.ProcessNotFound;
+            try applyV1Writes(allocator, hierarchies, writes, resources, &.{}, path);
+        } else {
+            var requested = resources;
+            var inferred_memory_limit = false;
+            if (requested.memory) |memory| {
+                if (memory.limit == null and (memory.swap orelse 0) > 0) {
+                    const existing = (try walkCgroup(root.fd, path, false, &.{.{ .name = "memory.max", .value = "" }})) orelse return error.ProcessNotFound;
+                    defer closeFd(existing);
+                    const current = try readCgroupFile(allocator, existing, "memory.max");
+                    defer allocator.free(current);
+                    const value = std.mem.trim(u8, current, " \t\n");
+                    requested.memory.?.limit = if (std.mem.eql(u8, value, "max"))
+                        -1
+                    else
+                        std.fmt.parseInt(i64, value, 10) catch return error.CgroupWriteFailed;
+                    inferred_memory_limit = true;
+                }
+            }
+            var writes = try v2Writes(allocator, requested);
+            defer freeWrites(allocator, writes);
+            const ignored_fields = try v2IgnoredFields(allocator, resources);
+            defer allocator.free(ignored_fields);
+            if (ignored_fields.len != 0)
+                std.debug.print("igvano: warning: cgroup v2 has no equivalent for: {s}; ignoring\n", .{ignored_fields});
+            const cgroup = (try walkCgroup(root.fd, path, false, writes)) orelse return error.ProcessNotFound;
+            defer closeFd(cgroup);
+            if (requested.cpu) |cpu| {
+                if ((cpu.quota != null or cpu.period != null) and (cpu.quota == null or cpu.period == null)) {
+                    // cpu.max combines two fields; preserve the omitted half.
+                    const current = try readCgroupFile(allocator, cgroup, "cpu.max");
+                    defer allocator.free(current);
+                    var fields = std.mem.tokenizeAny(u8, current, " \t\n");
+                    const quota = fields.next() orelse return error.CgroupWriteFailed;
+                    const period = fields.next() orelse return error.CgroupWriteFailed;
+                    if (cpu.quota == null) requested.cpu.?.quota = if (std.mem.eql(u8, quota, "max"))
+                        -1
+                    else
+                        std.fmt.parseInt(i64, quota, 10) catch return error.CgroupWriteFailed;
+                    if (cpu.period == null)
+                        requested.cpu.?.period = std.fmt.parseInt(u64, period, 10) catch return error.CgroupWriteFailed;
+                    const completed = try v2Writes(allocator, requested);
+                    freeWrites(allocator, writes);
+                    writes = completed;
+                }
+            }
+            for (writes) |write| {
+                // The current limit was needed only to convert total swap.
+                if (inferred_memory_limit and std.mem.eql(u8, write.name, "memory.max")) {
+                    inferred_memory_limit = false;
+                    continue;
+                }
+                try writeCgroupFile(cgroup, write.name, write.value, path);
+            }
         }
     }
 
@@ -3425,6 +3544,130 @@ test "linux cgroup creation reuses parents but rejects existing leaves" {
     try std.testing.expectEqual(@as(?posix.fd_t, null), try walkCgroup(root, "parent/owned", false, &.{}));
 }
 
+test "linux cgroup creation enables requested controllers and ordinary lookups leave them alone" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "parent", .default_dir);
+    for ([_][]const u8{ "cgroup.subtree_control", "parent/cgroup.subtree_control" }) |path|
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = path, .data = "" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "parent/cgroup.type", .data = "domain\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "parent/cgroup.procs", .data = "" });
+    const root = try openPath(tmp.dir.handle, ".", .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true });
+    defer closeFd(root);
+    const owned = (try walkCgroup(root, "parent/owned", true, &.{.{ .name = "pids.max", .value = "5" }})).?;
+    closeFd(owned);
+    for ([_][]const u8{ "cgroup.subtree_control", "parent/cgroup.subtree_control" }) |path| {
+        const enabled = try tmp.dir.readFileAlloc(std.testing.io, path, std.testing.allocator, .limited(256));
+        defer std.testing.allocator.free(enabled);
+        try std.testing.expectEqualStrings("+pids ", enabled);
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = path, .data = "sentinel" });
+    }
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, "parent/owned/cgroup.subtree_control", .{}));
+    // Lookup must not even need the controller files.
+    try tmp.dir.deleteFile(std.testing.io, "parent/cgroup.procs");
+    const existing = (try walkCgroup(root, "parent/owned", false, &.{})).?;
+    closeFd(existing);
+    for ([_][]const u8{ "cgroup.subtree_control", "parent/cgroup.subtree_control" }) |path| {
+        const unchanged = try tmp.dir.readFileAlloc(std.testing.io, path, std.testing.allocator, .limited(256));
+        defer std.testing.allocator.free(unchanged);
+        try std.testing.expectEqualStrings("sentinel", unchanged);
+    }
+    try tmp.dir.deleteFile(std.testing.io, "cgroup.subtree_control");
+    try tmp.dir.deleteFile(std.testing.io, "parent/cgroup.subtree_control");
+    const without_controls = (try walkCgroup(root, "parent/owned", false, &.{})).?;
+    closeFd(without_controls);
+    try std.testing.expectEqual(@as(?posix.fd_t, null), try walkCgroup(root, "missing", false, &.{}));
+}
+
+test "linux cgroup activation never follows subtree control symlinks" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    defer last_diagnostic_len = 0;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "outside", .data = "sentinel" });
+    try tmp.dir.symLink(std.testing.io, "outside", "cgroup.subtree_control", .{});
+    const root = try openPath(tmp.dir.handle, ".", .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true });
+    defer closeFd(root);
+    try std.testing.expectError(error.CgroupWriteFailed, walkCgroup(root, "owned", true, &.{.{ .name = "pids.max", .value = "5" }}));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, "owned", .{}));
+    const unchanged = try tmp.dir.readFileAlloc(std.testing.io, "outside", std.testing.allocator, .limited(256));
+    defer std.testing.allocator.free(unchanged);
+    try std.testing.expectEqualStrings("sentinel", unchanged);
+}
+
+test "linux cgroup activation refuses populated non-root parents even for threaded controllers" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    defer last_diagnostic_len = 0;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "parent", .default_dir);
+    for ([_][]const u8{ "cgroup.subtree_control", "parent/cgroup.subtree_control" }) |path|
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = path, .data = "" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "parent/cgroup.type", .data = "domain\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "parent/cgroup.procs", .data = "1\n" });
+    const root = try openPath(tmp.dir.handle, ".", .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true });
+    defer closeFd(root);
+    for ([_]Write{ .{ .name = "pids.max", .value = "5" }, .{ .name = "cpu.weight", .value = "20" } }) |write| {
+        for ([_]bool{ true, false }) |create| {
+            try std.testing.expectError(error.CgroupWriteFailed, walkCgroup(root, "parent/x", create, &.{write}));
+            try std.testing.expect(std.mem.indexOf(u8, last_diagnostic[0..last_diagnostic_len], "has processes") != null);
+            const unchanged = try tmp.dir.readFileAlloc(std.testing.io, "parent/cgroup.subtree_control", std.testing.allocator, .limited(64));
+            defer std.testing.allocator.free(unchanged);
+            try std.testing.expectEqualStrings("", unchanged);
+            const kind = try tmp.dir.readFileAlloc(std.testing.io, "parent/cgroup.type", std.testing.allocator, .limited(64));
+            defer std.testing.allocator.free(kind);
+            try std.testing.expectEqualStrings("domain\n", kind);
+            try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, "parent/x", .{}));
+        }
+    }
+    // The real hierarchy root has no cgroup.type and is exempt even when populated.
+    try tmp.dir.deleteFile(std.testing.io, "parent/cgroup.type");
+    const owned = (try walkCgroup(root, "parent/x", true, &.{.{ .name = "pids.max", .value = "5" }})).?;
+    closeFd(owned);
+    const enabled = try tmp.dir.readFileAlloc(std.testing.io, "parent/cgroup.subtree_control", std.testing.allocator, .limited(64));
+    defer std.testing.allocator.free(enabled);
+    try std.testing.expectEqualStrings("+pids ", enabled);
+    const procs = try tmp.dir.readFileAlloc(std.testing.io, "parent/cgroup.procs", std.testing.allocator, .limited(64));
+    defer std.testing.allocator.free(procs);
+    try std.testing.expectEqualStrings("1\n", procs);
+}
+
+test "linux cgroup update walk enables only ancestors without creating missing directories" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "parent/owned");
+    for ([_][]const u8{ "cgroup.subtree_control", "parent/cgroup.subtree_control" }) |path|
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = path, .data = "" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "parent/cgroup.type", .data = "domain\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "parent/cgroup.procs", .data = "" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "parent/owned/cgroup.type", .data = "domain\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "parent/owned/cgroup.procs", .data = "1\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "parent/owned/cgroup.subtree_control", .data = "sentinel" });
+    const root = try openPath(tmp.dir.handle, ".", .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true });
+    defer closeFd(root);
+    const writes: []const Write = &.{.{ .name = "memory.max", .value = "64" }};
+    const owned = (try walkCgroup(root, "parent/owned", false, writes)).?;
+    closeFd(owned);
+    for ([_][]const u8{ "cgroup.subtree_control", "parent/cgroup.subtree_control" }) |path| {
+        const enabled = try tmp.dir.readFileAlloc(std.testing.io, path, std.testing.allocator, .limited(64));
+        defer std.testing.allocator.free(enabled);
+        try std.testing.expectEqualStrings("+memory ", enabled);
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = path, .data = "" });
+    }
+    const leaf = try tmp.dir.readFileAlloc(std.testing.io, "parent/owned/cgroup.subtree_control", std.testing.allocator, .limited(64));
+    defer std.testing.allocator.free(leaf);
+    try std.testing.expectEqualStrings("sentinel", leaf);
+    try std.testing.expectEqual(@as(?posix.fd_t, null), try walkCgroup(root, "parent/missing/child", false, writes));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, "parent/missing", .{}));
+    for ([_][]const u8{ "cgroup.subtree_control", "parent/cgroup.subtree_control" }) |path| {
+        const enabled = try tmp.dir.readFileAlloc(std.testing.io, path, std.testing.allocator, .limited(64));
+        defer std.testing.allocator.free(enabled);
+        try std.testing.expectEqualStrings("+memory ", enabled);
+    }
+}
+
 test "linux cgroup removal deletes nested children and preserves sibling cgroups" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
@@ -3489,7 +3732,7 @@ test "linux child cgroup cleanup leaves control files and symlinks untouched" {
 }
 
 /// Walk through pinned directory fds so symlinks cannot redirect cgroup writes.
-/// Enable requested controllers in every parent before creating its child.
+/// Enable requested controllers in every ancestor before descending to the leaf.
 /// Creation requires a new leaf. Nested paths can still change controllers in
 /// existing parents, including other containers' cgroups. Like runc, config is trusted.
 fn walkCgroup(root: posix.fd_t, path: []const u8, create: bool, writes: []const Write) Backend.Error!?posix.fd_t {
@@ -3502,9 +3745,8 @@ fn walkCgroup(root: posix.fd_t, path: []const u8, create: bool, writes: []const 
     while (components.next()) |component| {
         var buffer: [256]u8 = undefined;
         const name = std.fmt.bufPrintZ(&buffer, "{s}", .{component}) catch return error.InvalidPath;
+        if (controllers.len != 0) try enableCgroupControllers(current, controllers, path);
         if (create) {
-            if (controllers.len != 0)
-                try writeCgroupFile(current, "cgroup.subtree_control", controllers, path);
             const result = linux.mkdirat(current, name, 0o755);
             switch (linux.errno(result)) {
                 .SUCCESS => {},
@@ -3532,6 +3774,21 @@ fn walkCgroup(root: posix.fd_t, path: []const u8, create: bool, writes: []const 
         }
     }
     return current;
+}
+
+// A populated non-root cgroup cannot hold domain controllers, and threaded
+// ones alone would make it a thread root whose new children are invalid.
+fn enableCgroupControllers(dir: posix.fd_t, controllers: []const u8, path: []const u8) Backend.Error!void {
+    // cgroup.type exists everywhere except the real root, which is exempt.
+    if (linux.errno(linux.faccessat(dir, "cgroup.type", linux.F_OK, 0)) == .SUCCESS) {
+        const procs = try readCgroupFile(std.heap.page_allocator, dir, "cgroup.procs");
+        defer std.heap.page_allocator.free(procs);
+        if (std.mem.trim(u8, procs, " \t\n").len != 0) {
+            reportDiagnostic("cannot enable cgroup controllers for '{s}': a parent cgroup has processes; move them into a child cgroup first", .{path});
+            return error.CgroupWriteFailed;
+        }
+    }
+    try writeCgroupFile(dir, "cgroup.subtree_control", controllers, path);
 }
 
 fn writeCgroupFile(dir: posix.fd_t, filename: []const u8, value: []const u8, path: []const u8) Backend.Error!void {

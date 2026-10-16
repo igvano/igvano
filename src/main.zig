@@ -28,6 +28,7 @@ const Subcommand = enum {
     start,
     exec,
     kill,
+    update,
     ps,
     pause,
     @"resume",
@@ -57,6 +58,7 @@ const Config = struct {
     ps_format: PsFormat = .table,
     ps_args: []const []const u8 = &.{},
     process_file: ?[]const u8 = null,
+    resources_file: ?[]const u8 = null,
     detach: bool = false,
     tty: ?bool = null,
     exec_cwd: ?[]const u8 = null,
@@ -122,6 +124,7 @@ fn parseArgsWithLog(args: []const []const u8, log: *?[]const u8, log_format: *Lo
     var all = false;
     var ps_format: PsFormat = .table;
     var process_file: ?[]const u8 = null;
+    var resources_file: ?[]const u8 = null;
     var detach = false;
     var tty: ?bool = null;
     var exec_cwd: ?[]const u8 = null;
@@ -180,6 +183,16 @@ fn parseArgsWithLog(args: []const []const u8, log: *?[]const u8, log_format: *Lo
             }
         }
         if (bundle == null) bundle = ".";
+    } else if (subcommand == .update) {
+        while (index < args.len and std.mem.startsWith(u8, args[index], "-")) : (index += 1) {
+            const flag = args[index];
+            if (!std.mem.eql(u8, flag, "--resources") and !std.mem.startsWith(u8, flag, "--resources=") and
+                !std.mem.eql(u8, flag, "-r")) return error.UnknownOption;
+            // ponytail: Individual runc flags (--memory, --cpu-shares, ...) are
+            // unsupported; translate them into OCI resource fields when needed.
+            resources_file = try optionValue(args, &index, error.MissingResources);
+        }
+        if (resources_file == null) return error.MissingResources;
     } else if (subcommand == .delete) {
         while (index < args.len and std.mem.startsWith(u8, args[index], "-")) : (index += 1) {
             if (!std.mem.eql(u8, args[index], "--force")) return error.UnknownOption;
@@ -231,6 +244,7 @@ fn parseArgsWithLog(args: []const []const u8, log: *?[]const u8, log_format: *Lo
         .ps_format = ps_format,
         .ps_args = if (subcommand == .ps) args[index + 1 ..] else &.{},
         .process_file = process_file,
+        .resources_file = resources_file,
         .detach = detach,
         .tty = tty,
         .exec_cwd = exec_cwd,
@@ -242,6 +256,7 @@ fn parseArgsWithLog(args: []const []const u8, log: *?[]const u8, log_format: *Lo
 
 fn optionValue(args: []const []const u8, index: *usize, comptime missing: error{
     MissingProcessFile,
+    MissingResources,
     MissingPidFile,
     MissingConsoleSocket,
     MissingCwd,
@@ -253,7 +268,9 @@ fn optionValue(args: []const []const u8, index: *usize, comptime missing: error{
         args[index.*][equals + 1 ..]
     else value: {
         index.* += 1;
-        if (index.* >= args.len or std.mem.startsWith(u8, args[index.*], "-")) return missing;
+        if (index.* >= args.len) return missing;
+        if (std.mem.startsWith(u8, args[index.*], "-") and
+            !(missing == error.MissingResources and std.mem.eql(u8, args[index.*], "-"))) return missing;
         break :value args[index.*];
     };
     if (value.len == 0) return missing;
@@ -1105,6 +1122,25 @@ fn requireDelete(status: oci.Status, force: bool) !void {
     if (!force) try oci.requireDelete(status);
 }
 
+fn updateContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, config: Config) !void {
+    const lock = try openContainerLock(allocator, config, false);
+    defer if (lock) |file| file.close(io);
+    const locked = if (lock) |file| try lockContainer(file, false) else true;
+    if (locked) {
+        if (lock) |file| try requireLinkedLock(io, file);
+    } else {
+        std.debug.print("igvano: warning: container '{s}' is busy; updating resources without the lock\n", .{config.id});
+    }
+    const state = try readLiveState(allocator, io, backend, config, locked);
+    defer state.deinit();
+    try oci.requireUpdate(state.parsed.value.status);
+    const parsed = try oci.loadResources(allocator, io, config.resources_file orelse return error.MissingResources);
+    defer parsed.deinit();
+    const resources = try oci.cgroupResources(allocator, parsed.value);
+    defer oci.freeCgroupResources(allocator, resources);
+    try backendResult(backend, backend.update(state.handle.?, resources));
+}
+
 fn psContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, config: Config, output: std.Io.File) !void {
     const lock = try openContainerLock(allocator, config, false);
     defer if (lock) |file| file.close(io);
@@ -1303,6 +1339,7 @@ pub fn main(init: std.process.Init) !u8 {
             error.MissingPidFile => "missing value for --pid-file",
             error.MissingConsoleSocket => "missing value for --console-socket",
             error.MissingProcessFile => "missing value for --process",
+            error.MissingResources => "update requires --resources <file|->",
             error.MissingCommand => "exec requires a command or --process",
             error.MissingCwd => "missing value for --cwd",
             error.MissingEnv => "missing value for --env",
@@ -1321,6 +1358,7 @@ pub fn main(init: std.process.Init) !u8 {
         std.debug.print(
             "Usage: igvano [--root <dir>] [--log <file>] [--log-format text|json] <state|start|pause|resume> <id>\n" ++
                 "       igvano [global flags] ps [--format table|json] <id> [ps args...]\n" ++
+                "       igvano [global flags] update --resources|-r <file|-> <id>\n" ++
                 "       igvano [--root <dir>] [--log <file>] [--log-format text|json] delete [--force] <id>\n" ++
                 "       igvano [--root <dir>] [--log <file>] [--log-format text|json] kill [--all] <id> [signal]\n" ++
                 "       igvano [--root <dir>] [--log <file>] [--log-format text|json] create [--bundle <path>] [--pid-file <file>] [--console-socket <path>] <id>\n" ++
@@ -1344,6 +1382,7 @@ pub fn main(init: std.process.Init) !u8 {
         .create => createContainer(allocator, init.io, backend, config),
         .start => startContainer(allocator, init.io, backend, config),
         .kill => killContainer(allocator, init.io, backend, config),
+        .update => updateContainer(allocator, init.io, backend, config),
         .ps => psContainer(allocator, init.io, backend, config, std.Io.File.stdout()),
         .pause, .@"resume" => pauseContainer(allocator, init.io, backend, config),
         .delete => deleteContainer(allocator, init.io, backend, config),
@@ -1592,7 +1631,7 @@ test "process validation and typed translation serve create and exec" {
     try std.testing.expectError(error.MissingConsoleSocket, prepareProcess(std.testing.allocator, invalid, null));
 }
 
-test "linux exec ps pause resume and forced delete obey the live container lifecycle" {
+test "linux exec update ps pause resume and forced delete obey the live container lifecycle" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const linux = std.os.linux;
     if (linux.geteuid() != 0 or linux.errno(linux.access("/bin/sh", linux.X_OK)) != .SUCCESS)
@@ -1700,6 +1739,7 @@ fn testExecLifecycle(base: []const u8) !void {
     try std.testing.expectEqual(@as(u8, 23), try execTestCommand(created_command, null));
     config.subcommand = .start;
     try startContainer(allocator, io, backend, config);
+    try testUpdateResources(allocator, io, backend, root, cgroup, base);
     // The saved config, rather than the now-missing bundle config, supplies exec defaults.
     try cwd.deleteFile(io, config_path);
     {
@@ -1799,6 +1839,8 @@ fn testExecLifecycle(base: []const u8) !void {
         defer paused.deinit();
         try std.testing.expectEqual(oci.Status.paused, paused.parsed.value.status);
         try std.testing.expect(try backend.frozen(paused.handle.?));
+        try testUpdateResources(allocator, io, backend, root, cgroup, base);
+        try std.testing.expect(try backend.frozen(paused.handle.?));
         try std.testing.expectError(error.InvalidStatus, pauseContainer(allocator, io, backend, pause));
         try std.testing.expectError(error.InvalidStatus, startContainer(allocator, io, backend, config));
         try std.testing.expectError(error.InvalidStatus, execContainer(allocator, io, backend, command));
@@ -1849,6 +1891,93 @@ fn testExecLifecycle(base: []const u8) !void {
         try std.testing.expectError(error.FileNotFound, cwd.openFile(io, members_path, .{}));
     }
     try std.testing.expectError(error.FileNotFound, execContainer(allocator, io, backend, command));
+}
+
+fn testUpdateResources(allocator: std.mem.Allocator, io: std.Io, backend: Backend, root: []const u8, cgroup: []const u8, base: []const u8) !void {
+    const cwd = std.Io.Dir.cwd();
+    const unified = std.os.linux.errno(std.os.linux.access("/sys/fs/cgroup/cgroup.controllers", std.os.linux.F_OK)) == .SUCCESS;
+    const memory_path = try std.fmt.allocPrint(allocator, "{s}/{s}/{s}", .{
+        @as([]const u8, if (unified) "/sys/fs/cgroup" else "/sys/fs/cgroup/memory"),
+        cgroup,
+        @as([]const u8, if (unified) "memory.max" else "memory.limit_in_bytes"),
+    });
+    const pids_path = try std.fmt.allocPrint(allocator, "{s}/{s}/pids.max", .{
+        @as([]const u8, if (unified) "/sys/fs/cgroup" else "/sys/fs/cgroup/pids"), cgroup,
+    });
+    const resource_file = try std.fs.path.join(allocator, &.{ base, "resources.json" });
+    const update = try parseArgs(&.{ "igvano", "--root", root, "update", "--resources", resource_file, "example" });
+    try cwd.writeFile(io, .{ .sub_path = resource_file, .data = "{\"memory\":{\"limit\":67108864},\"pids\":{\"limit\":50}}" });
+    if (unified and std.os.linux.errno(std.os.linux.access("/sys/fs/cgroup/cgroup.type", std.os.linux.F_OK)) == .SUCCESS) {
+        const procs = try readTestCgroup(allocator, io, "/sys/fs/cgroup/cgroup.procs");
+        if (std.mem.trim(u8, procs, " \t\n").len != 0) {
+            const controllers = try readTestCgroup(allocator, io, "/sys/fs/cgroup/cgroup.subtree_control");
+            const kind = try readTestCgroup(allocator, io, "/sys/fs/cgroup/cgroup.type");
+            try std.testing.expectError(error.CgroupWriteFailed, updateContainer(allocator, io, backend, update));
+            try std.testing.expect(std.mem.indexOf(u8, last_backend_detail orelse return error.TestUnexpectedResult, "has processes") != null);
+            try std.testing.expectEqualStrings(controllers, try readTestCgroup(allocator, io, "/sys/fs/cgroup/cgroup.subtree_control"));
+            try std.testing.expectEqualStrings(kind, try readTestCgroup(allocator, io, "/sys/fs/cgroup/cgroup.type"));
+            return;
+        }
+    }
+    try updateContainer(allocator, io, backend, update);
+    const memory = try readTestCgroup(allocator, io, memory_path);
+    try std.testing.expectEqualStrings("67108864", std.mem.trim(u8, memory, " \t\n"));
+    const pids = try readTestCgroup(allocator, io, pids_path);
+    try std.testing.expectEqualStrings("50", std.mem.trim(u8, pids, " \t\n"));
+
+    try cwd.writeFile(io, .{ .sub_path = resource_file, .data = "{\"cpu\":{\"shares\":512}}" });
+    try updateContainer(allocator, io, backend, update);
+    const unchanged = try readTestCgroup(allocator, io, memory_path);
+    try std.testing.expectEqualStrings(memory, unchanged);
+    const unchanged_pids = try readTestCgroup(allocator, io, pids_path);
+    try std.testing.expectEqualStrings(pids, unchanged_pids);
+    const cpu_path = try std.fmt.allocPrint(allocator, "{s}/{s}/{s}", .{
+        @as([]const u8, if (unified) "/sys/fs/cgroup" else "/sys/fs/cgroup/cpu"),
+        cgroup,
+        @as([]const u8, if (unified) "cpu.weight" else "cpu.shares"),
+    });
+    const shares = try readTestCgroup(allocator, io, cpu_path);
+    try std.testing.expectEqualStrings(if (unified) "20" else "512", std.mem.trim(u8, shares, " \t\n"));
+    if (unified) {
+        const max_path = try std.fmt.allocPrint(allocator, "/sys/fs/cgroup/{s}/cpu.max", .{cgroup});
+        try cwd.writeFile(io, .{ .sub_path = resource_file, .data = "{\"cpu\":{\"quota\":50000,\"period\":200000}}" });
+        try updateContainer(allocator, io, backend, update);
+        try cwd.writeFile(io, .{ .sub_path = resource_file, .data = "{\"cpu\":{\"quota\":25000}}" });
+        try updateContainer(allocator, io, backend, update);
+        const max = try readTestCgroup(allocator, io, max_path);
+        try std.testing.expectEqualStrings("25000 200000", std.mem.trim(u8, max, " \t\n"));
+        try cwd.writeFile(io, .{ .sub_path = resource_file, .data = "{\"memory\":{\"swap\":134217728}}" });
+        try updateContainer(allocator, io, backend, update);
+        const swap_path = try std.fmt.allocPrint(allocator, "/sys/fs/cgroup/{s}/memory.swap.max", .{cgroup});
+        const swap = try readTestCgroup(allocator, io, swap_path);
+        try std.testing.expectEqualStrings("67108864", std.mem.trim(u8, swap, " \t\n"));
+        try std.testing.expectEqualStrings(memory, try readTestCgroup(allocator, io, memory_path));
+    }
+    try cwd.writeFile(io, .{ .sub_path = resource_file, .data = "{\"cpu\":{\"shares\":512}}" });
+    // Model the shim's stdin request in a child so the test retains its stdin.
+    const input = try cwd.openFile(io, resource_file, .{});
+    defer input.close(io);
+    const linux = std.os.linux;
+    const forked = std.posix.system.fork();
+    if (std.posix.errno(forked) != .SUCCESS) return error.SystemResources;
+    const child: i32 = @intCast(forked);
+    if (child == 0) {
+        if (linux.errno(linux.dup2(input.handle, 0)) != .SUCCESS) linux.exit_group(1);
+        var threaded: std.Io.Threaded = .init_single_threaded;
+        var stdin_update = update;
+        stdin_update.resources_file = "-";
+        updateContainer(std.heap.page_allocator, threaded.io(), backend, stdin_update) catch linux.exit_group(1);
+        linux.exit_group(0);
+    }
+    try std.testing.expectEqual(@as(u8, 0), try waitExec(child));
+    try std.testing.expectEqualStrings(memory, try readTestCgroup(allocator, io, memory_path));
+}
+
+fn readTestCgroup(allocator: std.mem.Allocator, io: std.Io, path: []const u8) ![]u8 {
+    const file = try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+    var reader = file.readerStreaming(io, &.{});
+    return reader.interface.allocRemaining(allocator, .limited(4096));
 }
 
 fn execTestCommand(config: Config, stdout: ?std.posix.fd_t) !u8 {
@@ -2959,6 +3088,59 @@ test "ps pause and resume reject invalid flags values and extra arguments" {
         try std.testing.expectError(error.UnexpectedArgument, parseArgs(&.{ "igvano", command, "example", "extra" }));
 }
 
+test "update parsing accepts resource files stdin and shim global flags" {
+    for ([_][]const []const u8{
+        &.{ "igvano", "update", "--resources", "resources.json", "example" },
+        &.{ "igvano", "update", "--resources=resources.json", "example" },
+        &.{ "igvano", "update", "-r", "resources.json", "example" },
+        &.{ "igvano", "update", "--resources", "-", "example" },
+        &.{ "igvano", "update", "-r", "-", "example" },
+        &.{ "igvano", "--root", "/tmp/containers", "--log", "/tmp/runtime.log", "--log-format", "json", "update", "--resources=-", "example" },
+    }) |args| {
+        const config = try parseArgs(args);
+        try std.testing.expectEqualStrings("update", @tagName(config.subcommand));
+        try std.testing.expectEqualStrings("example", config.id);
+        const value = args[args.len - 2];
+        try std.testing.expectEqualStrings(if (std.mem.indexOfScalar(u8, value, '=')) |equals|
+            value[equals + 1 ..]
+        else
+            value, config.resources_file.?);
+    }
+}
+
+test "update parsing requires resources and rejects individual resource flags" {
+    const cases = [_]struct { args: []const []const u8, expected: anyerror }{
+        .{ .args = &.{ "igvano", "update", "example" }, .expected = error.MissingResources },
+        .{ .args = &.{ "igvano", "update", "--resources" }, .expected = error.MissingResources },
+        .{ .args = &.{ "igvano", "update", "--resources=", "example" }, .expected = error.MissingResources },
+        .{ .args = &.{ "igvano", "update", "-r", "", "example" }, .expected = error.MissingResources },
+        .{ .args = &.{ "igvano", "update", "--resources", "--other", "example" }, .expected = error.MissingResources },
+        .{ .args = &.{ "igvano", "update", "--resources=-" }, .expected = error.MissingId },
+        .{ .args = &.{ "igvano", "update", "--resources=-", "../example" }, .expected = error.InvalidId },
+        .{ .args = &.{ "igvano", "update", "--resources=-", "example", "extra" }, .expected = error.UnexpectedArgument },
+        .{ .args = &.{ "igvano", "update", "--resources=-", "--memory", "64m", "example" }, .expected = error.UnknownOption },
+        .{ .args = &.{ "igvano", "update", "--cpu-shares=512", "example" }, .expected = error.UnknownOption },
+        .{ .args = &.{ "igvano", "--resources=-", "update", "example" }, .expected = error.UnknownOption },
+    };
+    for (cases) |case| try std.testing.expectError(case.expected, parseArgs(case.args));
+}
+
+test "update rejects stopped containers before applying resources" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "example", .default_dir);
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer std.testing.allocator.free(root);
+    try oci.saveState(std.testing.allocator, std.testing.io, root, .{
+        .id = "example",
+        .status = .stopped,
+        .bundle = "/unused",
+    });
+    var implementation: backend_module.LinuxBackend = .{};
+    const config = try parseArgs(&.{ "igvano", "--root", root, "update", "--resources=-", "example" });
+    try std.testing.expectError(error.InvalidStatus, updateContainer(std.testing.allocator, std.testing.io, implementation.backend(), config));
+}
+
 test "create parsing accepts bundle and optional pid file after the subcommand" {
     const config = try parseArgs(&.{ "igvano", "--root", "/tmp/containers", "create", "--bundle", "/tmp/bundle", "--pid-file", "/tmp/init.pid", "example" });
     try std.testing.expectEqual(Subcommand.create, config.subcommand);
@@ -4027,7 +4209,7 @@ const LockTestProcess = struct {
                 .create => createContainer(std.heap.page_allocator, io, backend, config),
                 .start => startContainer(std.heap.page_allocator, io, backend, config),
                 .delete => deleteContainer(std.heap.page_allocator, io, backend, config),
-                .ps, .pause, .@"resume", .kill, .exec => unreachable,
+                .ps, .pause, .@"resume", .kill, .update, .exec => unreachable,
             };
             if (operation) |_| {
                 if (expected_error != null) linux.exit_group(3);

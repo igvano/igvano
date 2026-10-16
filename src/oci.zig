@@ -1221,10 +1221,24 @@ pub fn cgroupResources(allocator: std.mem.Allocator, configured: ?Spec.Resources
         for (priorities, translated) |entry, *priority|
             priority.* = .{ .name = entry.name, .priority = entry.priority };
     }
-    const devices = settings.devices orelse &.{};
-    const translated_devices = try allocator.alloc(Backend.Resources.DeviceRule, devices.len);
-    resources.devices = translated_devices;
-    for (devices, translated_devices) |entry, *device| {
+    resources.devices = try resourceDeviceRules(allocator, settings.devices);
+    if (settings.unified) |unified| {
+        const translated = try allocator.alloc(Backend.Resources.Unified, unified.map.count());
+        resources.unified = translated;
+        for (unified.map.keys(), unified.map.values(), translated) |key, value, *entry| {
+            if (key.len == 0 or std.mem.indexOfAny(u8, key, "/\x00") != null or
+                std.mem.eql(u8, key, ".") or std.mem.eql(u8, key, "..")) return error.InvalidConfig;
+            entry.* = .{ .key = key, .value = value };
+        }
+    }
+    return resources;
+}
+
+fn resourceDeviceRules(allocator: std.mem.Allocator, configured: ?[]const Spec.Resources.DeviceRule) ![]Backend.Resources.DeviceRule {
+    const devices = configured orelse &.{};
+    const translated = try allocator.alloc(Backend.Resources.DeviceRule, devices.len);
+    errdefer allocator.free(translated);
+    for (devices, translated) |entry, *device| {
         const kind: @FieldType(Backend.Resources.DeviceRule, "kind") = if (std.mem.eql(u8, entry.type, "a"))
             .all
         else if (std.mem.eql(u8, entry.type, "b"))
@@ -1245,16 +1259,7 @@ pub fn cgroupResources(allocator: std.mem.Allocator, configured: ?Spec.Resources
             .access = entry.access,
         };
     }
-    if (settings.unified) |unified| {
-        const translated = try allocator.alloc(Backend.Resources.Unified, unified.map.count());
-        resources.unified = translated;
-        for (unified.map.keys(), unified.map.values(), translated) |key, value, *entry| {
-            if (key.len == 0 or std.mem.indexOfAny(u8, key, "/\x00") != null or
-                std.mem.eql(u8, key, ".") or std.mem.eql(u8, key, "..")) return error.InvalidConfig;
-            entry.* = .{ .key = key, .value = value };
-        }
-    }
-    return resources;
+    return translated;
 }
 
 fn validateResourceLimit(value: ?i64) error{InvalidConfig}!void {
@@ -1749,11 +1754,13 @@ test "create requires container root in both user namespace maps" {
     try requireCreate(spec);
 }
 
+pub const json_size_limit: std.Io.Limit = .limited(1 << 20);
+
 /// Loads <bundle>/config.json. The caller owns the result and must call deinit().
 pub fn loadSpec(allocator: std.mem.Allocator, io: std.Io, bundle_dir: []const u8) !std.json.Parsed(Spec) {
     const path = try std.fs.path.join(allocator, &.{ bundle_dir, "config.json" });
     defer allocator.free(path);
-    const json = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1 << 20));
+    const json = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, json_size_limit);
     defer allocator.free(json);
     const parsed = try std.json.parseFromSlice(Spec, allocator, json, .{
         .ignore_unknown_fields = true,
@@ -1762,6 +1769,19 @@ pub fn loadSpec(allocator: std.mem.Allocator, io: std.Io, bundle_dir: []const u8
     errdefer parsed.deinit();
     try validateHooks(parsed.value.hooks);
     return parsed;
+}
+
+/// Loads resource JSON from a file or stdin. The caller must call deinit().
+pub fn loadResources(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !std.json.Parsed(Spec.Resources) {
+    const json = if (std.mem.eql(u8, path, "-")) input: {
+        var reader = std.Io.File.stdin().readerStreaming(io, &.{});
+        break :input try reader.interface.allocRemaining(allocator, json_size_limit);
+    } else try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, json_size_limit);
+    defer allocator.free(json);
+    return std.json.parseFromSlice(Spec.Resources, allocator, json, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    });
 }
 
 /// Resolves root.path against an absolute bundle directory. The caller owns the path.
@@ -1785,6 +1805,10 @@ pub fn requireStart(status: Status, has_process: bool) !void {
 }
 
 pub fn requireKill(status: Status) !void {
+    if (status != .created and status != .running and status != .paused) return error.InvalidStatus;
+}
+
+pub fn requireUpdate(status: Status) !void {
     if (status != .created and status != .running and status != .paused) return error.InvalidStatus;
 }
 
@@ -2112,6 +2136,38 @@ test "loadSpec rejects files larger than one MiB" {
     const bundle = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
     defer std.testing.allocator.free(bundle);
     try std.testing.expectError(error.StreamTooLong, loadSpec(std.testing.allocator, std.testing.io, bundle));
+    const resources_path = try std.fs.path.join(std.testing.allocator, &.{ bundle, "config.json" });
+    defer std.testing.allocator.free(resources_path);
+    try std.testing.expectError(error.StreamTooLong, loadResources(std.testing.allocator, std.testing.io, resources_path));
+}
+
+test "resource files preserve omitted fields and validate device rules through create's translation" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "resources.json" });
+    defer std.testing.allocator.free(path);
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "resources.json",
+        .data = "{\"cpu\":{\"shares\":512},\"devices\":[{\"allow\":true,\"type\":\"c\",\"major\":1,\"minor\":3,\"access\":\"rw\"}]}",
+    });
+    const parsed = try loadResources(std.testing.allocator, std.testing.io, path);
+    defer parsed.deinit();
+    const resources = try cgroupResources(std.testing.allocator, parsed.value);
+    defer freeCgroupResources(std.testing.allocator, resources);
+    try std.testing.expect(resources.memory == null and resources.pids == null);
+    try std.testing.expectEqual(@as(?u64, 512), resources.cpu.?.shares);
+    try std.testing.expect(resources.cpu.?.quota == null and resources.cpu.?.period == null);
+    try std.testing.expectEqualDeep(Backend.Resources.DeviceRule{
+        .allow = true,
+        .kind = .char,
+        .major = 1,
+        .minor = 3,
+        .access = "rw",
+    }, resources.devices[0]);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "resources.json", .data = "{\"devices\":[{\"allow\":true,\"type\":\"invalid\"}]}" });
+    const invalid = try loadResources(std.testing.allocator, std.testing.io, path);
+    defer invalid.deinit();
+    try std.testing.expectError(error.InvalidConfig, cgroupResources(std.testing.allocator, invalid.value));
 }
 
 test "rootfs resolution uses the bundle only for relative paths" {
@@ -2150,8 +2206,10 @@ test "lifecycle operations enforce their legal statuses" {
         }
         if (status == .created or status == .running or status == .paused) {
             try requireKill(status);
+            try requireUpdate(status);
         } else {
             try std.testing.expectError(error.InvalidStatus, requireKill(status));
+            try std.testing.expectError(error.InvalidStatus, requireUpdate(status));
         }
         if (status == .stopped) {
             try requireDelete(status);
