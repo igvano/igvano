@@ -31,7 +31,7 @@ fn diagnosticDrain(_: *std.Io.Writer, data: []const []const u8, splat: usize) st
 }
 
 /// Formatting and raw writes need neither allocator nor inherited debug locks.
-fn reportDiagnostic(comptime fmt: []const u8, args: anytype) void {
+pub fn reportDiagnostic(comptime fmt: []const u8, args: anytype) void {
     last_diagnostic_len = 0;
     _ = writeAll(2, "igvano: ");
     var writer: std.Io.Writer = .{ .vtable = &.{ .drain = diagnosticDrain }, .buffer = &.{} };
@@ -555,7 +555,11 @@ fn v2Writes(allocator: std.mem.Allocator, resources: Resources) Backend.Error![]
             if (swap == -1) {
                 try appendWrite(allocator, &writes, "memory.swap.max", try allocator.dupe(u8, "max"));
             } else if (swap > 0) {
-                if (limit <= 0 or swap < limit) return error.InvalidConfig;
+                if (limit <= 0) {
+                    reportDiagnostic("swap limit requires a memory limit", .{});
+                    return error.InvalidConfig;
+                }
+                if (swap < limit) return error.InvalidConfig;
                 try appendWrite(allocator, &writes, "memory.swap.max", try cgroupLimit(allocator, swap - limit));
             }
         }
@@ -843,6 +847,15 @@ test "v2 writes preserve cpuset strings" {
     try std.testing.expectEqualDeep(&[_]Write{
         .{ .name = "cpuset.cpus", .value = "0-2,4" }, .{ .name = "cpuset.mems", .value = "0,2" },
     }, writes);
+}
+
+test "v2 swap without a finite memory limit reports why it is invalid" {
+    defer last_diagnostic_len = 0;
+    for ([_]?i64{ null, 0, -1 }) |limit| {
+        last_diagnostic_len = 0;
+        try std.testing.expectError(error.InvalidConfig, v2Writes(std.testing.allocator, .{ .memory = .{ .limit = limit, .swap = 128 } }));
+        try std.testing.expectEqualStrings("swap limit requires a memory limit", last_diagnostic[0..last_diagnostic_len]);
+    }
 }
 
 test "v2 writes convert global and per-device block IO weights" {
@@ -1493,8 +1506,7 @@ pub const LinuxBackend = struct {
                     failCreate(ready[1], err);
                 };
                 checkResult(linux.syscall3(.close_range, 3, std.math.maxInt(u32), 1 << 2)) catch |err| failCreate(ready[1], err);
-                execProcess(argv.ptr, envp.ptr) catch |err| {
-                    childError("cannot execute process: ", err);
+                execProcess(argv.ptr, envp.ptr) catch {
                     failCreate(ready[1], error.CreateFailed);
                 };
             }
@@ -2130,6 +2142,8 @@ pub const LinuxBackend = struct {
             }
             const writes = try v1Writes(allocator, resources, null);
             defer freeV1Writes(allocator, writes);
+            // ponytail: Deny-all then allows briefly blocks device opens, and
+            // partial lists drop create-time allows. Upgrade to runc's devices emulator.
             const hierarchies = try openV1Hierarchies(allocator);
             defer freeV1Hierarchies(allocator, hierarchies);
             for (hierarchies) |*hierarchy|
@@ -5005,7 +5019,11 @@ fn setupRootfs(rootfs: [:0]const u8, mounts: []const PreparedMount, devices: []c
     // Runtime paths are still reachable; the hook already runs in the new
     // mount namespace and sees all configured mounts before pivot_root.
     step = .{ .operation = "create hooks" };
-    try hooks.run(options.create_hooks, options.create_hook_state);
+    hooks.run(options.create_hooks, options.create_hook_state) catch |err| {
+        // The hook runner already recorded its captured output.
+        step.operation = "";
+        return @as(Backend.Error!void, err);
+    };
     // runc's fd trick stacks the old root on the new root without a put_old
     // directory. Detach it and close both handles before any container exec.
     // Keep them above stdio, which console setup replaces before they close.
@@ -5101,6 +5119,11 @@ fn runInit(
             failCreate(ready_fd, err);
         };
     }
+    var executable_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const executable = if (spec.process != null)
+        resolveExecutable(argv, envp, &executable_buffer) catch |err| failCreate(ready_fd, err)
+    else
+        null;
     var response: CreateResponse = .{};
     if (!writeAll(ready_fd, std.mem.asBytes(&response))) linux.exit_group(1);
     closeFd(ready_fd);
@@ -5118,25 +5141,24 @@ fn runInit(
     closeFd(fifo_fd);
     // Opening the writer unblocks start. Acknowledge after hooks pass, then
     // retain the CLOEXEC writer so EOF confirms exec before start succeeds.
-    hooks.run(start_hooks, start_hook_state) catch |err| {
-        childError("start hook failed: ", err);
+    hooks.run(start_hooks, start_hook_state) catch {
         _ = writeAll(fd, &.{0});
         linux.exit_group(1);
     };
     if (!writeAll(fd, &.{1})) linux.exit_group(1);
-    runProcess(spec, argv, envp) catch |err| {
-        childError("cannot execute process: ", err);
+    runProcess(spec, executable, argv, envp) catch |err| {
+        if (err != error.ExecFailed) childError("cannot execute process: ", err);
         _ = writeAll(fd, &.{0});
         linux.exit_group(1);
     };
 }
 
-fn runProcess(spec: *const oci.Spec, argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*:0]const u8) !noreturn {
+fn runProcess(spec: *const oci.Spec, executable: ?[*:0]const u8, argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*:0]const u8) !noreturn {
     // A process-less config can be created; it cannot be started.
     if (spec.process == null) return error.InvalidProcess;
     // Linux CLOSE_RANGE_CLOEXEC is 1 << 2; Zig 0.16's packed flags use 1 << 1.
     try checkResult(linux.syscall3(.close_range, 3, std.math.maxInt(u32), 1 << 2));
-    return execProcess(argv, envp);
+    return execResolved(executable orelse return error.InvalidProcess, argv, envp);
 }
 
 fn applyOomScoreAdj(proc_dir: posix.fd_t, oom_score_adj: ?i32) Backend.Error!void {
@@ -5220,11 +5242,20 @@ fn applyProcessSettings(process: ProcessSettings) Backend.Error!void {
     }
 }
 
-fn execProcess(argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*:0]const u8) error{ExecFailed}!noreturn {
+fn isExecutable(path: [*:0]const u8) bool {
+    if (linux.errno(linux.faccessat(linux.AT.FDCWD, path, linux.X_OK, 0)) != .SUCCESS) return false;
+    // Zig 0.16 exposes statx rather than fstatat; follow symlinks and check type.
+    var stat: linux.Statx = undefined;
+    if (linux.errno(linux.statx(linux.AT.FDCWD, path, 0, .{ .TYPE = true }, &stat)) != .SUCCESS) return false;
+    return stat.mask.TYPE and linux.S.ISREG(stat.mode);
+}
+
+fn resolveExecutable(argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*:0]const u8, buffer: []u8) error{ExecFailed}![*:0]const u8 {
     const executable = argv[0] orelse return error.ExecFailed;
     const name = std.mem.span(executable);
+    errdefer reportDiagnostic("exec: \"{s}\": executable file not found in $PATH", .{name});
     if (std.mem.indexOfScalar(u8, name, '/') != null) {
-        _ = linux.execve(executable, argv, envp);
+        if (isExecutable(executable)) return executable;
         return error.ExecFailed;
     }
     var path: []const u8 = "/bin:/usr/bin";
@@ -5237,16 +5268,25 @@ fn execProcess(argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*:0]con
         }
     }
     // Lookup happens inside the rootfs, without allocating after fork.
-    var buffer: [std.fs.max_path_bytes]u8 = undefined;
     var directories = std.mem.splitScalar(u8, path, ':');
     while (directories.next()) |directory| {
-        const candidate = if (directory.len == 0) executable else (std.fmt.bufPrintZ(&buffer, "{s}/{s}", .{ directory, name }) catch continue).ptr;
-        switch (linux.errno(linux.execve(candidate, argv, envp))) {
-            .NOENT, .NOTDIR, .ACCES => continue,
-            else => return error.ExecFailed,
-        }
+        const candidate = if (directory.len == 0) executable else (std.fmt.bufPrintZ(buffer, "{s}/{s}", .{ directory, name }) catch continue).ptr;
+        if (isExecutable(candidate)) return candidate;
     }
     return error.ExecFailed;
+}
+
+fn execResolved(executable: [*:0]const u8, argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*:0]const u8) error{ExecFailed}!noreturn {
+    const err = linux.errno(linux.execve(executable, argv, envp));
+    // Linux's errno tags omit the E prefix used by runtime diagnostics.
+    reportDiagnostic("cannot execute process: E{s}", .{@tagName(err)});
+    return error.ExecFailed;
+}
+
+fn execProcess(argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*:0]const u8) error{ExecFailed}!noreturn {
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const executable = try resolveExecutable(argv, envp, &buffer);
+    return execResolved(executable, argv, envp);
 }
 
 test "proc stat parses field 22 after comm containing spaces and closing parentheses" {
@@ -5867,6 +5907,75 @@ test "linux exec searches the process PATH and preserves explicit paths" {
     }
 }
 
+test "linux exec failure diagnostics name the errno" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    defer last_diagnostic_len = 0;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer std.testing.allocator.free(base);
+    const cases = [_]struct { name: []const u8, data: []const u8, mode: posix.mode_t, expected: []const u8 }{
+        .{ .name = "denied", .data = "exit 0\n", .mode = 0o644, .expected = "cannot execute process: EACCES" },
+        .{ .name = "bad-format", .data = "not an executable\n", .mode = 0o755, .expected = "cannot execute process: ENOEXEC" },
+        .{ .name = "missing-interpreter", .data = "#!/igvano-no-such-interpreter\n", .mode = 0o755, .expected = "cannot execute process: ENOENT" },
+    };
+    const envp = [_:null]?[*:0]const u8{};
+    for (cases) |case| {
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = case.name, .data = case.data, .flags = .{ .permissions = .fromMode(case.mode) } });
+        const path = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/{s}", .{ base, case.name }, 0);
+        defer std.testing.allocator.free(path);
+        const argv = [_:null]?[*:0]const u8{path};
+        try std.testing.expectError(error.ExecFailed, execResolved(path, &argv, &envp));
+        try std.testing.expectEqualStrings(case.expected, last_diagnostic[0..last_diagnostic_len]);
+    }
+}
+
+test "linux init rejects missing directory and non-executable args before create readiness" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    try requireTestMountNamespace();
+    defer last_diagnostic_len = 0;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "directory", .default_dir);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "no-execute", .data = "exit 0\n", .flags = .{ .permissions = .fromMode(0o644) } });
+    const base = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer std.testing.allocator.free(base);
+    const rootfs = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, base, std.testing.allocator);
+    defer std.testing.allocator.free(rootfs);
+    const rootfs_z = try std.testing.allocator.dupeZ(u8, rootfs);
+    defer std.testing.allocator.free(rootfs_z);
+    for ([_][*:0]const u8{ "igvano-no-such-binary", "/igvano-no-such-binary", "/directory", "/no-execute" }) |arg0| {
+        const spec: oci.Spec = .{
+            .ociVersion = "1.0.2",
+            .root = .{ .path = "rootfs" },
+            .process = .{ .args = &.{std.mem.span(arg0)}, .cwd = "/", .user = .{ .uid = 0, .gid = 0 } },
+        };
+        const argv = [_:null]?[*:0]const u8{arg0};
+        const envp = [_:null]?[*:0]const u8{"PATH=/bin:/usr/bin"};
+        const ready = try makePipe();
+        defer closeFd(ready[0]);
+        const pid = forkProcess() catch |err| {
+            closeFd(ready[1]);
+            return err;
+        };
+        if (pid == 0) {
+            closeFd(ready[0]);
+            checkResult(linux.unshare(linux.CLONE.NEWNS)) catch linux.exit_group(2);
+            runInit(&spec, null, &.{}, linux.CLONE.NEWNS, rootfs_z, &.{}, &.{}, &.{}, "/", -1, -1, &argv, &envp, ready[1], .{}, &.{}, "");
+        }
+        closeFd(ready[1]);
+        var response: CreateResponse = .{};
+        const received = readAll(ready[0], std.mem.asBytes(&response));
+        const status = try waitChild(pid);
+        try std.testing.expect(received);
+        try std.testing.expectEqual(@as(u32, 1 << 8), status);
+        try std.testing.expectEqual(error.ExecFailed, response.failureError().?);
+        const expected = try std.fmt.allocPrint(std.testing.allocator, "exec: \"{s}\": executable file not found in $PATH", .{std.mem.span(arg0)});
+        defer std.testing.allocator.free(expected);
+        try std.testing.expectEqualStrings(expected, last_diagnostic[0..last_diagnostic_len]);
+    }
+}
+
 test "linux init applies uid gid and optional supplementary groups before exec" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     if (linux.geteuid() != 0) return error.SkipZigTest;
@@ -5906,7 +6015,9 @@ test "linux init applies uid gid and optional supplementary groups before exec" 
             checkResult(linux.dup2(output[1], posix.STDOUT_FILENO)) catch linux.exit_group(1);
             closeFd(output[1]);
             applyProcess(spec.process.?, null, &.{}) catch linux.exit_group(1);
-            runProcess(&spec, &argv, &envp) catch linux.exit_group(1);
+            var executable_buffer: [std.fs.max_path_bytes]u8 = undefined;
+            const executable = resolveExecutable(&argv, &envp, &executable_buffer) catch linux.exit_group(1);
+            runProcess(&spec, executable, &argv, &envp) catch linux.exit_group(1);
         }
         closeFd(output[1]);
         closeFd(ready[1]);
@@ -5990,7 +6101,7 @@ test "linux init exits nonzero instead of exec when it cannot apply process user
             checkResult(linux.setuid(1000)) catch linux.exit_group(2);
         }
         applyProcess(spec.process.?, null, &.{}) catch linux.exit_group(1);
-        runProcess(&spec, &argv, &envp) catch linux.exit_group(1);
+        runProcess(&spec, argv[0], &argv, &envp) catch linux.exit_group(1);
     }
     closeFd(ready[1]);
     try std.testing.expectEqual(@as(u32, 1 << 8), try waitChild(pid));
@@ -6022,7 +6133,7 @@ test "linux init marks inherited descriptors CLOEXEC and sets noNewPrivileges" {
         closeFd(ready[0]);
         checkResult(linux.dup2(ready[1], 200)) catch linux.exit_group(2);
         applyProcess(spec.process.?, null, &.{}) catch linux.exit_group(1);
-        runProcess(&spec, &argv, &envp) catch linux.exit_group(1);
+        runProcess(&spec, argv[0], &argv, &envp) catch linux.exit_group(1);
     }
     closeFd(ready[1]);
     try std.testing.expectEqual(@as(u32, 0), try waitChild(pid));
@@ -6214,6 +6325,25 @@ test "linux create reports child setup failures without leaving an init" {
         try std.testing.expectError(error.CreateFailed, implementation.backend().create(options));
         try std.testing.expectEqual(@as(?posix.fd_t, null), try walkCgroup(cgroup_root.fd, cgroup_path, false, &.{}));
     }
+    options.oom_score_adj = null;
+    try tmp.dir.createDir(std.testing.io, "rootfs", .default_dir);
+    const rootfs = try std.fs.path.join(std.testing.allocator, &.{ absolute_base, "rootfs" });
+    defer std.testing.allocator.free(rootfs);
+    spec.root.path = "rootfs";
+    options.rootfs = rootfs;
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "rootfs/no-execute",
+        .data = "exit 0\n",
+        .flags = .{ .permissions = .fromMode(0o644) },
+    });
+    for ([_][]const u8{ "igvano-no-such-binary", "/igvano-no-such-binary", "/", "/no-execute" }) |arg0| {
+        spec.process.?.args = &.{arg0};
+        try std.testing.expectError(error.ExecFailed, implementation.backend().create(options));
+        const expected = try std.fmt.allocPrint(std.testing.allocator, "exec: \"{s}\": executable file not found in $PATH", .{arg0});
+        defer std.testing.allocator.free(expected);
+        try std.testing.expectEqualStrings(expected, implementation.backend().diagnostic().?);
+        try std.testing.expectEqual(@as(?posix.fd_t, null), try walkCgroup(cgroup_root.fd, cgroup_path, false, &.{}));
+    }
 }
 
 test "linux create retains the init child's rootfs diagnostic" {
@@ -6271,10 +6401,10 @@ test "linux create retains the init child's rootfs diagnostic" {
     options.mounts = &.{};
     options.create_hooks = &.{.{ .path = "/igvano-missing-create-hook" }};
     try std.testing.expectError(error.HookFailed, backend.create(options));
-    try std.testing.expectEqualStrings("cannot prepare rootfs: create hooks: HookFailed", backend.diagnostic().?);
+    try std.testing.expectEqualStrings("error running hook #0: exit status 1, stdout: , stderr: ", backend.diagnostic().?);
 }
 
-test "linux create accepts an empty rootfs and returns a live blocked init" {
+test "linux create accepts a prepared executable or process-less rootfs and returns a live blocked init" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     try requireTestMountNamespace();
     const cgroup_root = openCgroupRoot() catch return error.SkipZigTest;
@@ -6297,6 +6427,11 @@ test "linux create accepts an empty rootfs and returns a live blocked init" {
     const rootfs = try std.fs.path.join(std.testing.allocator, &.{ absolute_base, "rootfs" });
     defer std.testing.allocator.free(rootfs);
     try tmp.dir.createDir(std.testing.io, "rootfs", .default_dir);
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "rootfs/init",
+        .data = "unused until start\n",
+        .flags = .{ .permissions = .fromMode(0o755) },
+    });
     const fifo = try std.fs.path.join(std.testing.allocator, &.{ absolute_base, "exec.fifo" });
     defer std.testing.allocator.free(fifo);
     const fifo_z = try std.testing.allocator.dupeZ(u8, fifo);
@@ -6327,7 +6462,7 @@ test "linux create accepts an empty rootfs and returns a live blocked init" {
             .ociVersion = "1.0.2",
             .root = .{ .path = "rootfs" },
             .linux = .{ .namespaces = &.{ .{ .type = .mount }, .{ .type = .cgroup } } },
-            .process = .{ .args = &.{ "/bin/sleep", "1000" }, .cwd = "/", .user = .{ .uid = 0, .gid = 0 } },
+            .process = .{ .args = &.{"/init"}, .cwd = "/", .user = .{ .uid = 0, .gid = 0 } },
         },
         .{ .ociVersion = "1.0.2", .root = .{ .path = "rootfs" }, .linux = .{ .namespaces = &.{.{ .type = .mount }} } },
     };
@@ -6432,6 +6567,11 @@ test "linux mapped init acknowledges start without path access to its private st
     defer tmp.cleanup();
     try tmp.dir.createDir(std.testing.io, "rootfs", .default_dir);
     try tmp.dir.createDir(std.testing.io, "state", .fromMode(0o700));
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "rootfs/init",
+        .data = "unused until start\n",
+        .flags = .{ .permissions = .fromMode(0o755) },
+    });
     const base = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     defer std.testing.allocator.free(base);
     const absolute = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, base, std.testing.allocator);
@@ -6450,7 +6590,7 @@ test "linux mapped init acknowledges start without path access to its private st
             .gidMappings = &.{.{ .containerID = 0, .hostID = 200000, .size = 2 }},
         },
         .process = .{
-            .args = &.{"/bin/true"},
+            .args = &.{"/init"},
             .cwd = "/",
             .user = .{ .uid = 1, .gid = 1 },
         },
@@ -6521,6 +6661,11 @@ test "linux mapped create installs maps outside init and cleans up rejected maps
     defer tmp.cleanup();
     try tmp.dir.createDir(std.testing.io, "rootfs", .default_dir);
     try tmp.dir.createDir(std.testing.io, "rootfs/dev", .default_dir);
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "rootfs/init",
+        .data = "unused until start\n",
+        .flags = .{ .permissions = .fromMode(0o755) },
+    });
     const base = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     defer std.testing.allocator.free(base);
     const absolute = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, base, std.testing.allocator);
@@ -6544,7 +6689,7 @@ test "linux mapped create installs maps outside init and cleans up rejected maps
             .gidMappings = &.{.{ .containerID = 0, .hostID = 200000, .size = 10 }},
         },
         .process = .{
-            .args = &.{"/bin/sh"},
+            .args = &.{"/init"},
             .cwd = "/",
             .user = .{ .uid = 0, .gid = 0, .additionalGids = &.{ 1, 2 } },
         },
@@ -6852,7 +6997,13 @@ test "linux inherited mount namespace creates starts and detaches rootfs on dele
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "rootfs space/masked-file", .data = "secret" });
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "rootfs space/masked-dir/secret", .data = "secret" });
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "rootfs space/readonly-file", .data = "read only" });
-    try tmp.dir.createDir(std.testing.io, "source", .default_dir);
+    // Stacked roots omit the host /bin bind and are killed before start.
+    try tmp.dir.createDirPath(std.testing.io, "source/bin");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "source/bin/sh",
+        .data = "unused until start\n",
+        .flags = .{ .permissions = .fromMode(0o755) },
+    });
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "source/masked-file", .data = "host secret" });
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "source/readonly-file", .data = "host writable" });
     const base = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });

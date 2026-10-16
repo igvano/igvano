@@ -1108,7 +1108,7 @@ fn killContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, con
     var state = try readLiveState(allocator, io, backend, config, persist_recovery);
     defer state.deinit();
     if (!config.all or state.parsed.value.status != .stopped)
-        try oci.requireKill(state.parsed.value.status);
+        oci.requireKill(state.parsed.value.status) catch return error.ContainerNotRunning;
     if (config.all) {
         if (state.handle == null)
             state.handle = try stateHandle(allocator, io, config.root, state.parsed.value);
@@ -1123,6 +1123,10 @@ fn requireDelete(status: oci.Status, force: bool) !void {
 }
 
 fn updateContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, config: Config) !void {
+    const parsed = try oci.loadResources(allocator, io, config.resources_file orelse return error.MissingResources);
+    defer parsed.deinit();
+    const resources = try oci.cgroupResources(allocator, parsed.value);
+    defer oci.freeCgroupResources(allocator, resources);
     const lock = try openContainerLock(allocator, config, false);
     defer if (lock) |file| file.close(io);
     const locked = if (lock) |file| try lockContainer(file, false) else true;
@@ -1134,10 +1138,6 @@ fn updateContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, c
     const state = try readLiveState(allocator, io, backend, config, locked);
     defer state.deinit();
     try oci.requireUpdate(state.parsed.value.status);
-    const parsed = try oci.loadResources(allocator, io, config.resources_file orelse return error.MissingResources);
-    defer parsed.deinit();
-    const resources = try oci.cgroupResources(allocator, parsed.value);
-    defer oci.freeCgroupResources(allocator, resources);
     try backendResult(backend, backend.update(state.handle.?, resources));
 }
 
@@ -1408,6 +1408,11 @@ fn reportError(allocator: std.mem.Allocator, io: std.Io, diagnostic: ?[]const u8
         allocator.dupe(u8, "igvano: --console-socket requires terminal=true")
     else if (config.subcommand == .start and err == error.ProcessNotFound)
         std.fmt.allocPrint(allocator, "igvano: init for '{s}' is no longer alive; start failed", .{config.id})
+    else if (config.subcommand == .kill and (err == error.ContainerNotRunning or err == error.ProcessNotFound))
+        std.fmt.allocPrint(allocator, "igvano: kill for '{s}' failed: {s}", .{
+            config.id,
+            @as([]const u8, if (err == error.ContainerNotRunning) "container not running" else "no such process"),
+        })
     else
         std.fmt.allocPrint(allocator, "igvano: {s} for '{s}' failed: {s}", .{ @tagName(config.subcommand), config.id, @errorName(err) })) catch {
         std.debug.print("igvano: {s} for '{s}' failed: {s}\n", .{ @tagName(config.subcommand), config.id, @errorName(err) });
@@ -1805,7 +1810,7 @@ fn testExecLifecycle(base: []const u8) !void {
     }
     const invalid = try parseArgs(&.{ "igvano", "--root", root, "exec", "example", "/igvano-missing-exec" });
     try std.testing.expectError(error.CreateFailed, execContainer(allocator, io, backend, invalid));
-    try std.testing.expect(std.mem.indexOf(u8, last_backend_detail.?, "cannot execute process") != null);
+    try std.testing.expectEqualStrings("exec: \"/igvano-missing-exec\": executable file not found in $PATH", last_backend_detail.?);
     const process_file = try std.fs.path.join(allocator, &.{ base, "process.json" });
     try cwd.writeFile(io, .{
         .sub_path = process_file,
@@ -2917,6 +2922,48 @@ test "reportError includes backend diagnostic in the JSON log" {
     try std.testing.expect(lines.next() == null);
 }
 
+test "kill errors use shim-compatible messages in the log" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    try tmp.dir.createDir(io, "example", .default_dir);
+    const root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer allocator.free(root);
+    const log = try std.fs.path.join(allocator, &.{ root, "runtime.log" });
+    defer allocator.free(log);
+    try oci.saveState(allocator, io, root, .{ .id = "example", .status = .stopped, .bundle = "/unused" });
+    var implementation: backend_module.LinuxBackend = .{};
+    const config: Config = .{ .root = root, .subcommand = .kill, .id = "example", .log = log, .log_format = .json };
+    killContainer(allocator, io, implementation.backend(), config) catch |err|
+        reportError(allocator, io, null, config, err);
+    reportError(allocator, io, null, config, error.ProcessNotFound);
+    const bytes = try tmp.dir.readFileAlloc(io, "runtime.log", allocator, .limited(4096));
+    defer allocator.free(bytes);
+    var lines = std.mem.tokenizeScalar(u8, bytes, '\n');
+    for ([_][]const u8{ "container not running", "no such process" }) |expected| {
+        const parsed = try std.json.parseFromSlice(struct { msg: []const u8 }, allocator, lines.next().?, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        try std.testing.expect(std.mem.indexOf(u8, parsed.value.msg, expected) != null);
+    }
+    try std.testing.expect(lines.next() == null);
+}
+
+test "update validates resource input before opening the container lock" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer allocator.free(root);
+    const path = try std.fs.path.join(allocator, &.{ root, "resources.json" });
+    defer allocator.free(path);
+    try tmp.dir.writeFile(io, .{ .sub_path = "resources.json", .data = "{\"memory\":{\"limit\":-2}}" });
+    var implementation: backend_module.LinuxBackend = .{};
+    const config: Config = .{ .root = root, .subcommand = .update, .id = "missing", .resources_file = path };
+    try std.testing.expectError(error.InvalidConfig, updateContainer(allocator, io, implementation.backend(), config));
+}
+
 test "backend error detail survives cleanup overwriting the borrowed buffer" {
     last_backend_detail = null;
     defer last_backend_detail = null;
@@ -3137,7 +3184,10 @@ test "update rejects stopped containers before applying resources" {
         .bundle = "/unused",
     });
     var implementation: backend_module.LinuxBackend = .{};
-    const config = try parseArgs(&.{ "igvano", "--root", root, "update", "--resources=-", "example" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "resources.json", .data = "{}" });
+    const resources_file = try std.fs.path.join(std.testing.allocator, &.{ root, "resources.json" });
+    defer std.testing.allocator.free(resources_file);
+    const config = try parseArgs(&.{ "igvano", "--root", root, "update", "--resources", resources_file, "example" });
     try std.testing.expectError(error.InvalidStatus, updateContainer(std.testing.allocator, std.testing.io, implementation.backend(), config));
 }
 
@@ -3796,7 +3846,7 @@ test "linux lifecycle waits for exec FIFO EOF and persists running then stopped"
     const persisted = try oci.loadState(std.testing.allocator, std.testing.io, root, "example");
     defer persisted.deinit();
     try std.testing.expectEqual(oci.Status.stopped, persisted.value.status);
-    try std.testing.expectError(error.InvalidStatus, killContainer(std.testing.allocator, std.testing.io, backend, config));
+    try std.testing.expectError(error.ContainerNotRunning, killContainer(std.testing.allocator, std.testing.io, backend, config));
     try deleteContainer(std.testing.allocator, std.testing.io, backend, config);
     try std.testing.expectError(error.FileNotFound, oci.loadState(std.testing.allocator, std.testing.io, root, "example"));
 }
@@ -3848,7 +3898,7 @@ test "linux kill all succeeds on stopped containers while plain kill fails" {
             .bundle = "/unused",
         });
         try killContainer(std.testing.allocator, std.testing.io, backend, all);
-        try std.testing.expectError(error.InvalidStatus, killContainer(std.testing.allocator, std.testing.io, backend, plain));
+        try std.testing.expectError(error.ContainerNotRunning, killContainer(std.testing.allocator, std.testing.io, backend, plain));
     }
 }
 
@@ -4025,7 +4075,7 @@ test "linux state kill and delete refresh stale creating created and running sta
                     defer state.deinit();
                     try std.testing.expectEqual(oci.Status.stopped, state.parsed.value.status);
                 },
-                .kill => try std.testing.expectError(error.InvalidStatus, killContainer(std.testing.allocator, std.testing.io, backend, config)),
+                .kill => try std.testing.expectError(error.ContainerNotRunning, killContainer(std.testing.allocator, std.testing.io, backend, config)),
                 .delete => {
                     try deleteContainer(std.testing.allocator, std.testing.io, backend, config);
                     try std.testing.expectError(error.FileNotFound, oci.loadState(std.testing.allocator, std.testing.io, root, "example"));
