@@ -28,10 +28,14 @@ const Subcommand = enum {
     start,
     exec,
     kill,
+    ps,
+    pause,
+    @"resume",
     delete,
 };
 
 const LogFormat = enum { text, json };
+const PsFormat = enum { table, json };
 
 const ExecUser = struct {
     uid: u32,
@@ -50,6 +54,8 @@ const Config = struct {
     signal: ?[]const u8 = null,
     force: bool = false,
     all: bool = false,
+    ps_format: PsFormat = .table,
+    ps_args: []const []const u8 = &.{},
     process_file: ?[]const u8 = null,
     detach: bool = false,
     tty: ?bool = null,
@@ -114,6 +120,7 @@ fn parseArgsWithLog(args: []const []const u8, log: *?[]const u8, log_format: *Lo
     var console_socket: ?[]const u8 = null;
     var force = false;
     var all = false;
+    var ps_format: PsFormat = .table;
     var process_file: ?[]const u8 = null;
     var detach = false;
     var tty: ?bool = null;
@@ -178,6 +185,14 @@ fn parseArgsWithLog(args: []const []const u8, log: *?[]const u8, log_format: *Lo
             if (!std.mem.eql(u8, args[index], "--force")) return error.UnknownOption;
             force = true;
         }
+    } else if (subcommand == .ps) {
+        while (index < args.len and std.mem.startsWith(u8, args[index], "-")) : (index += 1) {
+            const flag = args[index];
+            if (!std.mem.eql(u8, flag, "--format") and !std.mem.startsWith(u8, flag, "--format="))
+                return error.UnknownOption;
+            ps_format = std.meta.stringToEnum(PsFormat, try optionValue(args, &index, error.MissingFormat)) orelse
+                return error.InvalidFormat;
+        }
     } else if (subcommand == .kill) {
         while (index < args.len and (std.mem.eql(u8, args[index], "--all") or
             std.mem.eql(u8, args[index], "-a"))) : (index += 1)
@@ -190,7 +205,7 @@ fn parseArgsWithLog(args: []const []const u8, log: *?[]const u8, log_format: *Lo
     if (subcommand == .exec) {
         if (process_file != null and remaining != 1) return error.UnexpectedArgument;
         if (process_file == null and remaining == 1) return error.MissingCommand;
-    } else if (remaining != 1 and !(subcommand == .kill and remaining == 2)) return error.UnexpectedArgument;
+    } else if (subcommand != .ps and remaining != 1 and !(subcommand == .kill and remaining == 2)) return error.UnexpectedArgument;
     const id = args[index];
     if (id.len == 0 or std.mem.indexOfScalar(u8, id, 0) != null or std.mem.eql(u8, id, ".") or std.mem.eql(u8, id, "..") or
         std.mem.indexOfScalar(u8, id, '/') != null or std.mem.startsWith(u8, id, "-"))
@@ -213,6 +228,8 @@ fn parseArgsWithLog(args: []const []const u8, log: *?[]const u8, log_format: *Lo
         .signal = signal,
         .force = force,
         .all = all,
+        .ps_format = ps_format,
+        .ps_args = if (subcommand == .ps) args[index + 1 ..] else &.{},
         .process_file = process_file,
         .detach = detach,
         .tty = tty,
@@ -230,6 +247,7 @@ fn optionValue(args: []const []const u8, index: *usize, comptime missing: error{
     MissingCwd,
     MissingEnv,
     MissingUser,
+    MissingFormat,
 }) ![]const u8 {
     const value = if (std.mem.indexOfScalar(u8, args[index.*], '=')) |equals|
         args[index.*][equals + 1 ..]
@@ -793,7 +811,7 @@ fn recoverLiveState(allocator: std.mem.Allocator, io: std.Io, backend: Backend, 
     if (!std.mem.eql(u8, parsed.value.id, config.id)) return error.InvalidState;
     var handle: ?Backend.Handle = null;
     errdefer if (handle) |value| freeStateHandle(allocator, value);
-    if (parsed.value.status == .creating or parsed.value.status == .created or parsed.value.status == .running) {
+    if (parsed.value.status == .creating or parsed.value.status == .created or parsed.value.status == .running or parsed.value.status == .paused) {
         handle = stateHandle(allocator, io, config.root, parsed.value) catch |err| switch (err) {
             error.InvalidState => if (parsed.value.status == .creating) null else return err,
             else => return err,
@@ -801,6 +819,16 @@ fn recoverLiveState(allocator: std.mem.Allocator, io: std.Io, backend: Backend, 
         if (handle == null or !try backendResult(backend, backend.alive(handle.?))) {
             parsed.value.status = .stopped;
             if (persist_recovery) try oci.saveState(allocator, io, config.root, parsed.value);
+        } else if (parsed.value.status != .creating) {
+            const frozen = if (config.subcommand == .kill or (config.subcommand == .delete and config.force))
+                backend.frozen(handle.?) catch false
+            else
+                try backendResult(backend, backend.frozen(handle.?));
+            if (frozen) {
+                parsed.value.status = .paused;
+            } else if (parsed.value.status == .paused) {
+                parsed.value.status = .running;
+            }
         }
     }
     return .{ .parsed = parsed, .handle = handle, .allocator = allocator };
@@ -1077,6 +1105,53 @@ fn requireDelete(status: oci.Status, force: bool) !void {
     if (!force) try oci.requireDelete(status);
 }
 
+fn psContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, config: Config, output: std.Io.File) !void {
+    const lock = try openContainerLock(allocator, config, false);
+    defer if (lock) |file| file.close(io);
+    const locked = if (lock) |file| try lockContainer(file, false) else true;
+    if (locked) {
+        if (lock) |file| try requireLinkedLock(io, file);
+    }
+    const state = try readLiveState(allocator, io, backend, config, locked);
+    defer state.deinit();
+    if (state.parsed.value.status == .stopped) return error.InvalidStatus;
+    const pids = try backendResult(backend, backend.pids(state.handle.?, allocator));
+    defer allocator.free(pids);
+    if (config.ps_format == .json) {
+        const json = try std.json.Stringify.valueAlloc(allocator, pids, .{});
+        defer allocator.free(json);
+        try output.writeStreamingAll(io, json);
+        try output.writeStreamingAll(io, "\n");
+    } else {
+        // ponytail: Only PID is printed; runc runs host ps with the supplied ps args and full columns.
+        try output.writeStreamingAll(io, "PID\n");
+        for (pids) |pid| {
+            var buffer: [32]u8 = undefined;
+            try output.writeStreamingAll(io, try std.fmt.bufPrint(&buffer, "{d}\n", .{pid}));
+        }
+    }
+}
+
+fn pauseContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, config: Config) !void {
+    const lock = try openContainerLock(allocator, config, false);
+    defer if (lock) |file| file.close(io);
+    const locked = if (lock) |file| try lockContainer(file, false) else true;
+    if (locked) {
+        if (lock) |file| try requireLinkedLock(io, file);
+    } else {
+        std.debug.print("igvano: warning: container '{s}' is busy; changing freezer state without the lock\n", .{config.id});
+    }
+    const state = try readLiveState(allocator, io, backend, config, locked);
+    defer state.deinit();
+    if (config.subcommand == .pause) {
+        try oci.requirePause(state.parsed.value.status);
+        try backendResult(backend, backend.freeze(state.handle.?));
+    } else {
+        try oci.requireResume(state.parsed.value.status);
+        try backendResult(backend, backend.thaw(state.handle.?));
+    }
+}
+
 fn stopContainer(io: std.Io, backend: Backend, handle: ?Backend.Handle) !void {
     if (handle) |value| {
         if (try backendResult(backend, backend.alive(value))) {
@@ -1234,6 +1309,8 @@ pub fn main(init: std.process.Init) !u8 {
             error.MissingUser => "missing value for --user",
             error.InvalidUser => "invalid --user; expected UID[:GID]",
             error.InvalidBoolean => "invalid boolean; expected true or false",
+            error.MissingFormat => "missing value for --format",
+            error.InvalidFormat => "invalid --format; expected table or json",
             error.InvalidProcess => "invalid process environment; expected K=V",
             error.UnexpectedArgument => "unexpected argument; global flags must precede the subcommand",
             error.InvalidId => "invalid container id",
@@ -1242,7 +1319,8 @@ pub fn main(init: std.process.Init) !u8 {
         const line = std.fmt.bufPrint(&buffer, "igvano: {s}", .{message}) catch unreachable;
         emitError(allocator, init.io, log, log_format, line, null);
         std.debug.print(
-            "Usage: igvano [--root <dir>] [--log <file>] [--log-format text|json] <state|start> <id>\n" ++
+            "Usage: igvano [--root <dir>] [--log <file>] [--log-format text|json] <state|start|pause|resume> <id>\n" ++
+                "       igvano [global flags] ps [--format table|json] <id> [ps args...]\n" ++
                 "       igvano [--root <dir>] [--log <file>] [--log-format text|json] delete [--force] <id>\n" ++
                 "       igvano [--root <dir>] [--log <file>] [--log-format text|json] kill [--all] <id> [signal]\n" ++
                 "       igvano [--root <dir>] [--log <file>] [--log-format text|json] create [--bundle <path>] [--pid-file <file>] [--console-socket <path>] <id>\n" ++
@@ -1266,6 +1344,8 @@ pub fn main(init: std.process.Init) !u8 {
         .create => createContainer(allocator, init.io, backend, config),
         .start => startContainer(allocator, init.io, backend, config),
         .kill => killContainer(allocator, init.io, backend, config),
+        .ps => psContainer(allocator, init.io, backend, config, std.Io.File.stdout()),
+        .pause, .@"resume" => pauseContainer(allocator, init.io, backend, config),
         .delete => deleteContainer(allocator, init.io, backend, config),
         .exec => unreachable,
     };
@@ -1512,7 +1592,7 @@ test "process validation and typed translation serve create and exec" {
     try std.testing.expectError(error.MissingConsoleSocket, prepareProcess(std.testing.allocator, invalid, null));
 }
 
-test "linux exec joins created and running init namespaces and cgroups waits and writes detached pid files" {
+test "linux exec ps pause resume and forced delete obey the live container lifecycle" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const linux = std.os.linux;
     if (linux.geteuid() != 0 or linux.errno(linux.access("/bin/sh", linux.X_OK)) != .SUCCESS)
@@ -1589,11 +1669,33 @@ fn testExecLifecycle(base: []const u8) !void {
     }
     const saved = try oci.loadState(allocator, io, root, config.id);
     const init_pid = saved.value.pid.?;
+    const init_handle = try stateHandle(allocator, io, root, saved.value);
     var init_reaped = false;
     defer if (!init_reaped) {
         _ = linux.kill(init_pid, .KILL);
+        if (backend.frozen(init_handle) catch false) backend.thaw(init_handle) catch {};
         _ = waitExec(init_pid) catch {};
     };
+    const ps = try parseArgs(&.{ "igvano", "--root", root, "ps", "--format", "json", "example" });
+    const ps_path = try std.fs.path.join(allocator, &.{ base, "pids.json" });
+    {
+        const file = try cwd.createFile(io, ps_path, .{});
+        defer file.close(io);
+        try psContainer(allocator, io, backend, ps, file);
+        const json = try cwd.readFileAlloc(io, ps_path, allocator, .limited(4096));
+        const pids = try std.json.parseFromSlice([]i32, allocator, json, .{});
+        defer pids.deinit();
+        try std.testing.expect(std.mem.indexOfScalar(i32, pids.value, init_pid) != null);
+    }
+    // An externally frozen init must also override its saved created status.
+    try backend.freeze(init_handle);
+    {
+        const state = try readLiveState(allocator, io, backend, config, false);
+        defer state.deinit();
+        try std.testing.expectEqual(oci.Status.paused, state.parsed.value.status);
+        try std.testing.expectError(error.InvalidStatus, startContainer(allocator, io, backend, config));
+    }
+    try backend.thaw(init_handle);
     const created_command = try parseArgs(&.{ "igvano", "--root", root, "exec", "example", "sh", "-c", "exit 23" });
     try std.testing.expectEqual(@as(u8, 23), try execTestCommand(created_command, null));
     config.subcommand = .start;
@@ -1687,10 +1789,66 @@ fn testExecLifecycle(base: []const u8) !void {
     _ = linux.kill(exec_pid, .KILL);
     _ = try waitExec(exec_pid);
     exec_reaped = true;
-    _ = linux.kill(init_pid, .KILL);
+
+    const pause = try parseArgs(&.{ "igvano", "--root", root, "pause", "example" });
+    const resume_config = try parseArgs(&.{ "igvano", "--root", root, "resume", "example" });
+    try std.testing.expectError(error.InvalidStatus, pauseContainer(allocator, io, backend, resume_config));
+    try pauseContainer(allocator, io, backend, pause);
+    {
+        const paused = try readLiveState(allocator, io, backend, pause, false);
+        defer paused.deinit();
+        try std.testing.expectEqual(oci.Status.paused, paused.parsed.value.status);
+        try std.testing.expect(try backend.frozen(paused.handle.?));
+        try std.testing.expectError(error.InvalidStatus, pauseContainer(allocator, io, backend, pause));
+        try std.testing.expectError(error.InvalidStatus, startContainer(allocator, io, backend, config));
+        try std.testing.expectError(error.InvalidStatus, execContainer(allocator, io, backend, command));
+        try std.testing.expectError(error.InvalidStatus, deleteContainer(allocator, io, backend, config));
+        const file = try cwd.createFile(io, ps_path, .{});
+        defer file.close(io);
+        try psContainer(allocator, io, backend, ps, file);
+        const paused_json = try cwd.readFileAlloc(io, ps_path, allocator, .limited(4096));
+        const paused_pids = try std.json.parseFromSlice([]i32, allocator, paused_json, .{});
+        defer paused_pids.deinit();
+        try std.testing.expect(std.mem.indexOfScalar(i32, paused_pids.value, init_pid) != null);
+        const signal_all = try parseArgs(&.{ "igvano", "--root", root, "kill", "--all", "example", "15" });
+        try killContainer(allocator, io, backend, signal_all);
+        try std.testing.expect(try backend.frozen(paused.handle.?));
+    }
+    // PID namespace init ignores a default SIGTERM, so it stays running after thaw.
+    try pauseContainer(allocator, io, backend, resume_config);
+    {
+        const running = try readLiveState(allocator, io, backend, config, false);
+        defer running.deinit();
+        try std.testing.expectEqual(oci.Status.running, running.parsed.value.status);
+        try std.testing.expect(!try backend.frozen(running.handle.?));
+        const file = try cwd.createFile(io, ps_path, .{});
+        defer file.close(io);
+        const table = try parseArgs(&.{ "igvano", "--root", root, "ps", "example", "-ef" });
+        try psContainer(allocator, io, backend, table, file);
+        const text = try cwd.readFileAlloc(io, ps_path, allocator, .limited(4096));
+        try std.testing.expectEqualStrings(try std.fmt.allocPrint(allocator, "PID\n{d}\n", .{init_pid}), text);
+    }
+    try pauseContainer(allocator, io, backend, pause);
+    config.subcommand = .delete;
+    config.force = true;
+    const deleting = std.Io.Clock.awake.now(io);
+    try deleteContainer(allocator, io, backend, config);
+    try std.testing.expect(deleting.untilNow(io, .awake).nanoseconds < std.Io.Duration.fromSeconds(5).nanoseconds);
     _ = try waitExec(init_pid);
     init_reaped = true;
-    try std.testing.expectError(error.InvalidStatus, execContainer(allocator, io, backend, command));
+    try std.testing.expectError(error.FileNotFound, oci.loadState(allocator, io, root, config.id));
+    // Each mode's own membership file disappears when all cgroup hierarchies are removed.
+    var lines = std.mem.tokenizeScalar(u8, init_cgroup, '\n');
+    while (lines.next()) |line| {
+        const first = std.mem.indexOfScalar(u8, line, ':') orelse return error.InvalidState;
+        const second = std.mem.indexOfScalarPos(u8, line, first + 1, ':') orelse return error.InvalidState;
+        const controllers = line[first + 1 .. second];
+        if (std.mem.startsWith(u8, controllers, "name=")) continue;
+        const hierarchy = if (controllers.len == 0) "/sys/fs/cgroup" else try std.fmt.allocPrint(allocator, "/sys/fs/cgroup/{s}", .{controllers});
+        const members_path = try std.fmt.allocPrint(allocator, "{s}/{s}/cgroup.procs", .{ hierarchy, cgroup });
+        try std.testing.expectError(error.FileNotFound, cwd.openFile(io, members_path, .{}));
+    }
+    try std.testing.expectError(error.FileNotFound, execContainer(allocator, io, backend, command));
 }
 
 fn execTestCommand(config: Config, stdout: ?std.posix.fd_t) !u8 {
@@ -2303,10 +2461,11 @@ test "loading rootfs mounts rejects invalid ownership records" {
 test "delete requires stopped containers unless forced and waits after SIGKILL" {
     const TestBackend = struct {
         is_alive: bool,
+        fail_freezer: bool,
         deleted: bool = false,
         signal: ?i32 = null,
         polls_after_kill: usize = 0,
-        const vtable: Backend.VTable = .{ .create = create, .alive = alive, .kill = kill, .killAll = kill, .delete = delete };
+        const vtable: Backend.VTable = .{ .create = create, .alive = alive, .kill = kill, .killAll = kill, .delete = delete, .frozen = frozen };
 
         fn create(_: *anyopaque, _: Backend.CreateOptions) Backend.Error!Backend.Handle {
             return error.NotImplemented;
@@ -2323,6 +2482,11 @@ test "delete requires stopped containers unless forced and waits after SIGKILL" 
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.signal = signal;
         }
+        fn frozen(ptr: *anyopaque, _: Backend.Handle) Backend.Error!bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.fail_freezer) return error.CgroupWriteFailed;
+            return false;
+        }
         fn delete(ptr: *anyopaque, _: Backend.Handle) Backend.Error!void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.deleted = true;
@@ -2334,7 +2498,7 @@ test "delete requires stopped containers unless forced and waits after SIGKILL" 
     defer std.testing.allocator.free(root);
     for ([_]bool{ false, true }) |force| {
         const config: Config = .{ .root = root, .subcommand = .delete, .id = "example", .force = force };
-        for ([_]oci.Status{ .creating, .created, .running, .stopped }) |status| {
+        for ([_]oci.Status{ .creating, .created, .running, .paused, .stopped }) |status| {
             for ([_]bool{ true, false }) |is_alive| {
                 try tmp.dir.createDir(std.testing.io, "example", .default_dir);
                 try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "example/starttime", .data = "12345" });
@@ -2344,7 +2508,7 @@ test "delete requires stopped containers unless forced and waits after SIGKILL" 
                     .status = status,
                     .bundle = "/bundle",
                 });
-                var implementation: TestBackend = .{ .is_alive = is_alive };
+                var implementation: TestBackend = .{ .is_alive = is_alive, .fail_freezer = force };
                 const backend: Backend = .{ .ptr = &implementation, .vtable = &TestBackend.vtable };
                 if (!force and is_alive and status != .stopped) {
                     const before = try tmp.dir.readFileAlloc(std.testing.io, "example/state.json", std.testing.allocator, .limited(4096));
@@ -2447,13 +2611,16 @@ test "kill reuses the handle loaded during the liveness check" {
         cgroup_path: []const u8,
         killed: bool = false,
 
-        const vtable: Backend.VTable = .{ .create = unusedCreate, .alive = alive, .kill = kill, .killAll = kill, .delete = unusedDelete };
+        const vtable: Backend.VTable = .{ .create = unusedCreate, .alive = alive, .kill = kill, .killAll = kill, .delete = unusedDelete, .frozen = frozen };
 
         fn unusedCreate(_: *anyopaque, _: Backend.CreateOptions) Backend.Error!Backend.Handle {
             return error.NotImplemented;
         }
         fn unusedDelete(_: *anyopaque, _: Backend.Handle) Backend.Error!void {
             return error.NotImplemented;
+        }
+        fn frozen(_: *anyopaque, _: Backend.Handle) Backend.Error!bool {
+            return error.CgroupWriteFailed;
         }
         fn alive(ptr: *anyopaque, _: Backend.Handle) Backend.Error!bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -2760,6 +2927,38 @@ test "argument parsing rejects ids that escape the container directory" {
     }
 }
 
+test "ps pause and resume parsing accepts runc command forms" {
+    for ([_][]const []const u8{
+        &.{ "igvano", "ps", "example" },
+        &.{ "igvano", "ps", "--format", "json", "example" },
+        &.{ "igvano", "ps", "--format=table", "example", "-ef" },
+        &.{ "igvano", "pause", "example" },
+        &.{ "igvano", "resume", "example" },
+    }) |args| {
+        const config = try parseArgs(args);
+        try std.testing.expectEqualStrings(args[1], @tagName(config.subcommand));
+        try std.testing.expectEqualStrings("example", config.id);
+    }
+    try std.testing.expectEqual(PsFormat.table, (try parseArgs(&.{ "igvano", "ps", "example" })).ps_format);
+    try std.testing.expectEqual(PsFormat.json, (try parseArgs(&.{ "igvano", "ps", "--format=json", "example" })).ps_format);
+    const config = try parseArgs(&.{ "igvano", "ps", "example", "-o", "pid,comm" });
+    try std.testing.expectEqualSlices([]const u8, &.{ "-o", "pid,comm" }, config.ps_args);
+}
+
+test "ps pause and resume reject invalid flags values and extra arguments" {
+    try std.testing.expectError(error.MissingFormat, parseArgs(&.{ "igvano", "ps", "--format" }));
+    try std.testing.expectError(error.MissingFormat, parseArgs(&.{ "igvano", "ps", "--format=", "example" }));
+    try std.testing.expectError(error.MissingFormat, parseArgs(&.{ "igvano", "ps", "--format", "--other", "example" }));
+    try std.testing.expectError(error.InvalidFormat, parseArgs(&.{ "igvano", "ps", "--format", "yaml", "example" }));
+    try std.testing.expectError(error.UnknownOption, parseArgs(&.{ "igvano", "ps", "--unknown", "example" }));
+    for ([_][]const u8{ "ps", "pause", "resume" }) |command| {
+        try std.testing.expectError(error.MissingId, parseArgs(&.{ "igvano", command }));
+        try std.testing.expectError(error.InvalidId, parseArgs(&.{ "igvano", command, "../example" }));
+    }
+    for ([_][]const u8{ "pause", "resume" }) |command|
+        try std.testing.expectError(error.UnexpectedArgument, parseArgs(&.{ "igvano", command, "example", "extra" }));
+}
+
 test "create parsing accepts bundle and optional pid file after the subcommand" {
     const config = try parseArgs(&.{ "igvano", "--root", "/tmp/containers", "create", "--bundle", "/tmp/bundle", "--pid-file", "/tmp/init.pid", "example" });
     try std.testing.expectEqual(Subcommand.create, config.subcommand);
@@ -2856,7 +3055,7 @@ test "argument parsing accepts force only for delete" {
 }
 
 test "forced delete accepts every lifecycle status while ordinary delete requires stopped" {
-    for ([_]oci.Status{ .creating, .created, .running, .stopped }) |status| {
+    for ([_]oci.Status{ .creating, .created, .running, .paused, .stopped }) |status| {
         try requireDelete(status, true);
         if (status == .stopped) {
             try requireDelete(status, false);
@@ -3627,7 +3826,7 @@ test "linux state kill and delete refresh stale creating created and running sta
     defer std.testing.allocator.free(root);
     var implementation: backend_module.LinuxBackend = .{};
     const backend = implementation.backend();
-    for ([_]oci.Status{ .creating, .created, .running }) |status| {
+    for ([_]oci.Status{ .creating, .created, .running, .paused }) |status| {
         for ([_]Subcommand{ .state, .kill, .delete }) |subcommand| {
             try tmp.dir.createDirPath(std.testing.io, "example");
             try oci.saveState(std.testing.allocator, std.testing.io, root, .{
@@ -3828,7 +4027,7 @@ const LockTestProcess = struct {
                 .create => createContainer(std.heap.page_allocator, io, backend, config),
                 .start => startContainer(std.heap.page_allocator, io, backend, config),
                 .delete => deleteContainer(std.heap.page_allocator, io, backend, config),
-                .kill, .exec => unreachable,
+                .ps, .pause, .@"resume", .kill, .exec => unreachable,
             };
             if (operation) |_| {
                 if (expected_error != null) linux.exit_group(3);

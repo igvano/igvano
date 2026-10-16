@@ -1775,6 +1775,7 @@ pub const Status = enum {
     creating,
     created,
     running,
+    paused,
     stopped,
 };
 
@@ -1784,7 +1785,16 @@ pub fn requireStart(status: Status, has_process: bool) !void {
 }
 
 pub fn requireKill(status: Status) !void {
-    if (status != .created and status != .running) return error.InvalidStatus;
+    if (status != .created and status != .running and status != .paused) return error.InvalidStatus;
+}
+
+pub fn requirePause(status: Status) !void {
+    // ponytail: runc also allows pausing created containers; containerd only pauses running containers.
+    if (status != .running) return error.InvalidStatus;
+}
+
+pub fn requireResume(status: Status) !void {
+    if (status != .paused) return error.InvalidStatus;
 }
 
 pub fn requireDelete(status: Status) !void {
@@ -1855,8 +1865,8 @@ test "state JSON round-trips a running container with annotations" {
 }
 
 test "state JSON accepts lifecycle statuses and omits absent optional fields" {
-    for ([_]Status{ .creating, .created, .stopped }) |status| {
-        const pid: ?i32 = if (status == .created) 1234 else null;
+    for ([_]Status{ .creating, .created, .paused, .stopped }) |status| {
+        const pid: ?i32 = if (status == .created or status == .paused) 1234 else null;
         const json = try std.fmt.allocPrint(
             std.testing.allocator,
             "{{\"ociVersion\":\"1.0.2\",\"id\":\"example\",\"status\":\"{s}\"{s},\"bundle\":\"/tmp/bundle\"}}",
@@ -1879,7 +1889,7 @@ test "state JSON accepts lifecycle statuses and omits absent optional fields" {
 
 test "state JSON rejects an unknown lifecycle status" {
     try std.testing.expectError(error.InvalidEnumTag, std.json.parseFromSlice(State, std.testing.allocator,
-        \\{"ociVersion":"1.0.2","id":"example","status":"paused","bundle":"/tmp/bundle"}
+        \\{"ociVersion":"1.0.2","id":"example","status":"unknown","bundle":"/tmp/bundle"}
     , .{}));
 }
 
@@ -2131,14 +2141,14 @@ test "rootfs resolution rejects a relative bundle even for an absolute rootfs" {
 }
 
 test "lifecycle operations enforce their legal statuses" {
-    for ([_]Status{ .creating, .created, .running, .stopped }) |status| {
+    for ([_]Status{ .creating, .created, .running, .paused, .stopped }) |status| {
         if (status == .created) {
             try requireStart(status, true);
             try std.testing.expectError(error.MissingProcess, requireStart(status, false));
         } else {
             try std.testing.expectError(error.InvalidStatus, requireStart(status, true));
         }
-        if (status == .created or status == .running) {
+        if (status == .created or status == .running or status == .paused) {
             try requireKill(status);
         } else {
             try std.testing.expectError(error.InvalidStatus, requireKill(status));
@@ -2147,6 +2157,16 @@ test "lifecycle operations enforce their legal statuses" {
             try requireDelete(status);
         } else {
             try std.testing.expectError(error.InvalidStatus, requireDelete(status));
+        }
+        if (status == .running) {
+            try requirePause(status);
+        } else {
+            try std.testing.expectError(error.InvalidStatus, requirePause(status));
+        }
+        if (status == .paused) {
+            try requireResume(status);
+        } else {
+            try std.testing.expectError(error.InvalidStatus, requireResume(status));
         }
     }
 }

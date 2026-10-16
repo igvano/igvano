@@ -237,6 +237,11 @@ pub const Backend = struct {
         kill: *const fn (ptr: *anyopaque, handle: Handle, signal: i32) Error!void,
         /// Signal every cgroup member, even after init exits.
         killAll: *const fn (ptr: *anyopaque, handle: Handle, signal: i32) Error!void,
+        /// The caller owns the returned host PIDs, including descendant cgroups.
+        pids: *const fn (ptr: *anyopaque, handle: Handle, allocator: std.mem.Allocator) Error![]i32 = noPids,
+        freeze: *const fn (ptr: *anyopaque, handle: Handle) Error!void = noFreeze,
+        thaw: *const fn (ptr: *anyopaque, handle: Handle) Error!void = noFreeze,
+        frozen: *const fn (ptr: *anyopaque, handle: Handle) Error!bool = noFrozen,
         /// The id identifies resources after the container stops and its pid is gone.
         delete: *const fn (ptr: *anyopaque, handle: Handle) Error!void,
         /// Human-readable detail for the most recent failed operation.
@@ -248,6 +253,18 @@ pub const Backend = struct {
 
         fn noExec(_: *anyopaque, _: Handle, _: ExecOptions) Error!i32 {
             return error.NotImplemented;
+        }
+
+        fn noPids(_: *anyopaque, _: Handle, _: std.mem.Allocator) Error![]i32 {
+            return error.NotImplemented;
+        }
+
+        fn noFreeze(_: *anyopaque, _: Handle) Error!void {
+            return error.NotImplemented;
+        }
+
+        fn noFrozen(_: *anyopaque, _: Handle) Error!bool {
+            return false;
         }
     };
 
@@ -272,6 +289,22 @@ pub const Backend = struct {
 
     pub fn killAll(self: Backend, handle: Handle, signal: i32) Error!void {
         return self.vtable.killAll(self.ptr, handle, signal);
+    }
+
+    pub fn pids(self: Backend, handle: Handle, allocator: std.mem.Allocator) Error![]i32 {
+        return self.vtable.pids(self.ptr, handle, allocator);
+    }
+
+    pub fn freeze(self: Backend, handle: Handle) Error!void {
+        return self.vtable.freeze(self.ptr, handle);
+    }
+
+    pub fn thaw(self: Backend, handle: Handle) Error!void {
+        return self.vtable.thaw(self.ptr, handle);
+    }
+
+    pub fn frozen(self: Backend, handle: Handle) Error!bool {
+        return self.vtable.frozen(self.ptr, handle);
     }
 
     pub fn delete(self: Backend, handle: Handle) Error!void {

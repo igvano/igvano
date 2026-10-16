@@ -1286,6 +1286,10 @@ pub const LinuxBackend = struct {
         .alive = alive,
         .kill = kill,
         .killAll = killAll,
+        .pids = pids,
+        .freeze = freeze,
+        .thaw = thaw,
+        .frozen = frozen,
         .delete = delete,
         .diagnostic = diagnostic,
     };
@@ -1993,6 +1997,17 @@ pub const LinuxBackend = struct {
                 .PERM => return error.PermissionDenied,
                 else => return error.KillFailed,
             }
+            // A v1 freezer holds SIGKILL until the paused cgroup is thawed.
+            if (signal == @intFromEnum(linux.SIG.KILL)) {
+                const root = openCgroupRoot() catch return;
+                defer closeFd(root.fd);
+                if (root.mode == .unified) return;
+                if (openFreezerCgroup(handle) catch null) |cgroup| {
+                    defer closeFd(cgroup.fd);
+                    if (cgroupFrozen(cgroup.fd, .legacy) catch false)
+                        writeCgroupFile(cgroup.fd, "freezer.state", "THAWED", handle.cgroup_path.?) catch {};
+                }
+            }
         } else {
             return error.NotImplemented;
         }
@@ -2050,38 +2065,58 @@ pub const LinuxBackend = struct {
                     }
                 }
             }
-            // Thaw even after a freeze timeout or a failed read/signal.
-            defer {
-                const saved_diagnostic = last_diagnostic;
-                const saved_len = last_diagnostic_len;
-                writeCgroupFile(cgroup, "cgroup.freeze", "0", path) catch {};
-                last_diagnostic = saved_diagnostic;
-                last_diagnostic_len = saved_len;
-            }
-            try writeCgroupFile(cgroup, "cgroup.freeze", "1", path);
-            const delay: linux.timespec = .{ .sec = 0, .nsec = 10_000_000 };
-            for (0..50) |_| {
-                const events = try readCgroupFile(allocator, cgroup, "cgroup.events");
-                defer allocator.free(events);
-                var lines = std.mem.tokenizeScalar(u8, events, '\n');
-                var frozen = false;
-                while (lines.next()) |line| {
-                    if (std.mem.eql(u8, line, "frozen 1")) frozen = true;
-                }
-                if (frozen) break;
-                _ = linux.nanosleep(&delay, null);
-            } else {
-                const saved_diagnostic = last_diagnostic;
-                const saved_len = last_diagnostic_len;
-                writeCgroupFile(cgroup, "cgroup.freeze", "0", path) catch {};
-                last_diagnostic = saved_diagnostic;
-                last_diagnostic_len = saved_len;
-            }
-            // The v1 helper also enumerates cgroup.procs without a freezer.
-            try killV1Members(cgroup, null, signal, path);
+            try killV2Members(cgroup, signal, path);
         } else {
             return error.NotImplemented;
         }
+    }
+
+    fn pids(ptr: *anyopaque, handle: Backend.Handle, allocator: std.mem.Allocator) Backend.Error![]i32 {
+        last_diagnostic_len = 0;
+        if (comptime builtin.os.tag != .linux) return error.NotImplemented;
+        const path = handle.cgroup_path orelse {
+            return allocator.dupe(i32, if (try alive(ptr, handle)) &.{handle.pid} else &.{});
+        };
+        try validateCgroupPath(path);
+        var result: std.ArrayList(i32) = .empty;
+        errdefer result.deinit(allocator);
+        const root = try openCgroupRoot();
+        defer closeFd(root.fd);
+        const members = if (root.mode == .legacy) members: {
+            const hierarchies = try openV1Hierarchies(allocator);
+            defer freeV1Hierarchies(allocator, hierarchies);
+            for ([_]?[]const u8{ "freezer", "pids", null }) |controller| {
+                for (hierarchies) |hierarchy| {
+                    if (controller) |name| {
+                        if (!hierarchy.has(name)) continue;
+                    }
+                    if (try walkV1Cgroup(allocator, hierarchy.root.?, path, false, false)) |fd|
+                        break :members fd;
+                }
+            }
+            break :members null;
+        } else try walkCgroup(root.fd, path, false, &.{});
+        if (members) |fd| {
+            defer closeFd(fd);
+            try collectCgroupPids(allocator, fd, &result);
+        }
+        return result.toOwnedSlice(allocator);
+    }
+
+    fn freeze(_: *anyopaque, handle: Backend.Handle) Backend.Error!void {
+        return setFrozen(handle, true);
+    }
+
+    fn thaw(_: *anyopaque, handle: Backend.Handle) Backend.Error!void {
+        return setFrozen(handle, false);
+    }
+
+    fn frozen(_: *anyopaque, handle: Backend.Handle) Backend.Error!bool {
+        last_diagnostic_len = 0;
+        if (comptime builtin.os.tag != .linux) return error.NotImplemented;
+        const cgroup = (try openFreezerCgroup(handle)) orelse return false;
+        defer closeFd(cgroup.fd);
+        return cgroupFrozen(cgroup.fd, cgroup.mode);
     }
 
     fn delete(_: *anyopaque, handle: Backend.Handle) Backend.Error!void {
@@ -2438,6 +2473,199 @@ fn readCgroupFile(allocator: std.mem.Allocator, dir: posix.fd_t, filename: [:0]c
     }
 }
 
+fn collectCgroupPids(allocator: std.mem.Allocator, dir: posix.fd_t, result: *std.ArrayList(i32)) Backend.Error!void {
+    const text = try readCgroupFile(allocator, dir, "cgroup.procs");
+    defer allocator.free(text);
+    var fields = std.mem.tokenizeAny(u8, text, " \t\n");
+    while (fields.next()) |field| {
+        const pid = std.fmt.parseInt(i32, field, 10) catch return error.InvalidProcess;
+        if (pid <= 0) return error.InvalidProcess;
+        if (std.mem.indexOfScalar(i32, result.items, pid) == null) try result.append(allocator, pid);
+    }
+    var buffer: [4096]u8 = undefined;
+    while (true) {
+        const count = linux.getdents64(dir, &buffer, buffer.len);
+        if (linux.errno(count) == .INTR) continue;
+        try checkResult(count);
+        if (count == 0) return;
+        var offset: usize = 0;
+        while (offset < count) {
+            const entry: *align(1) const linux.dirent64 = @ptrCast(&buffer[offset]);
+            offset += entry.reclen;
+            if (entry.type != linux.DT.DIR) continue;
+            const name_ptr: [*]const u8 = &entry.name;
+            const padded = name_ptr[0 .. entry.reclen - @offsetOf(linux.dirent64, "name")];
+            const name = name_ptr[0..std.mem.indexOfScalar(u8, padded, 0).? :0];
+            if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
+            const opened = linux.openat(dir, name, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .NOFOLLOW = true, .CLOEXEC = true }, 0);
+            if (linux.errno(opened) == .NOENT) continue; // A child can disappear during ps.
+            try checkResult(opened);
+            const child: posix.fd_t = @intCast(opened);
+            defer closeFd(child);
+            try collectCgroupPids(allocator, child, result);
+        }
+    }
+}
+
+fn openFreezerCgroup(handle: Backend.Handle) Backend.Error!?struct { fd: posix.fd_t, mode: CgroupMode } {
+    const path = handle.cgroup_path orelse return null;
+    try validateCgroupPath(path);
+    const root = openCgroupRoot() catch |err| switch (err) {
+        error.Unsupported => return null,
+        else => return err,
+    };
+    defer closeFd(root.fd);
+    const fd = if (root.mode == .legacy) freezer: {
+        const allocator = std.heap.page_allocator;
+        const hierarchies = try openV1Hierarchies(allocator);
+        defer freeV1Hierarchies(allocator, hierarchies);
+        for (hierarchies) |hierarchy| {
+            if (hierarchy.has("freezer"))
+                break :freezer (try walkV1Cgroup(allocator, hierarchy.root.?, path, false, false)) orelse return null;
+        }
+        return null;
+    } else (try walkCgroup(root.fd, path, false, &.{})) orelse return null;
+    errdefer closeFd(fd);
+    const name: [:0]const u8 = if (root.mode == .unified) "cgroup.freeze" else "freezer.state";
+    const probe = linux.openat(fd, name, .{ .ACCMODE = .RDONLY, .NOFOLLOW = true, .CLOEXEC = true }, 0);
+    if (linux.errno(probe) == .NOENT) {
+        closeFd(fd);
+        return null;
+    }
+    try checkResult(probe);
+    closeFd(@intCast(probe));
+    return .{ .fd = fd, .mode = root.mode };
+}
+
+fn cgroupFrozen(dir: posix.fd_t, mode: CgroupMode) Backend.Error!bool {
+    const fd = try openPath(dir, if (mode == .unified) "cgroup.freeze" else "freezer.state", .{ .ACCMODE = .RDONLY, .NOFOLLOW = true, .CLOEXEC = true });
+    defer closeFd(fd);
+    var buffer: [4096]u8 = undefined;
+    var used: usize = 0;
+    while (used < buffer.len) {
+        const count = linux.read(fd, buffer[used..].ptr, buffer.len - used);
+        if (linux.errno(count) == .INTR) continue;
+        try checkResult(count);
+        if (count == 0) break;
+        used += count;
+    }
+    const state = std.mem.trim(u8, buffer[0..used], " \t\n");
+    if (mode == .unified) return std.mem.eql(u8, state, "1");
+    return std.mem.eql(u8, state, "FROZEN") or std.mem.eql(u8, state, "FREEZING");
+}
+
+/// Both freezer implementations are asynchronous; poll every ten milliseconds.
+fn waitFrozen(dir: posix.fd_t, mode: CgroupMode, wanted: bool, attempts: usize) Backend.Error!bool {
+    const allocator = std.heap.page_allocator;
+    const delay: linux.timespec = .{ .sec = 0, .nsec = 10_000_000 };
+    for (0..attempts) |_| {
+        if (mode == .legacy) {
+            const state = try readCgroupFile(allocator, dir, "freezer.state");
+            defer allocator.free(state);
+            if (std.mem.eql(u8, std.mem.trim(u8, state, " \t\n"), if (wanted) "FROZEN" else "THAWED"))
+                return true;
+        } else {
+            const events = try readCgroupFile(allocator, dir, "cgroup.events");
+            defer allocator.free(events);
+            var lines = std.mem.tokenizeScalar(u8, events, '\n');
+            const frozen = while (lines.next()) |line| {
+                if (std.mem.eql(u8, line, "frozen 1")) break true;
+                if (std.mem.eql(u8, line, "frozen 0")) break false;
+            } else {
+                reportDiagnostic("cgroup.events has no freezer state", .{});
+                return error.Unsupported;
+            };
+            if (frozen == wanted) return true;
+        }
+        _ = linux.nanosleep(&delay, null);
+    }
+    return false;
+}
+
+fn setFrozen(handle: Backend.Handle, wanted: bool) Backend.Error!void {
+    last_diagnostic_len = 0;
+    if (comptime builtin.os.tag != .linux) return error.NotImplemented;
+    const cgroup = (try openFreezerCgroup(handle)) orelse {
+        reportDiagnostic("container '{s}' has no cgroup freezer; pause/resume is unsupported", .{handle.id});
+        return error.Unsupported;
+    };
+    defer closeFd(cgroup.fd);
+    // Explicit pause allows ten seconds for busy containers to freeze.
+    try setCgroupFrozen(cgroup.fd, cgroup.mode, wanted, handle.cgroup_path.?, if (wanted) 1000 else 50);
+}
+
+fn setCgroupFrozen(dir: posix.fd_t, mode: CgroupMode, wanted: bool, path: []const u8, attempts: usize) Backend.Error!void {
+    const name: []const u8 = if (mode == .unified) "cgroup.freeze" else "freezer.state";
+    const value: []const u8 = if (mode == .unified)
+        (if (wanted) "1" else "0")
+    else
+        (if (wanted) "FROZEN" else "THAWED");
+    try writeCgroupFile(dir, name, value, path);
+    errdefer if (wanted) {
+        const saved_diagnostic = last_diagnostic;
+        const saved_len = last_diagnostic_len;
+        writeCgroupFile(dir, name, if (mode == .unified) "0" else "THAWED", path) catch {};
+        last_diagnostic = saved_diagnostic;
+        last_diagnostic_len = saved_len;
+    };
+    if (!try waitFrozen(dir, mode, wanted, attempts)) {
+        reportDiagnostic("cgroup '{s}' did not reach freezer state {s}", .{ path, value });
+        return error.CgroupWriteFailed;
+    }
+}
+
+test "linux explicit freeze timeout cancels the request and retains its diagnostic" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    defer last_diagnostic_len = 0;
+    for ([_]CgroupMode{ .unified, .legacy }) |mode| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const name: [:0]const u8 = if (mode == .unified) "cgroup.freeze" else "freezer.state";
+        const thawed: []const u8 = if (mode == .unified) "0" else "THAWED";
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = name, .data = thawed });
+        // Exhaust the polling budget immediately to exercise timeout cleanup
+        // without needing an unfreezable process or a real cgroup hierarchy.
+        try std.testing.expectError(error.CgroupWriteFailed, setCgroupFrozen(tmp.dir.handle, mode, true, "igvano/pause-test", 0));
+        const state = try readCgroupFile(std.testing.allocator, tmp.dir.handle, name);
+        defer std.testing.allocator.free(state);
+        try std.testing.expectEqualStrings(thawed, state);
+        const diagnostic = last_diagnostic[0..last_diagnostic_len];
+        try std.testing.expect(std.mem.indexOf(u8, diagnostic, "igvano/pause-test") != null);
+        try std.testing.expect(std.mem.indexOf(u8, diagnostic, "did not reach freezer state") != null);
+    }
+}
+
+test "linux v2 freezer status follows the local request while completion follows events" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    for ([_]struct { request: []const u8, events: []const u8, frozen: bool, completed: bool }{
+        .{ .request = "1\n", .events = "populated 1\nfrozen 0\n", .frozen = true, .completed = false },
+        .{ .request = "0\n", .events = "populated 1\nfrozen 1\n", .frozen = false, .completed = true },
+    }) |case| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "cgroup.freeze", .data = case.request });
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "cgroup.events", .data = case.events });
+        try std.testing.expectEqual(case.frozen, try cgroupFrozen(tmp.dir.handle, .unified));
+        try std.testing.expect(try waitFrozen(tmp.dir.handle, .unified, case.completed, 1));
+        try std.testing.expect(!try waitFrozen(tmp.dir.handle, .unified, case.frozen, 1));
+    }
+}
+
+test "linux v2 kill all retains a pending user freeze request" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "cgroup.freeze", .data = "1" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "cgroup.events", .data = "populated 0\nfrozen 0\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "cgroup.procs", .data = "" });
+    for ([_]i32{ 0, 9, 15 }) |signal| {
+        try killV2Members(tmp.dir.handle, signal, "igvano/pending-pause-test");
+        const state = try readCgroupFile(std.testing.allocator, tmp.dir.handle, "cgroup.freeze");
+        defer std.testing.allocator.free(state);
+        try std.testing.expectEqualStrings("1", state);
+    }
+}
+
 fn seedV1Cpuset(allocator: std.mem.Allocator, parent: posix.fd_t, child: posix.fd_t, path: []const u8) Backend.Error!void {
     for ([_][:0]const u8{ "cpuset.cpus", "cpuset.mems" }) |name| {
         const existing = try readCgroupFile(allocator, child, name);
@@ -2612,25 +2840,38 @@ fn applyV1Writes(allocator: std.mem.Allocator, hierarchies: []const V1Hierarchy,
     }
 }
 
+fn killV2Members(dir: posix.fd_t, signal: i32, path: []const u8) Backend.Error!void {
+    const was_frozen = try cgroupFrozen(dir, .unified);
+    // Only undo a freeze owned by this operation.
+    defer if (!was_frozen) {
+        const saved_diagnostic = last_diagnostic;
+        const saved_len = last_diagnostic_len;
+        writeCgroupFile(dir, "cgroup.freeze", "0", path) catch {};
+        last_diagnostic = saved_diagnostic;
+        last_diagnostic_len = saved_len;
+    };
+    if (!was_frozen) {
+        try writeCgroupFile(dir, "cgroup.freeze", "1", path);
+        _ = try waitFrozen(dir, .unified, true, 50);
+    }
+    // The v1 helper also enumerates cgroup.procs without a freezer.
+    try killV1Members(dir, null, signal, path);
+}
+
 fn killV1Members(dir: posix.fd_t, freezer: ?posix.fd_t, signal: i32, path: []const u8) Backend.Error!void {
     const allocator = std.heap.page_allocator;
-    // Thaw even after a freeze timeout or a failed read/signal.
-    defer if (freezer) |fd| {
+    const was_frozen = if (freezer) |fd| try cgroupFrozen(fd, .legacy) else false;
+    const owned_freezer = if (!was_frozen) freezer else null;
+    defer if (owned_freezer) |fd| {
         const saved_diagnostic = last_diagnostic;
         const saved_len = last_diagnostic_len;
         writeCgroupFile(fd, "freezer.state", "THAWED", path) catch {};
         last_diagnostic = saved_diagnostic;
         last_diagnostic_len = saved_len;
     };
-    if (freezer) |fd| {
+    if (owned_freezer) |fd| {
         try writeCgroupFile(fd, "freezer.state", "FROZEN", path);
-        const delay: linux.timespec = .{ .sec = 0, .nsec = 10_000_000 };
-        for (0..50) |_| {
-            const state = try readCgroupFile(allocator, fd, "freezer.state");
-            defer allocator.free(state);
-            if (std.mem.eql(u8, std.mem.trim(u8, state, " \t\n"), "FROZEN")) break;
-            _ = linux.nanosleep(&delay, null);
-        } else {
+        if (!try waitFrozen(fd, .legacy, true, 50)) {
             const saved_diagnostic = last_diagnostic;
             const saved_len = last_diagnostic_len;
             writeCgroupFile(fd, "freezer.state", "THAWED", path) catch {};
@@ -2653,6 +2894,9 @@ fn killV1Members(dir: posix.fd_t, freezer: ?posix.fd_t, signal: i32, path: []con
             else => return error.KillFailed,
         }
     }
+    // SIGKILL on v1 needs a thaw after signaling, even for a user pause.
+    if (was_frozen and signal == @intFromEnum(linux.SIG.KILL))
+        try writeCgroupFile(freezer.?, "freezer.state", "THAWED", path);
 }
 
 test "linux v1 failed freeze retains its diagnostic and real cgroup path after thaw fails" {
@@ -4800,6 +5044,10 @@ test "linux backend is unavailable on other platforms" {
     try std.testing.expectError(error.NotImplemented, backend.alive(handle));
     try std.testing.expectError(error.NotImplemented, backend.kill(handle, 15));
     try std.testing.expectError(error.NotImplemented, backend.killAll(handle, 15));
+    try std.testing.expectError(error.NotImplemented, backend.pids(handle, std.testing.allocator));
+    try std.testing.expectError(error.NotImplemented, backend.freeze(handle));
+    try std.testing.expectError(error.NotImplemented, backend.thaw(handle));
+    try std.testing.expectError(error.NotImplemented, backend.frozen(handle));
     try std.testing.expectError(error.NotImplemented, backend.delete(handle));
 }
 
@@ -4828,6 +5076,16 @@ test "linux liveness and signaling work with a handle loaded by a new backend" {
     try std.testing.expect(try backend.alive(handle));
     const reused: Backend.Handle = .{ .id = "persisted", .pid = pid, .starttime = "mismatched" };
     try std.testing.expect(!try backend.alive(reused));
+    const reused_pids = try backend.pids(reused, std.testing.allocator);
+    defer std.testing.allocator.free(reused_pids);
+    try std.testing.expectEqual(@as(usize, 0), reused_pids.len);
+    const pids = try backend.pids(handle, std.testing.allocator);
+    defer std.testing.allocator.free(pids);
+    try std.testing.expectEqualSlices(i32, &.{pid}, pids);
+    try std.testing.expect(!try backend.frozen(handle));
+    try std.testing.expectError(error.Unsupported, backend.freeze(handle));
+    try std.testing.expect(std.mem.indexOf(u8, backend.diagnostic().?, "no cgroup freezer") != null);
+    try std.testing.expectError(error.Unsupported, backend.thaw(handle));
     try std.testing.expectError(error.ProcessNotFound, backend.kill(reused, 9));
     try backend.killAll(reused, 9);
     try std.testing.expect(try backend.alive(handle));
@@ -4842,12 +5100,33 @@ test "linux liveness and signaling work with a handle loaded by a new backend" {
     _ = try waitChild(pid);
     reaped = true;
     try std.testing.expect(!try backend.alive(handle));
+    const stopped_pids = try backend.pids(handle, std.testing.allocator);
+    defer std.testing.allocator.free(stopped_pids);
+    try std.testing.expectEqual(@as(usize, 0), stopped_pids.len);
     try std.testing.expectError(error.ProcessNotFound, backend.kill(handle, 15));
     try backend.killAll(handle, 15);
     try backend.delete(handle);
 }
 
-test "linux kill all signals every cgroup member" {
+test "linux pid enumeration includes nested descendants and ignores control files and symlinks" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "child/grandchild");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "cgroup.procs", .data = "1234\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "child/cgroup.procs", .data = "1235\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "child/grandchild/cgroup.procs", .data = "1236\n1234\n" });
+    try tmp.dir.symLink(std.testing.io, "child", "linked-child", .{ .is_directory = true });
+    const dir = try openPath(tmp.dir.handle, ".", .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true });
+    defer closeFd(dir);
+    var pids: std.ArrayList(i32) = .empty;
+    defer pids.deinit(allocator);
+    try collectCgroupPids(allocator, dir, &pids);
+    try std.testing.expectEqualSlices(i32, &.{ 1234, 1235, 1236 }, pids.items);
+}
+
+test "linux kill all signals every cgroup member and plain SIGKILL thaws paused v1" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const root = openCgroupRoot() catch return error.SkipZigTest;
@@ -4872,18 +5151,35 @@ test "linux kill all signals every cgroup member" {
     }
     var implementation: LinuxBackend = .{};
     const backend = implementation.backend();
-    for ([_]i32{ 9, 15 }) |signal| {
+    for ([_]struct { signal: i32, paused: bool, all: bool = true }{
+        .{ .signal = 9, .paused = false },
+        .{ .signal = 15, .paused = false },
+        .{ .signal = 9, .paused = true },
+        .{ .signal = 15, .paused = true },
+        .{ .signal = 9, .paused = true, .all = false },
+    }) |case| {
+        const signal = case.signal;
+        if (case.paused and root.mode == .legacy) {
+            var has_freezer = false;
+            for (hierarchies) |hierarchy| {
+                if (hierarchy.has("freezer")) has_freezer = true;
+            }
+            if (!has_freezer) continue;
+        }
         const ready = try makePipe();
         defer closeFd(ready[0]);
         var writer: ?posix.fd_t = ready[1];
         defer if (writer) |fd| closeFd(fd);
         var children = [_]i32{ 0, 0 };
-        defer for (children) |pid| {
-            if (pid > 0) {
-                _ = linux.kill(pid, .KILL);
-                _ = waitChild(pid) catch {};
+        defer {
+            if (case.paused) backend.thaw(.{ .id = "kill-all", .pid = 0, .starttime = "", .cgroup_path = path }) catch {};
+            for (children) |pid| {
+                if (pid > 0) {
+                    _ = linux.kill(pid, .KILL);
+                    _ = waitChild(pid) catch {};
+                }
             }
-        };
+        }
         for (&children) |*child| {
             child.* = try forkProcess();
             if (child.* == 0) {
@@ -4916,7 +5212,24 @@ test "linux kill all signals every cgroup member" {
             children[0] = 0;
             try std.testing.expectEqual(@as(u32, 9), status);
         }
-        try backend.killAll(handle, signal);
+        if (case.paused) try backend.freeze(handle);
+        if (case.all) {
+            try backend.killAll(handle, signal);
+        } else {
+            try backend.kill(handle, signal);
+            try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.kill(children[1], @enumFromInt(0))));
+        }
+        const stays_frozen = case.paused and (root.mode == .unified or signal != 9);
+        if (case.paused and root.mode == .unified) {
+            // Exiting tasks can clear the events bit, but kill must retain the user's freeze request.
+            const requested = try readCgroupFile(allocator, cgroup.?, "cgroup.freeze");
+            defer allocator.free(requested);
+            try std.testing.expectEqualStrings("1", std.mem.trim(u8, requested, " \t\n"));
+        } else {
+            try std.testing.expectEqual(stays_frozen, try backend.frozen(handle));
+        }
+        if (stays_frozen) try backend.thaw(handle);
+        if (!case.all) try backend.killAll(handle, signal);
         if (cgroup) |fd| {
             const thawed = try readCgroupFile(allocator, fd, "cgroup.freeze");
             defer allocator.free(thawed);
