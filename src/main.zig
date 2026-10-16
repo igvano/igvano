@@ -27,6 +27,7 @@ const Config = struct {
     console_socket: ?[]const u8 = null,
     signal: ?[]const u8 = null,
     force: bool = false,
+    all: bool = false,
 };
 
 fn parseArgs(args: []const []const u8) !Config {
@@ -82,6 +83,7 @@ fn parseArgsWithLog(args: []const []const u8, log: *?[]const u8, log_format: *Lo
     var pid_file: ?[]const u8 = null;
     var console_socket: ?[]const u8 = null;
     var force = false;
+    var all = false;
     if (subcommand == .create) {
         while (index < args.len and std.mem.startsWith(u8, args[index], "-")) : (index += 1) {
             if (std.mem.eql(u8, args[index], "--bundle")) {
@@ -118,6 +120,12 @@ fn parseArgsWithLog(args: []const []const u8, log: *?[]const u8, log_format: *Lo
             if (!std.mem.eql(u8, args[index], "--force")) return error.UnknownOption;
             force = true;
         }
+    } else if (subcommand == .kill) {
+        while (index < args.len and (std.mem.eql(u8, args[index], "--all") or
+            std.mem.eql(u8, args[index], "-a"))) : (index += 1)
+        {
+            all = true;
+        }
     }
     if (index >= args.len) return error.MissingId;
     const remaining = args.len - index;
@@ -143,6 +151,7 @@ fn parseArgsWithLog(args: []const []const u8, log: *?[]const u8, log_format: *Lo
         .console_socket = console_socket,
         .signal = signal,
         .force = force,
+        .all = all,
     };
 }
 
@@ -773,13 +782,20 @@ fn killContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, con
     if (persist_recovery) {
         if (lock) |file| try requireLinkedLock(io, file);
     } else {
-        // Kill only signals a starttime-verified handle, so it is safe unlocked and must work during stuck start/create.
+        // Signal a verified init or the saved cgroup during stuck start/create.
         std.debug.print("igvano: warning: container '{s}' is busy; signalling without the lock\n", .{config.id});
     }
-    const state = try readLiveState(allocator, io, backend, config, persist_recovery);
+    var state = try readLiveState(allocator, io, backend, config, persist_recovery);
     defer state.deinit();
-    try oci.requireKill(state.parsed.value.status);
-    try backend.kill(state.handle.?, signal);
+    if (!config.all or state.parsed.value.status != .stopped)
+        try oci.requireKill(state.parsed.value.status);
+    if (config.all) {
+        if (state.handle == null)
+            state.handle = try stateHandle(allocator, io, config.root, state.parsed.value);
+        try backend.killAll(state.handle.?, signal);
+    } else {
+        try backend.kill(state.handle.?, signal);
+    }
 }
 
 fn requireDelete(status: oci.Status, force: bool) !void {
@@ -945,7 +961,7 @@ pub fn main(init: std.process.Init) !u8 {
         std.debug.print(
             "Usage: igvano [--root <dir>] [--log <file>] [--log-format text|json] <state|start> <id>\n" ++
                 "       igvano [--root <dir>] [--log <file>] [--log-format text|json] delete [--force] <id>\n" ++
-                "       igvano [--root <dir>] [--log <file>] [--log-format text|json] kill <id> [signal]\n" ++
+                "       igvano [--root <dir>] [--log <file>] [--log-format text|json] kill [--all] <id> [signal]\n" ++
                 "       igvano [--root <dir>] [--log <file>] [--log-format text|json] create [--bundle <path>] [--pid-file <file>] [--console-socket <path>] <id>\n",
             .{},
         );
@@ -1145,7 +1161,7 @@ test "linux failed create runs poststop after removing runtime state" {
         killed: bool = false,
         deleted: bool = false,
         fail_create: bool = false,
-        const vtable: Backend.VTable = .{ .create = create, .alive = alive, .kill = kill, .delete = delete };
+        const vtable: Backend.VTable = .{ .create = create, .alive = alive, .kill = kill, .killAll = kill, .delete = delete };
         fn create(ptr: *anyopaque, options: Backend.CreateOptions) Backend.Error!Backend.Handle {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.fail_create) return error.HookFailed;
@@ -1228,7 +1244,7 @@ test "linux failed create runs poststop after removing runtime state" {
 test "linux poststop runs after stopped-container deletion despite a missing bundle and earlier hook failure" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const TestBackend = struct {
-        const vtable: Backend.VTable = .{ .create = create, .alive = alive, .kill = kill, .delete = delete };
+        const vtable: Backend.VTable = .{ .create = create, .alive = alive, .kill = kill, .killAll = kill, .delete = delete };
         fn create(_: *anyopaque, _: Backend.CreateOptions) Backend.Error!Backend.Handle {
             return error.NotImplemented;
         }
@@ -1398,7 +1414,7 @@ test "prestart failure kills init and destroys runtime state" {
         killed: bool = false,
         signal: ?i32 = null,
         deleted: bool = false,
-        const vtable: Backend.VTable = .{ .create = create, .alive = alive, .kill = kill, .delete = delete };
+        const vtable: Backend.VTable = .{ .create = create, .alive = alive, .kill = kill, .killAll = kill, .delete = delete };
         fn create(_: *anyopaque, _: Backend.CreateOptions) Backend.Error!Backend.Handle {
             return error.NotImplemented;
         }
@@ -1505,7 +1521,7 @@ test "linux start drains buffered acknowledgements and exec failures after init 
         bytes: []const u8,
         opened: bool = false,
 
-        const vtable: Backend.VTable = .{ .create = unusedCreate, .alive = alive, .kill = unusedKill, .delete = unusedDelete };
+        const vtable: Backend.VTable = .{ .create = unusedCreate, .alive = alive, .kill = unusedKill, .killAll = unusedKill, .delete = unusedDelete };
 
         fn unusedCreate(_: *anyopaque, _: Backend.CreateOptions) Backend.Error!Backend.Handle {
             return error.NotImplemented;
@@ -1678,7 +1694,7 @@ test "delete requires stopped containers unless forced and waits after SIGKILL" 
         deleted: bool = false,
         signal: ?i32 = null,
         polls_after_kill: usize = 0,
-        const vtable: Backend.VTable = .{ .create = create, .alive = alive, .kill = kill, .delete = delete };
+        const vtable: Backend.VTable = .{ .create = create, .alive = alive, .kill = kill, .killAll = kill, .delete = delete };
 
         fn create(_: *anyopaque, _: Backend.CreateOptions) Backend.Error!Backend.Handle {
             return error.NotImplemented;
@@ -1751,7 +1767,7 @@ test "delete uses persisted cgroup and rootfs mounts and preserves state on back
     const TestBackend = struct {
         fail_delete: bool = true,
         deleted: bool = false,
-        const vtable: Backend.VTable = .{ .create = create, .alive = alive, .kill = kill, .delete = delete };
+        const vtable: Backend.VTable = .{ .create = create, .alive = alive, .kill = kill, .killAll = kill, .delete = delete };
 
         fn create(_: *anyopaque, _: Backend.CreateOptions) Backend.Error!Backend.Handle {
             return error.NotImplemented;
@@ -1819,7 +1835,7 @@ test "kill reuses the handle loaded during the liveness check" {
         cgroup_path: []const u8,
         killed: bool = false,
 
-        const vtable: Backend.VTable = .{ .create = unusedCreate, .alive = alive, .kill = kill, .delete = unusedDelete };
+        const vtable: Backend.VTable = .{ .create = unusedCreate, .alive = alive, .kill = kill, .killAll = kill, .delete = unusedDelete };
 
         fn unusedCreate(_: *anyopaque, _: Backend.CreateOptions) Backend.Error!Backend.Handle {
             return error.NotImplemented;
@@ -2096,9 +2112,37 @@ test "create parsing rejects missing bundle and pid file values" {
 test "kill parsing preserves an optional positional signal" {
     const default_signal = try parseArgs(&.{ "igvano", "kill", "example" });
     try std.testing.expect(default_signal.signal == null);
+    try std.testing.expect(!default_signal.all);
     const explicit_signal = try parseArgs(&.{ "igvano", "kill", "example", "TERM" });
     try std.testing.expectEqualStrings("TERM", explicit_signal.signal.?);
     try std.testing.expectError(error.UnexpectedArgument, parseArgs(&.{ "igvano", "kill", "example", "TERM", "extra" }));
+}
+
+test "kill parsing accepts all before the id" {
+    const default_signal = try parseArgs(&.{ "igvano", "kill", "--all", "example" });
+    try std.testing.expectEqual(Subcommand.kill, default_signal.subcommand);
+    try std.testing.expectEqualStrings("example", default_signal.id);
+    try std.testing.expect(default_signal.signal == null);
+    try std.testing.expect(default_signal.all);
+    const explicit_signal = try parseArgs(&.{ "igvano", "kill", "-a", "example", "15" });
+    try std.testing.expectEqualStrings("example", explicit_signal.id);
+    try std.testing.expectEqualStrings("15", explicit_signal.signal.?);
+    try std.testing.expect(explicit_signal.all);
+    try std.testing.expectError(error.MissingId, parseArgs(&.{ "igvano", "kill", "--all" }));
+    try std.testing.expectError(error.MissingId, parseArgs(&.{ "igvano", "kill", "-a" }));
+    try std.testing.expectError(error.UnexpectedArgument, parseArgs(&.{ "igvano", "kill", "example", "--all" }));
+    try std.testing.expectError(error.UnexpectedArgument, parseArgs(&.{ "igvano", "kill", "example", "-a" }));
+    try std.testing.expectError(error.UnknownOption, parseArgs(&.{ "igvano", "--all", "kill", "example" }));
+    const rejected = [_]struct { subcommand: []const u8, err: anyerror }{
+        .{ .subcommand = "create", .err = error.UnknownOption },
+        .{ .subcommand = "state", .err = error.UnexpectedArgument },
+        .{ .subcommand = "start", .err = error.UnexpectedArgument },
+        .{ .subcommand = "delete", .err = error.UnknownOption },
+    };
+    for (rejected) |case| {
+        for ([_][]const u8{ "--all", "-a" }) |flag|
+            try std.testing.expectError(case.err, parseArgs(&.{ "igvano", case.subcommand, flag, "example" }));
+    }
 }
 
 test "argument parsing accepts force only for delete" {
@@ -2179,7 +2223,7 @@ test "signal parsing accepts Linux names, prefixes, aliases and numbers" {
 test "create uses private state directories and preserves existing root permissions" {
     const TestBackend = struct {
         state_mode: ?std.posix.mode_t = null,
-        const vtable: Backend.VTable = .{ .create = create, .alive = alive, .kill = kill, .delete = delete };
+        const vtable: Backend.VTable = .{ .create = create, .alive = alive, .kill = kill, .killAll = kill, .delete = delete };
 
         fn create(ptr: *anyopaque, options: Backend.CreateOptions) Backend.Error!Backend.Handle {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -2409,6 +2453,7 @@ test "create with inherited mount isolation persists backend resources and rolls
             .create = create,
             .alive = alive,
             .kill = kill,
+            .killAll = kill,
             .delete = delete,
         };
 
@@ -2687,9 +2732,60 @@ test "linux lifecycle waits for exec FIFO EOF and persists running then stopped"
     try std.testing.expectError(error.FileNotFound, oci.loadState(std.testing.allocator, std.testing.io, root, "example"));
 }
 
+test "linux kill all succeeds on stopped containers while plain kill fails" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const linux = std.os.linux;
+    const posix = std.posix;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "example", .default_dir);
+    const relative = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer std.testing.allocator.free(relative);
+    const root = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, relative, std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const forked = posix.system.fork();
+    if (posix.errno(forked) != .SUCCESS) return error.ForkFailed;
+    const pid: i32 = @intCast(forked);
+    if (pid == 0) {
+        const delay: linux.timespec = .{ .sec = 60, .nsec = 0 };
+        while (true) _ = linux.nanosleep(&delay, null);
+    }
+    var reaped = false;
+    defer if (!reaped) {
+        _ = linux.kill(pid, .KILL);
+        var status: if (builtin.link_libc) c_int else u32 = undefined;
+        _ = posix.system.waitpid(pid, &status, 0);
+    };
+    try saveTestStarttime(root, pid);
+    _ = linux.kill(pid, .KILL);
+    var status: if (builtin.link_libc) c_int else u32 = undefined;
+    while (true) {
+        switch (posix.errno(posix.system.waitpid(pid, &status, 0))) {
+            .SUCCESS => break,
+            .INTR => continue,
+            else => return error.WaitFailed,
+        }
+    }
+    reaped = true;
+    var implementation: backend_module.LinuxBackend = .{};
+    const backend = implementation.backend();
+    const all = try parseArgs(&.{ "igvano", "--root", root, "kill", "--all", "example", "9" });
+    const plain = try parseArgs(&.{ "igvano", "--root", root, "kill", "example", "9" });
+    for ([_]oci.Status{ .created, .running, .stopped }) |saved_status| {
+        try oci.saveState(std.testing.allocator, std.testing.io, root, .{
+            .id = "example",
+            .pid = pid,
+            .status = saved_status,
+            .bundle = "/unused",
+        });
+        try killContainer(std.testing.allocator, std.testing.io, backend, all);
+        try std.testing.expectError(error.InvalidStatus, killContainer(std.testing.allocator, std.testing.io, backend, plain));
+    }
+}
+
 test "start uses saved process presence after bundle config changes" {
     const TestBackend = struct {
-        const vtable: Backend.VTable = .{ .create = create, .alive = alive, .kill = kill, .delete = delete };
+        const vtable: Backend.VTable = .{ .create = create, .alive = alive, .kill = kill, .killAll = kill, .delete = delete };
         fn create(_: *anyopaque, _: Backend.CreateOptions) Backend.Error!Backend.Handle {
             return error.NotImplemented;
         }
@@ -2756,7 +2852,7 @@ test "start uses saved process presence after bundle config changes" {
 test "linux start preserves process presence captured at create" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const TestBackend = struct {
-        const vtable: Backend.VTable = .{ .create = create, .alive = alive, .kill = kill, .delete = delete };
+        const vtable: Backend.VTable = .{ .create = create, .alive = alive, .kill = kill, .killAll = kill, .delete = delete };
         fn create(_: *anyopaque, options: Backend.CreateOptions) Backend.Error!Backend.Handle {
             if (options.on_create) |callback| try callback.run(callback.ptr, .{
                 .id = options.id,
@@ -2877,7 +2973,7 @@ test "linux state kill and delete refresh stale creating created and running sta
 
 test "creating state without a process identity becomes stopped and deletable" {
     const TestBackend = struct {
-        const vtable: Backend.VTable = .{ .create = create, .alive = alive, .kill = kill, .delete = delete };
+        const vtable: Backend.VTable = .{ .create = create, .alive = alive, .kill = kill, .killAll = kill, .delete = delete };
         fn create(_: *anyopaque, _: Backend.CreateOptions) Backend.Error!Backend.Handle {
             return error.NotImplemented;
         }
@@ -2932,7 +3028,7 @@ const LockTestBackend = struct {
     fail_create: bool = false,
     killed: bool = false,
 
-    const vtable: Backend.VTable = .{ .create = create, .alive = alive, .kill = kill, .delete = delete };
+    const vtable: Backend.VTable = .{ .create = create, .alive = alive, .kill = kill, .killAll = kill, .delete = delete };
     fn create(ptr: *anyopaque, options: Backend.CreateOptions) Backend.Error!Backend.Handle {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         const handle: Backend.Handle = .{ .id = options.id, .pid = self.create_pid orelse return error.NotImplemented, .starttime = "alive" };
@@ -3590,7 +3686,7 @@ test "linux early create failure removes state while holding the lock" {
 test "linux create holds a private lock until backend setup finishes" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const TestBackend = struct {
-        const vtable: Backend.VTable = .{ .create = create, .alive = LockTestBackend.alive, .kill = LockTestBackend.kill, .delete = LockTestBackend.delete };
+        const vtable: Backend.VTable = .{ .create = create, .alive = LockTestBackend.alive, .kill = LockTestBackend.kill, .killAll = LockTestBackend.kill, .delete = LockTestBackend.delete };
         fn create(_: *anyopaque, options: Backend.CreateOptions) Backend.Error!Backend.Handle {
             var buffer: [std.fs.max_path_bytes]u8 = undefined;
             const path = std.fmt.bufPrintZ(&buffer, "{s}/lock", .{std.fs.path.dirname(options.exec_fifo).?}) catch return error.InvalidPath;

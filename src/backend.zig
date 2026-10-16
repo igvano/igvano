@@ -215,8 +215,9 @@ pub const Backend = struct {
         /// A backend start hook can be added when an isolation mechanism needs it.
         alive: *const fn (ptr: *anyopaque, handle: Handle) Error!bool,
         /// Validate the process identity before signaling its host PID.
-        /// Whole-cgroup termination happens at delete, not kill.
         kill: *const fn (ptr: *anyopaque, handle: Handle, signal: i32) Error!void,
+        /// Signal every cgroup member, even after init exits.
+        killAll: *const fn (ptr: *anyopaque, handle: Handle, signal: i32) Error!void,
         /// The id identifies resources after the container stops and its pid is gone.
         delete: *const fn (ptr: *anyopaque, handle: Handle) Error!void,
     };
@@ -233,6 +234,10 @@ pub const Backend = struct {
         return self.vtable.kill(self.ptr, handle, signal);
     }
 
+    pub fn killAll(self: Backend, handle: Handle, signal: i32) Error!void {
+        return self.vtable.killAll(self.ptr, handle, signal);
+    }
+
     pub fn delete(self: Backend, handle: Handle) Error!void {
         return self.vtable.delete(self.ptr, handle);
     }
@@ -247,6 +252,7 @@ test "backend dispatches lifecycle operations through its vtable" {
         options: ?Backend.CreateOptions = null,
         checked: ?Backend.Handle = null,
         killed: ?Backend.Handle = null,
+        killed_all: ?Backend.Handle = null,
         signal: ?i32 = null,
         deleted: ?Backend.Handle = null,
         fail_create: bool = false,
@@ -255,6 +261,7 @@ test "backend dispatches lifecycle operations through its vtable" {
             .create = create,
             .alive = alive,
             .kill = kill,
+            .killAll = killAll,
             .delete = delete,
         };
 
@@ -274,6 +281,12 @@ test "backend dispatches lifecycle operations through its vtable" {
         fn kill(ptr: *anyopaque, handle: Backend.Handle, signal: i32) Backend.Error!void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.killed = handle;
+            self.signal = signal;
+        }
+
+        fn killAll(ptr: *anyopaque, handle: Backend.Handle, signal: i32) Backend.Error!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.killed_all = handle;
             self.signal = signal;
         }
 
@@ -311,6 +324,10 @@ test "backend dispatches lifecycle operations through its vtable" {
     try std.testing.expectEqualStrings("other", implementation.killed.?.id);
     try std.testing.expectEqual(@as(i32, 1235), implementation.killed.?.pid);
     try std.testing.expectEqual(@as(?i32, 15), implementation.signal);
+    try backend.killAll(.{ .id = "all", .pid = 1236, .starttime = "12347", .cgroup_path = "test/all" }, 9);
+    try std.testing.expectEqualStrings("all", implementation.killed_all.?.id);
+    try std.testing.expectEqualStrings("test/all", implementation.killed_all.?.cgroup_path.?);
+    try std.testing.expectEqual(@as(?i32, 9), implementation.signal);
     try backend.delete(.{ .id = "example", .pid = 0, .starttime = "" });
     try std.testing.expectEqualStrings("example", implementation.deleted.?.id);
     try std.testing.expectEqual(@as(i32, 0), implementation.deleted.?.pid);
