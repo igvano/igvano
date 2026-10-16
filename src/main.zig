@@ -14,10 +14,14 @@ const Subcommand = enum {
     delete,
 };
 
+const LogFormat = enum { text, json };
+
 const Config = struct {
     root: []const u8,
     subcommand: Subcommand,
     id: []const u8,
+    log: ?[]const u8 = null,
+    log_format: LogFormat = .text,
     bundle: ?[]const u8 = null,
     pid_file: ?[]const u8 = null,
     console_socket: ?[]const u8 = null,
@@ -26,6 +30,13 @@ const Config = struct {
 };
 
 fn parseArgs(args: []const []const u8) !Config {
+    var log: ?[]const u8 = null;
+    var log_format: LogFormat = .text;
+    return parseArgsWithLog(args, &log, &log_format);
+}
+
+// Keep the settings already parsed available when a later argument fails.
+fn parseArgsWithLog(args: []const []const u8, log: *?[]const u8, log_format: *LogFormat) !Config {
     var root: []const u8 = default_root;
     var index: usize = 1;
     while (index < args.len and std.mem.startsWith(u8, args[index], "-")) {
@@ -36,6 +47,27 @@ fn parseArgs(args: []const []const u8) !Config {
         } else if (std.mem.startsWith(u8, args[index], "--root=")) {
             root = args[index]["--root=".len..];
             if (root.len == 0) return error.MissingRoot;
+        } else if (std.mem.eql(u8, args[index], "--log")) {
+            index += 1;
+            if (index >= args.len or args[index].len == 0 or std.mem.startsWith(u8, args[index], "--"))
+                return error.MissingLog;
+            log.* = args[index];
+        } else if (std.mem.startsWith(u8, args[index], "--log=")) {
+            const value = args[index]["--log=".len..];
+            if (value.len == 0) return error.MissingLog;
+            log.* = value;
+        } else if (std.mem.eql(u8, args[index], "--log-format") or std.mem.startsWith(u8, args[index], "--log-format=")) {
+            const value = if (std.mem.eql(u8, args[index], "--log-format")) value: {
+                index += 1;
+                if (index >= args.len or std.mem.startsWith(u8, args[index], "--")) return error.MissingLogFormat;
+                break :value args[index];
+            } else args[index]["--log-format=".len..];
+            if (value.len == 0) return error.MissingLogFormat;
+            log_format.* = std.meta.stringToEnum(LogFormat, value) orelse return error.InvalidLogFormat;
+        } else if (std.mem.eql(u8, args[index], "--debug")) {
+            // Accepted for compatibility with runc callers.
+        } else if (std.mem.eql(u8, args[index], "--systemd-cgroup")) {
+            return error.SystemdCgroupUnsupported;
         } else {
             return error.UnknownOption;
         }
@@ -104,6 +136,8 @@ fn parseArgs(args: []const []const u8) !Config {
         .root = root,
         .subcommand = subcommand,
         .id = id,
+        .log = log.*,
+        .log_format = log_format.*,
         .bundle = bundle,
         .pid_file = pid_file,
         .console_socket = console_socket,
@@ -606,7 +640,11 @@ const LiveState = struct {
 };
 
 fn readLiveState(allocator: std.mem.Allocator, io: std.Io, backend: Backend, config: Config, persist_recovery: bool) !LiveState {
-    var parsed = try oci.loadState(allocator, io, config.root, config.id);
+    return recoverLiveState(allocator, io, backend, config, try oci.loadState(allocator, io, config.root, config.id), persist_recovery);
+}
+
+fn recoverLiveState(allocator: std.mem.Allocator, io: std.Io, backend: Backend, config: Config, saved: std.json.Parsed(oci.State), persist_recovery: bool) !LiveState {
+    var parsed = saved;
     errdefer parsed.deinit();
     if (!std.mem.eql(u8, parsed.value.id, config.id)) return error.InvalidState;
     var handle: ?Backend.Handle = null;
@@ -782,7 +820,21 @@ fn deleteContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, c
             // The unlinked lock makes the busy owner skip later cleanup and state writes.
         }
     }
-    var state = try readLiveState(allocator, io, backend, config, persist_recovery);
+    const saved = oci.loadState(allocator, io, config.root, config.id) catch |err| switch (err) {
+        error.FileNotFound => {
+            if (!config.force) return err;
+            if (!persist_recovery) {
+                // ponytail: A concurrent create may finish after this forced delete reports success; runc has the same window.
+                return;
+            }
+            const path = try std.fs.path.join(allocator, &.{ config.root, config.id });
+            defer allocator.free(path);
+            try deleteStateDirectory(io, path);
+            return;
+        },
+        else => return err,
+    };
+    var state = try recoverLiveState(allocator, io, backend, config, saved, persist_recovery);
     defer state.deinit();
     try requireDelete(state.parsed.value.status, config.force);
     if (config.force) try stopContainer(io, backend, state.handle);
@@ -868,9 +920,15 @@ pub fn main(init: std.process.Init) !u8 {
     const allocator = init.arena.allocator();
     const args = try init.minimal.args.toSlice(allocator);
 
-    const config = parseArgs(args) catch |err| {
+    var log: ?[]const u8 = null;
+    var log_format: LogFormat = .text;
+    const config = parseArgsWithLog(args, &log, &log_format) catch |err| {
         const message = switch (err) {
             error.MissingRoot => "missing value for --root",
+            error.MissingLog => "missing value for --log",
+            error.MissingLogFormat => "missing value for --log-format",
+            error.InvalidLogFormat => "invalid --log-format; expected text or json",
+            error.SystemdCgroupUnsupported => "--systemd-cgroup is not supported (systemd cgroup driver unavailable); set SystemdCgroup = false",
             error.MissingSubcommand => "missing subcommand",
             error.UnknownOption => "unknown option",
             error.UnknownSubcommand => "unknown subcommand",
@@ -881,12 +939,15 @@ pub fn main(init: std.process.Init) !u8 {
             error.UnexpectedArgument => "unexpected argument; global flags must precede the subcommand",
             error.InvalidId => "invalid container id",
         };
+        var buffer: [256]u8 = undefined;
+        const line = std.fmt.bufPrint(&buffer, "igvano: {s}", .{message}) catch unreachable;
+        emitError(allocator, init.io, log, log_format, line);
         std.debug.print(
-            "igvano: {s}\nUsage: igvano [--root <dir>] <state|start> <id>\n" ++
-                "       igvano [--root <dir>] delete [--force] <id>\n" ++
-                "       igvano [--root <dir>] kill <id> [signal]\n" ++
-                "       igvano [--root <dir>] create [--bundle <path>] [--pid-file <file>] [--console-socket <path>] <id>\n",
-            .{message},
+            "Usage: igvano [--root <dir>] [--log <file>] [--log-format text|json] <state|start> <id>\n" ++
+                "       igvano [--root <dir>] [--log <file>] [--log-format text|json] delete [--force] <id>\n" ++
+                "       igvano [--root <dir>] [--log <file>] [--log-format text|json] kill <id> [signal]\n" ++
+                "       igvano [--root <dir>] [--log <file>] [--log-format text|json] create [--bundle <path>] [--pid-file <file>] [--console-socket <path>] <id>\n",
+            .{},
         );
         return 1;
     };
@@ -900,28 +961,74 @@ pub fn main(init: std.process.Init) !u8 {
         .delete => deleteContainer(allocator, init.io, backend, config),
     };
     result catch |err| {
-        reportError(config, err);
+        reportError(allocator, init.io, config, err);
         return 1;
     };
     return 0;
 }
 
-fn reportError(config: Config, err: anyerror) void {
-    if (err == error.FileNotFound) {
-        std.debug.print("igvano: container '{s}' or a required file does not exist\n", .{config.id});
-    } else if (err == error.ContainerExists) {
-        std.debug.print("igvano: container '{s}' already exists\n", .{config.id});
-    } else if (err == error.StartTimeout) {
-        std.debug.print("igvano: start for '{s}' timed out waiting for init readiness\n", .{config.id});
-    } else if (err == error.MissingConsoleSocket) {
-        std.debug.print("igvano: terminal=true requires --console-socket\n", .{});
-    } else if (err == error.UnexpectedConsoleSocket) {
-        std.debug.print("igvano: --console-socket requires terminal=true\n", .{});
-    } else if (config.subcommand == .start and err == error.ProcessNotFound) {
-        std.debug.print("igvano: init for '{s}' is no longer alive; start failed\n", .{config.id});
-    } else {
+fn reportError(allocator: std.mem.Allocator, io: std.Io, config: Config, err: anyerror) void {
+    const message = (if (err == error.FileNotFound)
+        std.fmt.allocPrint(allocator, "igvano: container '{s}' or a required file does not exist", .{config.id})
+    else if (err == error.ContainerExists)
+        std.fmt.allocPrint(allocator, "igvano: container '{s}' already exists", .{config.id})
+    else if (err == error.StartTimeout)
+        std.fmt.allocPrint(allocator, "igvano: start for '{s}' timed out waiting for init readiness", .{config.id})
+    else if (err == error.MissingConsoleSocket)
+        allocator.dupe(u8, "igvano: terminal=true requires --console-socket")
+    else if (err == error.UnexpectedConsoleSocket)
+        allocator.dupe(u8, "igvano: --console-socket requires terminal=true")
+    else if (config.subcommand == .start and err == error.ProcessNotFound)
+        std.fmt.allocPrint(allocator, "igvano: init for '{s}' is no longer alive; start failed", .{config.id})
+    else
+        std.fmt.allocPrint(allocator, "igvano: {s} for '{s}' failed: {s}", .{ @tagName(config.subcommand), config.id, @errorName(err) })) catch {
         std.debug.print("igvano: {s} for '{s}' failed: {s}\n", .{ @tagName(config.subcommand), config.id, @errorName(err) });
+        return;
+    };
+    defer allocator.free(message);
+    emitError(allocator, io, config.log, config.log_format, message);
+}
+
+fn emitError(allocator: std.mem.Allocator, io: std.Io, log: ?[]const u8, log_format: LogFormat, message: []const u8) void {
+    std.debug.print("{s}\n", .{message});
+    if (log) |path| appendErrorLog(allocator, io, path, log_format, message) catch |err| {
+        std.debug.print("igvano: warning: cannot write log '{s}': {s}\n", .{ path, @errorName(err) });
+    };
+}
+
+fn appendErrorLog(allocator: std.mem.Allocator, io: std.Io, path: []const u8, log_format: LogFormat, message: []const u8) !void {
+    var line: std.Io.Writer.Allocating = .init(allocator);
+    defer line.deinit();
+    if (log_format == .json) {
+        const seconds = std.math.cast(u64, std.Io.Clock.real.now(io).toSeconds()) orelse return error.InvalidTimestamp;
+        const epoch: std.time.epoch.EpochSeconds = .{ .secs = seconds };
+        const year_day = epoch.getEpochDay().calculateYearDay();
+        const month_day = year_day.calculateMonthDay();
+        const day_seconds = epoch.getDaySeconds();
+        var time_buffer: [20]u8 = undefined;
+        const time = try std.fmt.bufPrint(&time_buffer, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{
+            year_day.year,
+            @intFromEnum(month_day.month),
+            @as(u8, month_day.day_index) + 1,
+            day_seconds.getHoursIntoDay(),
+            day_seconds.getMinutesIntoHour(),
+            day_seconds.getSecondsIntoMinute(),
+        });
+        try std.json.Stringify.value(.{ .level = "error", .msg = message, .time = time }, .{}, &line.writer);
+    } else {
+        try line.writer.writeAll(message);
     }
+    try line.writer.writeByte('\n');
+    // Dir.createFile has no append flag; use O_APPEND for concurrent callers.
+    const fd = try std.posix.openat(std.posix.AT.FDCWD, path, .{
+        .ACCMODE = .WRONLY,
+        .CREAT = true,
+        .APPEND = true,
+        .CLOEXEC = true,
+    }, 0o600);
+    const file: std.Io.File = .{ .handle = fd, .flags = .{ .nonblocking = false } };
+    defer file.close(io);
+    try file.writeStreamingAll(io, line.written());
 }
 test "start wait rejects a dead init before the timeout" {
     try std.testing.expectError(error.ProcessNotFound, requireStartWait(false, .zero));
@@ -1774,6 +1881,8 @@ test "argument parsing uses the default root and positional container id" {
     try std.testing.expectEqualStrings(default_root, config.root);
     try std.testing.expectEqual(Subcommand.state, config.subcommand);
     try std.testing.expectEqualStrings("example", config.id);
+    try std.testing.expect(config.log == null);
+    try std.testing.expectEqual(LogFormat.text, config.log_format);
 }
 
 test "argument parsing accepts a global root before the subcommand" {
@@ -1788,6 +1897,145 @@ test "argument parsing accepts a global root with an equals sign" {
     try std.testing.expectEqualStrings("/tmp/containers", config.root);
     try std.testing.expectEqual(Subcommand.state, config.subcommand);
     try std.testing.expectEqualStrings("example", config.id);
+}
+
+test "argument parsing accepts global log flags in both forms" {
+    for ([_][]const []const u8{
+        &.{ "igvano", "--root", "/tmp/containers", "--log", "/tmp/runtime.log", "--log-format", "json", "state", "example" },
+        &.{ "igvano", "--log-format=json", "--log=/tmp/runtime.log", "--root=/tmp/containers", "state", "example" },
+    }) |args| {
+        const config = try parseArgs(args);
+        try std.testing.expectEqualStrings("/tmp/containers", config.root);
+        try std.testing.expectEqualStrings("/tmp/runtime.log", config.log.?);
+        try std.testing.expectEqual(LogFormat.json, config.log_format);
+        try std.testing.expectEqual(Subcommand.state, config.subcommand);
+        try std.testing.expectEqualStrings("example", config.id);
+    }
+    for ([_][]const []const u8{
+        &.{ "igvano", "--log", "/tmp/runtime.log", "state", "example" },
+        &.{ "igvano", "--log-format", "text", "state", "example" },
+        &.{ "igvano", "--log-format=text", "state", "example" },
+    }) |args| try std.testing.expectEqual(LogFormat.text, (try parseArgs(args)).log_format);
+}
+
+test "argument parsing rejects missing log values and invalid log formats" {
+    for ([_][]const []const u8{
+        &.{ "igvano", "--log" },
+        &.{ "igvano", "--log", "", "state", "example" },
+        &.{ "igvano", "--log=" },
+        &.{ "igvano", "--log", "--debug", "state", "example" },
+    }) |args| try std.testing.expectError(error.MissingLog, parseArgs(args));
+    for ([_][]const []const u8{
+        &.{ "igvano", "--log-format" },
+        &.{ "igvano", "--log-format", "", "state", "example" },
+        &.{ "igvano", "--log-format=" },
+        &.{ "igvano", "--log-format", "--debug", "state", "example" },
+    }) |args| try std.testing.expectError(error.MissingLogFormat, parseArgs(args));
+    for ([_][]const []const u8{
+        &.{ "igvano", "--log-format", "yaml", "state", "example" },
+        &.{ "igvano", "--log-format=JSON", "state", "example" },
+    }) |args| try std.testing.expectError(error.InvalidLogFormat, parseArgs(args));
+}
+
+test "argument parsing accepts debug and rejects the systemd cgroup driver" {
+    const config = try parseArgs(&.{ "igvano", "--debug", "state", "example" });
+    try std.testing.expectEqual(Subcommand.state, config.subcommand);
+    try std.testing.expectEqualStrings("example", config.id);
+    try std.testing.expectError(error.SystemdCgroupUnsupported, parseArgs(&.{ "igvano", "--systemd-cgroup", "state", "example" }));
+}
+
+test "logging flags and debug remain global" {
+    for ([_][]const u8{ "--log", "--log=/tmp/runtime.log", "--log-format", "--log-format=json", "--debug", "--systemd-cgroup" }) |flag| {
+        try std.testing.expectError(error.UnknownOption, parseArgs(&.{ "igvano", "create", flag, "example" }));
+        try std.testing.expectError(error.UnknownOption, parseArgs(&.{ "igvano", "delete", flag, "example" }));
+        try std.testing.expectError(error.UnexpectedArgument, parseArgs(&.{ "igvano", "state", "example", flag }));
+    }
+}
+
+test "argument parsing preserves log settings on later failures" {
+    for ([_][]const []const u8{
+        &.{ "igvano", "--log", "/tmp/runtime.log", "--log-format", "json", "--unknown" },
+        &.{ "igvano", "--log=/tmp/runtime.log", "--log-format=json", "create", "--unknown", "example" },
+    }) |args| {
+        var log: ?[]const u8 = null;
+        var log_format: LogFormat = .text;
+        try std.testing.expectError(error.UnknownOption, parseArgsWithLog(args, &log, &log_format));
+        try std.testing.expectEqualStrings("/tmp/runtime.log", log.?);
+        try std.testing.expectEqual(LogFormat.json, log_format);
+    }
+    var log: ?[]const u8 = null;
+    var log_format: LogFormat = .text;
+    try std.testing.expectError(error.InvalidLogFormat, parseArgsWithLog(&.{ "igvano", "--log=runtime.log", "--log-format=bad" }, &log, &log_format));
+    try std.testing.expectEqualStrings("runtime.log", log.?);
+    try std.testing.expectEqual(LogFormat.text, log_format);
+}
+
+test "json error logs append escaped messages and RFC3339 UTC timestamps" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "runtime.log" });
+    defer std.testing.allocator.free(path);
+    const messages = [_][]const u8{ "igvano: \"quoted\" \\ slash\nnewline\t\x01", "igvano: another error" };
+    const before = std.Io.Clock.real.now(std.testing.io).toSeconds();
+    for (messages) |message| try appendErrorLog(std.testing.allocator, std.testing.io, path, .json, message);
+    const after = std.Io.Clock.real.now(std.testing.io).toSeconds();
+    const bytes = try tmp.dir.readFileAlloc(std.testing.io, "runtime.log", std.testing.allocator, .limited(4096));
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expect(bytes.len > 0 and bytes[bytes.len - 1] == '\n');
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    for (messages) |message| {
+        const parsed = try std.json.parseFromSlice(struct { level: []const u8, msg: []const u8, time: []const u8 }, std.testing.allocator, lines.next().?, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings("error", parsed.value.level);
+        try std.testing.expectEqualStrings(message, parsed.value.msg);
+        // Parse the UTC RFC3339 form and validate its calendar and clock fields.
+        const time = parsed.value.time;
+        try std.testing.expectEqual(@as(usize, 20), time.len);
+        try std.testing.expectEqualStrings("-", time[4..5]);
+        try std.testing.expectEqualStrings("-", time[7..8]);
+        try std.testing.expectEqualStrings("T", time[10..11]);
+        try std.testing.expectEqualStrings(":", time[13..14]);
+        try std.testing.expectEqualStrings(":", time[16..17]);
+        try std.testing.expectEqualStrings("Z", time[19..20]);
+        for (time, 0..) |byte, index| {
+            if (index == 4 or index == 7 or index == 10 or index == 13 or index == 16 or index == 19) continue;
+            try std.testing.expect(std.ascii.isDigit(byte));
+        }
+        const year = try std.fmt.parseInt(std.time.epoch.Year, time[0..4], 10);
+        const month = try std.fmt.parseInt(u8, time[5..7], 10);
+        const day = try std.fmt.parseInt(u8, time[8..10], 10);
+        const hour = try std.fmt.parseInt(u8, time[11..13], 10);
+        const minute = try std.fmt.parseInt(u8, time[14..16], 10);
+        const second = try std.fmt.parseInt(u8, time[17..19], 10);
+        try std.testing.expect(year >= 1970 and month >= 1 and month <= 12);
+        try std.testing.expect(day >= 1 and day <= std.time.epoch.getDaysInMonth(year, @enumFromInt(month)));
+        try std.testing.expect(hour < 24 and minute < 60 and second < 60);
+        var days: u64 = day - 1;
+        for (1970..year) |y| days += std.time.epoch.getDaysInYear(@intCast(y));
+        for (1..month) |m| days += std.time.epoch.getDaysInMonth(year, @enumFromInt(m));
+        const timestamp = days * 86400 + @as(u64, hour) * 3600 + @as(u64, minute) * 60 + second;
+        try std.testing.expect(timestamp >= before and timestamp <= after);
+    }
+    try std.testing.expectEqualStrings("", lines.next().?);
+    try std.testing.expect(lines.next() == null);
+    const stat = try tmp.dir.statFile(std.testing.io, "runtime.log", .{});
+    try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), stat.permissions.toMode() & 0o777);
+}
+
+test "text error logs append the stderr line without changing existing permissions" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile(std.testing.io, "runtime.log", .{ .permissions = .fromMode(0o640) });
+    defer file.close(std.testing.io);
+    try file.writeStreamingAll(std.testing.io, "existing\n");
+    const permissions = (try file.stat(std.testing.io)).permissions;
+    const path = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "runtime.log" });
+    defer std.testing.allocator.free(path);
+    try appendErrorLog(std.testing.allocator, std.testing.io, path, .text, "igvano: an error");
+    const bytes = try tmp.dir.readFileAlloc(std.testing.io, "runtime.log", std.testing.allocator, .limited(4096));
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expectEqualStrings("existing\nigvano: an error\n", bytes);
+    try std.testing.expectEqual(permissions, (try file.stat(std.testing.io)).permissions);
 }
 
 test "argument parsing rejects missing arguments and misplaced global flags" {
@@ -1883,6 +2131,25 @@ test "forced delete accepts every lifecycle status while ordinary delete require
         } else {
             try std.testing.expectError(error.InvalidStatus, requireDelete(status, false));
         }
+    }
+}
+
+test "forced delete of a missing container succeeds while ordinary delete errors" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer std.testing.allocator.free(root);
+    var implementation: backend_module.LinuxBackend = .{};
+    const config: Config = .{ .root = root, .subcommand = .delete, .id = "missing" };
+    try std.testing.expectError(error.FileNotFound, deleteContainer(std.testing.allocator, std.testing.io, implementation.backend(), config));
+    var forced = config;
+    forced.force = true;
+    try deleteContainer(std.testing.allocator, std.testing.io, implementation.backend(), forced);
+    for ([_]bool{ false, true }) |has_lock| {
+        try tmp.dir.createDir(std.testing.io, "missing", .default_dir);
+        if (has_lock) try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "missing/lock", .data = "" });
+        try deleteContainer(std.testing.allocator, std.testing.io, implementation.backend(), forced);
+        try std.testing.expectError(error.FileNotFound, tmp.dir.openDir(std.testing.io, "missing", .{}));
     }
 }
 
