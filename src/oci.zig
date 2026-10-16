@@ -1,5 +1,57 @@
 const std = @import("std");
 
+// One command per process. Keep validation detail alive after parsed data is freed.
+var diagnostic_buffer: [512]u8 = @splat(0);
+var diagnostic_len: usize = 0;
+var diagnostic_error: u16 = 0;
+
+pub fn clearDiagnostic() void {
+    diagnostic_len = 0;
+    diagnostic_error = 0;
+}
+
+pub fn diagnostic() ?[]const u8 {
+    return if (diagnostic_len == 0) null else diagnostic_buffer[0..diagnostic_len];
+}
+
+pub fn diagnosticFor(err: anyerror) ?[]const u8 {
+    return if (diagnostic_error == @intFromError(err)) diagnostic() else null;
+}
+
+pub fn validationError(err: anytype, comptime fmt: []const u8, args: anytype) @TypeOf(err) {
+    recordDiagnostic(err, fmt, args);
+    return err;
+}
+
+pub fn recordDiagnostic(err: anyerror, comptime fmt: []const u8, args: anytype) void {
+    diagnostic_error = @intFromError(err);
+    const text = std.fmt.bufPrint(&diagnostic_buffer, fmt, args) catch &diagnostic_buffer;
+    diagnostic_len = completeUTF8Prefix(text).len;
+}
+
+// Trim a partial trailing codepoint from either a detail or a context prefix.
+fn completeUTF8Prefix(text: []const u8) []const u8 {
+    if (text.len == 0) return text;
+    var start = text.len - 1;
+    while (start > 0 and text[start] & 0xc0 == 0x80) start -= 1;
+    const len = std.unicode.utf8ByteSequenceLength(text[start]) catch 1;
+    return if (len > text.len - start) text[0..start] else text;
+}
+
+pub fn invalidConfig(comptime fmt: []const u8, args: anytype) error{InvalidConfig} {
+    return validationError(error.InvalidConfig, fmt, args);
+}
+
+pub fn diagnosticContext(comptime fmt: []const u8, args: anytype) void {
+    const previous = diagnostic_buffer;
+    const len = diagnostic_len;
+    const err = diagnostic_error;
+    var prefix_buffer: [256]u8 = undefined;
+    const prefix = completeUTF8Prefix(std.fmt.bufPrint(&prefix_buffer, fmt, args) catch &prefix_buffer);
+    recordDiagnostic(error.InvalidConfig, "{s}: {s}", .{ prefix, previous[0..len] });
+    diagnostic_error = err;
+}
+
 test "OCI resources parse every supported resource field" {
     const parsed = try std.json.parseFromSlice(Spec.Resources, std.testing.allocator,
         \\{"memory":{"limit":64,"reservation":32,"swap":128,"kernel":-1,"kernelTCP":16,"swappiness":50,"disableOOMKiller":false},
@@ -531,15 +583,18 @@ pub fn resolveCgroupPath(allocator: std.mem.Allocator, configured: ?[]const u8, 
     if (configured == null and (id.len == 0 or
         std.mem.eql(u8, id, ".") or std.mem.eql(u8, id, "..") or
         std.mem.indexOfScalar(u8, id, '/') != null or
-        std.mem.indexOfScalar(u8, id, 0) != null)) return error.InvalidConfig;
+        std.mem.indexOfScalar(u8, id, 0) != null)) return invalidConfig("linux.cgroupsPath: invalid container id", .{});
     const path = if (configured) |value|
         try std.fmt.allocPrint(allocator, "/{s}", .{value})
     else
         try std.fmt.allocPrint(allocator, "/igvano/{s}", .{id});
     defer allocator.free(path);
-    const normalized = try resolveMountDestination(allocator, path);
+    const normalized = resolveMountDestination(allocator, path) catch |err| {
+        diagnosticContext("linux.cgroupsPath", .{});
+        return err;
+    };
     defer allocator.free(normalized);
-    if (normalized.len == 1) return error.InvalidConfig;
+    if (normalized.len == 1) return invalidConfig("linux.cgroupsPath: must not resolve to the cgroup root", .{});
     return allocator.dupe(u8, normalized[1..]);
 }
 
@@ -625,8 +680,7 @@ pub fn freeSeccomp(allocator: std.mem.Allocator, config: ?Backend.seccomp.Config
 }
 
 fn seccompInvalid(comptime fmt: []const u8, args: anytype) error{InvalidConfig} {
-    std.debug.print("igvano: " ++ fmt ++ "\n", args);
-    return error.InvalidConfig;
+    return invalidConfig("linux.seccomp: " ++ fmt, args);
 }
 
 fn seccompAction(name: []const u8) error{InvalidConfig}!Backend.seccomp.Action {
@@ -1045,8 +1099,7 @@ pub fn validateSysctls(config: Spec.Linux) error{InvalidConfig}!void {
             break :allowed false;
         };
         if (!allowed) {
-            std.debug.print("igvano: sysctl '{s}' is not namespaced or the required namespace is not configured\n", .{key});
-            return error.InvalidConfig;
+            return invalidConfig("linux.sysctl.{s}: invalid setting or required namespace is not isolated", .{key});
         }
     }
 }
@@ -1155,14 +1208,14 @@ test "OCI IPC network and UTS sysctls reject joining the runtime namespace" {
 pub fn validateHooks(configured: ?Spec.Hooks) error{InvalidConfig}!void {
     const hooks = configured orelse return;
     inline for (std.meta.fields(Spec.Hooks)) |field| {
-        for (@field(hooks, field.name) orelse &.{}) |hook| {
+        for (@field(hooks, field.name) orelse &.{}, 0..) |hook, i| {
             if (!std.mem.startsWith(u8, hook.path, "/") or
                 std.mem.indexOfScalar(u8, hook.path, 0) != null or
-                hook.timeout == 0) return error.InvalidConfig;
+                hook.timeout == 0) return invalidConfig("hooks.{s}[{d}]: require an absolute NUL-free path and positive timeout", .{ field.name, i });
             for (hook.args orelse &.{}) |arg|
-                if (std.mem.indexOfScalar(u8, arg, 0) != null) return error.InvalidConfig;
+                if (std.mem.indexOfScalar(u8, arg, 0) != null) return invalidConfig("hooks.{s}[{d}].args: must not contain NUL", .{ field.name, i });
             for (hook.env orelse &.{}) |env|
-                if (std.mem.indexOfScalar(u8, env, 0) != null) return error.InvalidConfig;
+                if (std.mem.indexOfScalar(u8, env, 0) != null) return invalidConfig("hooks.{s}[{d}].env: must not contain NUL", .{ field.name, i });
         }
     }
 }
@@ -1211,7 +1264,7 @@ pub fn prepareDevices(allocator: std.mem.Allocator, configured: ?[]const Spec.De
         for (devices.items) |device| allocator.free(device.path);
         devices.deinit(allocator);
     }
-    for (configured orelse &.{}) |device| {
+    for (configured orelse &.{}, 0..) |device, i| {
         const kind: Backend.Device.Kind = if (std.mem.eql(u8, device.type, "c") or std.mem.eql(u8, device.type, "u"))
             .character
         else if (std.mem.eql(u8, device.type, "b"))
@@ -1219,23 +1272,26 @@ pub fn prepareDevices(allocator: std.mem.Allocator, configured: ?[]const Spec.De
         else if (std.mem.eql(u8, device.type, "p"))
             .fifo
         else
-            return error.InvalidConfig;
-        const major = device.major orelse if (kind == .fifo) 0 else return error.InvalidConfig;
-        const minor = device.minor orelse if (kind == .fifo) 0 else return error.InvalidConfig;
+            return invalidConfig("linux.devices[{d}].type: expected c, u, b or p", .{i});
+        const major = device.major orelse if (kind == .fifo) 0 else return invalidConfig("linux.devices[{d}].major: required", .{i});
+        const minor = device.minor orelse if (kind == .fifo) 0 else return invalidConfig("linux.devices[{d}].minor: required", .{i});
         // Linux mknod encodes 12 major bits and 20 minor bits.
         if (major < 0 or major > 0xfff or minor < 0 or minor > 0xfffff)
-            return error.InvalidConfig;
+            return invalidConfig("linux.devices[{d}]: major or minor exceeds Linux device range", .{i});
         const mode = device.fileMode orelse 0o666;
         const uid = device.uid orelse 0;
         const gid = device.gid orelse 0;
         if (mode & ~@as(u32, 0o7777) != 0 or
             uid == std.math.maxInt(u32) or gid == std.math.maxInt(u32))
-            return error.InvalidConfig;
-        const path = try resolveMountDestination(allocator, device.path);
+            return invalidConfig("linux.devices[{d}]: invalid fileMode, uid or gid", .{i});
+        const path = resolveMountDestination(allocator, device.path) catch |err| {
+            diagnosticContext("linux.devices[{d}].path", .{i});
+            return err;
+        };
         errdefer allocator.free(path);
-        if (path.len == 1) return error.InvalidConfig;
+        if (path.len == 1) return invalidConfig("linux.devices[{d}].path: must not be /", .{i});
         for (devices.items) |previous| {
-            if (std.mem.eql(u8, previous.path, path)) return error.InvalidConfig;
+            if (std.mem.eql(u8, previous.path, path)) return invalidConfig("linux.devices[{d}].path: duplicate {s}", .{ i, path });
         }
         try devices.append(allocator, .{
             .path = path,
@@ -1455,9 +1511,9 @@ pub const capability_names = names: {
 /// Null means a well-formed CAP_* name unknown to our table, possibly a newer cap.
 /// Linux constants are available on every build host; no syscalls are made.
 pub fn capabilityNumber(name: []const u8) error{InvalidConfig}!?u6 {
-    if (!std.mem.startsWith(u8, name, "CAP_") or name.len == 4) return error.InvalidConfig;
+    if (!std.mem.startsWith(u8, name, "CAP_") or name.len == 4) return invalidConfig("process.capabilities: invalid name '{s}'", .{name});
     for (name[4..]) |c| {
-        if (!std.ascii.isUpper(c) and !std.ascii.isDigit(c) and c != '_') return error.InvalidConfig;
+        if (!std.ascii.isUpper(c) and !std.ascii.isDigit(c) and c != '_') return invalidConfig("process.capabilities: invalid name '{s}'", .{name});
     }
     for (capability_names, 0..) |known, number| {
         if (std.mem.eql(u8, name, known)) return @intCast(number);
@@ -1466,8 +1522,8 @@ pub fn capabilityNumber(name: []const u8) error{InvalidConfig}!?u6 {
 }
 
 pub fn rlimitResource(name: []const u8) error{InvalidConfig}!std.os.linux.rlimit_resource {
-    if (!std.mem.startsWith(u8, name, "RLIMIT_")) return error.InvalidConfig;
-    return std.meta.stringToEnum(std.os.linux.rlimit_resource, name["RLIMIT_".len..]) orelse error.InvalidConfig;
+    if (!std.mem.startsWith(u8, name, "RLIMIT_")) return invalidConfig("process.rlimits.type: invalid name '{s}'", .{name});
+    return std.meta.stringToEnum(std.os.linux.rlimit_resource, name["RLIMIT_".len..]) orelse invalidConfig("process.rlimits.type: unknown name '{s}'", .{name});
 }
 
 pub fn processCapabilities(config: Spec.Capabilities) !Backend.Capabilities {
@@ -1475,14 +1531,13 @@ pub fn processCapabilities(config: Spec.Capabilities) !Backend.Capabilities {
     inline for (std.meta.fields(Backend.Capabilities)) |field| {
         for (@field(config, field.name) orelse &.{}) |name| {
             const number = try capabilityNumber(name) orelse {
-                std.debug.print("igvano: unknown capability {s}\n", .{name});
-                return error.InvalidConfig;
+                return invalidConfig("process.capabilities.{s}: unknown capability {s}", .{ field.name, name });
             };
             @field(result, field.name) |= @as(u64, 1) << number;
         }
     }
     if (result.ambient & ~(result.permitted & result.inheritable) != 0)
-        return error.AmbientCapabilitiesRequirePermittedAndInheritable;
+        return validationError(error.AmbientCapabilitiesRequirePermittedAndInheritable, "process.capabilities.ambient: must be permitted and inheritable", .{});
     return result;
 }
 
@@ -1491,10 +1546,10 @@ pub fn processRlimits(allocator: std.mem.Allocator, config: ?[]const Spec.Rlimit
     const result = try allocator.alloc(Backend.Rlimit, limits.len);
     errdefer allocator.free(result);
     for (limits, result, 0..) |limit, *prepared, i| {
-        if (limit.soft > limit.hard) return error.InvalidConfig;
+        if (limit.soft > limit.hard) return invalidConfig("process.rlimits[{d}]: soft exceeds hard", .{i});
         const resource = try rlimitResource(limit.type);
         for (result[0..i]) |previous| {
-            if (previous.resource == resource) return error.InvalidConfig;
+            if (previous.resource == resource) return invalidConfig("process.rlimits[{d}]: duplicate {s}", .{ i, limit.type });
         }
         prepared.* = .{
             .resource = resource,
@@ -1660,7 +1715,7 @@ pub fn cgroupResources(allocator: std.mem.Allocator, configured: ?Spec.Resources
     errdefer freeCgroupResources(allocator, resources);
     if (settings.memory) |memory| {
         inline for (.{ "limit", "reservation", "swap", "kernel", "kernelTCP" }) |field|
-            try validateResourceLimit(@field(memory, field));
+            try validateResourceLimit(@field(memory, field), "linux.resources.memory." ++ field);
         resources.memory = .{
             .limit = memory.limit,
             .reservation = memory.reservation,
@@ -1672,10 +1727,10 @@ pub fn cgroupResources(allocator: std.mem.Allocator, configured: ?Spec.Resources
         };
     }
     if (settings.cpu) |cpu| {
-        try validateResourceLimit(cpu.quota);
-        try validateResourceLimit(cpu.realtimeRuntime);
+        try validateResourceLimit(cpu.quota, "linux.resources.cpu.quota");
+        try validateResourceLimit(cpu.realtimeRuntime, "linux.resources.cpu.realtimeRuntime");
         if (cpu.shares) |shares|
-            if (shares != 0 and (shares < 2 or shares > 262144)) return error.InvalidConfig;
+            if (shares != 0 and (shares < 2 or shares > 262144)) return invalidConfig("linux.resources.cpu.shares: expected 0 or 2..262144", .{});
         resources.cpu = .{
             .shares = cpu.shares,
             .quota = cpu.quota,
@@ -1687,20 +1742,20 @@ pub fn cgroupResources(allocator: std.mem.Allocator, configured: ?Spec.Resources
         };
     }
     if (settings.pids) |pids| {
-        try validateResourceLimit(pids.limit);
+        try validateResourceLimit(pids.limit, "linux.resources.pids.limit");
         resources.pids = .{ .limit = pids.limit };
     }
     if (settings.blockIO) |block| {
-        try validateResourceWeight(block.weight);
-        try validateResourceWeight(block.leafWeight);
+        try validateResourceWeight(block.weight, "linux.resources.blockIO.weight");
+        try validateResourceWeight(block.leafWeight, "linux.resources.blockIO.leafWeight");
         resources.block_io = .{ .weight = block.weight, .leaf_weight = block.leafWeight };
         const weights = block.weightDevice orelse &.{};
         const translated = try allocator.alloc(Backend.Resources.WeightDevice, weights.len);
         resources.block_io.?.weight_device = translated;
-        for (weights, translated) |entry, *device| {
-            if (entry.major < 0 or entry.minor < 0) return error.InvalidConfig;
-            try validateResourceWeight(entry.weight);
-            try validateResourceWeight(entry.leafWeight);
+        for (weights, translated, 0..) |entry, *device, i| {
+            if (entry.major < 0 or entry.minor < 0) return invalidConfig("linux.resources.blockIO.weightDevice[{d}]: major/minor must be nonnegative", .{i});
+            try validateResourceWeight(entry.weight, "linux.resources.blockIO.weightDevice.weight");
+            try validateResourceWeight(entry.leafWeight, "linux.resources.blockIO.weightDevice.leafWeight");
             device.* = .{
                 .major = entry.major,
                 .minor = entry.minor,
@@ -1708,16 +1763,16 @@ pub fn cgroupResources(allocator: std.mem.Allocator, configured: ?Spec.Resources
                 .leaf_weight = entry.leafWeight,
             };
         }
-        resources.block_io.?.throttle_read_bps = try resourceThrottleDevices(allocator, block.throttleReadBpsDevice);
-        resources.block_io.?.throttle_write_bps = try resourceThrottleDevices(allocator, block.throttleWriteBpsDevice);
-        resources.block_io.?.throttle_read_iops = try resourceThrottleDevices(allocator, block.throttleReadIOPSDevice);
-        resources.block_io.?.throttle_write_iops = try resourceThrottleDevices(allocator, block.throttleWriteIOPSDevice);
+        resources.block_io.?.throttle_read_bps = try resourceThrottleDevices(allocator, block.throttleReadBpsDevice, "throttleReadBpsDevice");
+        resources.block_io.?.throttle_write_bps = try resourceThrottleDevices(allocator, block.throttleWriteBpsDevice, "throttleWriteBpsDevice");
+        resources.block_io.?.throttle_read_iops = try resourceThrottleDevices(allocator, block.throttleReadIOPSDevice, "throttleReadIOPSDevice");
+        resources.block_io.?.throttle_write_iops = try resourceThrottleDevices(allocator, block.throttleWriteIOPSDevice, "throttleWriteIOPSDevice");
     }
     const hugepages = settings.hugepageLimits orelse &.{};
     const translated_pages = try allocator.alloc(Backend.Resources.HugepageLimit, hugepages.len);
     resources.hugepage_limits = translated_pages;
-    for (hugepages, translated_pages) |entry, *page| {
-        if (entry.pageSize.len == 0) return error.InvalidConfig;
+    for (hugepages, translated_pages, 0..) |entry, *page, i| {
+        if (entry.pageSize.len == 0) return invalidConfig("linux.resources.hugepageLimits[{d}].pageSize: must not be empty", .{i});
         page.* = .{ .page_size = entry.pageSize, .limit = entry.limit };
     }
     if (settings.network) |network| {
@@ -1734,7 +1789,7 @@ pub fn cgroupResources(allocator: std.mem.Allocator, configured: ?Spec.Resources
         resources.unified = translated;
         for (unified.map.keys(), unified.map.values(), translated) |key, value, *entry| {
             if (key.len == 0 or std.mem.indexOfAny(u8, key, "/\x00") != null or
-                std.mem.eql(u8, key, ".") or std.mem.eql(u8, key, "..")) return error.InvalidConfig;
+                std.mem.eql(u8, key, ".") or std.mem.eql(u8, key, "..")) return invalidConfig("linux.resources.unified: invalid key '{s}'", .{key});
             entry.* = .{ .key = key, .value = value };
         }
     }
@@ -1745,7 +1800,7 @@ fn resourceDeviceRules(allocator: std.mem.Allocator, configured: ?[]const Spec.R
     const devices = configured orelse &.{};
     const translated = try allocator.alloc(Backend.Resources.DeviceRule, devices.len);
     errdefer allocator.free(translated);
-    for (devices, translated) |entry, *device| {
+    for (devices, translated, 0..) |entry, *device, i| {
         const kind: @FieldType(Backend.Resources.DeviceRule, "kind") = if (std.mem.eql(u8, entry.type, "a"))
             .all
         else if (std.mem.eql(u8, entry.type, "b"))
@@ -1753,11 +1808,11 @@ fn resourceDeviceRules(allocator: std.mem.Allocator, configured: ?[]const Spec.R
         else if (std.mem.eql(u8, entry.type, "c"))
             .char
         else
-            return error.InvalidConfig;
+            return invalidConfig("linux.resources.devices[{d}].type: expected a, b or c", .{i});
         for (entry.access) |access|
-            if (access != 'r' and access != 'w' and access != 'm') return error.InvalidConfig;
-        try validateResourceLimit(entry.major);
-        try validateResourceLimit(entry.minor);
+            if (access != 'r' and access != 'w' and access != 'm') return invalidConfig("linux.resources.devices[{d}].access: expected r, w or m", .{i});
+        try validateResourceLimit(entry.major, "linux.resources.devices.major");
+        try validateResourceLimit(entry.minor, "linux.resources.devices.minor");
         device.* = .{
             .allow = entry.allow,
             .kind = kind,
@@ -1769,22 +1824,22 @@ fn resourceDeviceRules(allocator: std.mem.Allocator, configured: ?[]const Spec.R
     return translated;
 }
 
-fn validateResourceLimit(value: ?i64) error{InvalidConfig}!void {
+fn validateResourceLimit(value: ?i64, comptime field: []const u8) error{InvalidConfig}!void {
     if (value) |limit|
-        if (limit < -1) return error.InvalidConfig;
+        if (limit < -1) return invalidConfig(field ++ ": must be -1 or nonnegative", .{});
 }
 
-fn validateResourceWeight(value: ?u16) error{InvalidConfig}!void {
+fn validateResourceWeight(value: ?u16, comptime field: []const u8) error{InvalidConfig}!void {
     if (value) |weight|
-        if (weight != 0 and (weight < 10 or weight > 1000)) return error.InvalidConfig;
+        if (weight != 0 and (weight < 10 or weight > 1000)) return invalidConfig(field ++ ": expected 0 or 10..1000", .{});
 }
 
-fn resourceThrottleDevices(allocator: std.mem.Allocator, configured: ?[]const Spec.Resources.ThrottleDevice) ![]Backend.Resources.ThrottleDevice {
+fn resourceThrottleDevices(allocator: std.mem.Allocator, configured: ?[]const Spec.Resources.ThrottleDevice, comptime field: []const u8) ![]Backend.Resources.ThrottleDevice {
     const entries = configured orelse &.{};
     const devices = try allocator.alloc(Backend.Resources.ThrottleDevice, entries.len);
     errdefer allocator.free(devices);
-    for (entries, devices) |entry, *device| {
-        if (entry.major < 0 or entry.minor < 0) return error.InvalidConfig;
+    for (entries, devices, 0..) |entry, *device, i| {
+        if (entry.major < 0 or entry.minor < 0) return invalidConfig("linux.resources.blockIO." ++ field ++ "[{d}]: major/minor must be nonnegative", .{i});
         device.* = .{ .major = entry.major, .minor = entry.minor, .rate = entry.rate };
     }
     return devices;
@@ -1867,7 +1922,7 @@ pub fn parseMountOptions(allocator: std.mem.Allocator, options: []const []const 
     var data: std.ArrayList(u8) = .empty;
     defer data.deinit(allocator);
     option: for (options) |option| {
-        if (std.mem.indexOfScalar(u8, option, 0) != null) return error.InvalidConfig;
+        if (std.mem.indexOfScalar(u8, option, 0) != null) return invalidConfig("mount options: must not contain NUL", .{});
         for (mount_option_table) |entry| {
             if (std.mem.eql(u8, option, entry.name)) {
                 flags = (flags & ~entry.clear) | entry.set;
@@ -1895,13 +1950,13 @@ pub fn parseMountOptions(allocator: std.mem.Allocator, options: []const []const 
 
 pub fn validateMountDestination(destination: []const u8) !void {
     if (!std.mem.startsWith(u8, destination, "/") or
-        std.mem.indexOfScalar(u8, destination, 0) != null) return error.InvalidConfig;
+        std.mem.indexOfScalar(u8, destination, 0) != null) return invalidConfig("container path: must be absolute and NUL-free", .{});
     var depth: usize = 0;
     var components = std.mem.tokenizeScalar(u8, destination, '/');
     while (components.next()) |component| {
         if (std.mem.eql(u8, component, ".")) continue;
         if (std.mem.eql(u8, component, "..")) {
-            if (depth == 0) return error.InvalidConfig;
+            if (depth == 0) return invalidConfig("container path: must not escape the container root", .{});
             depth -= 1;
         } else {
             depth += 1;
@@ -1917,22 +1972,22 @@ pub fn resolveMountDestination(allocator: std.mem.Allocator, destination: []cons
 
 /// Map ranges are half-open; widen before adding to avoid wrapping u32 IDs.
 pub fn validateIDMappings(mappings: []const Spec.IDMapping) error{InvalidConfig}!void {
-    if (mappings.len == 0 or mappings.len > 340) return error.InvalidConfig;
+    if (mappings.len == 0 or mappings.len > 340) return invalidConfig("ID mappings: expected 1..340 ranges", .{});
     var text_size: usize = 0;
     for (mappings, 0..) |mapping, i| {
         const end = @as(u64, mapping.containerID) + mapping.size;
         const host_end = @as(u64, mapping.hostID) + mapping.size;
         // Linux reserves (uid_t)-1 and (gid_t)-1 as unmapped IDs.
         if (mapping.size == 0 or end > std.math.maxInt(u32) or host_end > std.math.maxInt(u32))
-            return error.InvalidConfig;
+            return invalidConfig("ID mappings[{d}]: range is empty or includes a reserved ID", .{i});
         text_size += std.fmt.count("{d} {d} {d}\n", .{ mapping.containerID, mapping.hostID, mapping.size });
-        if (text_size >= 4096) return error.InvalidConfig; // Linux requires a write smaller than one page.
+        if (text_size >= 4096) return invalidConfig("ID mappings: formatted map must be smaller than 4096 bytes", .{});
         for (mappings[0..i]) |previous| {
             const previous_end = @as(u64, previous.containerID) + previous.size;
             const previous_host_end = @as(u64, previous.hostID) + previous.size;
             if ((mapping.containerID < previous_end and previous.containerID < end) or
                 (mapping.hostID < previous_host_end and previous.hostID < host_end))
-                return error.InvalidConfig;
+                return invalidConfig("ID mappings[{d}]: overlapping container or host ranges", .{i});
         }
     }
 }
@@ -1956,8 +2011,7 @@ fn mountMappingConfig(mount: Spec.Mount, settings: Spec.Linux) !?MountMappingCon
     const explicit = mount.uidMappings != null or mount.gidMappings != null;
     if (!explicit and recursive == null) return null;
     if (!bind) {
-        std.debug.print("igvano: idmapped mount '{s}' must be a bind mount\n", .{mount.destination});
-        return error.InvalidConfig;
+        return invalidConfig("mount '{s}': idmapping requires a bind mount", .{mount.destination});
     }
     var config: MountMappingConfig = .{ .recursive = recursive orelse false };
     if (explicit) {
@@ -1976,12 +2030,11 @@ fn mountMappingConfig(mount: Spec.Mount, settings: Spec.Linux) !?MountMappingCon
         }
     }
     if (config.uid.len == 0 or config.gid.len == 0) {
-        std.debug.print("igvano: idmapped mount '{s}' requires both uid and gid mappings\n", .{mount.destination});
-        return error.InvalidConfig;
+        return invalidConfig("mount '{s}': idmapping requires both uid and gid mappings", .{mount.destination});
     }
     for ([_][]const Spec.IDMapping{ config.uid, config.gid }) |mappings| {
         validateIDMappings(mappings) catch |err| {
-            std.debug.print("igvano: invalid ID mappings for mount '{s}'\n", .{mount.destination});
+            diagnosticContext("mount '{s}' mappings", .{mount.destination});
             return err;
         };
     }
@@ -2009,7 +2062,7 @@ fn backendIDMappings(allocator: std.mem.Allocator, mappings: []const Spec.IDMapp
 
 /// Omitted namespace types are inherited from the runtime.
 pub fn requireCreate(spec: Spec) !void {
-    _ = std.SemanticVersion.parse(spec.ociVersion) catch return error.InvalidConfig;
+    _ = std.SemanticVersion.parse(spec.ociVersion) catch return invalidConfig("ociVersion: invalid semantic version", .{});
     try validateHooks(spec.hooks);
     const settings: Spec.Linux = spec.linux orelse .{};
     try validateSysctls(settings);
@@ -2018,53 +2071,67 @@ pub fn requireCreate(spec: Spec) !void {
     const namespaces = settings.namespaces orelse &.{};
     var has_mount = false;
     var has_user = false;
+    var joined_user = false;
     for (namespaces) |namespace| {
         if (namespace.type == .mount) has_mount = true;
-        if (namespace.type == .user and namespace.path == null) has_user = true;
+        if (namespace.type == .user) {
+            has_user = true;
+            joined_user = namespace.path != null;
+        }
     }
     if (has_user) {
-        for ([_][]const Spec.IDMapping{ uid_mappings, gid_mappings }) |mappings| {
-            try validateIDMappings(mappings);
+        for ([_][]const Spec.IDMapping{ uid_mappings, gid_mappings }, [_][]const u8{ "linux.uidMappings", "linux.gidMappings" }) |mappings, field| {
+            if (joined_user and mappings.len == 0) continue;
+            validateIDMappings(mappings) catch |err| {
+                diagnosticContext("{s}", .{field});
+                return err;
+            };
             // OCI does not require a root mapping; our init, like runc, needs one.
             for (mappings) |mapping| {
                 if (mapping.containerID == 0) break;
-            } else return error.InvalidConfig;
+            } else return invalidConfig("{s}: container root must be mapped", .{field});
         }
     } else if (uid_mappings.len > 0 or gid_mappings.len > 0) {
-        return error.InvalidConfig;
+        return invalidConfig("linux.uidMappings/gidMappings: require a user namespace", .{});
     }
     if (!has_mount and settings.rootfsPropagation != null) {
-        std.debug.print("igvano: cannot change propagation without a private mount namespace\n", .{});
-        return error.InvalidConfig;
+        return invalidConfig("linux.rootfsPropagation: requires a mount namespace", .{});
     }
-    if (spec.root.path.len == 0) return error.InvalidConfig;
+    if (spec.root.path.len == 0) return invalidConfig("root.path: must not be empty", .{});
     if (spec.process) |process| try validateProcess(process);
-    for (spec.mounts orelse &.{}) |mount| {
+    for (spec.mounts orelse &.{}, 0..) |mount, i| {
+        errdefer diagnosticContext("mounts[{d}]", .{i});
         try validateMountDestination(mount.destination);
         _ = try mountMappingConfig(mount, settings);
     }
-    for (settings.maskedPaths orelse &.{}) |path| try validateMountDestination(path);
-    for (settings.readonlyPaths orelse &.{}) |path| try validateMountDestination(path);
+    for (settings.maskedPaths orelse &.{}, 0..) |path, i| {
+        errdefer diagnosticContext("linux.maskedPaths[{d}]", .{i});
+        try validateMountDestination(path);
+    }
+    for (settings.readonlyPaths orelse &.{}, 0..) |path, i| {
+        errdefer diagnosticContext("linux.readonlyPaths[{d}]", .{i});
+        try validateMountDestination(path);
+    }
 }
 
 pub fn validateEnv(entry: []const u8) !void {
-    const equals = std.mem.indexOfScalar(u8, entry, '=') orelse return error.InvalidProcess;
-    if (equals == 0 or std.mem.indexOfScalar(u8, entry, 0) != null) return error.InvalidProcess;
+    const equals = std.mem.indexOfScalar(u8, entry, '=') orelse return validationError(error.InvalidProcess, "process.env: expected NAME=value", .{});
+    if (equals == 0 or std.mem.indexOfScalar(u8, entry, 0) != null) return validationError(error.InvalidProcess, "process.env: require a nonempty name and NUL-free value", .{});
 }
 
 pub fn validateProcess(process: Spec.Process) !void {
     if (!std.mem.startsWith(u8, process.cwd, "/") or
-        std.mem.indexOfScalar(u8, process.cwd, 0) != null or
-        process.args.len == 0 or process.args[0].len == 0) return error.InvalidProcess;
+        std.mem.indexOfScalar(u8, process.cwd, 0) != null) return validationError(error.InvalidProcess, "process.cwd: must be absolute and NUL-free", .{});
+    if (process.args.len == 0 or process.args[0].len == 0) return validationError(error.InvalidProcess, "process.args: executable must not be empty", .{});
     for (process.args) |arg| {
-        if (std.mem.indexOfScalar(u8, arg, 0) != null) return error.InvalidProcess;
+        if (std.mem.indexOfScalar(u8, arg, 0) != null) return validationError(error.InvalidProcess, "process.args: must not contain NUL", .{});
     }
     for (process.env orelse &.{}) |entry| try validateEnv(entry);
     if (process.apparmorProfile) |profile| {
-        if (std.mem.indexOfScalar(u8, profile, 0) != null) return error.InvalidProcess;
+        if (std.mem.indexOfScalar(u8, profile, 0) != null) return validationError(error.InvalidProcess, "process.apparmorProfile: must not contain NUL", .{});
     }
     if (process.oomScoreAdj) |value| {
-        if (value < -1000 or value > 1000) return error.InvalidConfig;
+        if (value < -1000 or value > 1000) return invalidConfig("process.oomScoreAdj: expected -1000..1000", .{});
     }
 }
 
@@ -2197,7 +2264,7 @@ test "create rejects malformed OCI version strings" {
     }
 }
 
-test "create accepts new user namespaces with maps and joins without maps" {
+test "create accepts new user namespaces with maps and joins with or without maps" {
     var spec: Spec = .{
         .ociVersion = "1.0.2",
         .root = .{ .path = "rootfs" },
@@ -2209,7 +2276,7 @@ test "create accepts new user namespaces with maps and joins without maps" {
     };
     try requireCreate(spec);
     spec.linux.?.namespaces = &.{ .{ .type = .mount }, .{ .type = .user, .path = "/proc/1/ns/user" } };
-    try std.testing.expectError(error.InvalidConfig, requireCreate(spec));
+    try requireCreate(spec);
     spec.linux.?.uidMappings = null;
     spec.linux.?.gidMappings = null;
     try requireCreate(spec);
@@ -2320,6 +2387,72 @@ test "create validates both user namespace mapping arrays" {
     try std.testing.expectError(error.InvalidConfig, requireCreate(spec));
 }
 
+test "create accepts joined user namespaces with optional mappings" {
+    const mappings: []const Spec.IDMapping = &.{.{ .containerID = 0, .hostID = 1000, .size = 100000 }};
+    var spec: Spec = .{
+        .ociVersion = "1.0.2",
+        .root = .{ .path = "rootfs" },
+        .linux = .{
+            .namespaces = &.{.{ .type = .user, .path = "/proc/123/ns/user" }},
+            .uidMappings = mappings,
+            .gidMappings = mappings,
+        },
+    };
+    try requireCreate(spec);
+    spec.linux.?.uidMappings = null;
+    try requireCreate(spec);
+    spec.linux.?.gidMappings = null;
+    try requireCreate(spec);
+}
+
+test "frontend validation failures retain specific diagnostics" {
+    defer clearDiagnostic();
+    const root: Spec.Root = .{ .path = "rootfs" };
+    const cases = [_]struct { spec: Spec, reason: []const u8 }{
+        .{ .spec = .{ .ociVersion = "invalid", .root = root }, .reason = "ociVersion:" },
+        .{ .spec = .{ .ociVersion = "1.0.2", .root = .{ .path = "" } }, .reason = "root.path:" },
+        .{ .spec = .{ .ociVersion = "1.0.2", .root = root, .linux = .{ .namespaces = &.{.{ .type = .user }} } }, .reason = "linux.uidMappings:" },
+        .{ .spec = .{ .ociVersion = "1.0.2", .root = root, .mounts = &.{.{ .destination = "relative" }} }, .reason = "mounts[0]:" },
+        .{ .spec = .{ .ociVersion = "1.0.2", .root = root, .hooks = .{ .prestart = &.{.{ .path = "relative" }} } }, .reason = "hooks.prestart[0]:" },
+        .{ .spec = .{ .ociVersion = "1.0.2", .root = root, .process = .{
+            .args = &.{"/init"},
+            .cwd = "/",
+            .user = .{ .uid = 0, .gid = 0 },
+            .oomScoreAdj = 1001,
+        } }, .reason = "process.oomScoreAdj:" },
+    };
+    for (cases) |case| {
+        clearDiagnostic();
+        try std.testing.expectError(error.InvalidConfig, requireCreate(case.spec));
+        const detail = diagnosticFor(error.InvalidConfig).?;
+        try std.testing.expect(std.mem.indexOf(u8, detail, case.reason) != null);
+        try std.testing.expect(diagnosticFor(error.OutOfMemory) == null);
+    }
+    clearDiagnostic();
+    try std.testing.expectError(error.InvalidConfig, cgroupResources(std.testing.allocator, .{ .cpu = .{ .shares = 1 } }));
+    try std.testing.expect(std.mem.startsWith(u8, diagnostic().?, "linux.resources.cpu.shares:"));
+    clearDiagnostic();
+    try std.testing.expectError(error.InvalidConfig, prepareSeccomp(std.testing.allocator, .{ .defaultAction = "unknown" }));
+    try std.testing.expect(std.mem.startsWith(u8, diagnostic().?, "linux.seccomp:"));
+    clearDiagnostic();
+    try std.testing.expectError(error.InvalidProcess, validateEnv("INVALID"));
+    try std.testing.expect(std.mem.startsWith(u8, diagnostic().?, "process.env:"));
+}
+
+test "frontend diagnostics truncate at UTF-8 boundaries and clear" {
+    defer clearDiagnostic();
+    recordDiagnostic(error.InvalidConfig, "{s}", .{"x" ** 511 ++ "é"});
+    try std.testing.expectEqual(@as(usize, 511), diagnostic().?.len);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(diagnostic().?));
+    diagnosticContext("mounts[3]", .{});
+    try std.testing.expect(std.mem.startsWith(u8, diagnostic().?, "mounts[3]: "));
+    recordDiagnostic(error.InvalidConfig, "reason", .{});
+    diagnosticContext("{s}", .{"x" ** 255 ++ "é"});
+    try std.testing.expect(std.unicode.utf8ValidateSlice(diagnostic().?));
+    clearDiagnostic();
+    try std.testing.expect(diagnostic() == null);
+}
+
 test "create requires container root in both user namespace maps" {
     const root_mapping: []const Spec.IDMapping = &.{.{ .containerID = 0, .hostID = 100000, .size = 10 }};
     const nonroot_mapping: []const Spec.IDMapping = &.{.{ .containerID = 1, .hostID = 200000, .size = 10 }};
@@ -2347,12 +2480,18 @@ pub const json_size_limit: std.Io.Limit = .limited(1 << 20);
 pub fn loadSpec(allocator: std.mem.Allocator, io: std.Io, bundle_dir: []const u8) !std.json.Parsed(Spec) {
     const path = try std.fs.path.join(allocator, &.{ bundle_dir, "config.json" });
     defer allocator.free(path);
-    const json = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, json_size_limit);
+    const json = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, json_size_limit) catch |err| {
+        if (err == error.StreamTooLong) recordDiagnostic(err, "config.json: exceeds 1 MiB", .{});
+        return err;
+    };
     defer allocator.free(json);
-    const parsed = try std.json.parseFromSlice(Spec, allocator, json, .{
+    const parsed = std.json.parseFromSlice(Spec, allocator, json, .{
         .ignore_unknown_fields = true,
         .allocate = .alloc_always,
-    });
+    }) catch |err| {
+        if (err != error.OutOfMemory) recordDiagnostic(err, "config.json: invalid JSON or schema ({s})", .{@errorName(err)});
+        return err;
+    };
     errdefer parsed.deinit();
     try validateHooks(parsed.value.hooks);
     return parsed;
@@ -2465,6 +2604,16 @@ test "mount mapping translation selects explicit container and joined namespace 
     try std.testing.expectEqual(@as(usize, 0), joined.uid.len);
     try std.testing.expectEqual(@as(usize, 0), joined.gid.len);
     try std.testing.expect(joined.recursive);
+    var joined_settings = settings;
+    joined_settings.namespaces = &.{.{ .type = .user, .path = "/proc/123/ns/user" }};
+    const joined_with_mappings = (try mountMappings(arena.allocator(), mount, joined_settings)).?;
+    try std.testing.expectEqualDeep(joined, joined_with_mappings);
+    try requireCreate(.{
+        .ociVersion = "1.2.0",
+        .root = .{ .path = "rootfs" },
+        .linux = joined_settings,
+        .mounts = &.{mount},
+    });
 }
 
 test "mount mapping translation frees partial allocations" {
@@ -2615,18 +2764,27 @@ test "loadSpec accepts version strings and create validates semantic version syn
 pub fn loadResources(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !std.json.Parsed(Spec.Resources) {
     const json = if (std.mem.eql(u8, path, "-")) input: {
         var reader = std.Io.File.stdin().readerStreaming(io, &.{});
-        break :input try reader.interface.allocRemaining(allocator, json_size_limit);
-    } else try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, json_size_limit);
+        break :input reader.interface.allocRemaining(allocator, json_size_limit) catch |err| {
+            if (err == error.StreamTooLong) recordDiagnostic(err, "resources: JSON exceeds 1 MiB", .{});
+            return err;
+        };
+    } else std.Io.Dir.cwd().readFileAlloc(io, path, allocator, json_size_limit) catch |err| {
+        if (err == error.StreamTooLong) recordDiagnostic(err, "resources: JSON exceeds 1 MiB", .{});
+        return err;
+    };
     defer allocator.free(json);
     return std.json.parseFromSlice(Spec.Resources, allocator, json, .{
         .ignore_unknown_fields = true,
         .allocate = .alloc_always,
-    });
+    }) catch |err| {
+        if (err != error.OutOfMemory) recordDiagnostic(err, "resources: invalid JSON or schema ({s})", .{@errorName(err)});
+        return err;
+    };
 }
 
 /// Resolves root.path against an absolute bundle directory. The caller owns the path.
 pub fn resolveRootfs(allocator: std.mem.Allocator, bundle_dir: []const u8, root_path: []const u8) ![]u8 {
-    if (!std.fs.path.isAbsolute(bundle_dir)) return error.RelativeBundle;
+    if (!std.fs.path.isAbsolute(bundle_dir)) return validationError(error.RelativeBundle, "bundle: must be absolute", .{});
     if (std.fs.path.isAbsolute(root_path)) return allocator.dupe(u8, root_path);
     return std.fs.path.join(allocator, &.{ bundle_dir, root_path });
 }
@@ -2640,29 +2798,29 @@ pub const Status = enum {
 };
 
 pub fn requireStart(status: Status, has_process: bool) !void {
-    if (status != .created) return error.InvalidStatus;
-    if (!has_process) return error.MissingProcess;
+    if (status != .created) return validationError(error.InvalidStatus, "start: requires created state; found {s}", .{@tagName(status)});
+    if (!has_process) return validationError(error.MissingProcess, "start: container has no process", .{});
 }
 
 pub fn requireKill(status: Status) !void {
-    if (status != .created and status != .running and status != .paused) return error.InvalidStatus;
+    if (status != .created and status != .running and status != .paused) return validationError(error.InvalidStatus, "kill: requires created, running or paused state; found {s}", .{@tagName(status)});
 }
 
 pub fn requireUpdate(status: Status) !void {
-    if (status != .created and status != .running and status != .paused) return error.InvalidStatus;
+    if (status != .created and status != .running and status != .paused) return validationError(error.InvalidStatus, "update: requires created, running or paused state; found {s}", .{@tagName(status)});
 }
 
 pub fn requirePause(status: Status) !void {
     // ponytail: runc also allows pausing created containers; containerd only pauses running containers.
-    if (status != .running) return error.InvalidStatus;
+    if (status != .running) return validationError(error.InvalidStatus, "pause: requires running state; found {s}", .{@tagName(status)});
 }
 
 pub fn requireResume(status: Status) !void {
-    if (status != .paused) return error.InvalidStatus;
+    if (status != .paused) return validationError(error.InvalidStatus, "resume: requires paused state; found {s}", .{@tagName(status)});
 }
 
 pub fn requireDelete(status: Status) !void {
-    if (status != .stopped) return error.InvalidStatus;
+    if (status != .stopped) return validationError(error.InvalidStatus, "delete: requires stopped state; found {s}", .{@tagName(status)});
 }
 
 pub const State = struct {
@@ -2702,9 +2860,15 @@ pub fn saveState(allocator: std.mem.Allocator, io: std.Io, root: []const u8, sta
 pub fn loadState(allocator: std.mem.Allocator, io: std.Io, root: []const u8, id: []const u8) !std.json.Parsed(State) {
     const path = try std.fs.path.join(allocator, &.{ root, id, state_file_name });
     defer allocator.free(path);
-    const json = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1 << 20));
+    const json = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1 << 20)) catch |err| {
+        if (err == error.StreamTooLong) recordDiagnostic(err, "state.json: exceeds 1 MiB", .{});
+        return err;
+    };
     defer allocator.free(json);
-    return std.json.parseFromSlice(State, allocator, json, .{ .allocate = .alloc_always });
+    return std.json.parseFromSlice(State, allocator, json, .{ .allocate = .alloc_always }) catch |err| {
+        if (err != error.OutOfMemory) recordDiagnostic(err, "state.json: invalid JSON or schema ({s})", .{@errorName(err)});
+        return err;
+    };
 }
 
 test "state JSON round-trips a running container with annotations" {

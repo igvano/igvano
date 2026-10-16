@@ -82,43 +82,43 @@ fn parseArgsWithLog(args: []const []const u8, log: *?[]const u8, log_format: *Lo
     while (index < args.len and std.mem.startsWith(u8, args[index], "-")) {
         if (std.mem.eql(u8, args[index], "--root")) {
             index += 1;
-            if (index >= args.len or args[index].len == 0) return error.MissingRoot;
+            if (index >= args.len or args[index].len == 0) return oci.validationError(error.MissingRoot, "--root: missing value", .{});
             root = args[index];
         } else if (std.mem.startsWith(u8, args[index], "--root=")) {
             root = args[index]["--root=".len..];
-            if (root.len == 0) return error.MissingRoot;
+            if (root.len == 0) return oci.validationError(error.MissingRoot, "--root: missing value", .{});
         } else if (std.mem.eql(u8, args[index], "--log")) {
             index += 1;
             if (index >= args.len or args[index].len == 0 or std.mem.startsWith(u8, args[index], "--"))
-                return error.MissingLog;
+                return oci.validationError(error.MissingLog, "--log: missing value", .{});
             log.* = args[index];
         } else if (std.mem.startsWith(u8, args[index], "--log=")) {
             const value = args[index]["--log=".len..];
-            if (value.len == 0) return error.MissingLog;
+            if (value.len == 0) return oci.validationError(error.MissingLog, "--log: missing value", .{});
             log.* = value;
         } else if (std.mem.eql(u8, args[index], "--log-format") or std.mem.startsWith(u8, args[index], "--log-format=")) {
             const value = if (std.mem.eql(u8, args[index], "--log-format")) value: {
                 index += 1;
-                if (index >= args.len or std.mem.startsWith(u8, args[index], "--")) return error.MissingLogFormat;
+                if (index >= args.len or std.mem.startsWith(u8, args[index], "--")) return oci.validationError(error.MissingLogFormat, "--log-format: missing value", .{});
                 break :value args[index];
             } else args[index]["--log-format=".len..];
-            if (value.len == 0) return error.MissingLogFormat;
-            log_format.* = std.meta.stringToEnum(LogFormat, value) orelse return error.InvalidLogFormat;
+            if (value.len == 0) return oci.validationError(error.MissingLogFormat, "--log-format: missing value", .{});
+            log_format.* = std.meta.stringToEnum(LogFormat, value) orelse return oci.validationError(error.InvalidLogFormat, "--log-format: expected text or json", .{});
         } else if (std.mem.eql(u8, args[index], "--debug")) {
             // Accepted for compatibility with runc callers.
         } else if (std.mem.eql(u8, args[index], "--systemd-cgroup")) {
-            return error.SystemdCgroupUnsupported;
+            return oci.validationError(error.SystemdCgroupUnsupported, "--systemd-cgroup: unsupported; set SystemdCgroup = false", .{});
         } else {
-            return error.UnknownOption;
+            return oci.validationError(error.UnknownOption, "unknown option '{s}'", .{args[index]});
         }
         index += 1;
     }
-    if (index >= args.len) return error.MissingSubcommand;
+    if (index >= args.len) return oci.validationError(error.MissingSubcommand, "missing subcommand", .{});
     const subcommand = std.meta.stringToEnum(Subcommand, args[index]) orelse
-        return error.UnknownSubcommand;
+        return oci.validationError(error.UnknownSubcommand, "unknown subcommand '{s}'", .{args[index]});
     index += 1;
     if (subcommand == .features) {
-        if (index != args.len) return error.UnexpectedArgument;
+        if (index != args.len) return oci.validationError(error.UnexpectedArgument, "unexpected argument; global flags must precede the subcommand", .{});
         return .{
             .root = root,
             .subcommand = subcommand,
@@ -160,7 +160,7 @@ fn parseArgsWithLog(args: []const []const u8, log: *?[]const u8, log_format: *Lo
                 exec_user = try parseUser(try optionValue(args, &index, error.MissingUser));
             } else if (std.mem.eql(u8, flag, "--env") or std.mem.startsWith(u8, flag, "--env=")) {
                 try oci.validateEnv(try optionValue(args, &index, error.MissingEnv));
-            } else return error.UnknownOption;
+            } else return oci.validationError(error.UnknownOption, "unknown option '{s}'", .{args[index]});
         }
     }
     if (subcommand == .create) {
@@ -168,29 +168,29 @@ fn parseArgsWithLog(args: []const []const u8, log: *?[]const u8, log_format: *Lo
             if (std.mem.eql(u8, args[index], "--bundle")) {
                 index += 1;
                 if (index >= args.len or args[index].len == 0 or std.mem.startsWith(u8, args[index], "--"))
-                    return error.MissingBundle;
+                    return oci.validationError(error.MissingBundle, "--bundle: missing value", .{});
                 bundle = args[index];
             } else if (std.mem.startsWith(u8, args[index], "--bundle=")) {
                 bundle = args[index]["--bundle=".len..];
-                if (bundle.?.len == 0) return error.MissingBundle;
+                if (bundle.?.len == 0) return oci.validationError(error.MissingBundle, "--bundle: missing value", .{});
             } else if (std.mem.eql(u8, args[index], "--pid-file")) {
                 index += 1;
                 if (index >= args.len or args[index].len == 0 or std.mem.startsWith(u8, args[index], "--"))
-                    return error.MissingPidFile;
+                    return oci.validationError(error.MissingPidFile, "--pid-file: missing value", .{});
                 pid_file = args[index];
             } else if (std.mem.startsWith(u8, args[index], "--pid-file=")) {
                 pid_file = args[index]["--pid-file=".len..];
-                if (pid_file.?.len == 0) return error.MissingPidFile;
+                if (pid_file.?.len == 0) return oci.validationError(error.MissingPidFile, "--pid-file: missing value", .{});
             } else if (std.mem.eql(u8, args[index], "--console-socket")) {
                 index += 1;
                 if (index >= args.len or args[index].len == 0 or std.mem.startsWith(u8, args[index], "--"))
-                    return error.MissingConsoleSocket;
+                    return oci.validationError(error.MissingConsoleSocket, "--console-socket: missing value", .{});
                 console_socket = args[index];
             } else if (std.mem.startsWith(u8, args[index], "--console-socket=")) {
                 console_socket = args[index]["--console-socket=".len..];
-                if (console_socket.?.len == 0) return error.MissingConsoleSocket;
+                if (console_socket.?.len == 0) return oci.validationError(error.MissingConsoleSocket, "--console-socket: missing value", .{});
             } else {
-                return error.UnknownOption;
+                return oci.validationError(error.UnknownOption, "unknown option '{s}'", .{args[index]});
             }
         }
         if (bundle == null) bundle = ".";
@@ -198,24 +198,24 @@ fn parseArgsWithLog(args: []const []const u8, log: *?[]const u8, log_format: *Lo
         while (index < args.len and std.mem.startsWith(u8, args[index], "-")) : (index += 1) {
             const flag = args[index];
             if (!std.mem.eql(u8, flag, "--resources") and !std.mem.startsWith(u8, flag, "--resources=") and
-                !std.mem.eql(u8, flag, "-r")) return error.UnknownOption;
+                !std.mem.eql(u8, flag, "-r")) return oci.validationError(error.UnknownOption, "unknown option '{s}'", .{args[index]});
             // ponytail: Individual runc flags (--memory, --cpu-shares, ...) are
             // unsupported; translate them into OCI resource fields when needed.
             resources_file = try optionValue(args, &index, error.MissingResources);
         }
-        if (resources_file == null) return error.MissingResources;
+        if (resources_file == null) return oci.validationError(error.MissingResources, "update: requires --resources <file|->", .{});
     } else if (subcommand == .delete) {
         while (index < args.len and std.mem.startsWith(u8, args[index], "-")) : (index += 1) {
-            if (!std.mem.eql(u8, args[index], "--force")) return error.UnknownOption;
+            if (!std.mem.eql(u8, args[index], "--force")) return oci.validationError(error.UnknownOption, "unknown option '{s}'", .{args[index]});
             force = true;
         }
     } else if (subcommand == .ps) {
         while (index < args.len and std.mem.startsWith(u8, args[index], "-")) : (index += 1) {
             const flag = args[index];
             if (!std.mem.eql(u8, flag, "--format") and !std.mem.startsWith(u8, flag, "--format="))
-                return error.UnknownOption;
+                return oci.validationError(error.UnknownOption, "unknown option '{s}'", .{args[index]});
             ps_format = std.meta.stringToEnum(PsFormat, try optionValue(args, &index, error.MissingFormat)) orelse
-                return error.InvalidFormat;
+                return oci.validationError(error.InvalidFormat, "--format: expected table or json", .{});
         }
     } else if (subcommand == .kill) {
         while (index < args.len and (std.mem.eql(u8, args[index], "--all") or
@@ -224,21 +224,21 @@ fn parseArgsWithLog(args: []const []const u8, log: *?[]const u8, log_format: *Lo
             all = true;
         }
     }
-    if (index >= args.len) return error.MissingId;
+    if (index >= args.len) return oci.validationError(error.MissingId, "container id: required", .{});
     const remaining = args.len - index;
     if (subcommand == .exec) {
-        if (process_file != null and remaining != 1) return error.UnexpectedArgument;
-        if (process_file == null and remaining == 1) return error.MissingCommand;
-    } else if (subcommand != .ps and remaining != 1 and !(subcommand == .kill and remaining == 2)) return error.UnexpectedArgument;
+        if (process_file != null and remaining != 1) return oci.validationError(error.UnexpectedArgument, "unexpected argument; global flags must precede the subcommand", .{});
+        if (process_file == null and remaining == 1) return oci.validationError(error.MissingCommand, "exec: requires a command or --process", .{});
+    } else if (subcommand != .ps and remaining != 1 and !(subcommand == .kill and remaining == 2)) return oci.validationError(error.UnexpectedArgument, "unexpected argument; global flags must precede the subcommand", .{});
     const id = args[index];
     if (id.len == 0 or std.mem.indexOfScalar(u8, id, 0) != null or std.mem.eql(u8, id, ".") or std.mem.eql(u8, id, "..") or
         std.mem.indexOfScalar(u8, id, '/') != null or std.mem.startsWith(u8, id, "-"))
     {
-        return error.InvalidId;
+        return oci.validationError(error.InvalidId, "container id: must not be empty, contain / or NUL, or equal . or ..", .{});
     }
     const signal = if (subcommand == .kill and remaining == 2) args[index + 1] else null;
     if (signal) |value| {
-        if (value.len == 0 or std.mem.startsWith(u8, value, "-")) return error.UnexpectedArgument;
+        if (value.len == 0 or std.mem.startsWith(u8, value, "-")) return oci.validationError(error.UnexpectedArgument, "unexpected argument; global flags must precede the subcommand", .{});
     }
     return .{
         .root = root,
@@ -275,16 +275,17 @@ fn optionValue(args: []const []const u8, index: *usize, comptime missing: error{
     MissingUser,
     MissingFormat,
 }) ![]const u8 {
+    const flag = args[index.*];
     const value = if (std.mem.indexOfScalar(u8, args[index.*], '=')) |equals|
         args[index.*][equals + 1 ..]
     else value: {
         index.* += 1;
-        if (index.* >= args.len) return missing;
+        if (index.* >= args.len) return oci.validationError(missing, "{s}: missing value", .{flag});
         if (std.mem.startsWith(u8, args[index.*], "-") and
-            !(missing == error.MissingResources and std.mem.eql(u8, args[index.*], "-"))) return missing;
+            !(missing == error.MissingResources and std.mem.eql(u8, args[index.*], "-"))) return oci.validationError(missing, "{s}: missing value", .{flag});
         break :value args[index.*];
     };
-    if (value.len == 0) return missing;
+    if (value.len == 0) return oci.validationError(missing, "{s}: missing value", .{flag});
     return value;
 }
 
@@ -293,21 +294,21 @@ fn boolOption(flag: []const u8) !bool {
     const value = flag[equals + 1 ..];
     if (std.mem.eql(u8, value, "true")) return true;
     if (std.mem.eql(u8, value, "false")) return false;
-    return error.InvalidBoolean;
+    return oci.validationError(error.InvalidBoolean, "boolean option: expected true or false", .{});
 }
 
 fn parseUser(value: []const u8) !ExecUser {
     var parts = std.mem.splitScalar(u8, value, ':');
     const uid = try numericId(parts.next().?);
     const gid: ?u32 = if (parts.next()) |part| try numericId(part) else null;
-    if (parts.next() != null) return error.InvalidUser;
+    if (parts.next() != null) return oci.validationError(error.InvalidUser, "--user: expected UID[:GID]", .{});
     return .{ .uid = uid, .gid = gid };
 }
 
 fn numericId(value: []const u8) !u32 {
-    if (value.len == 0) return error.InvalidUser;
-    for (value) |byte| if (!std.ascii.isDigit(byte)) return error.InvalidUser;
-    return std.fmt.parseInt(u32, value, 10) catch error.InvalidUser;
+    if (value.len == 0) return oci.validationError(error.InvalidUser, "--user: ID must not be empty", .{});
+    for (value) |byte| if (!std.ascii.isDigit(byte)) return oci.validationError(error.InvalidUser, "--user: IDs must be decimal numbers", .{});
+    return std.fmt.parseInt(u32, value, 10) catch oci.validationError(error.InvalidUser, "--user: ID exceeds u32", .{});
 }
 
 fn prepareProcess(allocator: std.mem.Allocator, process: oci.Spec.Process, socket: ?[]const u8) !Backend.ExecOptions {
@@ -330,8 +331,8 @@ fn prepareProcess(allocator: std.mem.Allocator, process: oci.Spec.Process, socke
 
 fn validateConsoleSocket(terminal: ?bool, socket: ?[]const u8) !void {
     if (terminal orelse false) {
-        if (socket == null) return error.MissingConsoleSocket;
-    } else if (socket != null) return error.UnexpectedConsoleSocket;
+        if (socket == null) return oci.validationError(error.MissingConsoleSocket, "process.terminal: requires --console-socket", .{});
+    } else if (socket != null) return oci.validationError(error.UnexpectedConsoleSocket, "--console-socket: requires process.terminal=true", .{});
 }
 
 fn connectConsoleSocket(path: []const u8) !std.posix.fd_t {
@@ -339,7 +340,7 @@ fn connectConsoleSocket(path: []const u8) !std.posix.fd_t {
     const linux = std.os.linux;
     var address: linux.sockaddr.un = .{ .path = @splat(0) };
     if (path.len == 0 or path.len >= address.path.len or std.mem.indexOfScalar(u8, path, 0) != null)
-        return error.InvalidPath;
+        return oci.validationError(error.InvalidPath, "--console-socket: path is empty, too long or contains NUL", .{});
     @memcpy(address.path[0..path.len], path);
     const opened = linux.socket(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
     if (linux.errno(opened) != .SUCCESS) return error.ConsoleSocketFailed;
@@ -357,17 +358,17 @@ fn connectConsoleSocket(path: []const u8) !std.posix.fd_t {
 
 fn parseSignal(value: ?[]const u8) !i32 {
     const text = value orelse return 15;
-    if (text.len == 0) return error.InvalidSignal;
+    if (text.len == 0) return oci.validationError(error.InvalidSignal, "signal: must not be empty", .{});
     if (std.ascii.isDigit(text[0])) {
         for (text) |byte| {
-            if (!std.ascii.isDigit(byte)) return error.InvalidSignal;
+            if (!std.ascii.isDigit(byte)) return oci.validationError(error.InvalidSignal, "signal: invalid decimal number", .{});
         }
-        const signal = std.fmt.parseInt(i32, text, 10) catch return error.InvalidSignal;
-        if (signal >= std.os.linux.NSIG) return error.InvalidSignal;
+        const signal = std.fmt.parseInt(i32, text, 10) catch return oci.validationError(error.InvalidSignal, "signal: number is out of range", .{});
+        if (signal >= std.os.linux.NSIG) return oci.validationError(error.InvalidSignal, "signal: number exceeds Linux signal range", .{});
         return signal;
     }
     var buffer: [16]u8 = undefined;
-    if (text.len > buffer.len) return error.InvalidSignal;
+    if (text.len > buffer.len) return oci.validationError(error.InvalidSignal, "signal: name is too long", .{});
     for (text, 0..) |byte, i| buffer[i] = std.ascii.toUpper(byte);
     var name: []const u8 = buffer[0..text.len];
     if (std.mem.startsWith(u8, name, "SIG")) name = name[3..];
@@ -375,7 +376,7 @@ fn parseSignal(value: ?[]const u8) !i32 {
     if (std.mem.eql(u8, name, "IOT")) name = "ABRT";
     if (std.mem.eql(u8, name, "POLL")) name = "IO";
     if (std.mem.eql(u8, name, "CLD")) name = "CHLD";
-    const signal = std.meta.stringToEnum(std.os.linux.SIG, name) orelse return error.InvalidSignal;
+    const signal = std.meta.stringToEnum(std.os.linux.SIG, name) orelse return oci.validationError(error.InvalidSignal, "signal: unknown name '{s}'", .{text});
     return @intCast(@intFromEnum(signal));
 }
 
@@ -463,14 +464,19 @@ fn createContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, c
     const settings: oci.Spec.Linux = parsed.value.linux orelse .{};
     const spec_mounts = parsed.value.mounts orelse &.{};
     const mounts = try mount_allocator.alloc(Backend.Mount, spec_mounts.len);
-    for (spec_mounts, mounts) |mount, *prepared| {
+    for (spec_mounts, mounts, 0..) |mount, *prepared, i| {
+        errdefer |err| if (err == error.InvalidConfig) oci.diagnosticContext("mounts[{d}]", .{i});
         const options = try oci.parseMountOptions(mount_allocator, mount.options orelse &.{}, mount.type);
+        const source = if (options.flags & std.os.linux.MS.BIND != 0) bind: {
+            const path = mount.source orelse {
+                oci.recordDiagnostic(error.InvalidConfig, "source: required for a bind mount", .{});
+                return error.InvalidConfig;
+            };
+            break :bind try oci.resolveRootfs(mount_allocator, bundle, path);
+        } else mount.source;
         prepared.* = .{
             .destination = try oci.resolveMountDestination(mount_allocator, mount.destination),
-            .source = if (options.flags & std.os.linux.MS.BIND != 0)
-                try oci.resolveRootfs(mount_allocator, bundle, mount.source orelse return error.InvalidConfig)
-            else
-                mount.source,
+            .source = source,
             .type = mount.type,
             .flags = options.flags,
             .propagation = options.propagation,
@@ -673,7 +679,7 @@ fn hookStateTemplate(allocator: std.mem.Allocator, state: oci.State) !Backend.Ho
     const json = try oci.stateJson(allocator, template);
     defer allocator.free(json);
     const field = "\"pid\":0";
-    const index = std.mem.indexOf(u8, json, field) orelse return error.InvalidState;
+    const index = std.mem.indexOf(u8, json, field) orelse return oci.validationError(error.InvalidState, "hook state: missing pid field", .{});
     const prefix = try allocator.dupe(u8, json[0 .. index + field.len - 1]);
     errdefer allocator.free(prefix);
     return .{ .prefix = prefix, .suffix = try allocator.dupe(u8, json[index + field.len ..]) };
@@ -704,10 +710,17 @@ fn loadSavedHooks(allocator: std.mem.Allocator, io: std.Io, config: Config) !?st
     defer allocator.free(path);
     const json = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1 << 20)) catch |err| switch (err) {
         error.FileNotFound => return null,
+        error.StreamTooLong => {
+            oci.recordDiagnostic(err, "saved hooks: JSON exceeds 1 MiB", .{});
+            return err;
+        },
         else => return err,
     };
     defer allocator.free(json);
-    return try std.json.parseFromSlice(oci.Spec.Hooks, allocator, json, .{ .allocate = .alloc_always });
+    return std.json.parseFromSlice(oci.Spec.Hooks, allocator, json, .{ .allocate = .alloc_always }) catch |err| {
+        if (err != error.OutOfMemory) oci.recordDiagnostic(err, "saved hooks: invalid JSON or schema ({s})", .{@errorName(err)});
+        return err;
+    };
 }
 
 fn loadHasProcess(allocator: std.mem.Allocator, io: std.Io, config: Config) !bool {
@@ -716,27 +729,27 @@ fn loadHasProcess(allocator: std.mem.Allocator, io: std.Io, config: Config) !boo
     const json = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(32)) catch |err| switch (err) {
         // Older state directories did not capture whether a process was configured.
         error.FileNotFound => return true,
-        error.StreamTooLong => return error.InvalidState,
+        error.StreamTooLong => return oci.validationError(error.InvalidState, "has-process record: exceeds 32 bytes", .{}),
         else => return err,
     };
     defer allocator.free(json);
     const value = std.mem.trim(u8, json, " \t\r\n");
     if (std.mem.eql(u8, value, "true")) return true;
     if (std.mem.eql(u8, value, "false")) return false;
-    return error.InvalidState;
+    return oci.validationError(error.InvalidState, "has-process record: expected true or false", .{});
 }
 
 fn stateHandle(allocator: std.mem.Allocator, io: std.Io, root: []const u8, state: oci.State) !Backend.Handle {
-    const pid = state.pid orelse return error.InvalidState;
-    if (pid <= 0) return error.InvalidState;
+    const pid = state.pid orelse return oci.validationError(error.InvalidState, "state.pid: required for a live container", .{});
+    if (pid <= 0) return oci.validationError(error.InvalidState, "state.pid: must be positive", .{});
     const path = try std.fs.path.join(allocator, &.{ root, state.id, oci.starttime_file_name });
     defer allocator.free(path);
     const starttime = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(32)) catch |err| switch (err) {
-        error.FileNotFound => return error.InvalidState,
+        error.FileNotFound => return oci.validationError(error.InvalidState, "starttime record: missing for a live container", .{}),
         else => return err,
     };
     errdefer allocator.free(starttime);
-    if (starttime.len == 0) return error.InvalidState;
+    if (starttime.len == 0) return oci.validationError(error.InvalidState, "starttime record: must not be empty", .{});
     const cgroup_path = try loadCgroupPath(allocator, io, root, state.id);
     errdefer if (cgroup_path) |value| allocator.free(value);
     const rootfs_mount = try loadRootfsMount(allocator, io, root, state.id);
@@ -761,7 +774,9 @@ fn loadCgroupPath(allocator: std.mem.Allocator, io: std.Io, root: []const u8, id
     };
     defer allocator.free(bytes);
     return oci.resolveCgroupPath(allocator, bytes, id) catch |err| switch (err) {
-        error.InvalidConfig => return error.InvalidState,
+        error.InvalidConfig => {
+            return oci.validationError(error.InvalidState, "saved cgroup path: invalid or escapes the cgroup root", .{});
+        },
         else => return err,
     };
 }
@@ -777,8 +792,8 @@ const RootfsMount = struct {
 fn saveRootfsMount(allocator: std.mem.Allocator, io: std.Io, state_dir: []const u8, handle: Backend.Handle) !void {
     const mount = RootfsMount{
         .path = handle.rootfs_mount orelse return,
-        .mount_id_unique = handle.rootfs_mount_id orelse return error.InvalidState,
-        .boot_id = handle.rootfs_mount_boot_id orelse return error.InvalidState,
+        .mount_id_unique = handle.rootfs_mount_id orelse return oci.validationError(error.InvalidState, "rootfs mount record: missing unique mount ID", .{}),
+        .boot_id = handle.rootfs_mount_boot_id orelse return oci.validationError(error.InvalidState, "rootfs mount record: missing boot ID", .{}),
     };
     const path = try std.fs.path.join(allocator, &.{ state_dir, oci.rootfs_mount_file_name });
     defer allocator.free(path);
@@ -792,25 +807,25 @@ fn loadRootfsMount(allocator: std.mem.Allocator, io: std.Io, root: []const u8, i
     defer allocator.free(path);
     const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(6 * std.fs.max_path_bytes + 128)) catch |err| switch (err) {
         error.FileNotFound => return null,
-        error.StreamTooLong => return error.InvalidState,
+        error.StreamTooLong => return oci.validationError(error.InvalidState, "rootfs mount record: exceeds size limit", .{}),
         else => return err,
     };
     defer allocator.free(bytes);
     // Older path-only records remain readable, but cannot authorize detach.
     if (std.fs.path.isAbsolute(bytes)) {
-        if (std.mem.indexOfScalar(u8, bytes, 0) != null) return error.InvalidState;
+        if (std.mem.indexOfScalar(u8, bytes, 0) != null) return oci.validationError(error.InvalidState, "rootfs mount record: path contains NUL", .{});
         return .{ .path = try allocator.dupe(u8, bytes) };
     }
     const parsed = std.json.parseFromSlice(RootfsMount, allocator, bytes, .{}) catch |err| switch (err) {
         error.OutOfMemory => return err,
-        else => return error.InvalidState,
+        else => return oci.validationError(error.InvalidState, "rootfs mount record: invalid JSON or schema", .{}),
     };
     defer parsed.deinit();
     const mount = parsed.value;
     if (!std.fs.path.isAbsolute(mount.path) or std.mem.indexOfScalar(u8, mount.path, 0) != null or
         (mount.mount_id_unique orelse mount.mount_id orelse 0) == 0 or
         (mount.mount_id_unique != null and mount.boot_id == null))
-        return error.InvalidState;
+        return oci.validationError(error.InvalidState, "rootfs mount record: requires an absolute NUL-free path, mount ID and boot ID", .{});
     return .{
         .path = try allocator.dupe(u8, mount.path),
         .mount_id_unique = mount.mount_id_unique,
@@ -842,12 +857,15 @@ fn readLiveState(allocator: std.mem.Allocator, io: std.Io, backend: Backend, con
 fn recoverLiveState(allocator: std.mem.Allocator, io: std.Io, backend: Backend, config: Config, saved: std.json.Parsed(oci.State), persist_recovery: bool) !LiveState {
     var parsed = saved;
     errdefer parsed.deinit();
-    if (!std.mem.eql(u8, parsed.value.id, config.id)) return error.InvalidState;
+    if (!std.mem.eql(u8, parsed.value.id, config.id)) return oci.validationError(error.InvalidState, "state.id: does not match requested container", .{});
     var handle: ?Backend.Handle = null;
     errdefer if (handle) |value| freeStateHandle(allocator, value);
     if (parsed.value.status == .creating or parsed.value.status == .created or parsed.value.status == .running or parsed.value.status == .paused) {
         handle = stateHandle(allocator, io, config.root, parsed.value) catch |err| switch (err) {
-            error.InvalidState => if (parsed.value.status == .creating) null else return err,
+            error.InvalidState => if (parsed.value.status == .creating) recovered: {
+                oci.clearDiagnostic();
+                break :recovered null;
+            } else return err,
             else => return err,
         };
         if (handle == null or !try backendResult(backend, backend.alive(handle.?))) {
@@ -957,7 +975,7 @@ fn execContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, con
     }
     const state = try readLiveState(allocator, io, backend, config, locked);
     defer state.deinit();
-    if (state.parsed.value.status != .created and state.parsed.value.status != .running) return error.InvalidStatus;
+    if (state.parsed.value.status != .created and state.parsed.value.status != .running) return oci.validationError(error.InvalidStatus, "exec: requires created or running state", .{});
 
     var arena: std.heap.ArenaAllocator = .init(allocator);
     defer arena.deinit();
@@ -973,15 +991,21 @@ fn execContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, con
         else => return err,
     };
     var process: oci.Spec.Process = if (config.process_file) |path| process: {
-        const json = try std.Io.Dir.cwd().readFileAlloc(io, path, process_allocator, .limited(1 << 20));
-        const parsed = try std.json.parseFromSlice(oci.Spec.Process, process_allocator, json, .{
+        const json = std.Io.Dir.cwd().readFileAlloc(io, path, process_allocator, .limited(1 << 20)) catch |err| {
+            if (err == error.StreamTooLong) oci.recordDiagnostic(err, "--process: JSON exceeds 1 MiB", .{});
+            return err;
+        };
+        const parsed = std.json.parseFromSlice(oci.Spec.Process, process_allocator, json, .{
             .allocate = .alloc_always,
             .ignore_unknown_fields = true,
-        });
+        }) catch |err| {
+            if (err != error.OutOfMemory) oci.recordDiagnostic(err, "--process: invalid JSON or schema ({s})", .{@errorName(err)});
+            return err;
+        };
         break :process parsed.value;
     } else process: {
         const spec = saved_spec orelse return error.FileNotFound;
-        break :process try execProcessConfig(process_allocator, spec.value.process orelse return error.MissingProcess, config);
+        break :process try execProcessConfig(process_allocator, spec.value.process orelse return oci.validationError(error.MissingProcess, "exec: bundle has no process to inherit", .{}), config);
     };
     // Like runc, an omitted or empty exec profile inherits the container default.
     if (process.apparmorProfile == null or process.apparmorProfile.?.len == 0) {
@@ -997,7 +1021,7 @@ fn execContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, con
         break :seccomp settings.seccomp;
     };
     options.seccomp = try oci.prepareSeccomp(process_allocator, seccomp);
-    options.cgroup_path = state.handle.?.cgroup_path orelse return error.InvalidState;
+    options.cgroup_path = state.handle.?.cgroup_path orelse return oci.validationError(error.InvalidState, "exec: saved cgroup path is missing", .{});
     options.console_fds = if (config.console_socket != null) try backend_module.console.socketpair() else null;
     defer if (options.console_fds) |fds| for (fds) |fd| {
         _ = linux.close(fd);
@@ -1142,7 +1166,7 @@ fn killContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, con
     var state = try readLiveState(allocator, io, backend, config, persist_recovery);
     defer state.deinit();
     if (!config.all or state.parsed.value.status != .stopped)
-        oci.requireKill(state.parsed.value.status) catch return error.ContainerNotRunning;
+        oci.requireKill(state.parsed.value.status) catch return oci.validationError(error.ContainerNotRunning, "kill: container is not running", .{});
     if (config.all) {
         if (state.handle == null)
             state.handle = try stateHandle(allocator, io, config.root, state.parsed.value);
@@ -1157,7 +1181,7 @@ fn requireDelete(status: oci.Status, force: bool) !void {
 }
 
 fn updateContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, config: Config) !void {
-    const parsed = try oci.loadResources(allocator, io, config.resources_file orelse return error.MissingResources);
+    const parsed = try oci.loadResources(allocator, io, config.resources_file orelse return oci.validationError(error.MissingResources, "update: requires --resources", .{}));
     defer parsed.deinit();
     const resources = try oci.cgroupResources(allocator, parsed.value);
     defer oci.freeCgroupResources(allocator, resources);
@@ -1184,7 +1208,7 @@ fn psContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, confi
     }
     const state = try readLiveState(allocator, io, backend, config, locked);
     defer state.deinit();
-    if (state.parsed.value.status == .stopped) return error.InvalidStatus;
+    if (state.parsed.value.status == .stopped) return oci.validationError(error.InvalidStatus, "ps: container is stopped", .{});
     const pids = try backendResult(backend, backend.pids(state.handle.?, allocator));
     defer allocator.free(pids);
     if (config.ps_format == .json) {
@@ -1276,6 +1300,7 @@ fn deleteContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, c
     if (config.force) try stopContainer(io, backend, state.handle);
     const hooks = loadSavedHooks(allocator, io, config) catch |err| hooks: {
         std.debug.print("igvano: warning: cannot load poststop hooks: {s}\n", .{@errorName(err)});
+        oci.clearDiagnostic();
         break :hooks null;
     };
     defer if (hooks) |parsed| parsed.deinit();
@@ -1359,6 +1384,7 @@ fn makeExecFifo(allocator: std.mem.Allocator, path: []const u8) !void {
 }
 
 pub fn main(init: std.process.Init) !u8 {
+    oci.clearDiagnostic();
     const allocator = init.arena.allocator();
     const args = try init.minimal.args.toSlice(allocator);
 
@@ -1392,8 +1418,8 @@ pub fn main(init: std.process.Init) !u8 {
             error.UnexpectedArgument => "unexpected argument; global flags must precede the subcommand",
             error.InvalidId => "invalid container id",
         };
-        var buffer: [256]u8 = undefined;
-        const line = std.fmt.bufPrint(&buffer, "igvano: {s}", .{message}) catch unreachable;
+        var buffer: [1024]u8 = undefined;
+        const line = std.fmt.bufPrint(&buffer, "igvano: {s}", .{oci.diagnosticFor(err) orelse message}) catch unreachable;
         emitError(allocator, init.io, log, log_format, line, null);
         std.debug.print(
             "Usage: igvano [--root <dir>] [--log <file>] [--log-format text|json] <state|start|pause|resume> <id>\n" ++
@@ -1461,11 +1487,14 @@ fn reportError(allocator: std.mem.Allocator, io: std.Io, diagnostic: ?[]const u8
         return;
     };
     defer allocator.free(message);
-    emitError(allocator, io, config.log, config.log_format, message, diagnostic);
+    emitError(allocator, io, config.log, config.log_format, message, diagnostic orelse oci.diagnosticFor(err));
 }
 
 fn emitError(allocator: std.mem.Allocator, io: std.Io, log: ?[]const u8, log_format: LogFormat, message: []const u8, diagnostic: ?[]const u8) void {
-    std.debug.print("{s}\n", .{message});
+    if (diagnostic) |detail|
+        std.debug.print("{s}: {s}\n", .{ message, detail })
+    else
+        std.debug.print("{s}\n", .{message});
     if (log) |path| {
         const detailed = if (diagnostic) |detail|
             std.fmt.allocPrint(allocator, "{s}: {s}", .{ message, detail }) catch null
@@ -1482,7 +1511,7 @@ fn appendErrorLog(allocator: std.mem.Allocator, io: std.Io, path: []const u8, lo
     var line: std.Io.Writer.Allocating = .init(allocator);
     defer line.deinit();
     if (log_format == .json) {
-        const seconds = std.math.cast(u64, std.Io.Clock.real.now(io).toSeconds()) orelse return error.InvalidTimestamp;
+        const seconds = std.math.cast(u64, std.Io.Clock.real.now(io).toSeconds()) orelse return oci.validationError(error.InvalidTimestamp, "log timestamp: predates the Unix epoch", .{});
         const epoch: std.time.epoch.EpochSeconds = .{ .secs = seconds };
         const year_day = epoch.getEpochDay().calculateYearDay();
         const month_day = year_day.calculateMonthDay();
@@ -2004,15 +2033,23 @@ fn testPropagationLifecycle(base: []const u8) !void {
     const probe_path = std.testing.environ.getPosix("IGVANO_SECCOMP_PROBE") orelse return error.MissingSeccompProbe;
     const probe = try cwd.realPathFileAlloc(io, probe_path, allocator);
     try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.prctl(@intFromEnum(linux.PR.SET_CHILD_SUBREAPER), 1, 0, 0, 0)));
-    const cases = [_]struct { root: oci.Spec.Propagation, mount: oci.Spec.Propagation }{
+    const cases = [_]struct {
+        id: ?[]const u8 = null,
+        root: oci.Spec.Propagation,
+        mount: ?oci.Spec.Propagation,
+        userns: bool = false,
+    }{
         .{ .root = .rshared, .mount = .rshared },
         .{ .root = .rslave, .mount = .rslave },
         .{ .root = .shared, .mount = .rshared },
         .{ .root = .slave, .mount = .rslave },
         .{ .root = .private, .mount = .rshared },
+        .{ .id = "userns-rslave-rslave", .root = .rslave, .mount = .rslave, .userns = true },
+        .{ .id = "userns-private-rshared", .root = .private, .mount = .rshared, .userns = true },
+        .{ .id = "userns-rslave-default", .root = .rslave, .mount = null, .userns = true },
     };
     for (cases) |case| {
-        const id = @tagName(case.root);
+        const id = case.id orelse @tagName(case.root);
         const bundle = try std.fs.path.join(allocator, &.{ base, id });
         const bundle_z = try allocator.dupeZ(u8, bundle);
         const rootfs = try std.fs.path.join(allocator, &.{ bundle, "rootfs" });
@@ -2022,6 +2059,10 @@ fn testPropagationLifecycle(base: []const u8) !void {
         const container_mount = try std.fmt.allocPrintSentinel(allocator, "{s}/from-container", .{source}, 0);
         const host_data = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}/host-data", .{ base, id }, 0);
         for ([_][]const u8{ rootfs, host_mount, container_mount, host_data }) |path| try cwd.createDirPath(io, path);
+        if (case.userns) {
+            const rootfs_z = try allocator.dupeZ(u8, rootfs);
+            try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.chown(rootfs_z, 100000, 200000)));
+        }
         try cwd.writeFile(io, .{
             .sub_path = try std.fs.path.join(allocator, &.{ host_data, "flag" }),
             .data = "host",
@@ -2046,12 +2087,14 @@ fn testPropagationLifecycle(base: []const u8) !void {
             .mounts = &.{
                 .{ .destination = "/probe", .source = probe, .type = "bind", .options = &.{ "bind", "ro" } },
                 .{ .destination = "/proc", .source = "proc", .type = "proc" },
-                .{ .destination = "/volume", .source = source, .type = "bind", .options = &.{ "rbind", @tagName(case.mount) } },
+                .{ .destination = "/volume", .source = source, .type = "bind", .options = if (case.mount) |propagation| &.{ "rbind", @tagName(propagation) } else &.{"rbind"} },
             },
             .linux = .{
                 .rootfsPropagation = case.root,
                 .cgroupsPath = try std.fmt.allocPrint(allocator, "igvano-propagation-{d}-{s}", .{ linux.getpid(), id }),
-                .namespaces = &.{ .{ .type = .mount }, .{ .type = .pid } },
+                .namespaces = if (case.userns) &.{ .{ .type = .mount }, .{ .type = .pid }, .{ .type = .user } } else &.{ .{ .type = .mount }, .{ .type = .pid } },
+                .uidMappings = if (case.userns) &.{.{ .containerID = 0, .hostID = 100000, .size = 65536 }} else null,
+                .gidMappings = if (case.userns) &.{.{ .containerID = 0, .hostID = 200000, .size = 65536 }} else null,
             },
         };
         try cwd.writeFile(io, .{
@@ -2084,9 +2127,14 @@ fn testPropagationLifecycle(base: []const u8) !void {
         config.exec_args = &.{ "/probe", "true", "propagation-container" };
         try std.testing.expectEqual(@as(u8, 0), try execContainer(allocator, io, backend, config));
         const flag = try std.fmt.allocPrintSentinel(allocator, "{s}/flag", .{container_mount}, 0);
-        try std.testing.expectEqual(if (case.mount == .rshared) linux.E.SUCCESS else linux.E.NOENT, linux.errno(linux.access(flag, linux.F_OK)));
-        if (case.mount == .rshared)
-            try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.umount2(container_mount, linux.MNT.DETACH)));
+        if (case.userns) {
+            // The container's user namespace is downstream of the host.
+            try std.testing.expectEqual(linux.E.NOENT, linux.errno(linux.access(flag, linux.F_OK)));
+        } else {
+            try std.testing.expectEqual(if (case.mount == .rshared) linux.E.SUCCESS else linux.E.NOENT, linux.errno(linux.access(flag, linux.F_OK)));
+            if (case.mount == .rshared)
+                try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.umount2(container_mount, linux.MNT.DETACH)));
+        }
     }
 }
 
@@ -3402,6 +3450,29 @@ test "reportError includes backend diagnostic in the JSON log" {
     try std.testing.expect(lines.next() == null);
 }
 
+test "reportError includes frontend validation detail in text and JSON logs" {
+    defer oci.clearDiagnostic();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_]LogFormat{ .text, .json }) |format| {
+        oci.clearDiagnostic();
+        const path = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, @tagName(format) });
+        defer std.testing.allocator.free(path);
+        const config: Config = .{ .root = "/unused", .subcommand = .create, .id = "example", .log = path, .log_format = format };
+        oci.requireCreate(.{
+            .ociVersion = "1.0.2",
+            .root = .{ .path = "rootfs" },
+            .mounts = &.{.{ .destination = "../outside" }},
+        }) catch |err| {
+            try std.testing.expectEqual(error.InvalidConfig, err);
+            reportError(std.testing.allocator, std.testing.io, null, config, err);
+        };
+        const bytes = try tmp.dir.readFileAlloc(std.testing.io, @tagName(format), std.testing.allocator, .limited(4096));
+        defer std.testing.allocator.free(bytes);
+        try std.testing.expect(std.mem.indexOf(u8, bytes, "mounts[0]: container path: must be absolute and NUL-free") != null);
+    }
+}
+
 test "kill errors use shim-compatible messages in the log" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3494,7 +3565,7 @@ test "frontend failure after successful liveness does not log stale backend deta
     };
     const bytes = try tmp.dir.readFileAlloc(std.testing.io, "runtime.log", std.testing.allocator, .limited(4096));
     defer std.testing.allocator.free(bytes);
-    try std.testing.expectEqualStrings("igvano: start for 'example' failed: MissingProcess\n", bytes);
+    try std.testing.expectEqualStrings("igvano: start for 'example' failed: MissingProcess: start: container has no process\n", bytes);
 }
 
 test "json error logs append escaped messages and RFC3339 UTC timestamps" {
@@ -4576,6 +4647,7 @@ test "linux state kill and delete refresh stale creating created and running sta
 }
 
 test "creating state without a process identity becomes stopped and deletable" {
+    defer oci.clearDiagnostic();
     const TestBackend = struct {
         const vtable: Backend.VTable = .{ .create = create, .alive = alive, .kill = kill, .killAll = kill, .delete = delete };
         fn create(_: *anyopaque, _: Backend.CreateOptions) Backend.Error!Backend.Handle {
@@ -4607,6 +4679,7 @@ test "creating state without a process identity becomes stopped and deletable" {
         const state = try readLiveState(std.testing.allocator, std.testing.io, backend, config, true);
         defer state.deinit();
         try std.testing.expectEqual(oci.Status.stopped, state.parsed.value.status);
+        try std.testing.expect(oci.diagnostic() == null);
         try deleteContainer(std.testing.allocator, std.testing.io, backend, config);
         try std.testing.expectError(error.FileNotFound, tmp.dir.openDir(std.testing.io, "example", .{}));
     }

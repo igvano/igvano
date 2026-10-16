@@ -1353,13 +1353,20 @@ fn validateNamespaceFd(fd: posix.fd_t, flag: usize) Backend.Error!void {
 
 /// Open every host path before entering a user or mount namespace.
 fn joinNamespaces(joins: []const NamespaceJoin) Backend.Error!void {
+    return joinNamespacesWithUser(joins, null);
+}
+
+fn joinNamespacesWithUser(joins: []const NamespaceJoin, user_fd: ?posix.fd_t) Backend.Error!void {
     var fds: [8]posix.fd_t = @splat(-1);
     if (joins.len > fds.len) return error.InvalidConfig;
     defer for (fds) |fd| {
         if (fd >= 0) closeFd(fd);
     };
     for (joins, 0..) |join, i| {
-        fds[i] = try openPath(linux.AT.FDCWD, join.path, .{ .ACCMODE = .RDONLY, .NONBLOCK = true, .CLOEXEC = true });
+        fds[i] = if (join.flag == linux.CLONE.NEWUSER and user_fd != null)
+            user_fd.?
+        else
+            try openPath(linux.AT.FDCWD, join.path, .{ .ACCMODE = .RDONLY, .NONBLOCK = true, .CLOEXEC = true });
         try validateNamespaceFd(fds[i], join.flag);
     }
     try joinNamespaceFds(joins, fds[0..joins.len]);
@@ -1702,11 +1709,41 @@ pub const LinuxBackend = struct {
             const user_namespace = flags & linux.CLONE.NEWUSER != 0;
             const joined_user_namespace = !user_namespace and isolation_flags & linux.CLONE.NEWUSER != 0;
             // Library callers bypass frontend validation, so mapping-presence checks are intentional.
-            const uid_mappings = if (user_namespace) options.spec.linux.?.uidMappings orelse return error.InvalidConfig else &.{};
-            const gid_mappings = if (user_namespace) options.spec.linux.?.gidMappings orelse return error.InvalidConfig else &.{};
+            const uid_mappings: []const oci.Spec.IDMapping = if (options.spec.linux) |settings| settings.uidMappings orelse &.{} else &.{};
+            const gid_mappings: []const oci.Spec.IDMapping = if (options.spec.linux) |settings| settings.gidMappings orelse &.{} else &.{};
             if (user_namespace and (uid_mappings.len == 0 or gid_mappings.len == 0)) return error.InvalidConfig;
-            const fifo_uid = if (user_namespace) try mappedRootID(uid_mappings) else 0;
-            const fifo_gid = if (user_namespace) try mappedRootID(gid_mappings) else 0;
+            var container_mappings: Backend.MountMappings = .{};
+            const uid_ranges = try allocator.alloc(Backend.IDMapping, uid_mappings.len);
+            for (uid_mappings, uid_ranges) |mapping, *range| range.* = .{
+                .container_id = mapping.containerID,
+                .host_id = mapping.hostID,
+                .size = mapping.size,
+            };
+            const gid_ranges = try allocator.alloc(Backend.IDMapping, gid_mappings.len);
+            for (gid_mappings, gid_ranges) |mapping, *range| range.* = .{
+                .container_id = mapping.containerID,
+                .host_id = mapping.hostID,
+                .size = mapping.size,
+            };
+            container_mappings = .{ .uid = uid_ranges, .gid = gid_ranges };
+            // Pin the validated namespace and use that same descriptor in init.
+            var joined_user_fd: ?posix.fd_t = null;
+            var joined_user_path: ?[]const u8 = null;
+            defer if (joined_user_fd) |fd| closeFd(fd);
+            if (joined_user_namespace) {
+                for (joins.items) |join| {
+                    if (join.flag != linux.CLONE.NEWUSER) continue;
+                    const fd = try openPath(linux.AT.FDCWD, join.path, .{ .ACCMODE = .RDONLY, .NONBLOCK = true, .CLOEXEC = true });
+                    joined_user_fd = fd;
+                    joined_user_path = join.path;
+                    try validateNamespaceFd(fd, linux.CLONE.NEWUSER);
+                    container_mappings = try joinedUserNamespaceMappings(allocator, fd);
+                    try validateJoinedMappings(allocator, container_mappings, .{ .uid = uid_ranges, .gid = gid_ranges });
+                    break;
+                }
+            }
+            const fifo_uid = if (user_namespace or joined_user_namespace) try mappedRootID(container_mappings.uid) else 0;
+            const fifo_gid = if (user_namespace or joined_user_namespace) try mappedRootID(container_mappings.gid) else 0;
             const uid_map = try formatIDMappings(allocator, uid_mappings);
             const gid_map = try formatIDMappings(allocator, gid_mappings);
             const fifo = try allocator.dupeZ(u8, options.exec_fifo);
@@ -1741,16 +1778,22 @@ pub const LinuxBackend = struct {
                 rootfs_mount_boot_id = try bootId();
             }
             try validateCgroupPath(options.cgroup_path);
-            // Joined user namespaces may map root to a different host UID.
-            // Only the outside parent can chmod this host-owned FIFO. Readers
-            // remain root-only, as when init drops to a nonzero process UID.
-            if (joined_user_namespace) try checkResult(linux.fchmodat(linux.AT.FDCWD, fifo, 0o622));
+            if (joined_user_namespace) try checkResult(linux.chown(fifo, fifo_uid, fifo_gid));
             const cgroup_root = try openCgroupRoot();
             defer closeFd(cgroup_root.fd);
             const hierarchies: []V1Hierarchy = if (cgroup_root.mode == .legacy) try openV1Hierarchies(allocator) else &.{};
             defer if (cgroup_root.mode == .legacy) freeV1Hierarchies(allocator, hierarchies);
             const mounts = try prepareMounts(allocator, options.mounts, cgroup_root.fs_type, hierarchies, options.cgroup_path);
             defer closeMountFds(mounts);
+            if (joined_user_fd) |fd| {
+                for (mounts) |*mount| {
+                    if (mount.mappings) |*mappings| {
+                        const path = mappings.userns_path orelse continue;
+                        if (std.mem.eql(u8, path, joined_user_path.?))
+                            mappings.userns_path = try std.fmt.allocPrint(allocator, "/proc/self/fd/{d}", .{fd});
+                    }
+                }
+            }
             try prepareIDMappedMounts(allocator, mounts);
             const devices = try allocator.alloc(PreparedDevice, options.devices.len);
             for (options.devices, devices) |device, *prepared| {
@@ -1834,6 +1877,21 @@ pub const LinuxBackend = struct {
                 try writeCgroupFile(cgroup.?, write.name, write.value, options.cgroup_path);
             if (cgroup_root.mode == .legacy)
                 try applyV1Writes(allocator, hierarchies, v1_writes, options.resources, options.devices, options.cgroup_path);
+            var needs_mount_sources = false;
+            for (mounts) |mount| {
+                if (mount.flags & linux.MS.BIND != 0 and
+                    (isolation_flags & linux.CLONE.NEWUSER != 0 or mount.mappings != null))
+                {
+                    needs_mount_sources = true;
+                    break;
+                }
+            }
+            const mount_source_helper = if (needs_mount_sources) try startMountSourceHelper(mounts) else null;
+            var mount_source_socket: ?posix.fd_t = if (mount_source_helper) |helper| helper.socket else null;
+            defer if (mount_source_helper) |helper| {
+                if (mount_source_socket) |fd| closeFd(fd);
+                _ = waitChild(helper.pid) catch {};
+            };
             // getpid() in child2 may be 1. Child1 supplies its host PID for
             // opaque hook input; buffers and JSON fragments were prepared above.
             const pid_pipe = try makePipe();
@@ -1886,7 +1944,7 @@ pub const LinuxBackend = struct {
                 // Set with host privileges before entering user namespaces.
                 // Child2 inherits the adjustment across fork and exec.
                 applyOomScoreAdj(proc_dir, options.oom_score_adj) catch |err| failCreate(report[1], err);
-                joinNamespaces(joins.items) catch |err| failCreate(report[1], err);
+                joinNamespacesWithUser(joins.items, joined_user_fd) catch |err| failCreate(report[1], err);
                 // NEWUSER is unshared together with the others so it owns them.
                 if (flags != 0) checkResult(linux.unshare(flags)) catch |err| failCreate(report[1], err);
                 // NEWPID affects the next fork, making child2 pid 1 inside the namespace.
@@ -1902,7 +1960,6 @@ pub const LinuxBackend = struct {
                     // Host procfs resolves "self" to child2's host PID, even
                     // when a joined mount namespace supplies a different /proc.
                     const fd_dir = openPath(proc_dir, "self/fd", .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true }) catch linux.exit_group(1);
-                    closeFd(proc_dir);
                     // The outside parent must install our ID maps
                     // before any rootfs, mount, hostname, or process work.
                     if (map_pipe) |fds| {
@@ -1917,6 +1974,13 @@ pub const LinuxBackend = struct {
                         checkResult(linux.setgid(0)) catch linux.exit_group(1);
                         checkResult(linux.setuid(0)) catch linux.exit_group(1);
                     }
+                    if (mount_source_socket) |socket| {
+                        const namespace = openPath(proc_dir, "self/ns/mnt", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }) catch |err| failCreate(ready[1], err);
+                        receiveMountSources(mounts, socket, namespace) catch |err| failCreate(ready[1], err);
+                        closeFd(namespace);
+                        closeFd(socket);
+                    }
+                    closeFd(proc_dir);
                     const create_input = std.fmt.bufPrint(create_state, "{s}{d}{s}", .{
                         options.create_hook_state.prefix, host_pid, options.create_hook_state.suffix,
                     }) catch linux.exit_group(1);
@@ -1933,9 +1997,9 @@ pub const LinuxBackend = struct {
                         .sysctls = options.sysctls,
                         .runtime_sync = .{ .ready_fd = ready[1], .go_fd = create_go[0] },
                         .console_fd = if (options.console_fds) |fds| fds[1] else null,
-                        .fifo_writable = joined_user_namespace,
                     }, start_hooks, start_input, apparmor_command, seccomp_program);
                 }
+                if (mount_source_socket) |fd| closeFd(fd);
                 closeMountFds(mounts);
                 closeFd(fifo_fd);
                 if (options.console_fds) |fds| closeFd(fds[1]);
@@ -2009,6 +2073,8 @@ pub const LinuxBackend = struct {
                 linux.exit_group(0);
             }
 
+            if (mount_source_socket) |fd| closeFd(fd);
+            mount_source_socket = null;
             // Only child1 writes the PID. Keeping a writer in this parent
             // would strand child2 if child1 died before sending it, preventing
             // report EOF and hanging create.
@@ -4501,11 +4567,112 @@ fn childError(message: []const u8, err: anyerror) void {
     reportDiagnostic("{s}{s}", .{ message, @errorName(err) });
 }
 
-fn mappedRootID(mappings: []const oci.Spec.IDMapping) Backend.Error!u32 {
+fn mappedRootID(mappings: []const Backend.IDMapping) Backend.Error!u32 {
     for (mappings) |mapping| {
-        if (mapping.containerID == 0 and mapping.size > 0) return mapping.hostID;
+        if (mapping.container_id == 0 and mapping.size > 0) return mapping.host_id;
     }
+    reportDiagnostic("user namespace mappings must include container root", .{});
     return error.InvalidConfig;
+}
+
+/// Linux may return ranges in a different order; compare every range exactly.
+fn equalIDMappings(allocator: std.mem.Allocator, a: []const Backend.IDMapping, b: []const Backend.IDMapping) Backend.Error!bool {
+    if (a.len != b.len) return false;
+    const left = try allocator.dupe(Backend.IDMapping, a);
+    defer allocator.free(left);
+    const right = try allocator.dupe(Backend.IDMapping, b);
+    defer allocator.free(right);
+    const Order = struct {
+        fn lessThan(_: void, x: Backend.IDMapping, y: Backend.IDMapping) bool {
+            if (x.container_id != y.container_id) return x.container_id < y.container_id;
+            if (x.host_id != y.host_id) return x.host_id < y.host_id;
+            return x.size < y.size;
+        }
+    };
+    std.mem.sort(Backend.IDMapping, left, {}, Order.lessThan);
+    std.mem.sort(Backend.IDMapping, right, {}, Order.lessThan);
+    comptime std.debug.assert(std.meta.hasUniqueRepresentation(Backend.IDMapping));
+    return std.mem.eql(u8, std.mem.sliceAsBytes(left), std.mem.sliceAsBytes(right));
+}
+
+fn validateJoinedMappings(allocator: std.mem.Allocator, actual: Backend.MountMappings, configured: Backend.MountMappings) Backend.Error!void {
+    if ((configured.uid.len != 0 and !try equalIDMappings(allocator, actual.uid, configured.uid)) or
+        (configured.gid.len != 0 and !try equalIDMappings(allocator, actual.gid, configured.gid)))
+    {
+        reportDiagnostic("user namespace mappings do not match the joined namespace", .{});
+        return error.InvalidConfig;
+    }
+}
+
+fn readIDMappings(allocator: std.mem.Allocator, pid: i32, name: []const u8) Backend.Error![]Backend.IDMapping {
+    var path_buffer: [64]u8 = undefined;
+    const path = std.fmt.bufPrintZ(&path_buffer, "/proc/{d}/{s}", .{ pid, name }) catch unreachable;
+    const fd = try openPath(linux.AT.FDCWD, path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true });
+    defer closeFd(fd);
+    var buffer: [16384]u8 = undefined;
+    var used: usize = 0;
+    while (true) {
+        if (used == buffer.len) return error.InvalidConfig;
+        const result = linux.read(fd, buffer[used..].ptr, buffer.len - used);
+        if (linux.errno(result) == .INTR) continue;
+        try checkResult(result);
+        if (result == 0) break;
+        used += result;
+    }
+    var mappings: std.ArrayList(Backend.IDMapping) = .empty;
+    defer mappings.deinit(allocator);
+    var lines = std.mem.tokenizeScalar(u8, buffer[0..used], '\n');
+    while (lines.next()) |line| {
+        var fields = std.mem.tokenizeAny(u8, line, " \t");
+        var numbers: [3]u32 = undefined;
+        for (&numbers) |*number| {
+            const field = fields.next() orelse return error.InvalidConfig;
+            number.* = std.fmt.parseInt(u32, field, 10) catch return error.InvalidConfig;
+        }
+        if (fields.next() != null) return error.InvalidConfig;
+        try mappings.append(allocator, .{ .container_id = numbers[0], .host_id = numbers[1], .size = numbers[2] });
+    }
+    return mappings.toOwnedSlice(allocator);
+}
+
+/// The parent reads /proc/<helper>/ maps so host IDs use the runtime's namespace.
+/// Like createMountUserNamespace, keep the helper alive with a pipe and reap it.
+fn joinedUserNamespaceMappings(allocator: std.mem.Allocator, fd: posix.fd_t) Backend.Error!Backend.MountMappings {
+    const ready = try makePipe();
+    defer closeFd(ready[0]);
+    var ready_writer: ?posix.fd_t = ready[1];
+    defer if (ready_writer) |pipe_fd| closeFd(pipe_fd);
+    const go = try makePipe();
+    defer closeFd(go[0]);
+    const child = forkProcess() catch |err| {
+        closeFd(go[1]);
+        return err;
+    };
+    if (child == 0) {
+        closeFd(ready[0]);
+        closeFd(go[1]);
+        // Hide inherited host descriptors from processes in the joined namespace.
+        checkResult(linux.prctl(@intFromEnum(linux.PR.SET_DUMPABLE), 0, 0, 0, 0)) catch |err| failCreate(ready[1], err);
+        checkResult(linux.setns(fd, linux.CLONE.NEWUSER)) catch |err| failCreate(ready[1], err);
+        const response: CreateResponse = .{};
+        if (!writeAll(ready[1], std.mem.asBytes(&response))) linux.exit_group(1);
+        var byte: [1]u8 = undefined;
+        _ = readAll(go[0], &byte);
+        linux.exit_group(0);
+    }
+    defer {
+        closeFd(go[1]);
+        _ = waitChild(child) catch {};
+    }
+    closeFd(ready[1]);
+    ready_writer = null;
+    var response: CreateResponse = .{};
+    if (!readAll(ready[0], std.mem.asBytes(&response))) return error.CreateFailed;
+    if (response.failureError()) |err| return err;
+    const uid = try readIDMappings(allocator, child, "uid_map");
+    errdefer allocator.free(uid);
+    const gid = try readIDMappings(allocator, child, "gid_map");
+    return .{ .uid = uid, .gid = gid };
 }
 
 fn formatIDMappings(allocator: std.mem.Allocator, mappings: []const oci.Spec.IDMapping) std.mem.Allocator.Error![]u8 {
@@ -4572,12 +4739,15 @@ fn createMountUserNamespace(allocator: std.mem.Allocator, mappings: Backend.Moun
 }
 
 fn closeMountFds(mounts: []const PreparedMount) void {
-    for (mounts) |mount| if (mount.mount_fd) |fd| closeFd(fd);
+    for (mounts) |mount| {
+        if (mount.source_fd) |fd| closeFd(fd);
+        if (mount.mount_fd) |fd| closeFd(fd);
+        if (mount.userns_fd) |fd| closeFd(fd);
+    }
 }
 
-/// Clone host sources before entering the container's user/mount namespaces.
-/// The detached trees carry their ID maps into child2; no host lookup or
-/// allocation is needed there, just move_mount to the pinned destination.
+/// Prepare mapping namespaces before fork; clones must come from init's mount
+/// namespace so they inherit its MNT_LOCK_* protection.
 fn prepareIDMappedMounts(allocator: std.mem.Allocator, mounts: []PreparedMount) Backend.Error!void {
     if (comptime builtin.os.tag != .linux) return error.NotImplemented;
     for (mounts) |*mount| {
@@ -4589,22 +4759,76 @@ fn prepareIDMappedMounts(allocator: std.mem.Allocator, mounts: []PreparedMount) 
             defer allocator.free(namespace_path);
             break :existing try openPath(linux.AT.FDCWD, namespace_path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true });
         } else try createMountUserNamespace(allocator, mappings);
-        defer closeFd(userns);
+        errdefer closeFd(userns);
         try validateNamespaceFd(userns, linux.CLONE.NEWUSER);
-        step.operation = "";
-        mount.mount_fd = try cloneIDMappedMount(mount.*, userns);
+        mount.userns_fd = userns;
     }
 }
 
-/// The caller owns the returned detached tree. This part needs no allocator.
+/// Host credentials are needed for private sources and idmapping superblocks.
+/// Join only init's mount namespace: opening sources there pins its locked
+/// mounts, rather than unlocked host mounts. In particular, a mount namespace
+/// joined by path resolves bind sources there, just as ordinary binds do.
+fn startMountSourceHelper(mounts: []const PreparedMount) Backend.Error!struct { pid: i32, socket: posix.fd_t } {
+    const sockets = try console.socketpair();
+    errdefer for (sockets) |fd| closeFd(fd);
+    const child = try forkProcess();
+    if (child == 0) {
+        closeFd(sockets[1]);
+        checkResult(linux.prctl(@intFromEnum(linux.PR.SET_DUMPABLE), 0, 0, 0, 0)) catch |err| failCreate(sockets[0], err);
+        const namespace = console.receiveFd(sockets[0]) catch linux.exit_group(1);
+        checkResult(linux.setns(namespace, linux.CLONE.NEWNS)) catch |err| failCreate(sockets[0], err);
+        closeFd(namespace);
+        sendMountSources(mounts, sockets[0]) catch |err| failCreate(sockets[0], err);
+        linux.exit_group(0);
+    }
+    closeFd(sockets[0]);
+    return .{ .pid = child, .socket = sockets[1] };
+}
+
+fn sendMountSources(mounts: []const PreparedMount, socket: posix.fd_t) Backend.Error!void {
+    for (mounts) |mount| {
+        if (mount.flags & linux.MS.BIND == 0) continue;
+        var step: RootfsStep = .{ .operation = "open bind source", .source = mount.source, .path = mount.destination };
+        errdefer |err| if (step.operation.len != 0) step.report(err);
+        const source = mount.source orelse return error.InvalidConfig;
+        const source_fd = try openPath(linux.AT.FDCWD, source, .{ .PATH = true, .CLOEXEC = true });
+        defer closeFd(source_fd);
+        var prepared = mount;
+        prepared.source_fd = source_fd;
+        step.operation = "";
+        const tree = if (mount.userns_fd) |userns| try cloneIDMappedMount(prepared, userns) else null;
+        defer if (tree) |fd| closeFd(fd);
+        const response: CreateResponse = .{};
+        if (!writeAll(socket, std.mem.asBytes(&response))) return error.CreateFailed;
+        try console.sendFd(socket, tree orelse source_fd);
+    }
+}
+
+fn receiveMountSources(mounts: []PreparedMount, socket: posix.fd_t, namespace: posix.fd_t) Backend.Error!void {
+    try console.sendFd(socket, namespace);
+    for (mounts) |*mount| {
+        if (mount.flags & linux.MS.BIND == 0) continue;
+        var response: CreateResponse = .{};
+        if (!readAll(socket, std.mem.asBytes(&response))) return error.CreateFailed;
+        if (response.failureError()) |err| return err;
+        const fd = try console.receiveFd(socket);
+        if (mount.mappings != null) mount.mount_fd = fd else mount.source_fd = fd;
+    }
+}
+
+/// Called with host credentials inside the container's mount namespace.
+/// open_tree copies the source's kernel locks, including for recursive binds.
 fn cloneIDMappedMount(mount: PreparedMount, userns: posix.fd_t) Backend.Error!posix.fd_t {
     var step: RootfsStep = .{ .operation = "open_tree for idmapped mount", .source = mount.source, .path = mount.destination };
     errdefer |err| if (step.operation.len != 0) step.report(err);
     const source = mount.source orelse return error.InvalidConfig;
     const mappings = mount.mappings orelse return error.InvalidConfig;
-    const clone_flags = OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC |
+    const source_fd = mount.source_fd orelse try openPath(linux.AT.FDCWD, source, .{ .PATH = true, .CLOEXEC = true });
+    defer if (mount.source_fd == null) closeFd(source_fd);
+    const clone_flags = OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC | linux.AT.EMPTY_PATH |
         (if (mount.flags & linux.MS.REC != 0) @as(u32, linux.AT.RECURSIVE) else 0);
-    const cloned = linux.syscall3(.open_tree, @bitCast(@as(isize, linux.AT.FDCWD)), @intFromPtr(source.ptr), clone_flags);
+    const cloned = linux.syscall3(.open_tree, @intCast(source_fd), @intFromPtr(""), clone_flags);
     try checkResult(cloned);
     const fd: posix.fd_t = @intCast(cloned);
     errdefer closeFd(fd);
@@ -4749,8 +4973,11 @@ const PreparedMount = struct {
     data: [:0]const u8,
     recursive_readonly: ?bool = null,
     mappings: ?Backend.MountMappings = null,
-    /// Detached, already idmapped tree prepared in the host namespace.
+    /// O_PATH source opened with host credentials in init's mount namespace.
+    source_fd: ?posix.fd_t = null,
+    /// Detached idmapped tree cloned from init's locked mount namespace.
     mount_fd: ?posix.fd_t = null,
+    userns_fd: ?posix.fd_t = null,
     /// Created after this mount, before a following tmpfs readonly remount.
     symlinks: []const Backend.Symlink = &.{},
 };
@@ -4887,15 +5114,15 @@ const RootfsStep = struct {
     }
 };
 
-fn applyMount(rootfs: [:0]const u8, root_fd: posix.fd_t, mount: PreparedMount, private_mount_namespace: bool, step: *RootfsStep) Backend.Error!void {
+fn applyMount(rootfs: [:0]const u8, root_fd: posix.fd_t, mount: PreparedMount, private_mount_namespace: bool, rootfs_propagation: u32, step: *RootfsStep) Backend.Error!void {
     const ms = linux.MS;
     const bind = mount.flags & ms.BIND != 0;
     step.* = .{ .operation = "open bind source", .source = mount.source, .path = mount.destination };
     const source_fd: ?posix.fd_t = if (bind)
-        mount.mount_fd orelse try openPath(linux.AT.FDCWD, (mount.source orelse return error.InvalidConfig).ptr, .{ .PATH = true, .CLOEXEC = true })
+        mount.mount_fd orelse mount.source_fd orelse try openPath(linux.AT.FDCWD, (mount.source orelse return error.InvalidConfig).ptr, .{ .PATH = true, .CLOEXEC = true })
     else
         null;
-    defer if (mount.mount_fd == null) {
+    defer if (mount.mount_fd == null and mount.source_fd == null) {
         if (source_fd) |fd| closeFd(fd);
     };
     step.operation = "stat bind source";
@@ -4918,7 +5145,7 @@ fn applyMount(rootfs: [:0]const u8, root_fd: posix.fd_t, mount: PreparedMount, p
         .fs_type = if (bind) null else mount.type,
     };
     if (mount.mount_fd) |fd| {
-        step.operation = "move idmapped mount";
+        step.operation = "move detached mount";
         var flags = std.mem.zeroes(linux.MOVE_MOUNT);
         flags.F_EMPTY_PATH = true;
         flags.T_EMPTY_PATH = true;
@@ -4941,15 +5168,24 @@ fn applyMount(rootfs: [:0]const u8, root_fd: posix.fd_t, mount: PreparedMount, p
         try mountDestination(root_fd, mount.destination, is_file, false);
     closeFd(target_fd);
     target_fd = mounted_fd;
-    // Detached idmapped trees were cloned in the host namespace and retain its
-    // peer groups even under a private parent. Cut them before remounts can
-    // propagate to the host, as for binds in an inherited mount namespace.
-    step.operation = "mount private propagation";
-    if (bind and (!private_mount_namespace or mount.mount_fd != null))
+    // Detached trees retain host peer groups even under a private parent.
+    // Make them slaves before remounts to stop propagation to the host while
+    // retaining the host master when root or mount propagation needs it.
+    if (bind and mount.mount_fd != null) {
+        step.operation = "mount slave propagation";
+        try checkResult(linux.mount(null, fdPath(&target_buffer, target_fd), null, ms.SLAVE | ms.REC, 0));
+        if ((rootfs_propagation | mount.propagation) & (ms.SLAVE | ms.SHARED) == 0) {
+            step.operation = "mount private propagation";
+            try checkResult(linux.mount(null, fdPath(&target_buffer, target_fd), null, ms.PRIVATE | ms.REC, 0));
+        }
+    } else if (bind and !private_mount_namespace) {
+        step.operation = "mount private propagation";
         try checkResult(linux.mount(null, fdPath(&target_buffer, target_fd), null, ms.PRIVATE | ms.REC, 0));
+    }
     if (bind and mount.flags & ~@as(u32, ms.BIND | ms.REC) != 0) {
         step.operation = "bind remount";
-        try bindRemount(target_fd, fdPath(&target_buffer, target_fd), (mount.flags & ~@as(u32, ms.REC)) | ms.BIND | ms.REMOUNT);
+        const requested = (mount.flags & ~@as(u32, ms.REC)) | ms.BIND | ms.REMOUNT;
+        try bindRemount(target_fd, fdPath(&target_buffer, target_fd), requested);
     }
     if (mount.recursive_readonly) |readonly| {
         step.operation = "mount_setattr";
@@ -5081,7 +5317,6 @@ fn setupSymlinks(root_fd: posix.fd_t, symlinks: []const Backend.Symlink, step: *
 const RootfsOptions = struct {
     private_mount_namespace: bool = true,
     console_fd: ?posix.fd_t = null,
-    fifo_writable: bool = false,
     propagation: u32 = linux.MS.PRIVATE | linux.MS.REC,
     create_hooks: []const hooks.Prepared = &.{},
     create_hook_state: []const u8 = "",
@@ -5229,7 +5464,8 @@ fn makeRootfsParentUnshared(rootfs: [:0]const u8, propagation: u32, step: *Rootf
 /// Allocating in child2 risks inherited allocator locks (POSIX only permits
 /// async-signal-safe work after fork). The raw hook runner needs no allocation.
 fn setupRootfs(rootfs: [:0]const u8, mounts: []const PreparedMount, devices: []const PreparedDevice, symlinks: []const Backend.Symlink, readonly: bool, options: RootfsOptions) Backend.Error!void {
-    defer closeMountFds(mounts);
+    var owns_mount_fds = true;
+    defer if (owns_mount_fds) closeMountFds(mounts);
     const ms = linux.MS;
     var step: RootfsStep = .{ .operation = "mount propagation", .path = "/" };
     errdefer |err| if (step.operation.len != 0) step.report(err);
@@ -5264,9 +5500,11 @@ fn setupRootfs(rootfs: [:0]const u8, mounts: []const PreparedMount, devices: []c
         step = .{ .operation = "open rootfs", .path = rootfs };
         const root_fd = try openPath(linux.AT.FDCWD, rootfs, .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true });
         defer closeFd(root_fd);
-        try applyMount(rootfs, root_fd, mount, options.private_mount_namespace, &step);
+        try applyMount(rootfs, root_fd, mount, options.private_mount_namespace, options.propagation, &step);
         try setupSymlinks(root_fd, mount.symlinks, &step);
     }
+    closeMountFds(mounts);
+    owns_mount_fds = false;
     if (options.runtime_sync) |sync| {
         step = .{ .operation = "create synchronization" };
         var response: CreateResponse = .{};
@@ -5376,7 +5614,7 @@ fn runInit(
     closeExecFrom(3, fd_dir) catch |err| failCreate(ready_fd, err);
     if (spec.process) |process| {
         // Allow write-only reopen after setuid while keeping readers root-only.
-        if (process.user.uid != 0 and !rootfs_options.fifo_writable)
+        if (process.user.uid != 0)
             checkResult(linux.fchmodat(fd_dir, fifo_name, 0o622)) catch |err| failCreate(ready_fd, err);
         applyRlimits(rlimits) catch |err| failCreate(ready_fd, err);
         // Without NNP the kernel requires CAP_SYS_ADMIN, which applyProcess
@@ -6209,18 +6447,74 @@ test "ID mapping lines preserve order and decimal IDs" {
 
 test "FIFO ownership uses namespace root's mapped host UID and GID" {
     try std.testing.expectEqual(@as(u32, 100000), try mappedRootID(&.{
-        .{ .containerID = 10, .hostID = 300000, .size = 10 },
-        .{ .containerID = 0, .hostID = 100000, .size = 10 },
+        .{ .container_id = 10, .host_id = 300000, .size = 10 },
+        .{ .container_id = 0, .host_id = 100000, .size = 10 },
     }));
-    try std.testing.expectEqual(@as(u32, 200000), try mappedRootID(&.{.{ .containerID = 0, .hostID = 200000, .size = 10 }}));
-    try std.testing.expectEqual(@as(u32, 0), try mappedRootID(&.{.{ .containerID = 0, .hostID = 0, .size = 1 }}));
-    for ([_][]const oci.Spec.IDMapping{
+    try std.testing.expectEqual(@as(u32, 200000), try mappedRootID(&.{.{ .container_id = 0, .host_id = 200000, .size = 10 }}));
+    try std.testing.expectEqual(@as(u32, 0), try mappedRootID(&.{.{ .container_id = 0, .host_id = 0, .size = 1 }}));
+    for ([_][]const Backend.IDMapping{
         &.{},
-        &.{.{ .containerID = 1, .hostID = 100000, .size = 10 }},
-        &.{.{ .containerID = 0, .hostID = 100000, .size = 0 }},
+        &.{.{ .container_id = 1, .host_id = 100000, .size = 10 }},
+        &.{.{ .container_id = 0, .host_id = 100000, .size = 0 }},
     }) |mappings| {
         try std.testing.expectError(error.InvalidConfig, mappedRootID(mappings));
     }
+}
+
+test "joined user namespace mappings compare ranges without regard to order" {
+    defer last_diagnostic_len = 0;
+    const mappings: []const Backend.IDMapping = &.{
+        .{ .container_id = 0, .host_id = 1000, .size = 10 },
+        .{ .container_id = 20, .host_id = 2000, .size = 2 },
+    };
+    const reversed: []const Backend.IDMapping = &.{ mappings[1], mappings[0] };
+    const actual: Backend.MountMappings = .{ .uid = mappings, .gid = reversed };
+    try validateJoinedMappings(std.testing.allocator, actual, .{ .uid = reversed, .gid = mappings });
+    try validateJoinedMappings(std.testing.allocator, actual, .{});
+    try validateJoinedMappings(std.testing.allocator, actual, .{ .uid = reversed });
+    try validateJoinedMappings(std.testing.allocator, actual, .{ .gid = mappings });
+    for ([_][]const Backend.IDMapping{
+        mappings[0..1],
+        &.{ mappings[0], mappings[0] },
+        &.{ mappings[0], mappings[1], .{ .container_id = 30, .host_id = 3000, .size = 1 } },
+        &.{ mappings[0], .{ .container_id = 21, .host_id = 2000, .size = 2 } },
+        &.{ mappings[0], .{ .container_id = 20, .host_id = 2001, .size = 2 } },
+        &.{ mappings[0], .{ .container_id = 20, .host_id = 2000, .size = 1 } },
+    }) |wrong| {
+        try std.testing.expectError(error.InvalidConfig, validateJoinedMappings(std.testing.allocator, actual, .{ .uid = wrong, .gid = mappings }));
+        try std.testing.expectEqualStrings("user namespace mappings do not match the joined namespace", last_diagnostic[0..last_diagnostic_len]);
+        try std.testing.expectError(error.InvalidConfig, validateJoinedMappings(std.testing.allocator, actual, .{ .uid = mappings, .gid = wrong }));
+    }
+    // Equal lengths and membership do not account for duplicate multiplicities.
+    try std.testing.expectError(error.InvalidConfig, validateJoinedMappings(
+        std.testing.allocator,
+        .{ .uid = &.{ mappings[0], mappings[0], mappings[1] } },
+        .{ .uid = &.{ mappings[0], mappings[1], mappings[1] } },
+    ));
+}
+
+test "linux joined user namespace helper reads host mappings from a pinned namespace" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (linux.geteuid() != 0) return error.SkipZigTest;
+    const uid: []const Backend.IDMapping = &.{
+        .{ .container_id = 20, .host_id = 200000, .size = 2 },
+        .{ .container_id = 0, .host_id = 100000, .size = 10 },
+    };
+    const gid: []const Backend.IDMapping = &.{
+        .{ .container_id = 0, .host_id = 300000, .size = 10 },
+        .{ .container_id = 20, .host_id = 400000, .size = 2 },
+    };
+    const fd = createMountUserNamespace(std.testing.allocator, .{ .uid = uid, .gid = gid }) catch |err| switch (err) {
+        error.PermissionDenied, error.Unsupported => return error.SkipZigTest,
+        else => return err,
+    };
+    defer closeFd(fd);
+    const actual = try joinedUserNamespaceMappings(std.testing.allocator, fd);
+    defer std.testing.allocator.free(actual.uid);
+    defer std.testing.allocator.free(actual.gid);
+    try validateJoinedMappings(std.testing.allocator, actual, .{ .uid = uid, .gid = gid });
+    try std.testing.expectEqual(@as(u32, 100000), try mappedRootID(actual.uid));
+    try std.testing.expectEqual(@as(u32, 300000), try mappedRootID(actual.gid));
 }
 
 test "linux create reports the frontend ambient capability validation error" {
@@ -7081,6 +7375,15 @@ test "linux mapped create installs maps outside init and cleans up rejected maps
     defer tmp.cleanup();
     try tmp.dir.createDir(std.testing.io, "rootfs", .default_dir);
     try tmp.dir.createDir(std.testing.io, "rootfs/dev", .default_dir);
+    // Mapped root can read the sources, but cannot search their host-only ancestor.
+    try tmp.dir.createDir(std.testing.io, "priv", .fromMode(0o700));
+    try checkResult(linux.fchownat(tmp.dir.handle, "priv", 0, 0, 0));
+    try tmp.dir.createDir(std.testing.io, "priv/dir", .fromMode(0o755));
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "priv/dir/content",
+        .data = "private bind source\n",
+        .flags = .{ .permissions = .fromMode(0o644) },
+    });
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "rootfs/init",
         .data = "unused until start\n",
@@ -7090,6 +7393,10 @@ test "linux mapped create installs maps outside init and cleans up rejected maps
     defer std.testing.allocator.free(base);
     const absolute = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, base, std.testing.allocator);
     defer std.testing.allocator.free(absolute);
+    const bind_dir = try std.fs.path.join(std.testing.allocator, &.{ absolute, "priv/dir" });
+    defer std.testing.allocator.free(bind_dir);
+    const bind_file = try std.fs.path.join(std.testing.allocator, &.{ bind_dir, "content" });
+    defer std.testing.allocator.free(bind_file);
     const rootfs = try std.fs.path.join(std.testing.allocator, &.{ absolute, "rootfs" });
     defer std.testing.allocator.free(rootfs);
     const fifo = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/exec.fifo", .{absolute}, 0);
@@ -7128,6 +7435,8 @@ test "linux mapped create installs maps outside init and cleans up rejected maps
             .{ .destination = "/dev", .source = "tmpfs", .type = "tmpfs", .flags = 0, .propagation = 0, .data = "mode=755" },
             .{ .destination = "/dev/pts", .source = "tmpfs", .type = "tmpfs", .flags = 0, .propagation = 0, .data = "mode=755" },
             .{ .destination = "/dev/host-null", .source = "/dev/null", .type = null, .flags = linux.MS.BIND | linux.MS.RDONLY, .propagation = 0, .data = "" },
+            .{ .destination = "/dev/bind-file", .source = bind_file, .type = null, .flags = linux.MS.BIND, .propagation = 0, .data = "" },
+            .{ .destination = "/dev/bind-dir", .source = bind_dir, .type = null, .flags = linux.MS.BIND, .propagation = 0, .data = "" },
         },
         .devices = &.{
             .{ .path = "/dev/null", .kind = .character, .major = 1, .minor = 3 },
@@ -7148,6 +7457,13 @@ test "linux mapped create installs maps outside init and cleans up rejected maps
         backend.delete(handle) catch {};
     }
     try std.testing.expect(try backend.alive(handle));
+    for ([_][]const u8{ "dev/bind-file", "dev/bind-dir/content" }) |destination| {
+        const path = try std.fmt.allocPrint(std.testing.allocator, "/proc/{d}/root/{s}", .{ handle.pid, destination });
+        defer std.testing.allocator.free(path);
+        const content = try ProcFile.read(path, .limited(64));
+        defer std.testing.allocator.free(content);
+        try std.testing.expectEqualStrings("private bind source\n", content);
+    }
     const oom_path = try std.fmt.allocPrint(std.testing.allocator, "/proc/{d}/oom_score_adj", .{handle.pid});
     defer std.testing.allocator.free(oom_path);
     const oom_score_adj = try ProcFile.read(oom_path, .limited(32));
@@ -7189,25 +7505,45 @@ test "linux mapped create installs maps outside init and cleans up rejected maps
     }
     const fifo_stat = try tmp.dir.statFile(std.testing.io, "exec.fifo", .{});
     try std.testing.expectEqual(@as(posix.mode_t, 0o600), fifo_stat.permissions.toMode() & 0o7777);
-    {
+    for ([_]struct { with_mappings: bool, uid: u32 }{
+        .{ .with_mappings = true, .uid = 0 },
+        .{ .with_mappings = false, .uid = 0 },
+        .{ .with_mappings = true, .uid = 1 },
+        .{ .with_mappings = false, .uid = 1 },
+    }) |case| {
+        const with_mappings = case.with_mappings;
         // Reuse this mapped user namespace while creating fresh mount/PID
         // namespaces. Root's host UID differs from the runtime's UID.
         const user_path = try std.fmt.allocPrint(std.testing.allocator, "/proc/{d}/ns/user", .{handle.pid});
         defer std.testing.allocator.free(user_path);
-        const joined_fifo = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/joined.fifo", .{absolute}, 0);
+        const joined_fifo = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/joined-{s}-{d}.fifo", .{ absolute, if (with_mappings) "mapped" else "unmapped", case.uid }, 0);
         defer std.testing.allocator.free(joined_fifo);
         try checkResult(linux.mknod(joined_fifo, linux.S.IFIFO | 0o600, 0));
-        const joined_cgroup = try std.fmt.allocPrint(std.testing.allocator, "{s}-joined", .{cgroup_path});
+        const joined_cgroup = try std.fmt.allocPrint(std.testing.allocator, "{s}-joined-{s}-{d}", .{ cgroup_path, if (with_mappings) "mapped" else "unmapped", case.uid });
         defer std.testing.allocator.free(joined_cgroup);
         var joined_spec = spec;
         joined_spec.linux.?.namespaces = &.{ .{ .type = .mount }, .{ .type = .user, .path = user_path }, .{ .type = .pid } };
-        joined_spec.linux.?.uidMappings = null;
-        joined_spec.linux.?.gidMappings = null;
+        joined_spec.process.?.user.uid = case.uid;
+        if (!with_mappings) {
+            joined_spec.linux.?.uidMappings = null;
+            joined_spec.linux.?.gidMappings = null;
+        }
         var joined_options = options;
         joined_options.id = "joined";
         joined_options.spec = &joined_spec;
         joined_options.exec_fifo = joined_fifo;
         joined_options.cgroup_path = joined_cgroup;
+        if (with_mappings) {
+            joined_spec.linux.?.uidMappings = &.{.{ .containerID = 0, .hostID = 100001, .size = 10 }};
+            try std.testing.expectError(error.InvalidConfig, backend.create(joined_options));
+            try std.testing.expectEqualStrings("user namespace mappings do not match the joined namespace", backend.diagnostic().?);
+            joined_spec.linux.?.uidMappings = spec.linux.?.uidMappings;
+            joined_spec.linux.?.gidMappings = &.{.{ .containerID = 0, .hostID = 200001, .size = 10 }};
+            try std.testing.expectError(error.InvalidConfig, backend.create(joined_options));
+            try std.testing.expectEqualStrings("user namespace mappings do not match the joined namespace", backend.diagnostic().?);
+            joined_spec.linux.?.gidMappings = spec.linux.?.gidMappings;
+            try std.testing.expectEqual(@as(?posix.fd_t, null), try walkCgroup(cgroup_root.fd, joined_cgroup, false, &.{}));
+        }
         // Lowering requires host CAP_SYS_RESOURCE even when joining a user
         // namespace whose root maps to a different host UID.
         if (caps[0].effective & (@as(u32, 1) << linux.CAP.SYS_RESOURCE) != 0)
@@ -7219,6 +7555,18 @@ test "linux mapped create installs maps outside init and cleans up rejected maps
             backend.delete(joined) catch {};
         }
         try std.testing.expect(try backend.alive(joined));
+        for ([_][]const u8{ "dev/bind-file", "dev/bind-dir/content" }) |destination| {
+            const path = try std.fmt.allocPrint(std.testing.allocator, "/proc/{d}/root/{s}", .{ joined.pid, destination });
+            defer std.testing.allocator.free(path);
+            const content = try ProcFile.read(path, .limited(64));
+            defer std.testing.allocator.free(content);
+            try std.testing.expectEqualStrings("private bind source\n", content);
+        }
+        var joined_fifo_stat: linux.Statx = undefined;
+        try checkResult(linux.statx(linux.AT.FDCWD, joined_fifo, 0, .{ .UID = true, .GID = true, .MODE = true }, &joined_fifo_stat));
+        try std.testing.expectEqual(@as(u32, 100000), joined_fifo_stat.uid);
+        try std.testing.expectEqual(@as(u32, 200000), joined_fifo_stat.gid);
+        try std.testing.expectEqual(@as(u16, if (case.uid == 0) 0o600 else 0o622), joined_fifo_stat.mode & 0o7777);
         const joined_oom_path = try std.fmt.allocPrint(std.testing.allocator, "/proc/{d}/oom_score_adj", .{joined.pid});
         defer std.testing.allocator.free(joined_oom_path);
         const joined_oom_score_adj = try ProcFile.read(joined_oom_path, .limited(32));
@@ -7306,11 +7654,14 @@ test "linux idmapped binds translate ownership and writes with and without a con
 }
 
 fn testIDMappedBindOwnership(base: []const u8, cgroup_path: []const u8) !void {
-    for ([_]bool{ true, false }) |with_userns| {
+    const Mode = enum { new, joined, joined_without_mappings, plain };
+    for ([_]Mode{ .new, .joined, .joined_without_mappings, .plain }) |mode| {
+        const with_userns = mode != .plain;
+        const joined = mode == .joined or mode == .joined_without_mappings;
         var arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
         defer arena.deinit();
         const allocator = arena.allocator();
-        const suffix: []const u8 = if (with_userns) "mapped" else "plain";
+        const suffix = @tagName(mode);
         const rootfs = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}-rootfs", .{ base, suffix }, 0);
         const source = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}-source", .{ base, suffix }, 0);
         const fifo = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}.fifo", .{ base, suffix }, 0);
@@ -7333,10 +7684,27 @@ fn testIDMappedBindOwnership(base: []const u8, cgroup_path: []const u8) !void {
             .uidMappings = &.{container_mapping},
             .gidMappings = &.{container_mapping},
         };
+        var joined_fd: ?posix.fd_t = null;
+        defer if (joined_fd) |fd| closeFd(fd);
+        if (joined) {
+            const ranges: []const Backend.IDMapping = &.{.{ .container_id = 0, .host_id = 100000, .size = 1 }};
+            const fd = try createMountUserNamespace(allocator, .{ .uid = ranges, .gid = ranges });
+            joined_fd = fd;
+            const path = try std.fmt.allocPrintSentinel(allocator, "/proc/self/fd/{d}", .{fd}, 0);
+            spec.linux.?.namespaces = &.{ .{ .type = .user, .path = path }, .{ .type = .mount } };
+            if (mode == .joined_without_mappings) {
+                spec.linux.?.uidMappings = null;
+                spec.linux.?.gidMappings = null;
+            }
+        }
         // The mount map translates filesystem IDs to kernel IDs. Thus 0:100000
         // exposes a host-root-owned tree as root in a 0:100000 container.
         const mapping: oci.Spec.IDMapping = .{ .containerID = source_uid, .hostID = container_uid, .size = 1 };
-        const mappings = try oci.mountMappings(allocator, .{
+        const mappings = try oci.mountMappings(allocator, if (joined) .{
+            .destination = "/data",
+            .type = "bind",
+            .options = &.{"idmap"},
+        } else .{
             .destination = "/data",
             .type = "bind",
             .uidMappings = &.{mapping},
@@ -7450,20 +7818,20 @@ test "linux idmapped binds isolate shared source propagation recursively" {
                 // rbind must privatize submounts even with a nonrecursive idmap.
                 .mappings = .{ .recursive = false },
             };
-            mount.mount_fd = cloneIDMappedMount(mount, userns) catch linux.exit_group(10);
             const ready = makePipe() catch linux.exit_group(12);
             const go = makePipe() catch linux.exit_group(13);
             const container = forkProcess() catch linux.exit_group(14);
             if (container == 0) {
                 closeFd(ready[0]);
                 closeFd(go[1]);
-                // Clone before entering the container namespace, just as the
-                // runtime parent does before setupRootfs makes '/' rprivate.
+                // The source helper clones inside the container namespace,
+                // with host credentials, before setupRootfs makes '/' rprivate.
                 checkResult(linux.unshare(linux.CLONE.NEWNS)) catch linux.exit_group(15);
+                mount.mount_fd = cloneIDMappedMount(mount, userns) catch linux.exit_group(10);
                 checkResult(linux.mount(null, "/", null, ms.PRIVATE | ms.REC, 0)) catch linux.exit_group(16);
                 const root_fd = openPath(linux.AT.FDCWD, rootfs, .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true }) catch linux.exit_group(11);
                 var step: RootfsStep = .{};
-                applyMount(rootfs, root_fd, mount, true, &step) catch |err| {
+                applyMount(rootfs, root_fd, mount, true, ms.PRIVATE | ms.REC, &step) catch |err| {
                     step.report(err);
                     linux.exit_group(17);
                 };
@@ -7483,7 +7851,6 @@ test "linux idmapped binds isolate shared source propagation recursively" {
             }
             closeFd(ready[1]);
             closeFd(go[0]);
-            closeFd(mount.mount_fd.?);
             var byte: [1]u8 = undefined;
             if (!readAll(ready[0], &byte)) linux.exit_group(26);
             // Mounts from the container must not cover the host's markers.
@@ -7550,7 +7917,7 @@ test "linux rbind clones submounts and ridmap alone maps them recursively" {
             mount.mount_fd = cloneIDMappedMount(mount, userns) catch linux.exit_group(7);
             const root_fd = openPath(linux.AT.FDCWD, rootfs, .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true }) catch linux.exit_group(8);
             var step: RootfsStep = .{};
-            applyMount(rootfs, root_fd, mount, true, &step) catch |err| {
+            applyMount(rootfs, root_fd, mount, true, linux.MS.PRIVATE | linux.MS.REC, &step) catch |err| {
                 step.report(err);
                 linux.exit_group(9);
             };
@@ -7712,13 +8079,178 @@ test "linux privileged bind remount honors atime changes and clears unrequested 
                 .flags = ms.BIND | case.requested,
                 .propagation = 0,
                 .data = "",
-            }, true, &step) catch linux.exit_group(6);
+            }, true, ms.PRIVATE | ms.REC, &step) catch linux.exit_group(6);
             const target = mountDestination(root_fd, "/bound", false, false) catch linux.exit_group(7);
             const actual = remountFlags(target, 0) catch linux.exit_group(8);
             if (actual != case.requested) linux.exit_group(9);
             linux.exit_group(0);
         }
         try std.testing.expectEqual(@as(u32, 0), try waitChild(pid));
+    }
+}
+
+test "linux accessible user namespace binds retain locked host mount restrictions" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (linux.geteuid() != 0) return error.SkipZigTest;
+    try requireTestMountNamespace();
+    const ranges: []const Backend.IDMapping = &.{.{ .container_id = 0, .host_id = 100000, .size = 10 }};
+    const mappings: Backend.MountMappings = .{ .uid = ranges, .gid = ranges };
+    const userns = createMountUserNamespace(std.testing.allocator, mappings) catch |err| switch (err) {
+        error.PermissionDenied, error.Unsupported => return error.SkipZigTest,
+        else => return err,
+    };
+    defer closeFd(userns);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "rootfs/bound");
+    try tmp.dir.createDir(std.testing.io, "source", .default_dir);
+    const base = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer std.testing.allocator.free(base);
+    const absolute = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, base, std.testing.allocator);
+    defer std.testing.allocator.free(absolute);
+    const rootfs = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/rootfs", .{absolute}, 0);
+    defer std.testing.allocator.free(rootfs);
+    const source = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/source", .{absolute}, 0);
+    defer std.testing.allocator.free(source);
+    const child = try forkProcess();
+    if (child == 0) {
+        const ms = linux.MS;
+        checkResult(linux.unshare(linux.CLONE.NEWNS)) catch linux.exit_group(1);
+        checkResult(linux.mount(null, "/", null, ms.PRIVATE | ms.REC, 0)) catch linux.exit_group(2);
+        checkResult(linux.mount("tmpfs", source, "tmpfs", 0, 0)) catch linux.exit_group(3);
+        const restrictions = ms.RDONLY | ms.NOSUID | ms.NODEV | ms.NOEXEC;
+        checkResult(linux.mount(null, source, null, ms.BIND | ms.REMOUNT | restrictions, 0)) catch linux.exit_group(4);
+        var mounts = [_]PreparedMount{.{
+            .destination = "/bound",
+            .source = source,
+            .type = null,
+            .flags = ms.BIND,
+            .propagation = 0,
+            .data = "",
+        }};
+        const helper = startMountSourceHelper(&mounts) catch linux.exit_group(5);
+        checkResult(linux.setns(userns, linux.CLONE.NEWUSER)) catch linux.exit_group(7);
+        checkResult(linux.unshare(linux.CLONE.NEWNS)) catch linux.exit_group(8);
+        checkResult(linux.setgid(0)) catch linux.exit_group(9);
+        checkResult(linux.setuid(0)) catch linux.exit_group(10);
+        const namespace = openPath(linux.AT.FDCWD, "/proc/self/ns/mnt", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }) catch linux.exit_group(6);
+        receiveMountSources(&mounts, helper.socket, namespace) catch linux.exit_group(15);
+        closeFd(namespace);
+        closeFd(helper.socket);
+        if ((waitChild(helper.pid) catch linux.exit_group(16)) != 0) linux.exit_group(17);
+        const root_fd = openPath(linux.AT.FDCWD, rootfs, .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true }) catch linux.exit_group(11);
+        var step: RootfsStep = .{};
+        applyMount(rootfs, root_fd, mounts[0], true, ms.PRIVATE | ms.REC, &step) catch linux.exit_group(12);
+        const target = mountDestination(root_fd, "/bound", false, false) catch linux.exit_group(13);
+        const actual = remountFlags(target, 0) catch linux.exit_group(18);
+        checkResult(linux.fchdir(root_fd)) catch linux.exit_group(19);
+        checkResult(linux.chroot(".")) catch linux.exit_group(20);
+        checkResult(linux.chdir("/")) catch linux.exit_group(21);
+        for ([_]u32{ ms.RDONLY, ms.NOSUID, ms.NODEV, ms.NOEXEC }) |flag| {
+            const result = linux.mount(null, "/bound", null, ms.BIND | ms.REMOUNT | (actual & ~flag), 0);
+            if (linux.errno(result) != .PERM) linux.exit_group(14);
+        }
+        linux.exit_group(0);
+    }
+    try std.testing.expectEqual(@as(u32, 0), try waitChild(child));
+}
+
+test "linux host-private user namespace binds lock host mount restrictions" {
+    try testPrivateUserNamespaceBindLocks(false);
+}
+
+test "linux host-private idmapped user namespace binds lock host mount restrictions" {
+    try testPrivateUserNamespaceBindLocks(true);
+}
+
+fn testPrivateUserNamespaceBindLocks(idmapped: bool) !void {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (linux.geteuid() != 0) return error.SkipZigTest;
+    try requireTestMountNamespace();
+    const ranges: []const Backend.IDMapping = &.{.{ .container_id = 0, .host_id = 100000, .size = 10 }};
+    const mappings: Backend.MountMappings = .{ .uid = ranges, .gid = ranges };
+    const userns = createMountUserNamespace(std.testing.allocator, mappings) catch |err| switch (err) {
+        error.PermissionDenied, error.Unsupported => return error.SkipZigTest,
+        else => return err,
+    };
+    defer closeFd(userns);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "rootfs/bound");
+    try tmp.dir.createDir(std.testing.io, "source", .default_dir);
+    const base = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer std.testing.allocator.free(base);
+    const absolute = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, base, std.testing.allocator);
+    defer std.testing.allocator.free(absolute);
+    const rootfs = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/rootfs", .{absolute}, 0);
+    defer std.testing.allocator.free(rootfs);
+    const source = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/source", .{absolute}, 0);
+    defer std.testing.allocator.free(source);
+    const private_source = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/private/data", .{source}, 0);
+    defer std.testing.allocator.free(private_source);
+    if (idmapped) try requireTestIDMappedMounts(source);
+    const ms = linux.MS;
+    const restrictions = ms.RDONLY | ms.NOSUID | ms.NODEV | ms.NOEXEC;
+    for ([_]u32{ ms.RDONLY, ms.NOEXEC }) |requested| {
+        const child = try forkProcess();
+        if (child == 0) {
+            checkResult(linux.unshare(linux.CLONE.NEWNS)) catch linux.exit_group(1);
+            checkResult(linux.mount(null, "/", null, ms.PRIVATE | ms.REC, 0)) catch linux.exit_group(2);
+            checkResult(linux.mount("tmpfs", source, "tmpfs", 0, 0)) catch linux.exit_group(3);
+            checkResult(linux.chdir(source)) catch linux.exit_group(4);
+            checkResult(linux.mkdir("private", 0o700)) catch linux.exit_group(5);
+            checkResult(linux.mkdir("private/data", 0o700)) catch linux.exit_group(6);
+            const owner: u32 = if (idmapped) 0 else 100000;
+            checkResult(linux.chown("private/data", owner, owner)) catch linux.exit_group(21);
+            checkResult(linux.mount(null, source, null, ms.BIND | ms.REMOUNT | restrictions, 0)) catch linux.exit_group(7);
+            var mounts = [_]PreparedMount{.{
+                .destination = "/bound",
+                .source = private_source,
+                .type = null,
+                .flags = ms.BIND | requested,
+                .propagation = 0,
+                .data = "",
+                .mappings = if (idmapped) mappings else null,
+                .userns_fd = if (idmapped) userns else null,
+            }};
+            const helper = startMountSourceHelper(&mounts) catch linux.exit_group(8);
+            checkResult(linux.setns(userns, linux.CLONE.NEWUSER)) catch linux.exit_group(10);
+            checkResult(linux.unshare(linux.CLONE.NEWNS)) catch linux.exit_group(11);
+            checkResult(linux.setgid(0)) catch linux.exit_group(12);
+            checkResult(linux.setuid(0)) catch linux.exit_group(13);
+            const inaccessible = linux.open(private_source, .{ .PATH = true, .CLOEXEC = true }, 0);
+            if (linux.errno(inaccessible) != .ACCES) linux.exit_group(9);
+            const namespace = openPath(linux.AT.FDCWD, "/proc/self/ns/mnt", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }) catch linux.exit_group(22);
+            receiveMountSources(&mounts, helper.socket, namespace) catch linux.exit_group(23);
+            closeFd(namespace);
+            closeFd(helper.socket);
+            if ((waitChild(helper.pid) catch linux.exit_group(24)) != 0) linux.exit_group(25);
+            const root_fd = openPath(linux.AT.FDCWD, rootfs, .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true }) catch linux.exit_group(14);
+            var step: RootfsStep = .{};
+            applyMount(rootfs, root_fd, mounts[0], true, ms.PRIVATE | ms.REC, &step) catch |err| {
+                step.report(err);
+                linux.exit_group(15);
+            };
+            const target = mountDestination(root_fd, "/bound", false, false) catch linux.exit_group(16);
+            const actual = remountFlags(target, 0) catch linux.exit_group(17);
+            if (actual & restrictions != restrictions) linux.exit_group(18);
+            checkResult(linux.fchdir(root_fd)) catch linux.exit_group(26);
+            checkResult(linux.chroot(".")) catch linux.exit_group(27);
+            checkResult(linux.chdir("/")) catch linux.exit_group(28);
+            for ([_]u32{ ms.RDONLY, ms.NOSUID, ms.NODEV, ms.NOEXEC }) |flag| {
+                const result = linux.mount(null, "/bound", null, ms.BIND | ms.REMOUNT | (actual & ~flag), 0);
+                if (linux.errno(result) != .PERM) linux.exit_group(19);
+            }
+            const atime_mask = ms.NOATIME | ms.RELATIME | ms.STRICTATIME;
+            const atime = if (actual & ms.NOATIME != 0) @as(u32, ms.RELATIME) else ms.NOATIME;
+            const remount = linux.mount(null, "/bound", null, ms.BIND | ms.REMOUNT | (actual & ~@as(u32, atime_mask)) | atime, 0);
+            if (linux.errno(remount) != .PERM) linux.exit_group(29);
+            // The leaf is writable by mapped root; only the mount denies writes.
+            const file = linux.open("/bound/created", .{ .ACCMODE = .WRONLY, .CREAT = true }, 0o644);
+            if (linux.errno(file) != .ROFS) linux.exit_group(20);
+            linux.exit_group(0);
+        }
+        try std.testing.expectEqual(@as(u32, 0), try waitChild(child));
     }
 }
 
