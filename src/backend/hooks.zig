@@ -55,8 +55,10 @@ pub fn run(entries: []const Prepared, state: []const u8) Error!void {
     if (entries.len == 0) return;
     if (comptime builtin.os.tag != .linux) return error.NotImplemented;
     for (entries, 0..) |hook, index| {
-        runOne(hook, state, index) catch |err| {
-            if (err == error.SystemResources)
+        var reported = false;
+        runOne(hook, state, index, &reported) catch |err| {
+            // Only memfd setup can fail before runOne's diagnostic errdefer.
+            if (!reported)
                 reportDiagnostic("error running hook #{d}: {s}, stdout: , stderr: ", .{ index, @errorName(err) });
             return err;
         };
@@ -117,15 +119,20 @@ fn reportFailure(index: usize, err: Error, status: u32, output: std.posix.fd_t, 
     reportDiagnostic("error running hook #{d}: {s}, stdout: {s}, stderr: {s}", .{ index, reason, stdout, stderr });
 }
 
-fn runOne(hook: Prepared, state: []const u8, index: usize) Error!void {
+fn runOne(hook: Prepared, state: []const u8, index: usize, reported: *bool) Error!void {
     const input = try createMemfd("igvano-hook-stdin");
     defer _ = linux.close(input);
+    // ponytail: Captured hook output is unbounded, like runc's buffers; the
+    // upgrade path is a size cap.
     const output = try createMemfd("igvano-hook-stdout");
     defer _ = linux.close(output);
     const errors = try createMemfd("igvano-hook-stderr");
     defer _ = linux.close(errors);
     var status: u32 = 0;
-    errdefer |err| reportFailure(index, err, status, output, errors);
+    errdefer |err| {
+        reportFailure(index, err, status, output, errors);
+        reported.* = true;
+    }
     var offset: usize = 0;
     while (offset < state.len) {
         const result = linux.write(input, state[offset..].ptr, state.len - offset);

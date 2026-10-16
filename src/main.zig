@@ -23,6 +23,7 @@ fn backendResult(backend: Backend, result: anytype) @TypeOf(result) {
 pub const default_root = "/run/igvano";
 
 const Subcommand = enum {
+    features,
     state,
     create,
     start,
@@ -116,6 +117,16 @@ fn parseArgsWithLog(args: []const []const u8, log: *?[]const u8, log_format: *Lo
     const subcommand = std.meta.stringToEnum(Subcommand, args[index]) orelse
         return error.UnknownSubcommand;
     index += 1;
+    if (subcommand == .features) {
+        if (index != args.len) return error.UnexpectedArgument;
+        return .{
+            .root = root,
+            .subcommand = subcommand,
+            .id = "",
+            .log = log.*,
+            .log_format = log_format.*,
+        };
+    }
 
     var bundle: ?[]const u8 = null;
     var pid_file: ?[]const u8 = null;
@@ -1302,6 +1313,12 @@ fn stateContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, co
     try std.Io.File.stdout().writeStreamingAll(io, json);
 }
 
+fn features(allocator: std.mem.Allocator, io: std.Io) !void {
+    const json = try oci.featuresJson(allocator);
+    defer allocator.free(json);
+    try std.Io.File.stdout().writeStreamingAll(io, json);
+}
+
 fn makeExecFifo(allocator: std.mem.Allocator, path: []const u8) !void {
     if (comptime builtin.os.tag == .linux) {
         const path_z = try allocator.dupeZ(u8, path);
@@ -1357,6 +1374,7 @@ pub fn main(init: std.process.Init) !u8 {
         emitError(allocator, init.io, log, log_format, line, null);
         std.debug.print(
             "Usage: igvano [--root <dir>] [--log <file>] [--log-format text|json] <state|start|pause|resume> <id>\n" ++
+                "       igvano [global flags] features\n" ++
                 "       igvano [global flags] ps [--format table|json] <id> [ps args...]\n" ++
                 "       igvano [global flags] update --resources|-r <file|-> <id>\n" ++
                 "       igvano [--root <dir>] [--log <file>] [--log-format text|json] delete [--force] <id>\n" ++
@@ -1378,6 +1396,7 @@ pub fn main(init: std.process.Init) !u8 {
         };
     }
     const result = switch (config.subcommand) {
+        .features => features(allocator, init.io),
         .state => stateContainer(allocator, init.io, backend, config),
         .create => createContainer(allocator, init.io, backend, config),
         .start => startContainer(allocator, init.io, backend, config),
@@ -2803,6 +2822,32 @@ test "dispatch recognizes lifecycle subcommands and rejects unknown commands" {
     try std.testing.expect(std.meta.stringToEnum(Subcommand, "unknown") == null);
     try std.testing.expect(std.meta.stringToEnum(Subcommand, "STATE") == null);
     try std.testing.expect(std.meta.stringToEnum(Subcommand, "starting") == null);
+}
+
+test "features takes no id and accepts shim global flags" {
+    const plain = try parseArgs(&.{ "igvano", "features" });
+    try std.testing.expectEqualStrings("features", @tagName(plain.subcommand));
+    try std.testing.expectEqualStrings("", plain.id);
+    for ([_][]const []const u8{
+        &.{ "igvano", "--root", "/run/test", "--log", "/tmp/runtime.log", "--log-format", "json", "--debug", "features" },
+        &.{ "igvano", "--root=/run/test", "--log=/tmp/runtime.log", "--log-format=json", "features" },
+    }) |args| {
+        const config = try parseArgs(args);
+        try std.testing.expectEqualStrings("features", @tagName(config.subcommand));
+        try std.testing.expectEqualStrings("/run/test", config.root);
+        try std.testing.expectEqualStrings("/tmp/runtime.log", config.log.?);
+        try std.testing.expectEqual(LogFormat.json, config.log_format);
+        try std.testing.expectEqualStrings("", config.id);
+    }
+}
+
+test "features rejects ids and subcommand flags" {
+    for ([_][]const []const u8{
+        &.{ "igvano", "features", "example" },
+        &.{ "igvano", "features", "--root=/run/test" },
+        &.{ "igvano", "features", "--log", "/tmp/runtime.log" },
+        &.{ "igvano", "features", "--debug" },
+    }) |args| try std.testing.expectError(error.UnexpectedArgument, parseArgs(args));
 }
 
 test "argument parsing uses the default root and positional container id" {
@@ -4259,7 +4304,7 @@ const LockTestProcess = struct {
                 .create => createContainer(std.heap.page_allocator, io, backend, config),
                 .start => startContainer(std.heap.page_allocator, io, backend, config),
                 .delete => deleteContainer(std.heap.page_allocator, io, backend, config),
-                .ps, .pause, .@"resume", .kill, .update, .exec => unreachable,
+                .features, .ps, .pause, .@"resume", .kill, .update, .exec => unreachable,
             };
             if (operation) |_| {
                 if (expected_error != null) linux.exit_group(3);

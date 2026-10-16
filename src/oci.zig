@@ -312,6 +312,9 @@ pub const cgroup_file_name = "cgroup";
 pub const rootfs_mount_file_name = "rootfs_mount";
 pub const hooks_file_name = "hooks.json";
 pub const runtime_oci_version = "1.0.2";
+// Recognized schema revisions reported by features do not gate config loading.
+pub const oci_version_min = "1.0.0";
+pub const oci_version_max = "1.2.1";
 
 /// Parsed config.json values needed by a namespace backend.
 pub const Spec = struct {
@@ -940,6 +943,18 @@ test "device preparation frees paths on allocation failure including default ove
     try std.testing.checkAllAllocationFailures(std.testing.allocator, AllocationTest.run, .{});
 }
 
+pub const capability_names = names: {
+    var result: [std.os.linux.CAP.LAST_CAP + 1][]const u8 = undefined;
+    for (std.meta.declarations(std.os.linux.CAP)) |decl| {
+        if (!std.mem.eql(u8, decl.name, "LAST_CAP") and
+            @TypeOf(@field(std.os.linux.CAP, decl.name)) == comptime_int)
+        {
+            result[@field(std.os.linux.CAP, decl.name)] = "CAP_" ++ decl.name;
+        }
+    }
+    break :names result;
+};
+
 /// Null means a well-formed CAP_* name unknown to our table, possibly a newer cap.
 /// Linux constants are available on every build host; no syscalls are made.
 pub fn capabilityNumber(name: []const u8) error{InvalidConfig}!?u6 {
@@ -947,13 +962,8 @@ pub fn capabilityNumber(name: []const u8) error{InvalidConfig}!?u6 {
     for (name[4..]) |c| {
         if (!std.ascii.isUpper(c) and !std.ascii.isDigit(c) and c != '_') return error.InvalidConfig;
     }
-    inline for (comptime std.meta.declarations(std.os.linux.CAP)) |decl| {
-        if (comptime !std.mem.eql(u8, decl.name, "LAST_CAP") and
-            @TypeOf(@field(std.os.linux.CAP, decl.name)) == comptime_int)
-        {
-            if (std.mem.eql(u8, name, "CAP_" ++ decl.name))
-                return @intCast(@field(std.os.linux.CAP, decl.name));
-        }
+    for (capability_names, 0..) |known, number| {
+        if (std.mem.eql(u8, name, known)) return @intCast(number);
     }
     return null;
 }
@@ -1306,10 +1316,16 @@ pub const MountOptions = struct {
     recursive_readonly: ?bool = null,
 };
 
-pub fn parseMountOptions(allocator: std.mem.Allocator, options: []const []const u8, mount_type: ?[]const u8) !MountOptions {
+pub const mount_option_table = options: {
     const ms = std.os.linux.MS;
     const atime = ms.NOATIME | ms.RELATIME | ms.STRICTATIME;
-    const flag_options = [_]struct { name: []const u8, set: u32 = 0, clear: u32 = 0 }{
+    break :options [_]struct {
+        name: []const u8,
+        set: u32 = 0,
+        clear: u32 = 0,
+        propagation: u32 = 0,
+        recursive_readonly: ?bool = null,
+    }{
         .{ .name = "defaults" },
         .{ .name = "ro", .set = ms.RDONLY },
         .{ .name = "rw", .clear = ms.RDONLY },
@@ -1330,17 +1346,21 @@ pub fn parseMountOptions(allocator: std.mem.Allocator, options: []const []const 
         .{ .name = "sync", .set = ms.SYNCHRONOUS },
         .{ .name = "async", .clear = ms.SYNCHRONOUS },
         .{ .name = "dirsync", .set = ms.DIRSYNC },
+        .{ .name = "private", .propagation = ms.PRIVATE },
+        .{ .name = "rprivate", .propagation = ms.PRIVATE | ms.REC },
+        .{ .name = "slave", .propagation = ms.SLAVE },
+        .{ .name = "rslave", .propagation = ms.SLAVE | ms.REC },
+        .{ .name = "shared", .propagation = ms.SHARED },
+        .{ .name = "rshared", .propagation = ms.SHARED | ms.REC },
+        .{ .name = "unbindable", .propagation = ms.UNBINDABLE },
+        .{ .name = "runbindable", .propagation = ms.UNBINDABLE | ms.REC },
+        .{ .name = "rro", .recursive_readonly = true },
+        .{ .name = "rrw", .recursive_readonly = false },
     };
-    const propagation_options = [_]struct { name: []const u8, flags: u32 }{
-        .{ .name = "private", .flags = ms.PRIVATE },
-        .{ .name = "rprivate", .flags = ms.PRIVATE | ms.REC },
-        .{ .name = "slave", .flags = ms.SLAVE },
-        .{ .name = "rslave", .flags = ms.SLAVE | ms.REC },
-        .{ .name = "shared", .flags = ms.SHARED },
-        .{ .name = "rshared", .flags = ms.SHARED | ms.REC },
-        .{ .name = "unbindable", .flags = ms.UNBINDABLE },
-        .{ .name = "runbindable", .flags = ms.UNBINDABLE | ms.REC },
-    };
+};
+
+pub fn parseMountOptions(allocator: std.mem.Allocator, options: []const []const u8, mount_type: ?[]const u8) !MountOptions {
+    const ms = std.os.linux.MS;
     var flags: u32 = if (mount_type != null and std.mem.eql(u8, mount_type.?, "bind")) ms.BIND else 0;
     var propagation: u32 = 0;
     var recursive_readonly: ?bool = null;
@@ -1348,20 +1368,11 @@ pub fn parseMountOptions(allocator: std.mem.Allocator, options: []const []const 
     defer data.deinit(allocator);
     option: for (options) |option| {
         if (std.mem.indexOfScalar(u8, option, 0) != null) return error.InvalidConfig;
-        if (std.mem.eql(u8, option, "rro") or std.mem.eql(u8, option, "rrw")) {
-            recursive_readonly = std.mem.eql(u8, option, "rro");
-            continue;
-        }
-        for (flag_options) |entry| {
+        for (mount_option_table) |entry| {
             if (std.mem.eql(u8, option, entry.name)) {
                 flags = (flags & ~entry.clear) | entry.set;
-                continue :option;
-            }
-        }
-        // Propagation changes require their own mount syscall.
-        for (propagation_options) |entry| {
-            if (std.mem.eql(u8, option, entry.name)) {
-                propagation = entry.flags;
+                if (entry.propagation != 0) propagation = entry.propagation;
+                if (entry.recursive_readonly) |readonly| recursive_readonly = readonly;
                 continue :option;
             }
         }
@@ -1769,6 +1780,116 @@ pub fn loadSpec(allocator: std.mem.Allocator, io: std.Io, bundle_dir: []const u8
     errdefer parsed.deinit();
     try validateHooks(parsed.value.hooks);
     return parsed;
+}
+
+/// Runtime build capabilities, independent of the host kernel and privileges.
+pub fn featuresJson(allocator: std.mem.Allocator) ![]u8 {
+    const mount_options = comptime names: {
+        var names: [mount_option_table.len][]const u8 = undefined;
+        for (mount_option_table, 0..) |entry, i| names[i] = entry.name;
+        break :names names;
+    };
+    return std.json.Stringify.valueAlloc(allocator, .{
+        .ociVersionMin = oci_version_min,
+        .ociVersionMax = oci_version_max,
+        .hooks = std.meta.fieldNames(Spec.Hooks),
+        .mountOptions = &mount_options,
+        .linux = .{
+            .namespaces = std.meta.fieldNames(@FieldType(Spec.Namespace, "type")),
+            .capabilities = &capability_names,
+            .cgroup = .{ .v1 = true, .v2 = true, .systemd = false, .systemdUser = false, .rdma = false },
+            .seccomp = .{ .enabled = false },
+            .apparmor = .{ .enabled = false },
+            .selinux = .{ .enabled = false },
+            .intelRdt = .{ .enabled = false },
+            .mountExtensions = .{ .idmap = .{ .enabled = false } },
+        },
+    }, .{});
+}
+
+test "features JSON reports parser tables and disables unimplemented isolation" {
+    const allocator = std.testing.allocator;
+    const json = try featuresJson(allocator);
+    defer allocator.free(json);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    try std.testing.expectEqualStrings(oci_version_min, root.get("ociVersionMin").?.string);
+    try std.testing.expectEqualStrings(oci_version_max, root.get("ociVersionMax").?.string);
+    const reported_mounts = root.get("mountOptions").?.array.items;
+    try std.testing.expectEqual(mount_option_table.len, reported_mounts.len);
+    var has_rro = false;
+    for (mount_option_table, reported_mounts) |entry, reported| {
+        try std.testing.expectEqualStrings(entry.name, reported.string);
+        const options = try parseMountOptions(allocator, &.{reported.string}, null);
+        defer allocator.free(options.data);
+        try std.testing.expectEqualStrings("", options.data);
+        if (std.mem.eql(u8, reported.string, "rro")) {
+            has_rro = true;
+            try std.testing.expectEqual(@as(?bool, true), options.recursive_readonly);
+        }
+    }
+    try std.testing.expect(has_rro);
+    const hooks = root.get("hooks").?.array.items;
+    const hook_names = std.meta.fieldNames(Spec.Hooks);
+    try std.testing.expectEqual(hook_names.len, hooks.len);
+    for (hook_names, hooks) |name, reported| try std.testing.expectEqualStrings(name, reported.string);
+    const linux = root.get("linux").?.object;
+    const namespaces = linux.get("namespaces").?.array.items;
+    const namespace_names = std.meta.fieldNames(@FieldType(Spec.Namespace, "type"));
+    try std.testing.expectEqual(namespace_names.len, namespaces.len);
+    for (namespace_names, namespaces) |name, reported| try std.testing.expectEqualStrings(name, reported.string);
+    const caps = linux.get("capabilities").?.array.items;
+    try std.testing.expectEqual(capability_names.len, caps.len);
+    for (capability_names, caps, 0..) |name, reported, number| {
+        try std.testing.expectEqualStrings(name, reported.string);
+        try std.testing.expectEqual(@as(?u6, @intCast(number)), try capabilityNumber(reported.string));
+    }
+    const cgroup = linux.get("cgroup").?.object;
+    try std.testing.expect(cgroup.get("v1").?.bool);
+    try std.testing.expect(cgroup.get("v2").?.bool);
+    for ([_][]const u8{ "systemd", "systemdUser", "rdma" }) |name|
+        try std.testing.expect(!cgroup.get(name).?.bool);
+    for ([_][]const u8{ "seccomp", "apparmor", "selinux", "intelRdt" }) |name|
+        try std.testing.expect(!linux.get(name).?.object.get("enabled").?.bool);
+    try std.testing.expect(!linux.get("mountExtensions").?.object.get("idmap").?.object.get("enabled").?.bool);
+}
+
+test "loadSpec accepts version strings and create validates semantic version syntax" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const allocator = std.testing.allocator;
+    const bundle = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer allocator.free(bundle);
+    const cases = [_]struct { version: []const u8, accepted: bool }{
+        .{ .version = "1.0.0", .accepted = true },
+        .{ .version = "1.0.2", .accepted = true },
+        .{ .version = "1.1.0", .accepted = true },
+        .{ .version = "1.2.0", .accepted = true },
+        .{ .version = "1.2.1", .accepted = true },
+        .{ .version = "1.2.1+build", .accepted = true },
+        .{ .version = "0.9.0", .accepted = true },
+        .{ .version = "1.0.0-rc.1", .accepted = true },
+        .{ .version = "1.2.2", .accepted = true },
+        .{ .version = "1.3.0", .accepted = true },
+        .{ .version = "2.0.0", .accepted = true },
+        .{ .version = "9.9.9", .accepted = true },
+        .{ .version = "invalid", .accepted = false },
+    };
+    for (cases) |case| {
+        const spec: Spec = .{ .ociVersion = case.version, .root = .{ .path = "rootfs" } };
+        const json = try std.json.Stringify.valueAlloc(allocator, spec, .{ .emit_null_optional_fields = false });
+        defer allocator.free(json);
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "config.json", .data = json });
+        const parsed = try loadSpec(allocator, std.testing.io, bundle);
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings(case.version, parsed.value.ociVersion);
+        if (case.accepted) {
+            try requireCreate(parsed.value);
+        } else {
+            try std.testing.expectError(error.InvalidConfig, requireCreate(parsed.value));
+        }
+    }
 }
 
 /// Loads resource JSON from a file or stdin. The caller must call deinit().
