@@ -26,11 +26,17 @@ const Subcommand = enum {
     state,
     create,
     start,
+    exec,
     kill,
     delete,
 };
 
 const LogFormat = enum { text, json };
+
+const ExecUser = struct {
+    uid: u32,
+    gid: ?u32,
+};
 
 const Config = struct {
     root: []const u8,
@@ -44,6 +50,14 @@ const Config = struct {
     signal: ?[]const u8 = null,
     force: bool = false,
     all: bool = false,
+    process_file: ?[]const u8 = null,
+    detach: bool = false,
+    tty: ?bool = null,
+    exec_cwd: ?[]const u8 = null,
+    exec_user: ?ExecUser = null,
+    /// Borrowed option tokens, scanned again to collect repeated --env values.
+    exec_flags: []const []const u8 = &.{},
+    exec_args: []const []const u8 = &.{},
 };
 
 fn parseArgs(args: []const []const u8) !Config {
@@ -100,6 +114,34 @@ fn parseArgsWithLog(args: []const []const u8, log: *?[]const u8, log_format: *Lo
     var console_socket: ?[]const u8 = null;
     var force = false;
     var all = false;
+    var process_file: ?[]const u8 = null;
+    var detach = false;
+    var tty: ?bool = null;
+    var exec_cwd: ?[]const u8 = null;
+    var exec_user: ?ExecUser = null;
+    const flags_start = index;
+    if (subcommand == .exec) {
+        while (index < args.len and std.mem.startsWith(u8, args[index], "-")) : (index += 1) {
+            const flag = args[index];
+            if (std.mem.eql(u8, flag, "--detach") or std.mem.eql(u8, flag, "-d") or std.mem.startsWith(u8, flag, "--detach=")) {
+                detach = try boolOption(flag);
+            } else if (std.mem.eql(u8, flag, "--tty") or std.mem.eql(u8, flag, "-t") or std.mem.startsWith(u8, flag, "--tty=")) {
+                tty = try boolOption(flag);
+            } else if (std.mem.eql(u8, flag, "--process") or std.mem.startsWith(u8, flag, "--process=")) {
+                process_file = try optionValue(args, &index, error.MissingProcessFile);
+            } else if (std.mem.eql(u8, flag, "--pid-file") or std.mem.startsWith(u8, flag, "--pid-file=")) {
+                pid_file = try optionValue(args, &index, error.MissingPidFile);
+            } else if (std.mem.eql(u8, flag, "--console-socket") or std.mem.startsWith(u8, flag, "--console-socket=")) {
+                console_socket = try optionValue(args, &index, error.MissingConsoleSocket);
+            } else if (std.mem.eql(u8, flag, "--cwd") or std.mem.startsWith(u8, flag, "--cwd=")) {
+                exec_cwd = try optionValue(args, &index, error.MissingCwd);
+            } else if (std.mem.eql(u8, flag, "--user") or std.mem.startsWith(u8, flag, "--user=")) {
+                exec_user = try parseUser(try optionValue(args, &index, error.MissingUser));
+            } else if (std.mem.eql(u8, flag, "--env") or std.mem.startsWith(u8, flag, "--env=")) {
+                try oci.validateEnv(try optionValue(args, &index, error.MissingEnv));
+            } else return error.UnknownOption;
+        }
+    }
     if (subcommand == .create) {
         while (index < args.len and std.mem.startsWith(u8, args[index], "-")) : (index += 1) {
             if (std.mem.eql(u8, args[index], "--bundle")) {
@@ -145,14 +187,17 @@ fn parseArgsWithLog(args: []const []const u8, log: *?[]const u8, log_format: *Lo
     }
     if (index >= args.len) return error.MissingId;
     const remaining = args.len - index;
-    if (remaining != 1 and !(subcommand == .kill and remaining == 2)) return error.UnexpectedArgument;
+    if (subcommand == .exec) {
+        if (process_file != null and remaining != 1) return error.UnexpectedArgument;
+        if (process_file == null and remaining == 1) return error.MissingCommand;
+    } else if (remaining != 1 and !(subcommand == .kill and remaining == 2)) return error.UnexpectedArgument;
     const id = args[index];
     if (id.len == 0 or std.mem.indexOfScalar(u8, id, 0) != null or std.mem.eql(u8, id, ".") or std.mem.eql(u8, id, "..") or
         std.mem.indexOfScalar(u8, id, '/') != null or std.mem.startsWith(u8, id, "-"))
     {
         return error.InvalidId;
     }
-    const signal = if (remaining == 2) args[index + 1] else null;
+    const signal = if (subcommand == .kill and remaining == 2) args[index + 1] else null;
     if (signal) |value| {
         if (value.len == 0 or std.mem.startsWith(u8, value, "-")) return error.UnexpectedArgument;
     }
@@ -168,6 +213,71 @@ fn parseArgsWithLog(args: []const []const u8, log: *?[]const u8, log_format: *Lo
         .signal = signal,
         .force = force,
         .all = all,
+        .process_file = process_file,
+        .detach = detach,
+        .tty = tty,
+        .exec_cwd = exec_cwd,
+        .exec_user = exec_user,
+        .exec_flags = if (subcommand == .exec) args[flags_start..index] else &.{},
+        .exec_args = if (subcommand == .exec) args[index + 1 ..] else &.{},
+    };
+}
+
+fn optionValue(args: []const []const u8, index: *usize, comptime missing: error{
+    MissingProcessFile,
+    MissingPidFile,
+    MissingConsoleSocket,
+    MissingCwd,
+    MissingEnv,
+    MissingUser,
+}) ![]const u8 {
+    const value = if (std.mem.indexOfScalar(u8, args[index.*], '=')) |equals|
+        args[index.*][equals + 1 ..]
+    else value: {
+        index.* += 1;
+        if (index.* >= args.len or std.mem.startsWith(u8, args[index.*], "-")) return missing;
+        break :value args[index.*];
+    };
+    if (value.len == 0) return missing;
+    return value;
+}
+
+fn boolOption(flag: []const u8) !bool {
+    const equals = std.mem.indexOfScalar(u8, flag, '=') orelse return true;
+    const value = flag[equals + 1 ..];
+    if (std.mem.eql(u8, value, "true")) return true;
+    if (std.mem.eql(u8, value, "false")) return false;
+    return error.InvalidBoolean;
+}
+
+fn parseUser(value: []const u8) !ExecUser {
+    var parts = std.mem.splitScalar(u8, value, ':');
+    const uid = try numericId(parts.next().?);
+    const gid: ?u32 = if (parts.next()) |part| try numericId(part) else null;
+    if (parts.next() != null) return error.InvalidUser;
+    return .{ .uid = uid, .gid = gid };
+}
+
+fn numericId(value: []const u8) !u32 {
+    if (value.len == 0) return error.InvalidUser;
+    for (value) |byte| if (!std.ascii.isDigit(byte)) return error.InvalidUser;
+    return std.fmt.parseInt(u32, value, 10) catch error.InvalidUser;
+}
+
+fn prepareProcess(allocator: std.mem.Allocator, process: oci.Spec.Process, socket: ?[]const u8) !Backend.ExecOptions {
+    try validateConsoleSocket(process.terminal, socket);
+    return .{
+        .allocator = allocator,
+        .argv = process.args,
+        .envp = process.env orelse &.{},
+        .cwd = process.cwd,
+        .uid = process.user.uid,
+        .gid = process.user.gid,
+        .additional_gids = process.user.additionalGids orelse &.{},
+        .capabilities = if (process.capabilities) |caps| try oci.processCapabilities(caps) else null,
+        .rlimits = try oci.processRlimits(allocator, process.rlimits),
+        .no_new_privileges = process.noNewPrivileges,
+        .oom_score_adj = process.oomScoreAdj,
     };
 }
 
@@ -287,7 +397,13 @@ fn createContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, c
     const parsed = try oci.loadSpec(allocator, io, bundle);
     defer parsed.deinit();
     try oci.requireCreate(parsed.value);
-    try validateConsoleSocket(if (parsed.value.process) |process| process.terminal else null, config.console_socket);
+    const process_options = if (parsed.value.process) |process|
+        try prepareProcess(allocator, process, config.console_socket)
+    else options: {
+        try validateConsoleSocket(null, config.console_socket);
+        break :options @as(?Backend.ExecOptions, null);
+    };
+    defer if (process_options) |options| allocator.free(options.rlimits);
     const console_fds = if (config.console_socket != null) try backend_module.console.socketpair() else null;
     defer if (console_fds) |fds| for (fds) |fd| {
         _ = std.os.linux.close(fd);
@@ -327,13 +443,6 @@ fn createContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, c
     defer allocator.free(cgroup_path);
     const resources = try oci.cgroupResources(allocator, settings.resources);
     defer oci.freeCgroupResources(allocator, resources);
-    const capabilities = if (parsed.value.process) |process|
-        if (process.capabilities) |caps| try oci.processCapabilities(caps) else null
-    else
-        null;
-    const rlimits = try oci.processRlimits(allocator, if (parsed.value.process) |process| process.rlimits else null);
-    defer allocator.free(rlimits);
-
     _ = try cwd.createDirPathStatus(io, config.root, .fromMode(0o700));
     const root = try cwd.realPathFileAlloc(io, config.root, allocator);
     defer allocator.free(root);
@@ -376,6 +485,12 @@ fn createContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, c
     const process_path = try std.fs.path.join(allocator, &.{ state_dir, oci.process_file_name });
     defer allocator.free(process_path);
     try oci.atomicWrite(io, process_path, if (parsed.value.process != null) "true\n" else "false\n");
+    // Capture exec defaults independently of later changes to the bundle.
+    const saved_config = try std.fs.path.join(allocator, &.{ state_dir, "config.json" });
+    defer allocator.free(saved_config);
+    const config_json = try std.json.Stringify.valueAlloc(allocator, parsed.value, .{ .emit_null_optional_fields = false });
+    defer allocator.free(config_json);
+    try oci.atomicWrite(io, saved_config, config_json);
     const fifo = try std.fs.path.join(allocator, &.{ state_dir, oci.exec_fifo_name });
     defer allocator.free(fifo);
     try makeExecFifo(allocator, fifo);
@@ -412,9 +527,9 @@ fn createContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, c
         .mounts = mounts,
         .cgroup_path = cgroup_path,
         .resources = resources,
-        .capabilities = capabilities,
-        .rlimits = rlimits,
-        .oom_score_adj = if (parsed.value.process) |process| process.oomScoreAdj else null,
+        .capabilities = if (process_options) |options| options.capabilities else null,
+        .rlimits = if (process_options) |options| options.rlimits else &.{},
+        .oom_score_adj = if (process_options) |options| options.oom_score_adj else null,
         .devices = devices,
         .device_symlinks = oci.deviceSymlinks(mounts),
         .create_hooks = create_hooks,
@@ -456,9 +571,7 @@ fn createContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, c
     if (lock) |file| try requireLinkedLock(io, file);
     try oci.saveState(allocator, io, root, state);
     if (config.pid_file) |path| {
-        const pid = try std.fmt.allocPrint(allocator, "{d}", .{handle.pid});
-        defer allocator.free(pid);
-        try oci.atomicWrite(io, path, pid);
+        try writePidFile(allocator, io, path, handle.pid);
     }
 }
 
@@ -731,6 +844,144 @@ fn startContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, co
     warnHooks(allocator, if (saved_hooks) |entries| entries.value.poststart else null, state.parsed.value, "poststart");
 }
 
+fn execProcessConfig(allocator: std.mem.Allocator, inherited: oci.Spec.Process, config: Config) !oci.Spec.Process {
+    var process = inherited;
+    process.args = config.exec_args;
+    if (config.exec_cwd) |value| process.cwd = value;
+    process.terminal = config.tty orelse false;
+    if (config.exec_user) |value| {
+        process.user.uid = value.uid;
+        if (value.gid) |gid| process.user.gid = gid;
+    }
+    var env: std.ArrayList([]const u8) = .empty;
+    errdefer env.deinit(allocator);
+    try env.appendSlice(allocator, process.env orelse &.{});
+    var index: usize = 0;
+    while (index < config.exec_flags.len) : (index += 1) {
+        const flag = config.exec_flags[index];
+        if (std.mem.eql(u8, flag, "--env") or std.mem.startsWith(u8, flag, "--env=")) {
+            const value = try optionValue(config.exec_flags, &index, error.MissingEnv);
+            const key_len = std.mem.indexOfScalar(u8, value, '=').?;
+            // Later values override the saved environment and earlier --envs.
+            var entry: usize = 0;
+            while (entry < env.items.len) {
+                const existing = env.items[entry];
+                if (existing.len > key_len and existing[key_len] == '=' and
+                    std.mem.eql(u8, existing[0..key_len], value[0..key_len]))
+                    _ = env.orderedRemove(entry)
+                else
+                    entry += 1;
+            }
+            try env.append(allocator, value);
+        } else if (std.mem.indexOfScalar(u8, flag, '=') == null and
+            !std.mem.eql(u8, flag, "--detach") and !std.mem.eql(u8, flag, "-d") and
+            !std.mem.eql(u8, flag, "--tty") and !std.mem.eql(u8, flag, "-t"))
+        {
+            index += 1; // Skip the value of another parsed option.
+        }
+    }
+    process.env = try env.toOwnedSlice(allocator);
+    return process;
+}
+
+fn execContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, config: Config) !u8 {
+    if (comptime builtin.os.tag != .linux) return error.NotImplemented;
+    const linux = std.os.linux;
+    var lock = try openContainerLock(allocator, config, false);
+    defer if (lock) |file| file.close(io);
+    const locked = if (lock) |file| try lockContainer(file, false) else true;
+    if (locked) {
+        if (lock) |file| try requireLinkedLock(io, file);
+    }
+    const state = try readLiveState(allocator, io, backend, config, locked);
+    defer state.deinit();
+    if (state.parsed.value.status != .created and state.parsed.value.status != .running) return error.InvalidStatus;
+
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer arena.deinit();
+    const process_allocator = arena.allocator();
+    const process = if (config.process_file) |path| process: {
+        const json = try std.Io.Dir.cwd().readFileAlloc(io, path, process_allocator, .limited(1 << 20));
+        const parsed = try std.json.parseFromSlice(oci.Spec.Process, process_allocator, json, .{
+            .allocate = .alloc_always,
+            .ignore_unknown_fields = true,
+        });
+        break :process parsed.value;
+    } else process: {
+        const saved_bundle = try std.fs.path.join(process_allocator, &.{ config.root, config.id });
+        // Legacy containers did not snapshot config.json at create.
+        const parsed = oci.loadSpec(process_allocator, io, saved_bundle) catch |err| switch (err) {
+            error.FileNotFound => try oci.loadSpec(process_allocator, io, state.parsed.value.bundle),
+            else => return err,
+        };
+        break :process try execProcessConfig(process_allocator, parsed.value.process orelse return error.MissingProcess, config);
+    };
+    try oci.validateProcess(process);
+    var options = try prepareProcess(process_allocator, process, config.console_socket);
+    options.cgroup_path = state.handle.?.cgroup_path orelse return error.InvalidState;
+    options.console_fds = if (config.console_socket != null) try backend_module.console.socketpair() else null;
+    defer if (options.console_fds) |fds| for (fds) |fd| {
+        _ = linux.close(fd);
+    };
+    var was_subreaper: u32 = 0;
+    if (!config.detach) {
+        // The helper exits after exec; adoption lets this frontend waitpid the
+        // grandchild. Detached exec leaves adoption/reaping to the shim.
+        if (linux.errno(linux.prctl(@intFromEnum(linux.PR.GET_CHILD_SUBREAPER), @intFromPtr(&was_subreaper), 0, 0, 0)) != .SUCCESS or
+            linux.errno(linux.prctl(@intFromEnum(linux.PR.SET_CHILD_SUBREAPER), 1, 0, 0, 0)) != .SUCCESS)
+            return error.SubreaperFailed;
+    }
+    defer if (!config.detach) {
+        _ = linux.prctl(@intFromEnum(linux.PR.SET_CHILD_SUBREAPER), was_subreaper, 0, 0, 0);
+    };
+    const pid = try backendResult(backend, backend.exec(state.handle.?, options));
+    {
+        errdefer {
+            _ = linux.kill(pid, .KILL);
+            if (!config.detach) _ = waitExec(pid) catch {};
+        }
+        if (options.console_fds) |fds| {
+            const master = try backend_module.console.receiveFd(fds[0]);
+            defer _ = linux.close(master);
+            const peer = try connectConsoleSocket(config.console_socket.?);
+            defer _ = linux.close(peer);
+            try backend_module.console.sendFd(peer, master);
+        }
+        if (config.pid_file) |path| try writePidFile(allocator, io, path, pid);
+    }
+    // Do not hold the container lock while waiting for a long-running command.
+    if (locked) {
+        if (lock) |file| {
+            file.close(io);
+            lock = null;
+        }
+    }
+    // Attached exec does not forward signals; containerd always uses --detach.
+    return if (config.detach) 0 else try waitExec(pid);
+}
+
+fn waitExec(pid: i32) !u8 {
+    if (comptime builtin.os.tag != .linux) return error.NotImplemented;
+    var status: if (builtin.link_libc) c_int else u32 = undefined;
+    while (true) {
+        switch (std.posix.errno(std.posix.system.waitpid(pid, &status, 0))) {
+            .SUCCESS => {
+                const value: u32 = @bitCast(status);
+                const signal = value & 0x7f;
+                return @intCast(if (signal == 0) (value >> 8) & 0xff else 128 + signal);
+            },
+            .INTR => continue,
+            else => return error.WaitFailed,
+        }
+    }
+}
+
+fn writePidFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8, pid: i32) !void {
+    const text = try std.fmt.allocPrint(allocator, "{d}", .{pid});
+    defer allocator.free(text);
+    try oci.atomicWrite(io, path, text);
+}
+
 /// After acknowledgement, CLOEXEC closes the writer at exec; earlier EOF can
 /// precede the writer's first open or signal a failure before acknowledgement.
 fn startReadComplete(writer_seen: bool, acked: bool, count: usize, byte: u8) !bool {
@@ -976,6 +1227,14 @@ pub fn main(init: std.process.Init) !u8 {
             error.MissingBundle => "missing value for --bundle",
             error.MissingPidFile => "missing value for --pid-file",
             error.MissingConsoleSocket => "missing value for --console-socket",
+            error.MissingProcessFile => "missing value for --process",
+            error.MissingCommand => "exec requires a command or --process",
+            error.MissingCwd => "missing value for --cwd",
+            error.MissingEnv => "missing value for --env",
+            error.MissingUser => "missing value for --user",
+            error.InvalidUser => "invalid --user; expected UID[:GID]",
+            error.InvalidBoolean => "invalid boolean; expected true or false",
+            error.InvalidProcess => "invalid process environment; expected K=V",
             error.UnexpectedArgument => "unexpected argument; global flags must precede the subcommand",
             error.InvalidId => "invalid container id",
         };
@@ -986,7 +1245,9 @@ pub fn main(init: std.process.Init) !u8 {
             "Usage: igvano [--root <dir>] [--log <file>] [--log-format text|json] <state|start> <id>\n" ++
                 "       igvano [--root <dir>] [--log <file>] [--log-format text|json] delete [--force] <id>\n" ++
                 "       igvano [--root <dir>] [--log <file>] [--log-format text|json] kill [--all] <id> [signal]\n" ++
-                "       igvano [--root <dir>] [--log <file>] [--log-format text|json] create [--bundle <path>] [--pid-file <file>] [--console-socket <path>] <id>\n",
+                "       igvano [--root <dir>] [--log <file>] [--log-format text|json] create [--bundle <path>] [--pid-file <file>] [--console-socket <path>] <id>\n" ++
+                "       igvano [global flags] exec [--process <file>] [--detach|-d] [--pid-file <file>] [--console-socket <path>]\n" ++
+                "              [--tty|-t] [--cwd <dir>] [--env K=V]... [--user UID[:GID]] <id> [command args...]\n",
             .{},
         );
         return 1;
@@ -994,12 +1255,19 @@ pub fn main(init: std.process.Init) !u8 {
     var implementation: backend_module.LinuxBackend = .{};
     const backend = implementation.backend();
     last_backend_detail = null;
+    if (config.subcommand == .exec) {
+        return execContainer(allocator, init.io, backend, config) catch |err| {
+            reportError(allocator, init.io, last_backend_detail, config, err);
+            return 1;
+        };
+    }
     const result = switch (config.subcommand) {
         .state => stateContainer(allocator, init.io, backend, config),
         .create => createContainer(allocator, init.io, backend, config),
         .start => startContainer(allocator, init.io, backend, config),
         .kill => killContainer(allocator, init.io, backend, config),
         .delete => deleteContainer(allocator, init.io, backend, config),
+        .exec => unreachable,
     };
     result catch |err| {
         reportError(allocator, init.io, last_backend_detail, config, err);
@@ -1128,6 +1396,318 @@ test "create argument parsing accepts console sockets and rejects missing values
         &.{ "igvano", "create", "--console-socket", "--bundle", "/tmp" },
     }) |args| try std.testing.expectError(error.MissingConsoleSocket, parseArgs(args));
     try std.testing.expectError(error.UnexpectedArgument, parseArgs(&.{ "igvano", "start", "--console-socket", "/tmp/console.sock", "example" }));
+}
+
+test "exec argument parsing supports shim flags and equals forms" {
+    for ([_][]const []const u8{
+        &.{ "igvano", "--root", "/run/test", "--log", "/tmp/log", "--log-format", "json", "exec", "--process", "/tmp/process.json", "--detach", "--pid-file", "/tmp/pid", "--console-socket", "/tmp/console", "example" },
+        &.{ "igvano", "--root=/run/test", "--log=/tmp/log", "--log-format=json", "exec", "--process=/tmp/process.json", "-d", "--pid-file=/tmp/pid", "--console-socket=/tmp/console", "example" },
+    }) |args| {
+        const config = try parseArgs(args);
+        try std.testing.expectEqual(Subcommand.exec, config.subcommand);
+        try std.testing.expectEqualStrings("/tmp/process.json", config.process_file.?);
+        try std.testing.expect(config.detach);
+        try std.testing.expectEqualStrings("/tmp/pid", config.pid_file.?);
+        try std.testing.expectEqualStrings("/tmp/console", config.console_socket.?);
+        try std.testing.expectEqual(@as(usize, 0), config.exec_args.len);
+    }
+    const config = try parseArgs(&.{ "igvano", "exec", "--detach=false", "--tty=true", "example", "sh", "-c", "exit 7" });
+    try std.testing.expect(!config.detach);
+    try std.testing.expect(config.tty.?);
+    try std.testing.expectEqualStrings("-c", config.exec_args[1]);
+}
+
+test "exec command overrides inherit process settings and replace environment keys" {
+    const config = try parseArgs(&.{
+        "igvano", "exec", "--cwd", "/work", "--env", "A=first", "--env=A=last", "--env", "NEW=x=y", "--user=1000:1001", "-t", "example", "sh", "-c", "exit 7",
+    });
+    const original: oci.Spec.Process = .{
+        .args = &.{"sleep"},
+        .env = &.{ "A=old", "KEEP=value" },
+        .cwd = "/",
+        .user = .{ .uid = 0, .gid = 1002, .additionalGids = &.{42} },
+        .noNewPrivileges = true,
+        .oomScoreAdj = 100,
+        .capabilities = .{ .bounding = &.{"CAP_CHOWN"} },
+        .rlimits = &.{.{ .type = "RLIMIT_NOFILE", .hard = 1024, .soft = 512 }},
+    };
+    const process = try execProcessConfig(std.testing.allocator, original, config);
+    defer std.testing.allocator.free(process.env.?);
+    try std.testing.expectEqualSlices([]const u8, config.exec_args, process.args);
+    try std.testing.expectEqualStrings("/work", process.cwd);
+    try std.testing.expect(process.terminal.?);
+    try std.testing.expectEqual(@as(u32, 1000), process.user.uid);
+    try std.testing.expectEqual(@as(u32, 1001), process.user.gid);
+    try std.testing.expectEqual(@as(u32, 42), process.user.additionalGids.?[0]);
+    try std.testing.expect(process.noNewPrivileges);
+    try std.testing.expectEqual(original.oomScoreAdj, process.oomScoreAdj);
+    try std.testing.expectEqualStrings("CAP_CHOWN", process.capabilities.?.bounding.?[0]);
+    try std.testing.expectEqual(original.rlimits.?[0].hard, process.rlimits.?[0].hard);
+    try std.testing.expectEqual(@as(usize, 3), process.env.?.len);
+    try std.testing.expectEqualStrings("KEEP=value", process.env.?[0]);
+    try std.testing.expectEqualStrings("A=last", process.env.?[1]);
+    try std.testing.expectEqualStrings("NEW=x=y", process.env.?[2]);
+    const uid_only = try parseArgs(&.{ "igvano", "exec", "--user", "99", "example", "true" });
+    try std.testing.expectEqual(@as(?u32, null), uid_only.exec_user.?.gid);
+    var terminal_init = original;
+    terminal_init.terminal = true;
+    const no_tty = try execProcessConfig(std.testing.allocator, terminal_init, uid_only);
+    defer std.testing.allocator.free(no_tty.env.?);
+    try std.testing.expect(!no_tty.terminal.?);
+    try std.testing.expectEqual(@as(u32, 99), no_tty.user.uid);
+    try std.testing.expectEqual(@as(u32, 1002), no_tty.user.gid);
+}
+
+test "exec argument parsing rejects missing values invalid users and conflicting commands" {
+    const cases = [_]struct { args: []const []const u8, expected: anyerror }{
+        .{ .args = &.{ "igvano", "exec" }, .expected = error.MissingId },
+        .{ .args = &.{ "igvano", "exec", "example" }, .expected = error.MissingCommand },
+        .{ .args = &.{ "igvano", "exec", "--process", "p.json", "example", "true" }, .expected = error.UnexpectedArgument },
+        .{ .args = &.{ "igvano", "exec", "--process" }, .expected = error.MissingProcessFile },
+        .{ .args = &.{ "igvano", "exec", "--process=" }, .expected = error.MissingProcessFile },
+        .{ .args = &.{ "igvano", "exec", "--pid-file", "--detach", "example", "true" }, .expected = error.MissingPidFile },
+        .{ .args = &.{ "igvano", "exec", "--console-socket=" }, .expected = error.MissingConsoleSocket },
+        .{ .args = &.{ "igvano", "exec", "--cwd=" }, .expected = error.MissingCwd },
+        .{ .args = &.{ "igvano", "exec", "--env=" }, .expected = error.MissingEnv },
+        .{ .args = &.{ "igvano", "exec", "--env", "INVALID", "example", "true" }, .expected = error.InvalidProcess },
+        .{ .args = &.{ "igvano", "exec", "--env==value", "example", "true" }, .expected = error.InvalidProcess },
+        .{ .args = &.{ "igvano", "exec", "--user=" }, .expected = error.MissingUser },
+        .{ .args = &.{ "igvano", "exec", "--user=root", "example", "true" }, .expected = error.InvalidUser },
+        .{ .args = &.{ "igvano", "exec", "--user=1:", "example", "true" }, .expected = error.InvalidUser },
+        .{ .args = &.{ "igvano", "exec", "--user=1:2:3", "example", "true" }, .expected = error.InvalidUser },
+        .{ .args = &.{ "igvano", "exec", "--user=4294967296", "example", "true" }, .expected = error.InvalidUser },
+        .{ .args = &.{ "igvano", "exec", "--tty=maybe", "example", "true" }, .expected = error.InvalidBoolean },
+        .{ .args = &.{ "igvano", "exec", "--bundle=/tmp", "example", "true" }, .expected = error.UnknownOption },
+        .{ .args = &.{ "igvano", "exec", "--process=p.json", "--detach" }, .expected = error.MissingId },
+    };
+    for (cases) |case| try std.testing.expectError(case.expected, parseArgs(case.args));
+}
+
+test "process validation and typed translation serve create and exec" {
+    const process: oci.Spec.Process = .{
+        .args = &.{ "sh", "-c", "true" },
+        .env = &.{"PATH=/bin"},
+        .cwd = "/",
+        .user = .{ .uid = 1000, .gid = 1001, .additionalGids = &.{42} },
+        .capabilities = .{ .bounding = &.{"CAP_CHOWN"} },
+        .rlimits = &.{.{ .type = "RLIMIT_NOFILE", .hard = 1024, .soft = 512 }},
+        .noNewPrivileges = true,
+        .oomScoreAdj = 50,
+    };
+    const options = try prepareProcess(std.testing.allocator, process, null);
+    defer std.testing.allocator.free(options.rlimits);
+    try std.testing.expectEqual(@as(u64, 1), options.capabilities.?.bounding);
+    try std.testing.expectEqual(@as(u64, 512), options.rlimits[0].soft);
+    try std.testing.expectEqual(@as(u32, 42), options.additional_gids[0]);
+    try std.testing.expect(options.no_new_privileges);
+    try std.testing.expectEqual(@as(?i32, 50), options.oom_score_adj);
+    var invalid = process;
+    invalid.env = &.{"NO_EQUALS"};
+    try std.testing.expectError(error.InvalidProcess, oci.validateProcess(invalid));
+    invalid = process;
+    invalid.args = &.{"bad\x00arg"};
+    try std.testing.expectError(error.InvalidProcess, oci.validateProcess(invalid));
+    invalid = process;
+    invalid.terminal = true;
+    try std.testing.expectError(error.MissingConsoleSocket, prepareProcess(std.testing.allocator, invalid, null));
+}
+
+test "linux exec joins created and running init namespaces and cgroups waits and writes detached pid files" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const linux = std.os.linux;
+    if (linux.geteuid() != 0 or linux.errno(linux.access("/bin/sh", linux.X_OK)) != .SUCCESS)
+        return error.SkipZigTest;
+    // On v1 the tmpfs hierarchy root may be readonly while controller mounts
+    // beneath it are writable. Only v2 requires writes directly to this root.
+    if (linux.errno(linux.access("/sys/fs/cgroup/cgroup.controllers", linux.F_OK)) == .SUCCESS and
+        linux.errno(linux.access("/sys/fs/cgroup", linux.W_OK)) != .SUCCESS)
+        return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer std.testing.allocator.free(base);
+    const absolute = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, base, std.testing.allocator);
+    defer std.testing.allocator.free(absolute);
+    const forked = std.posix.system.fork();
+    if (std.posix.errno(forked) != .SUCCESS) return error.SystemResources;
+    const child: i32 = @intCast(forked);
+    if (child == 0) {
+        if (linux.errno(linux.unshare(linux.CLONE.NEWNS)) != .SUCCESS) linux.exit_group(77);
+        if (linux.errno(linux.mount(null, "/", null, linux.MS.PRIVATE | linux.MS.REC, 0)) != .SUCCESS)
+            linux.exit_group(1);
+        testExecLifecycle(absolute) catch |err| {
+            std.debug.print("exec lifecycle test: {s}\n", .{@errorName(err)});
+            linux.exit_group(1);
+        };
+        linux.exit_group(0);
+    }
+    const status = try waitExec(child);
+    if (status == 77) return error.SkipZigTest;
+    try std.testing.expectEqual(@as(u8, 0), status);
+}
+
+fn testExecLifecycle(base: []const u8) !void {
+    const linux = std.os.linux;
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    const io = threaded.io();
+    var arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const cwd = std.Io.Dir.cwd();
+    const bundle = try std.fs.path.join(allocator, &.{ base, "bundle" });
+    const rootfs = try std.fs.path.join(allocator, &.{ bundle, "rootfs" });
+    try cwd.createDirPath(io, rootfs);
+    const root = try std.fs.path.join(allocator, &.{ base, "state" });
+    const cgroup = try std.fmt.allocPrint(allocator, "igvano-exec-test-{d}", .{linux.getpid()});
+    var mounts: std.ArrayList(oci.Spec.Mount) = .empty;
+    for ([_][]const u8{ "/bin", "/sbin", "/usr", "/lib", "/lib64" }) |path| {
+        const path_z = try allocator.dupeZ(u8, path);
+        if (linux.errno(linux.access(path_z, linux.F_OK)) == .SUCCESS)
+            try mounts.append(allocator, .{ .destination = path, .source = path, .type = "bind", .options = &.{ "rbind", "ro" } });
+    }
+    try mounts.append(allocator, .{ .destination = "/proc", .source = "proc", .type = "proc" });
+    const spec: oci.Spec = .{
+        .ociVersion = "1.0.2",
+        .root = .{ .path = "rootfs" },
+        .process = .{ .args = &.{ "sleep", "120" }, .env = &.{"PATH=/bin:/usr/bin"}, .cwd = "/", .user = .{ .uid = 0, .gid = 0 } },
+        .linux = .{ .cgroupsPath = cgroup, .namespaces = &.{ .{ .type = .mount }, .{ .type = .pid }, .{ .type = .cgroup } } },
+        .mounts = mounts.items,
+    };
+    const config_path = try std.fs.path.join(allocator, &.{ bundle, "config.json" });
+    try cwd.writeFile(io, .{ .sub_path = config_path, .data = try std.json.Stringify.valueAlloc(allocator, spec, .{ .emit_null_optional_fields = false }) });
+    // Stand in for the shim, so detached children and init can be reaped.
+    if (linux.errno(linux.prctl(@intFromEnum(linux.PR.SET_CHILD_SUBREAPER), 1, 0, 0, 0)) != .SUCCESS)
+        return error.SubreaperFailed;
+    var implementation: backend_module.LinuxBackend = .{};
+    const backend = implementation.backend();
+    var config: Config = .{ .root = root, .id = "example", .subcommand = .create, .bundle = bundle };
+    try createContainer(allocator, io, backend, config);
+    defer {
+        config.subcommand = .delete;
+        config.force = true;
+        deleteContainer(allocator, io, backend, config) catch {};
+    }
+    const saved = try oci.loadState(allocator, io, root, config.id);
+    const init_pid = saved.value.pid.?;
+    var init_reaped = false;
+    defer if (!init_reaped) {
+        _ = linux.kill(init_pid, .KILL);
+        _ = waitExec(init_pid) catch {};
+    };
+    const created_command = try parseArgs(&.{ "igvano", "--root", root, "exec", "example", "sh", "-c", "exit 23" });
+    try std.testing.expectEqual(@as(u8, 23), try execTestCommand(created_command, null));
+    config.subcommand = .start;
+    try startContainer(allocator, io, backend, config);
+    // The saved config, rather than the now-missing bundle config, supplies exec defaults.
+    try cwd.deleteFile(io, config_path);
+    {
+        // CLOEXEC alone still lets cwd escape through an inherited host directory.
+        var host_dir = try cwd.openDir(io, base, .{});
+        defer host_dir.close(io);
+        const leaked_cwd = try std.fmt.allocPrint(allocator, "/proc/self/fd/{d}", .{host_dir.handle});
+        const escaping = try parseArgs(&.{ "igvano", "--root", root, "exec", "--cwd", leaked_cwd, "example", "true" });
+        try std.testing.expectError(error.CreateFailed, execContainer(allocator, io, backend, escaping));
+        try std.testing.expect(std.mem.indexOf(u8, last_backend_detail.?, "cannot change exec cwd") != null);
+    }
+    var capture: [2]std.posix.fd_t = undefined;
+    if (std.posix.errno(std.posix.system.pipe2(&capture, .{ .CLOEXEC = true })) != .SUCCESS)
+        return error.SystemResources;
+    defer _ = linux.close(capture[0]);
+    var capture_writer: ?std.posix.fd_t = capture[1];
+    defer if (capture_writer) |fd| {
+        _ = linux.close(fd);
+    };
+    const command = try parseArgs(&.{
+        "igvano",                                                                                                                    "--root", root, "exec", "example", "sh", "-c",
+        "echo $$; cat /proc/self/cgroup; readlink /proc/self/ns/pid; test \"$(cat /proc/self/cgroup)\" = \"$(cat /proc/1/cgroup)\"",
+    });
+    // exec must also work while a different command owns the container lock.
+    const lock_path = try std.fs.path.join(allocator, &.{ root, config.id, oci.lock_file_name });
+    {
+        var holder = try LockTestProcess.hold(lock_path);
+        defer holder.deinit();
+        try std.testing.expectEqual(@as(u8, 0), try execTestCommand(command, capture[1]));
+    }
+    _ = linux.close(capture[1]);
+    capture_writer = null;
+    var output: [4096]u8 = undefined;
+    var used: usize = 0;
+    while (used < output.len) {
+        const read = linux.read(capture[0], output[used..].ptr, output.len - used);
+        if (linux.errno(read) == .INTR) continue;
+        if (linux.errno(read) != .SUCCESS) return error.ReadFailed;
+        if (read == 0) break;
+        used += read;
+    }
+    const first_newline = std.mem.indexOfScalar(u8, output[0..used], '\n') orelse return error.InvalidProcess;
+    try std.testing.expect(try std.fmt.parseInt(u32, output[0..first_newline], 10) > 1);
+    const ns_path = try std.fmt.allocPrint(allocator, "/proc/{d}/ns/pid", .{init_pid});
+    var ns: [64]u8 = undefined;
+    const ns_len = try cwd.readLink(io, ns_path, &ns);
+    const ns_line = try std.fmt.allocPrint(allocator, "{s}\n", .{ns[0..ns_len]});
+    try std.testing.expect(std.mem.endsWith(u8, output[0..used], ns_line));
+    try std.testing.expect(std.mem.indexOf(u8, output[first_newline + 1 .. used], ":/\n") != null);
+    const pid_file = try std.fs.path.join(allocator, &.{ base, "exec.pid" });
+    for ([_]struct { script: []const u8, status: u8 }{
+        .{ .script = "exit 0", .status = 0 },
+        .{ .script = "exit 23", .status = 23 },
+        .{ .script = "kill -TERM $$", .status = 143 },
+    }) |case| {
+        const exiting = try parseArgs(&.{ "igvano", "--root", root, "exec", "example", "sh", "-c", case.script });
+        try std.testing.expectEqual(case.status, try execTestCommand(exiting, null));
+        const detached_exiting = try parseArgs(&.{ "igvano", "--root", root, "exec", "--detach", "--pid-file", pid_file, "example", "sh", "-c", case.script });
+        try std.testing.expectEqual(@as(u8, 0), try execTestCommand(detached_exiting, null));
+        const detached_pid_text = try cwd.readFileAlloc(io, pid_file, allocator, .limited(32));
+        const detached_pid = try std.fmt.parseInt(i32, detached_pid_text, 10);
+        try std.testing.expectEqual(case.status, try waitExec(detached_pid));
+    }
+    const invalid = try parseArgs(&.{ "igvano", "--root", root, "exec", "example", "/igvano-missing-exec" });
+    try std.testing.expectError(error.CreateFailed, execContainer(allocator, io, backend, invalid));
+    try std.testing.expect(std.mem.indexOf(u8, last_backend_detail.?, "cannot execute process") != null);
+    const process_file = try std.fs.path.join(allocator, &.{ base, "process.json" });
+    try cwd.writeFile(io, .{
+        .sub_path = process_file,
+        .data = "{\"args\":[\"sleep\",\"120\"],\"env\":[\"PATH=/bin:/usr/bin\"],\"cwd\":\"/\",\"user\":{\"uid\":0,\"gid\":0}}",
+    });
+    const detached = try parseArgs(&.{ "igvano", "--root", root, "exec", "--process", process_file, "--detach", "--pid-file", pid_file, "example" });
+    try std.testing.expectEqual(@as(u8, 0), try execTestCommand(detached, null));
+    const pid_text = try cwd.readFileAlloc(io, pid_file, allocator, .limited(32));
+    const exec_pid = try std.fmt.parseInt(i32, pid_text, 10);
+    var exec_reaped = false;
+    defer if (!exec_reaped) {
+        _ = linux.kill(exec_pid, .KILL);
+        _ = waitExec(exec_pid) catch {};
+    };
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.kill(exec_pid, @enumFromInt(0))));
+    const init_cgroup_path = try std.fmt.allocPrint(allocator, "/proc/{d}/cgroup", .{init_pid});
+    const exec_cgroup_path = try std.fmt.allocPrint(allocator, "/proc/{d}/cgroup", .{exec_pid});
+    const init_cgroup = try cwd.readFileAlloc(io, init_cgroup_path, allocator, .limited(4096));
+    const exec_cgroup = try cwd.readFileAlloc(io, exec_cgroup_path, allocator, .limited(4096));
+    try std.testing.expectEqualStrings(init_cgroup, exec_cgroup);
+    _ = linux.kill(exec_pid, .KILL);
+    _ = try waitExec(exec_pid);
+    exec_reaped = true;
+    _ = linux.kill(init_pid, .KILL);
+    _ = try waitExec(init_pid);
+    init_reaped = true;
+    try std.testing.expectError(error.InvalidStatus, execContainer(allocator, io, backend, command));
+}
+
+fn execTestCommand(config: Config, stdout: ?std.posix.fd_t) !u8 {
+    const linux = std.os.linux;
+    const result = std.posix.system.fork();
+    if (std.posix.errno(result) != .SUCCESS) return error.SystemResources;
+    const child: i32 = @intCast(result);
+    if (child == 0) {
+        if (stdout) |fd| {
+            if (linux.errno(linux.dup2(fd, 1)) != .SUCCESS) linux.exit_group(1);
+        }
+        var threaded: std.Io.Threaded = .init_single_threaded;
+        var implementation: backend_module.LinuxBackend = .{};
+        const status = execContainer(std.heap.page_allocator, threaded.io(), implementation.backend(), config) catch linux.exit_group(1);
+        linux.exit_group(status);
+    }
+    return waitExec(child);
 }
 
 test "hook state templates reproduce state stdout with a host PID" {
@@ -3248,7 +3828,7 @@ const LockTestProcess = struct {
                 .create => createContainer(std.heap.page_allocator, io, backend, config),
                 .start => startContainer(std.heap.page_allocator, io, backend, config),
                 .delete => deleteContainer(std.heap.page_allocator, io, backend, config),
-                .kill => unreachable,
+                .kill, .exec => unreachable,
             };
             if (operation) |_| {
                 if (expected_error != null) linux.exit_group(3);

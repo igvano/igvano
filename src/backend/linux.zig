@@ -1253,14 +1253,24 @@ fn joinNamespaces(joins: []const NamespaceJoin) Backend.Error!void {
         fds[i] = try openPath(linux.AT.FDCWD, join.path, .{ .ACCMODE = .RDONLY, .NONBLOCK = true, .CLOEXEC = true });
         try validateNamespaceFd(fds[i], join.flag);
     }
-    // runc's nsexec order: user first for capabilities in the target owner.
+    try joinNamespaceFds(joins, fds[0..joins.len]);
+}
+
+fn joinNamespaceFds(joins: []const NamespaceJoin, fds: []const posix.fd_t) Backend.Error!void {
+    // User first grants capabilities in the target owner; mount last keeps
+    // host paths reachable until all other namespace operations have finished.
     for ([_]usize{
         linux.CLONE.NEWUSER, linux.CLONE.NEWCGROUP, linux.CLONE.NEWIPC,
         linux.CLONE.NEWUTS,  linux.CLONE.NEWNET,    linux.CLONE.NEWPID,
-        linux.CLONE.NEWNS,   linux.CLONE.NEWTIME,
+        linux.CLONE.NEWTIME, linux.CLONE.NEWNS,
     }) |flag| {
         for (joins, 0..) |join, i| {
-            if (join.flag == flag) try checkResult(linux.setns(fds[i], @intCast(flag)));
+            if (join.flag == flag and fds[i] >= 0) {
+                checkResult(linux.setns(fds[i], @intCast(flag))) catch |err| {
+                    reportDiagnostic("cannot join namespace {s}: {s}", .{ join.path, @errorName(err) });
+                    return err;
+                };
+            }
         }
     }
 }
@@ -1272,6 +1282,7 @@ pub const LinuxBackend = struct {
 
     const vtable: Backend.VTable = .{
         .create = create,
+        .exec = exec,
         .alive = alive,
         .kill = kill,
         .killAll = killAll,
@@ -1281,6 +1292,196 @@ pub const LinuxBackend = struct {
 
     fn diagnostic(_: *anyopaque) ?[]const u8 {
         return if (last_diagnostic_len == 0) null else last_diagnostic[0..last_diagnostic_len];
+    }
+
+    fn exec(ptr: *anyopaque, handle: Backend.Handle, options: Backend.ExecOptions) Backend.Error!i32 {
+        last_diagnostic_len = 0;
+        if (comptime builtin.os.tag != .linux) return error.NotImplemented;
+        if (!try alive(ptr, handle)) return error.ProcessNotFound;
+        if (options.argv.len == 0 or options.argv[0].len == 0 or !std.fs.path.isAbsolute(options.cwd))
+            return error.InvalidProcess;
+        try validateCgroupPath(options.cgroup_path);
+        var arena: std.heap.ArenaAllocator = .init(options.allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        const cwd = try pathString(allocator, options.cwd);
+        const argv = try allocator.allocSentinel(?[*:0]const u8, options.argv.len, null);
+        for (options.argv, 0..) |arg, i| argv[i] = (try processString(allocator, arg)).ptr;
+        const envp = try allocator.allocSentinel(?[*:0]const u8, options.envp.len, null);
+        for (options.envp, 0..) |entry, i| envp[i] = (try processString(allocator, entry)).ptr;
+        const process: ProcessSettings = .{
+            .uid = options.uid,
+            .gid = options.gid,
+            .additional_gids = options.additional_gids,
+            .no_new_privileges = options.no_new_privileges,
+            .capabilities = if (options.capabilities) |caps| try kernelCapabilities(caps) else null,
+            .rlimits = options.rlimits,
+        };
+        if (process.capabilities) |caps| {
+            if (caps.ambient & ~(caps.permitted & caps.inheritable) != 0)
+                return error.AmbientCapabilitiesRequirePermittedAndInheritable;
+        }
+        for (options.rlimits) |limit| if (limit.soft > limit.hard) return error.InvalidConfig;
+
+        const proc_dir = try openPath(linux.AT.FDCWD, "/proc", .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true });
+        defer closeFd(proc_dir);
+        const root_path = try std.fmt.allocPrintSentinel(allocator, "/proc/{d}/root", .{handle.pid}, 0);
+        const root = try openPath(linux.AT.FDCWD, root_path, .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true });
+        defer closeFd(root);
+        const cgroup_root = try openCgroupRoot();
+        defer closeFd(cgroup_root.fd);
+        const cgroup: ?posix.fd_t = if (cgroup_root.mode == .unified)
+            (try walkCgroup(cgroup_root.fd, options.cgroup_path, false, &.{})) orelse return error.ProcessNotFound
+        else
+            null;
+        defer if (cgroup) |fd| closeFd(fd);
+        const hierarchies: []V1Hierarchy = if (cgroup_root.mode == .legacy) try openV1Hierarchies(allocator) else &.{};
+        defer if (cgroup_root.mode == .legacy) freeV1Hierarchies(allocator, hierarchies);
+        for (hierarchies) |*hierarchy|
+            hierarchy.leaf = (try walkV1Cgroup(allocator, hierarchy.root.?, options.cgroup_path, false, false)) orelse return error.ProcessNotFound;
+
+        var joins: [8]NamespaceJoin = undefined;
+        var ns_fds: [8]posix.fd_t = @splat(-1);
+        defer for (ns_fds) |fd| if (fd >= 0) closeFd(fd);
+        const names = [_][]const u8{ "user", "cgroup", "ipc", "uts", "net", "pid", "mnt", "time" };
+        const flags = [_]usize{
+            linux.CLONE.NEWUSER, linux.CLONE.NEWCGROUP, linux.CLONE.NEWIPC, linux.CLONE.NEWUTS,
+            linux.CLONE.NEWNET,  linux.CLONE.NEWPID,    linux.CLONE.NEWNS,  linux.CLONE.NEWTIME,
+        };
+        for (names, flags, 0..) |name, flag, i| {
+            const path = try std.fmt.allocPrintSentinel(allocator, "/proc/{d}/ns/{s}", .{ handle.pid, name }, 0);
+            joins[i] = .{ .flag = flag, .path = path };
+            const opened = linux.openat(linux.AT.FDCWD, path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+            if (std.mem.eql(u8, name, "time") and linux.errno(opened) == .NOENT) continue;
+            try checkResult(opened);
+            ns_fds[i] = @intCast(opened);
+            try validateNamespaceFd(ns_fds[i], flag);
+        }
+        // Recheck after pinning root and namespaces, before entering any of them.
+        if (!try alive(ptr, handle)) return error.ProcessNotFound;
+        const report = try makePipe();
+        defer closeFd(report[0]);
+        var report_writer: ?posix.fd_t = report[1];
+        defer if (report_writer) |fd| closeFd(fd);
+        const ready = try makePipe();
+        var owns_ready = true;
+        defer if (owns_ready) for (ready) |fd| closeFd(fd);
+        const helper = try forkProcess();
+        if (helper == 0) {
+            // Hide the host runtime and its descriptors from container ptrace/procfs.
+            checkResult(linux.prctl(@intFromEnum(linux.PR.SET_DUMPABLE), 0, 0, 0, 0)) catch |err| failCreate(report[1], err);
+            closeFd(report[0]);
+            if (options.console_fds) |fds| closeFd(fds[0]);
+            // Membership must be established while still in the host cgroup
+            // namespace; the grandchild inherits it across the second fork.
+            if (cgroup) |fd| {
+                writeCgroupFile(fd, "cgroup.procs", "0", options.cgroup_path) catch |err| failCreate(report[1], err);
+            }
+            for (hierarchies) |hierarchy|
+                writeCgroupFile(hierarchy.leaf.?, "cgroup.procs", "0", options.cgroup_path) catch |err| failCreate(report[1], err);
+            for (names, 0..) |name, i| {
+                if (ns_fds[i] < 0) continue;
+                var buffer: [64]u8 = undefined;
+                const own_path = std.fmt.bufPrintZ(&buffer, "self/ns/{s}", .{name}) catch unreachable;
+                const own = openPath(proc_dir, own_path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }) catch |err| failCreate(report[1], err);
+                var own_stat: linux.Statx = undefined;
+                var target_stat: linux.Statx = undefined;
+                checkResult(linux.statx(own, "", linux.AT.EMPTY_PATH, .{ .INO = true }, &own_stat)) catch |err| failCreate(report[1], err);
+                checkResult(linux.statx(ns_fds[i], "", linux.AT.EMPTY_PATH, .{ .INO = true }, &target_stat)) catch |err| failCreate(report[1], err);
+                closeFd(own);
+                if (!own_stat.mask.INO or !target_stat.mask.INO) failCreate(report[1], error.CreateFailed);
+                // In particular, setns into the current user namespace is EINVAL.
+                if (own_stat.dev_major == target_stat.dev_major and own_stat.dev_minor == target_stat.dev_minor and own_stat.ino == target_stat.ino) {
+                    closeFd(ns_fds[i]);
+                    ns_fds[i] = -1;
+                }
+            }
+            var stat_buffer: [4096]u8 = undefined;
+            const stat = readProcStatAt(proc_dir, handle.pid, &stat_buffer) catch |err| failCreate(report[1], err);
+            if (!stat.matches(handle.starttime)) failCreate(report[1], error.ProcessNotFound);
+            // Negative adjustments require CAP_SYS_RESOURCE in the initial user
+            // namespace. Set it here; the grandchild inherits it across fork.
+            applyOomScoreAdj(proc_dir, options.oom_score_adj) catch |err| failCreate(report[1], err);
+            joinNamespaceFds(&joins, &ns_fds) catch |err| failCreate(report[1], err);
+            const child = forkProcess() catch |err| failCreate(report[1], err);
+            if (child == 0) {
+                closeFd(report[1]);
+                closeFd(ready[0]);
+                // setns(mnt) changes mount visibility, not our inherited root
+                // and cwd. Use init's pinned root from the joined mount tree;
+                // fchdir + chroot(".") avoids resolving a host PID in container /proc.
+                checkResult(linux.fchdir(root)) catch |err| failCreate(ready[1], err);
+                checkResult(linux.chroot(".")) catch |err| failCreate(ready[1], err);
+                // Actually close host directories before cwd can follow /proc/self/fd.
+                // Keep only stdio, the CLOEXEC sync pipe and optional console socket.
+                const console_fd = if (options.console_fds) |fds| fds[1] else ready[1];
+                var next_fd: u32 = 3;
+                for ([_]posix.fd_t{ @min(ready[1], console_fd), @max(ready[1], console_fd) }) |fd| {
+                    const keep_fd: u32 = @intCast(fd);
+                    if (keep_fd < next_fd) continue;
+                    if (next_fd < keep_fd)
+                        checkResult(linux.syscall3(.close_range, next_fd, keep_fd - 1, 0)) catch |err| failCreate(ready[1], err);
+                    next_fd = keep_fd + 1;
+                }
+                checkResult(linux.syscall3(.close_range, next_fd, std.math.maxInt(u32), 0)) catch |err| failCreate(ready[1], err);
+                checkResult(linux.chdir(cwd)) catch |err| {
+                    childError("cannot change exec cwd: ", err);
+                    failCreate(ready[1], err);
+                };
+                var cwd_buffer: [std.fs.max_path_bytes]u8 = undefined;
+                const cwd_len = linux.getcwd(&cwd_buffer, cwd_buffer.len);
+                checkResult(cwd_len) catch |err| {
+                    childError("cannot verify exec cwd: ", err);
+                    failCreate(ready[1], err);
+                };
+                if (std.mem.startsWith(u8, cwd_buffer[0..cwd_len], "(unreachable)")) {
+                    childError("exec cwd is outside the container root: ", error.InvalidPath);
+                    failCreate(ready[1], error.InvalidPath);
+                }
+                // Exec shares init's mount namespace; preserve its /dev/console.
+                if (options.console_fds) |fds| setupConsole(fds[1], false) catch |err| {
+                    childError("cannot set up exec console: ", err);
+                    failCreate(ready[1], err);
+                };
+                applyProcessSettings(process) catch |err| {
+                    childError("cannot apply exec process settings: ", err);
+                    failCreate(ready[1], err);
+                };
+                checkResult(linux.syscall3(.close_range, 3, std.math.maxInt(u32), 1 << 2)) catch |err| failCreate(ready[1], err);
+                execProcess(argv.ptr, envp.ptr) catch |err| {
+                    childError("cannot execute process: ", err);
+                    failCreate(ready[1], error.CreateFailed);
+                };
+            }
+            closeFd(ready[1]);
+            // EOF closes the grandchild's CLOEXEC writer, on exec or death.
+            waitExecReady(ready[0]) catch |err| {
+                _ = linux.kill(child, .KILL);
+                _ = waitChild(child) catch {};
+                failCreate(report[1], err);
+            };
+            // Leave even an already-exited child for the frontend or shim to reap.
+            var response: CreateResponse = .{ .pid = child };
+            if (!writeAll(report[1], std.mem.asBytes(&response))) {
+                _ = linux.kill(child, .KILL);
+                _ = waitChild(child) catch {};
+                linux.exit_group(1);
+            }
+            // Adoption is by the nearest subreaper: the shim for detached exec,
+            // or the frontend (which enables subreaping) for an attached exec.
+            linux.exit_group(0);
+        }
+        for (ready) |fd| closeFd(fd);
+        owns_ready = false;
+        closeFd(report_writer.?);
+        report_writer = null;
+        var response: CreateResponse = .{};
+        const reported = readAll(report[0], std.mem.asBytes(&response));
+        const status = try waitChild(helper);
+        if (!reported) return error.CreateFailed;
+        if (response.failureError()) |err| return err;
+        if (status != 0 or response.pid <= 0) return error.CreateFailed;
+        return response.pid;
     }
 
     fn create(ptr: *anyopaque, options: Backend.CreateOptions) Backend.Error!Backend.Handle {
@@ -1512,6 +1713,7 @@ pub const LinuxBackend = struct {
                 return err;
             };
             if (child1 == 0) {
+                checkResult(linux.prctl(@intFromEnum(linux.PR.SET_DUMPABLE), 0, 0, 0, 0)) catch |err| failCreate(report[1], err);
                 if (options.console_fds) |fds| closeFd(fds[0]);
                 closeFd(create_go[1]);
                 if (map_pipe) |fds| closeFd(fds[1]);
@@ -3521,7 +3723,7 @@ test "linux console setup binds its slave to dev console and sends its master" {
         checkResult(linux.mkdir("/dev/pts", 0o755)) catch linux.exit_group(1);
         checkResult(linux.mount("devpts", "/dev/pts", "devpts", linux.MS.NOSUID | linux.MS.NOEXEC, @intFromPtr("newinstance,ptmxmode=666,mode=620"))) catch linux.exit_group(1);
         checkResult(linux.symlink("pts/ptmx", "/dev/ptmx")) catch linux.exit_group(1);
-        setupConsole(sockets[1]) catch linux.exit_group(1);
+        setupConsole(sockets[1], true) catch linux.exit_group(1);
         closeFd(sockets[1]);
         var console_stat: linux.Statx = undefined;
         var slave_stat: linux.Statx = undefined;
@@ -3559,7 +3761,7 @@ test "linux console setup binds its slave to dev console and sends its master" {
     reaped = true;
 }
 
-fn setupConsole(socket: posix.fd_t) Backend.Error!void {
+fn setupConsole(socket: posix.fd_t, mount_console: bool) Backend.Error!void {
     const pts = consolePath("/dev/pts", .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true }) catch
         return error.MissingDevpts;
     defer closeFd(pts);
@@ -3589,29 +3791,31 @@ fn setupConsole(socket: posix.fd_t) Backend.Error!void {
     };
     const slave = try consoleAboveStdio(opened_slave);
     defer closeFd(slave);
-    const root = try consolePath("/", .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true });
-    defer closeFd(root);
-    const target = try consoleAboveStdio(try mountDestination(root, "/dev/console", true, true));
-    defer closeFd(target);
-    bind: {
-        const cloned = linux.syscall3(.open_tree, @intCast(slave), @intFromPtr(""), OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC | linux.AT.EMPTY_PATH);
-        if (linux.errno(cloned) != .NOSYS and linux.errno(cloned) != .PERM) {
-            try checkResult(cloned);
-            const tree: posix.fd_t = @intCast(cloned);
-            defer closeFd(tree);
-            var flags = std.mem.zeroes(linux.MOVE_MOUNT);
-            flags.F_EMPTY_PATH = true;
-            flags.T_EMPTY_PATH = true;
-            const moved = linux.move_mount(tree, "", target, "", flags);
-            if (linux.errno(moved) != .NOSYS and linux.errno(moved) != .PERM) {
-                try checkResult(moved);
-                break :bind;
+    if (mount_console) {
+        const root = try consolePath("/", .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true });
+        defer closeFd(root);
+        const target = try consoleAboveStdio(try mountDestination(root, "/dev/console", true, true));
+        defer closeFd(target);
+        bind: {
+            const cloned = linux.syscall3(.open_tree, @intCast(slave), @intFromPtr(""), OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC | linux.AT.EMPTY_PATH);
+            if (linux.errno(cloned) != .NOSYS and linux.errno(cloned) != .PERM) {
+                try checkResult(cloned);
+                const tree: posix.fd_t = @intCast(cloned);
+                defer closeFd(tree);
+                var flags = std.mem.zeroes(linux.MOVE_MOUNT);
+                flags.F_EMPTY_PATH = true;
+                flags.T_EMPTY_PATH = true;
+                const moved = linux.move_mount(tree, "", target, "", flags);
+                if (linux.errno(moved) != .NOSYS and linux.errno(moved) != .PERM) {
+                    try checkResult(moved);
+                    break :bind;
+                }
             }
+            // Older kernels and seccomp policies still need procfs for the descriptor paths.
+            var source_buffer: [64]u8 = undefined;
+            var target_buffer: [64]u8 = undefined;
+            try checkResult(linux.mount(slave_path orelse fdPath(&source_buffer, slave), fdPath(&target_buffer, target), null, linux.MS.BIND, 0));
         }
-        // Older kernels and seccomp policies still need procfs for the descriptor paths.
-        var source_buffer: [64]u8 = undefined;
-        var target_buffer: [64]u8 = undefined;
-        try checkResult(linux.mount(slave_path orelse fdPath(&source_buffer, slave), fdPath(&target_buffer, target), null, linux.MS.BIND, 0));
     }
     try checkResult(linux.setsid());
     try checkResult(linux.ioctl(slave, linux.T.IOCSCTTY, 0));
@@ -3727,6 +3931,23 @@ fn readAll(fd: posix.fd_t, bytes: []u8) bool {
         }
     }
     return true;
+}
+
+fn waitExecReady(fd: posix.fd_t) Backend.Error!void {
+    var response: CreateResponse = .{};
+    const bytes = std.mem.asBytes(&response);
+    while (true) {
+        const result = posix.system.read(fd, bytes.ptr, 1);
+        switch (posix.errno(result)) {
+            .SUCCESS => {
+                if (result == 0) return;
+                if (!readAll(fd, bytes[1..])) return error.CreateFailed;
+                return response.failureError() orelse error.CreateFailed;
+            },
+            .INTR => continue,
+            else => return error.CreateFailed,
+        }
+    }
 }
 
 fn writeAll(fd: posix.fd_t, bytes: []const u8) bool {
@@ -4319,7 +4540,7 @@ fn setupRootfs(rootfs: [:0]const u8, mounts: []const PreparedMount, devices: []c
     try checkResult(linux.chdir("/"));
     if (options.console_fd) |socket| {
         defer closeFd(socket);
-        setupConsole(socket) catch |err| {
+        setupConsole(socket, true) catch |err| {
             childError("cannot set up console (requires devpts mounted at /dev/pts): ", err);
             if (options.runtime_sync) |sync| failCreate(sync.ready_fd, err);
             linux.exit_group(1);
@@ -4430,18 +4651,38 @@ fn applyOomScoreAdj(proc_dir: posix.fd_t, oom_score_adj: ?i32) Backend.Error!voi
     }
 }
 
+const ProcessSettings = struct {
+    uid: u32,
+    gid: u32,
+    additional_gids: []const u32,
+    no_new_privileges: bool,
+    capabilities: ?Backend.Capabilities,
+    rlimits: []const Backend.Rlimit,
+};
+
 /// Runs before readiness, without allocating. Keep privileges until limits and
 /// bounding drops finish, then retain permitted caps across the UID transition.
 // For UID 0, exec recomputes permitted/effective as inheritable | bounding (as in runc).
 fn applyProcess(process: oci.Spec.Process, capabilities: ?Backend.Capabilities, rlimits: []const Backend.Rlimit) Backend.Error!void {
+    return applyProcessSettings(.{
+        .uid = process.user.uid,
+        .gid = process.user.gid,
+        .additional_gids = process.user.additionalGids orelse &.{},
+        .no_new_privileges = process.noNewPrivileges,
+        .capabilities = capabilities,
+        .rlimits = rlimits,
+    });
+}
+
+fn applyProcessSettings(process: ProcessSettings) Backend.Error!void {
     if (comptime builtin.os.tag == .linux) {
-        for (rlimits) |limit| {
+        for (process.rlimits) |limit| {
             const value: linux.rlimit = .{ .cur = limit.soft, .max = limit.hard };
             try checkResult(linux.setrlimit(limit.resource, &value));
         }
-        if (process.noNewPrivileges)
+        if (process.no_new_privileges)
             try checkResult(linux.prctl(@intFromEnum(linux.PR.SET_NO_NEW_PRIVS), 1, 0, 0, 0));
-        if (capabilities) |caps| {
+        if (process.capabilities) |caps| {
             for (0..64) |cap| {
                 // EINVAL marks the running kernel's last supported capability.
                 const result = linux.prctl(@intFromEnum(linux.PR.CAPBSET_READ), cap, 0, 0, 0);
@@ -4453,11 +4694,11 @@ fn applyProcess(process: oci.Spec.Process, capabilities: ?Backend.Capabilities, 
             try checkResult(linux.prctl(@intFromEnum(linux.PR.SET_KEEPCAPS), 1, 0, 0, 0));
         }
         // With a user namespace, additionalGids (like uid/gid) are namespace IDs.
-        const groups = process.user.additionalGids orelse &.{};
+        const groups = process.additional_gids;
         try checkResult(linux.setgroups(groups.len, groups.ptr));
-        try checkResult(linux.setgid(process.user.gid));
-        try checkResult(linux.setuid(process.user.uid));
-        if (capabilities) |caps| {
+        try checkResult(linux.setgid(process.gid));
+        try checkResult(linux.setuid(process.uid));
+        if (process.capabilities) |caps| {
             // Linux's header uses a 32-bit pid, unlike Zig 0.16's usize field.
             const header: CapabilityHeader = .{};
             const data = [2]linux.cap_user_data_t{

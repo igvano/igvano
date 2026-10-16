@@ -47,6 +47,23 @@ pub const Backend = struct {
     };
 
     pub const Hook = hooks.Hook;
+    /// Process settings translated by the frontend; all memory is caller-owned.
+    pub const ExecOptions = struct {
+        allocator: std.mem.Allocator,
+        argv: []const []const u8,
+        envp: []const []const u8 = &.{},
+        cwd: []const u8,
+        uid: u32,
+        gid: u32,
+        additional_gids: []const u32 = &.{},
+        capabilities: ?Capabilities = null,
+        rlimits: []const Rlimit = &.{},
+        no_new_privileges: bool = false,
+        oom_score_adj: ?i32 = null,
+        console_fds: ?[2]std.posix.fd_t = null,
+        cgroup_path: []const u8 = "",
+    };
+
     pub const CreateCallback = struct {
         ptr: *anyopaque,
         run: *const fn (*anyopaque, Handle) Error!void,
@@ -196,6 +213,7 @@ pub const Backend = struct {
         PermissionDenied,
         SystemResources,
         CreateFailed,
+        ExecFailed,
         KillFailed,
         LivenessFailed,
         ProcessNotFound,
@@ -211,6 +229,7 @@ pub const Backend = struct {
     /// Backends receive parsed values only; the frontend loads config.json and resolves paths.
     pub const VTable = struct {
         create: *const fn (ptr: *anyopaque, options: CreateOptions) Error!Handle,
+        exec: *const fn (ptr: *anyopaque, handle: Handle, options: ExecOptions) Error!i32 = noExec,
         /// The FIFO ready exchange is runtime state machinery, not isolation.
         /// A backend start hook can be added when an isolation mechanism needs it.
         alive: *const fn (ptr: *anyopaque, handle: Handle) Error!bool,
@@ -226,10 +245,21 @@ pub const Backend = struct {
         fn noDiagnostic(_: *anyopaque) ?[]const u8 {
             return null;
         }
+
+        fn noExec(_: *anyopaque, _: Handle, _: ExecOptions) Error!i32 {
+            return error.NotImplemented;
+        }
     };
 
     pub fn create(self: Backend, options: CreateOptions) Error!Handle {
         return self.vtable.create(self.ptr, options);
+    }
+
+    /// Returns the host PID after successful exec. A caller that intends to
+    /// waitpid must enable child subreaping before this call; otherwise the
+    /// process is adopted by the outer shim's subreaper (or host init).
+    pub fn exec(self: Backend, handle: Handle, options: ExecOptions) Error!i32 {
+        return self.vtable.exec(self.ptr, handle, options);
     }
 
     pub fn alive(self: Backend, handle: Handle) Error!bool {

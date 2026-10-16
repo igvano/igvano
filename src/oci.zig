@@ -1452,13 +1452,28 @@ pub fn requireCreate(spec: Spec) !void {
         return error.InvalidConfig;
     }
     if (spec.root.path.len == 0) return error.InvalidConfig;
-    if (spec.process) |process| {
-        if (!std.mem.startsWith(u8, process.cwd, "/") or
-            std.mem.indexOfScalar(u8, process.cwd, 0) != null) return error.InvalidProcess;
-    }
+    if (spec.process) |process| try validateProcess(process);
     for (spec.mounts orelse &.{}) |mount| try validateMountDestination(mount.destination);
     for (settings.maskedPaths orelse &.{}) |path| try validateMountDestination(path);
     for (settings.readonlyPaths orelse &.{}) |path| try validateMountDestination(path);
+}
+
+pub fn validateEnv(entry: []const u8) !void {
+    const equals = std.mem.indexOfScalar(u8, entry, '=') orelse return error.InvalidProcess;
+    if (equals == 0 or std.mem.indexOfScalar(u8, entry, 0) != null) return error.InvalidProcess;
+}
+
+pub fn validateProcess(process: Spec.Process) !void {
+    if (!std.mem.startsWith(u8, process.cwd, "/") or
+        std.mem.indexOfScalar(u8, process.cwd, 0) != null or
+        process.args.len == 0 or process.args[0].len == 0) return error.InvalidProcess;
+    for (process.args) |arg| {
+        if (std.mem.indexOfScalar(u8, arg, 0) != null) return error.InvalidProcess;
+    }
+    for (process.env orelse &.{}) |entry| try validateEnv(entry);
+    if (process.oomScoreAdj) |value| {
+        if (value < -1000 or value > 1000) return error.InvalidConfig;
+    }
 }
 
 test "mount options translate flags propagation and filesystem data" {
