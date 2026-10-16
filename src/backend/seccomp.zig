@@ -25,13 +25,14 @@ pub const Action = enum {
 
 pub const Arch = enum {
     x86_64,
+    x32,
     x86,
     aarch64,
     arm,
 
     pub fn audit(self: Arch) u32 {
         return switch (self) {
-            .x86_64 => 0xc000003e,
+            .x86_64, .x32 => 0xc000003e,
             .x86 => 0x40000003,
             .aarch64 => 0xc00000b7,
             .arm => 0x40000028,
@@ -40,7 +41,7 @@ pub const Arch = enum {
 
     pub fn native() ?Arch {
         return switch (builtin.cpu.arch) {
-            .x86_64 => .x86_64,
+            .x86_64 => if (builtin.abi == .gnux32 or builtin.abi == .muslx32) .x32 else .x86_64,
             .x86 => .x86,
             .aarch64 => .aarch64,
             .arm => .arm,
@@ -49,7 +50,8 @@ pub const Arch = enum {
     }
 
     pub fn runnable(self: Arch, host: Arch) bool {
-        return self == host or (host == .x86_64 and self == .x86) or
+        return self == host or ((host == .x86_64 or host == .x32) and
+            (self == .x86_64 or self == .x86 or self == .x32)) or
             (host == .aarch64 and self == .arm);
     }
 };
@@ -78,8 +80,8 @@ pub fn compile(allocator: std.mem.Allocator, config: Config, host: Arch) Error!P
     defer builder.code.deinit(allocator);
     var failures: std.ArrayList(usize) = .empty;
     defer failures.deinit(allocator);
-    var arches: [4]Arch = undefined;
-    var targets: [4]usize = undefined;
+    var arches: [5]Arch = undefined;
+    var targets: [5]usize = undefined;
     var count: usize = 0;
     try builder.emit(0x20, 4); // seccomp_data.arch
     for (config.architectures) |arch| {
@@ -88,8 +90,16 @@ pub fn compile(allocator: std.mem.Allocator, config: Config, host: Arch) Error!P
         arches[count] = arch;
         // A nearby conditional skips a 32-bit JA trampoline.
         try builder.emit(0x15, arch.audit());
-        builder.code.items[builder.code.items.len - 1].jf = 1;
+        builder.code.items[builder.code.items.len - 1].jf = if (arch == .x86_64 or arch == .x32) 3 else 1;
+        if (arch == .x86_64 or arch == .x32) {
+            // These ABIs share AUDIT_ARCH_X86_64; bit 30 selects x32.
+            try builder.emit(0x20, 0);
+            try builder.emit(0x45, 0x40000000);
+            builder.code.items[builder.code.items.len - 1].jt = if (arch == .x86_64) 1 else 0;
+            builder.code.items[builder.code.items.len - 1].jf = if (arch == .x32) 1 else 0;
+        }
         targets[count] = try builder.jump();
+        if (arch == .x86_64 or arch == .x32) try builder.emit(0x20, 4);
         count += 1;
     }
     if (count == 0) return error.UnsupportedArchitecture;
@@ -97,16 +107,36 @@ pub fn compile(allocator: std.mem.Allocator, config: Config, host: Arch) Error!P
     const default = config.default_action.encode(config.default_errno_ret);
     for (arches[0..count], targets[0..count]) |arch, target| {
         builder.patch(target);
-        if (arch == .x86_64) {
-            try builder.emit(0x20, 0);
-            try builder.emit(0x35, 0x40000000);
-            builder.code.items[builder.code.items.len - 1].jf = 1;
-            try builder.emit(0x06, Action.kill_process.encode(null));
+        // runc's patchbpf/enosys_linux.go: permissive defaults (including
+        // TRACE, whose tracer handles future syscalls) do not get a stub.
+        // Count every named rule, regardless of its action or conditions.
+        switch (config.default_action) {
+            .allow, .log, .trace => {},
+            else => {
+                var maximum: u32 = 0;
+                for (config.rules) |rule| {
+                    if (rule.arch == arch) maximum = @max(maximum, rule.number);
+                }
+                // Like runc, an ABI with no positive syscall number has no stub.
+                if (maximum != 0) {
+                    try builder.emit(0x20, 0);
+                    try builder.emit(0x25, maximum);
+                    builder.code.items[builder.code.items.len - 1].jf = 1;
+                    try builder.emit(0x06, Action.errno.encode(38)); // Linux ENOSYS.
+                }
+            },
         }
         for (config.rules) |rule| {
             if (rule.arch != arch) continue;
             failures.clearRetainingCapacity();
             try builder.emit(0x20, 0); // Reload nr after argument loads.
+            if (rule.args.len == 0) {
+                // This rule only skips one RET; no long-jump trampoline needed.
+                try builder.emit(0x15, rule.number);
+                builder.code.items[builder.code.items.len - 1].jf = 1;
+                try builder.emit(0x06, rule.action.encode(rule.errno_ret));
+                continue;
+            }
             try builder.require(0x15, rule.number, true, &failures);
             for (rule.args) |arg| try builder.argument(arg, arch, &failures);
             try builder.emit(0x06, rule.action.encode(rule.errno_ret));
@@ -156,7 +186,7 @@ const Builder = struct {
         const high = low + 4;
         const hi: u32 = @truncate(arg.value >> 32);
         const lo: u32 = @truncate(arg.value);
-        if (arch == .x86 or arch == .arm) {
+        if (arch == .x86 or arch == .x32 or arch == .arm) {
             // libseccomp truncates both operands for 32-bit ABIs.
             try self.emit(0x20, low);
             if (arg.op == .masked_eq) try self.emit(0x54, lo);
@@ -221,6 +251,87 @@ pub fn install(program: Program) std.os.linux.E {
 const TestData = @import("../test/seccomp.zig").Data;
 const interpret = @import("../test/seccomp.zig").interpret;
 
+test "seccomp unknown syscalls return ENOSYS above each ABI maximum" {
+    for ([_]Arch{ .x86_64, .aarch64 }) |host| {
+        const compat: Arch = if (host == .x86_64) .x86 else .arm;
+        const program = try compile(std.testing.allocator, .{
+            .default_action = .errno,
+            .default_errno_ret = 13,
+            .architectures = &.{ host, compat },
+            .rules = &.{
+                .{ .arch = host, .number = 10, .action = .allow },
+                // Denied and conditional names also contribute to the maximum.
+                .{ .arch = compat, .number = 20, .action = .trap, .args = &.{.{ .index = 0, .value = 1, .op = .eq }} },
+            },
+        }, host);
+        defer std.testing.allocator.free(program.filters);
+        for ([_]Arch{ host, compat }) |arch| {
+            const maximum: u32 = if (arch == host) 10 else 20;
+            try std.testing.expectEqual(@as(u32, 0x00050026), try interpret(program.filters, .{ .arch = arch.audit(), .nr = maximum + 1 }));
+            try std.testing.expectEqual(@as(u32, 0x0005000d), try interpret(program.filters, .{ .arch = arch.audit(), .nr = maximum - 1 }));
+        }
+        try std.testing.expectEqual(@as(u32, 0x0005000d), try interpret(program.filters, .{ .arch = compat.audit(), .nr = 20 }));
+        try std.testing.expectEqual(@as(u32, 0x80000000), try interpret(program.filters, .{ .arch = 0 }));
+    }
+}
+
+test "seccomp ENOSYS stub follows runc default action conditions" {
+    for ([_]Action{ .allow, .log, .trace, .errno, .trap, .kill_thread, .kill_process }) |action| {
+        const program = try compile(std.testing.allocator, .{
+            .default_action = action,
+            .architectures = &.{.aarch64},
+            .rules = &.{.{ .arch = .aarch64, .number = 10, .action = .allow }},
+        }, .aarch64);
+        defer std.testing.allocator.free(program.filters);
+        const expected: u32 = switch (action) {
+            .allow => 0x7fff0000,
+            .log => 0x7ffc0000,
+            .trace => 0x7ff00001,
+            else => 0x00050026,
+        };
+        try std.testing.expectEqual(expected, try interpret(program.filters, .{ .arch = 0xc00000b7, .nr = 11 }));
+        try std.testing.expectEqual(action.encode(null), try interpret(program.filters, .{ .arch = 0xc00000b7, .nr = 9 }));
+    }
+    // runc omits the stub when no positive syscall number is named.
+    for ([_][]const Rule{ &.{}, &.{.{ .arch = .x86_64, .number = 0, .action = .allow }} }) |rules| {
+        const program = try compile(std.testing.allocator, .{
+            .default_action = .errno,
+            .architectures = &.{ .x86_64, .x86 },
+            .rules = rules,
+        }, .x86_64);
+        defer std.testing.allocator.free(program.filters);
+        try std.testing.expectEqual(@as(u32, 0x00050001), try interpret(program.filters, .{ .nr = 1000 }));
+        try std.testing.expectEqual(@as(u32, 0x00050001), try interpret(program.filters, .{ .arch = 0x40000003, .nr = 1000 }));
+    }
+}
+
+test "seccomp x32 and amd64 have independent ENOSYS boundaries" {
+    const x32: Arch = .x32;
+    const program = try compile(std.testing.allocator, .{
+        .default_action = .errno,
+        .default_errno_ret = 13,
+        .architectures = &.{ x32, .x86_64, .x86 },
+        .rules = &.{
+            .{ .arch = .x86_64, .number = 10, .action = .allow },
+            .{ .arch = x32, .number = 0x40000000 + 20, .action = .allow },
+            .{ .arch = .x86, .number = 30, .action = .allow },
+        },
+    }, .x86_64);
+    defer std.testing.allocator.free(program.filters);
+    const cases = [_]struct { number: u32, expected: u32 }{
+        .{ .number = 9, .expected = 0x0005000d },
+        .{ .number = 10, .expected = 0x7fff0000 },
+        .{ .number = 11, .expected = 0x00050026 },
+        .{ .number = 0x40000000 + 19, .expected = 0x0005000d },
+        .{ .number = 0x40000000 + 20, .expected = 0x7fff0000 },
+        .{ .number = 0x40000000 + 21, .expected = 0x00050026 },
+    };
+    for (cases) |case|
+        try std.testing.expectEqual(case.expected, try interpret(program.filters, .{ .nr = case.number }));
+    try std.testing.expectEqual(@as(u32, 0x0005000d), try interpret(program.filters, .{ .arch = 0x40000003, .nr = 29 }));
+    try std.testing.expectEqual(@as(u32, 0x00050026), try interpret(program.filters, .{ .arch = 0x40000003, .nr = 31 }));
+}
+
 test "seccomp dispatch rejects foreign architectures and x32 and preserves default errno" {
     const program = try compile(std.testing.allocator, .{
         .default_action = .errno,
@@ -236,7 +347,7 @@ test "seccomp dispatch rejects foreign architectures and x32 and preserves defau
     try std.testing.expectEqual(@as(u32, 0x00030000), try interpret(program.filters, .{ .arch = 0x40000003, .nr = 9 }));
     try std.testing.expectEqual(@as(u32, 0x80000000), try interpret(program.filters, .{ .arch = 0x40000028 }));
     try std.testing.expectEqual(@as(u32, 0x80000000), try interpret(program.filters, .{ .arch = 0 }));
-    try std.testing.expectEqual(@as(u32, 0x0005000d), try interpret(program.filters, .{ .nr = 8 }));
+    try std.testing.expectEqual(@as(u32, 0x0005000d), try interpret(program.filters, .{ .nr = 6 }));
     for ([_]u32{ 0x40000000, 0x40000007, 0xffffffff }) |number|
         try std.testing.expectEqual(@as(u32, 0x80000000), try interpret(program.filters, .{ .nr = number }));
 }
@@ -347,7 +458,7 @@ test "seccomp compat comparisons truncate values and ignore argument high words"
 }
 
 test "seccomp oversized filters and invalid argument indices fail before installation" {
-    var rules: [1100]Rule = undefined;
+    var rules: [1400]Rule = undefined;
     for (&rules, 0..) |*rule, number| rule.* = .{ .arch = .x86_64, .number = @intCast(number), .action = .allow };
     try std.testing.expectError(error.FilterTooLarge, compile(std.testing.allocator, .{
         .default_action = .errno,
@@ -359,12 +470,12 @@ test "seccomp oversized filters and invalid argument indices fail before install
         .architectures = &.{.x86_64},
         .rules = &.{.{ .arch = .x86_64, .number = 7, .action = .allow, .args = &.{.{ .index = 6, .value = 0, .op = .eq }} }},
     }, .x86_64));
-    // Fill the compat block so the native ABI's x32 guard crosses the limit.
+    // Architecture dispatch and the ENOSYS stub count towards the same limit.
     for (&rules) |*rule| rule.arch = .x86;
     try std.testing.expectError(error.FilterTooLarge, compile(std.testing.allocator, .{
         .default_action = .errno,
         .architectures = &.{ .x86, .x86_64 },
-        .rules = rules[0..1022],
+        .rules = rules[0..1364],
     }, .x86_64));
 }
 
@@ -446,7 +557,7 @@ test "seccomp actions preserve rule return data and default EPERM" {
             .rules = &.{.{ .arch = .x86_64, .number = 7, .action = case.action, .errno_ret = case.data }},
         }, .x86_64);
         defer std.testing.allocator.free(program.filters);
-        for ([_]u32{ 7, 8 }) |nr|
+        for ([_]u32{ 6, 7 }) |nr|
             try std.testing.expectEqual(case.expected, try interpret(program.filters, .{ .nr = nr }));
         try std.testing.expectEqual(@as(u32, 0x80000000), try interpret(program.filters, .{ .nr = 0x40000000 }));
     }

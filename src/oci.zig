@@ -562,7 +562,7 @@ pub fn prepareSeccomp(allocator: std.mem.Allocator, configured: ?Spec.Seccomp) !
     try arches.append(allocator, seccomp.Arch.native() orelse
         return seccompInvalid("seccomp is unsupported on this architecture", .{}));
     for (config.architectures orelse &.{}) |name| {
-        // Known but unimplemented ABIs are ignored; x32 still gets bad-arch KILL.
+        // Known but unimplemented ABIs are ignored.
         const arch = (seccomp_arches.get(name) orelse
             return seccompInvalid("unknown seccomp architecture: {s}", .{name})) orelse continue;
         if (std.mem.indexOfScalar(seccomp.Arch, arches.items, arch) == null)
@@ -652,7 +652,7 @@ const seccomp_arches = std.StaticStringMap(?Backend.seccomp.Arch).initComptime(.
     .{ "SCMP_ARCH_X86", .x86 },
     .{ "SCMP_ARCH_AARCH64", .aarch64 },
     .{ "SCMP_ARCH_ARM", .arm },
-    .{ "SCMP_ARCH_X32", null },
+    .{ "SCMP_ARCH_X32", .x32 },
     .{ "SCMP_ARCH_MIPS", null },
     .{ "SCMP_ARCH_MIPS64", null },
     .{ "SCMP_ARCH_MIPS64N32", null },
@@ -712,6 +712,9 @@ const seccomp_syscalls_x64 = syscallMap(std.os.linux.syscalls.X64, &.{
     .{ "newfstatat", "fstatat64" },
     .{ "_sysctl", "sysctl" },
 });
+const seccomp_syscalls_x32 = syscallMap(std.os.linux.syscalls.X32, &.{
+    .{ "newfstatat", "fstatat64" },
+});
 const seccomp_syscalls_x86 = syscallMap(std.os.linux.syscalls.X86, &.{
     .{ "_llseek", "llseek" },
     .{ "_newselect", "newselect" },
@@ -732,6 +735,7 @@ const seccomp_syscalls_arm = syscallMap(std.os.linux.syscalls.Arm, &.{
 fn seccompSyscall(arch: Backend.seccomp.Arch, name: []const u8) ?u32 {
     return switch (arch) {
         .x86_64 => seccomp_syscalls_x64.get(name),
+        .x32 => seccomp_syscalls_x32.get(name),
         .x86 => seccomp_syscalls_x86.get(name),
         .aarch64 => seccomp_syscalls_arm64.get(name),
         .arm => seccomp_syscalls_arm.get(name),
@@ -741,6 +745,8 @@ fn seccompSyscall(arch: Backend.seccomp.Arch, name: []const u8) ?u32 {
 test "seccomp syscall lookup uses ABI-specific OCI names" {
     const cases = [_]struct { arch: Backend.seccomp.Arch, name: []const u8, number: ?u32 }{
         .{ .arch = .x86_64, .name = "newfstatat", .number = 262 },
+        .{ .arch = .x32, .name = "newfstatat", .number = 0x40000000 + 262 },
+        .{ .arch = .x32, .name = "execve", .number = 0x40000000 + 520 },
         .{ .arch = .aarch64, .name = "newfstatat", .number = 79 },
         .{ .arch = .x86, .name = "_llseek", .number = 140 },
         .{ .arch = .arm, .name = "_llseek", .number = 140 },
@@ -773,7 +779,7 @@ test "seccomp syscall lookup uses ABI-specific OCI names" {
     };
     for (cases) |case|
         try std.testing.expectEqual(case.number, seccompSyscall(case.arch, case.name));
-    for ([_]Backend.seccomp.Arch{ .x86_64, .x86, .aarch64, .arm }) |arch|
+    for ([_]Backend.seccomp.Arch{ .x86_64, .x32, .x86, .aarch64, .arm }) |arch|
         try std.testing.expectEqual(@as(?u32, null), seccompSyscall(arch, "riscv_hwprobe"));
 }
 
@@ -846,7 +852,7 @@ test "seccomp rejects unsupported or unknown schema values even for unknown sysc
     try std.testing.expect((try prepareSeccomp(arena.allocator(), .{
         .defaultAction = "SCMP_ACT_ALLOW",
         .architectures = &.{"SCMP_ARCH_X32"},
-    })).?.architectures.len == 1);
+    })).?.architectures.len == if (Backend.seccomp.Arch.native() == .x32) @as(usize, 1) else 2);
 }
 
 test "seccomp repeated argument indices deny personality alternatives" {
@@ -914,6 +920,7 @@ test "seccomp accepts all spec architecture names and ignores unimplemented ABIs
         defer std.testing.allocator.free(program.filters);
         if (std.mem.eql(u8, name, "SCMP_ARCH_NATIVE") or
             (!std.mem.eql(u8, name, "SCMP_ARCH_X86") and !std.mem.eql(u8, name, "SCMP_ARCH_X86_64") and
+                !std.mem.eql(u8, name, "SCMP_ARCH_X32") and
                 !std.mem.eql(u8, name, "SCMP_ARCH_ARM") and !std.mem.eql(u8, name, "SCMP_ARCH_AARCH64")))
             try std.testing.expectEqualSlices(Backend.seccomp.Arch, &.{native}, config.architectures);
     }

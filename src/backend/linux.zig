@@ -1480,18 +1480,23 @@ pub const LinuxBackend = struct {
                 // fchdir + chroot(".") avoids resolving a host PID in container /proc.
                 checkResult(linux.fchdir(root)) catch |err| failCreate(ready[1], err);
                 checkResult(linux.chroot(".")) catch |err| failCreate(ready[1], err);
+                const fd_dir = openPath(proc_dir, "self/fd", .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true }) catch |err| failCreate(ready[1], err);
+                closeExecFrom(3, fd_dir) catch |err| failCreate(ready[1], err);
                 // Actually close host directories before cwd can follow /proc/self/fd.
-                // Keep only stdio, the CLOEXEC sync pipe and optional console socket.
+                // Keep stdio, the sync pipe, console socket and the fd scan handle.
                 const console_fd = if (options.console_fds) |fds| fds[1] else ready[1];
+                var keep = [_]posix.fd_t{ ready[1], console_fd, fd_dir };
+                std.mem.sort(posix.fd_t, &keep, {}, std.sort.asc(posix.fd_t));
                 var next_fd: u32 = 3;
-                for ([_]posix.fd_t{ @min(ready[1], console_fd), @max(ready[1], console_fd) }) |fd| {
+                for (keep) |fd| {
                     const keep_fd: u32 = @intCast(fd);
                     if (keep_fd < next_fd) continue;
                     if (next_fd < keep_fd)
-                        checkResult(linux.syscall3(.close_range, next_fd, keep_fd - 1, 0)) catch |err| failCreate(ready[1], err);
+                        closeFdRange(next_fd, keep_fd - 1, false, fd_dir) catch |err| failCreate(ready[1], err);
                     next_fd = keep_fd + 1;
                 }
-                checkResult(linux.syscall3(.close_range, next_fd, std.math.maxInt(u32), 0)) catch |err| failCreate(ready[1], err);
+                closeFdRange(next_fd, std.math.maxInt(u32), false, fd_dir) catch |err| failCreate(ready[1], err);
+                closeFd(fd_dir);
                 checkResult(linux.chdir(cwd)) catch |err| {
                     childError("cannot change exec cwd: ", err);
                     failCreate(ready[1], err);
@@ -1512,20 +1517,22 @@ pub const LinuxBackend = struct {
                     failCreate(ready[1], err);
                 };
                 applyAppArmor(apparmor_command) catch |err| failCreate(ready[1], err);
+                applyRlimits(process.rlimits) catch |err| failCreate(ready[1], err);
                 // Retain CAP_SYS_ADMIN for installation when NNP is false,
                 // matching init's ordering before dropping process privileges.
                 if (!process.no_new_privileges) {
                     if (seccomp_program) |program|
                         installSeccomp(program) catch |err| failCreate(ready[1], err);
                 }
-                applyProcessSettings(process) catch |err| {
+                var finalized_process = process;
+                finalized_process.rlimits = &.{};
+                applyProcessSettings(finalized_process) catch |err| {
                     childError("cannot apply exec process settings: ", err);
                     failCreate(ready[1], err);
                 };
                 var executable_buffer: [std.fs.max_path_bytes]u8 = undefined;
                 const executable = resolveExecutable(argv.ptr, envp.ptr, &executable_buffer) catch
                     failCreate(ready[1], error.CreateFailed);
-                checkResult(linux.syscall3(.close_range, 3, std.math.maxInt(u32), 1 << 2)) catch |err| failCreate(ready[1], err);
                 if (process.no_new_privileges) {
                     if (seccomp_program) |program|
                         installSeccomp(program) catch |err| failCreate(ready[1], err);
@@ -4115,6 +4122,51 @@ fn closeFd(fd: posix.fd_t) void {
     _ = posix.system.close(fd);
 }
 
+/// Mark inherited descriptors before installing seccomp. A pinned self/fd
+/// directory allows the fallback even when the container has no /proc mount.
+pub fn closeExecFrom(first: u32, fd_dir: ?posix.fd_t) Backend.Error!void {
+    if (comptime builtin.os.tag != .linux) return error.NotImplemented;
+    return closeFdRange(first, std.math.maxInt(u32), true, fd_dir);
+}
+
+fn closeFdRange(first: u32, last: u32, cloexec: bool, fd_dir: ?posix.fd_t) Backend.Error!void {
+    // Linux CLOSE_RANGE_CLOEXEC is 1 << 2; Zig 0.16's packed flags differ.
+    const result = linux.syscall3(.close_range, first, last, if (cloexec) @as(u32, 1 << 2) else 0);
+    switch (linux.errno(result)) {
+        .SUCCESS => return,
+        .NOSYS, .PERM, .INVAL => {}, // Old kernel, unsupported flags, or outer filter.
+        else => return checkResult(result),
+    }
+    const dir = try openPath(fd_dir orelse linux.AT.FDCWD, if (fd_dir != null) "." else "/proc/self/fd", .{ .DIRECTORY = true, .CLOEXEC = true });
+    defer closeFd(dir);
+    var buffer: [4096]u8 = undefined;
+    while (true) {
+        const count = linux.getdents64(dir, &buffer, buffer.len);
+        if (linux.errno(count) == .INTR) continue;
+        try checkResult(count);
+        if (count == 0) return;
+        var offset: usize = 0;
+        while (offset < count) {
+            const entry: *align(1) const linux.dirent64 = @ptrCast(&buffer[offset]);
+            offset += entry.reclen;
+            const name_ptr: [*]const u8 = &entry.name;
+            const padded = name_ptr[0 .. entry.reclen - @offsetOf(linux.dirent64, "name")];
+            const name = padded[0..std.mem.indexOfScalar(u8, padded, 0).?];
+            const number = std.fmt.parseInt(u32, name, 10) catch continue;
+            if (number < first or number > last or number == dir) continue;
+            const fd: posix.fd_t = @intCast(number);
+            if (!cloexec) {
+                closeFd(fd);
+                continue;
+            }
+            const flags = linux.fcntl(fd, linux.F.GETFD, 0);
+            if (linux.errno(flags) == .BADF) continue;
+            try checkResult(flags);
+            try checkResult(linux.fcntl(fd, linux.F.SETFD, flags | linux.FD_CLOEXEC));
+        }
+    }
+}
+
 /// Linux descriptor passing, shared by init and the frontend. No allocation
 /// or std.Io machinery: these helpers also run after fork.
 pub const console = struct {
@@ -5145,10 +5197,12 @@ fn runInit(
     setupRootfs(rootfs, mounts, devices, symlinks, spec.root.readonly, rootfs_options) catch |err| failCreate(ready_fd, err);
     checkResult(linux.chdir(cwd)) catch |err| failCreate(ready_fd, err);
     applyAppArmor(apparmor_command) catch |err| failCreate(ready_fd, err);
+    closeExecFrom(3, fd_dir) catch |err| failCreate(ready_fd, err);
     if (spec.process) |process| {
         // Allow write-only reopen after setuid while keeping readers root-only.
         if (process.user.uid != 0 and !rootfs_options.fifo_writable)
             checkResult(linux.fchmodat(fd_dir, fifo_name, 0o622)) catch |err| failCreate(ready_fd, err);
+        applyRlimits(rlimits) catch |err| failCreate(ready_fd, err);
         // Without NNP the kernel requires CAP_SYS_ADMIN, which applyProcess
         // may drop. Do not change the OCI noNewPrivileges setting.
         // With NNP=true, install after startContainer hooks (unfiltered); NNP=false hooks run filtered, intentionally.
@@ -5156,7 +5210,7 @@ fn runInit(
             if (seccomp_program) |program|
                 installSeccomp(program) catch |err| failCreate(ready_fd, err);
         }
-        applyProcess(process, capabilities, rlimits) catch |err| {
+        applyProcess(process, capabilities, &.{}) catch |err| {
             childError("cannot apply process settings: ", err);
             failCreate(ready_fd, err);
         };
@@ -5183,7 +5237,7 @@ fn runInit(
     closeFd(fifo_fd);
     // Opening the writer unblocks start. Acknowledge after hooks pass, then
     // retain the CLOEXEC writer so EOF confirms exec before start succeeds.
-    hooks.run(start_hooks, start_hook_state) catch {
+    hooks.runWithCloexecFds(start_hooks, start_hook_state) catch {
         _ = writeAll(fd, &.{0});
         linux.exit_group(1);
     };
@@ -5198,8 +5252,6 @@ fn runInit(
 fn runProcess(spec: *const oci.Spec, executable: ?[*:0]const u8, argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*:0]const u8, seccomp_program: ?seccomp.Program) !noreturn {
     // A process-less config can be created; it cannot be started.
     if (spec.process == null) return error.InvalidProcess;
-    // Linux CLOSE_RANGE_CLOEXEC is 1 << 2; Zig 0.16's packed flags use 1 << 1.
-    try checkResult(linux.syscall3(.close_range, 3, std.math.maxInt(u32), 1 << 2));
     // With NNP=true, install after startContainer hooks (unfiltered); NNP=false hooks run filtered, intentionally.
     if (spec.process.?.noNewPrivileges) {
         if (seccomp_program) |program| try installSeccomp(program);
@@ -5279,6 +5331,20 @@ fn applyAppArmor(command: ?[]const u8) Backend.Error!void {
     return error.MissingProcfs;
 }
 
+// Runtime syscalls after successful filter installation:
+// - NNP=false init/exec: setgroups, setgid, setuid, capset, prctl (credentials
+//   and capabilities); faccessat, statx (PATH lookup under the configured user).
+//   On x86/arm these credential calls are setgroups32/setgid32/setuid32.
+// - init: write/close (readiness), openat/close (FIFO), write (acknowledgement),
+//   execve. NNP=true installs after the hooks and FIFO ack, leaving only execve.
+// - exec: execve; NNP=true installs after process settings and PATH lookup.
+// - NNP=false start hooks, when configured: memfd_create, fcntl (only with
+//   closed stdio), write, lseek, clock_gettime, fork (clone on aarch64), dup2
+//   (dup3 on aarch64), execve, wait4, nanosleep, close; kill on hook failure/
+//   timeout, pread64 on hook failure. Error paths also write and exit_group.
+// No descriptor sweep or rlimit syscall belongs after this point. FIFO opens
+// use O_CLOEXEC; hook memfds and relocated fds use MFD_CLOEXEC/F_DUPFD_CLOEXEC,
+// and only intentional hook stdio dup2/dup3 targets clear CLOEXEC.
 fn installSeccomp(program: seccomp.Program) Backend.Error!void {
     const result = seccomp.install(program);
     if (result != .SUCCESS) {
@@ -5328,10 +5394,7 @@ fn applyProcess(process: oci.Spec.Process, capabilities: ?Backend.Capabilities, 
 
 fn applyProcessSettings(process: ProcessSettings) Backend.Error!void {
     if (comptime builtin.os.tag == .linux) {
-        for (process.rlimits) |limit| {
-            const value: linux.rlimit = .{ .cur = limit.soft, .max = limit.hard };
-            try checkResult(linux.setrlimit(limit.resource, &value));
-        }
+        try applyRlimits(process.rlimits);
         if (process.no_new_privileges)
             try checkResult(linux.prctl(@intFromEnum(linux.PR.SET_NO_NEW_PRIVS), 1, 0, 0, 0));
         if (process.capabilities) |caps| {
@@ -5368,6 +5431,13 @@ fn applyProcessSettings(process: ProcessSettings) Backend.Error!void {
         }
     } else {
         return error.NotImplemented;
+    }
+}
+
+fn applyRlimits(rlimits: []const Backend.Rlimit) Backend.Error!void {
+    for (rlimits) |limit| {
+        const value: linux.rlimit = .{ .cur = limit.soft, .max = limit.hard };
+        try checkResult(linux.setrlimit(limit.resource, &value));
     }
 }
 
@@ -6264,11 +6334,53 @@ test "linux init marks inherited descriptors CLOEXEC and sets noNewPrivileges" {
     if (pid == 0) {
         closeFd(ready[0]);
         checkResult(linux.dup2(ready[1], 200)) catch linux.exit_group(2);
+        closeExecFrom(3, null) catch linux.exit_group(1);
         applyProcess(spec.process.?, null, &.{}) catch linux.exit_group(1);
         runProcess(&spec, argv[0], &argv, &envp, null) catch linux.exit_group(1);
     }
     closeFd(ready[1]);
     try std.testing.expectEqual(@as(u32, 0), try waitChild(pid));
+}
+
+test "linux descriptor sweep falls back when close_range returns ENOSYS EPERM or EINVAL" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const arch = seccomp.Arch.native() orelse return error.SkipZigTest;
+    const pipe = try makePipe();
+    defer for (pipe) |fd| closeFd(fd);
+    for ([_]linux.E{ .NOSYS, .PERM, .INVAL }) |denied| {
+        const program = try seccomp.compile(std.testing.allocator, .{
+            .default_action = .allow,
+            .architectures = &.{arch},
+            .rules = &.{.{ .arch = arch, .number = @intFromEnum(linux.SYS.close_range), .action = .errno, .errno_ret = @intCast(@intFromEnum(denied)) }},
+        }, arch);
+        defer std.testing.allocator.free(program.filters);
+        for ([_]bool{ false, true }) |pinned| {
+            const pid = try forkProcess();
+            if (pid == 0) {
+                // self/fd captures the calling task, so pin it after fork.
+                const directory: ?posix.fd_t = if (pinned)
+                    openPath(linux.AT.FDCWD, "/proc/self/fd", .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true }) catch linux.exit_group(1)
+                else
+                    null;
+                checkResult(linux.dup2(pipe[1], 99)) catch linux.exit_group(1);
+                checkResult(linux.dup2(pipe[1], 200)) catch linux.exit_group(1);
+                checkResult(linux.prctl(@intFromEnum(linux.PR.SET_NO_NEW_PRIVS), 1, 0, 0, 0)) catch linux.exit_group(2);
+                if (seccomp.install(program) != .SUCCESS) linux.exit_group(3);
+                closeExecFrom(100, directory) catch linux.exit_group(4);
+                const low_flags = linux.fcntl(99, linux.F.GETFD, 0);
+                const high_flags = linux.fcntl(200, linux.F.GETFD, 0);
+                if (low_flags != 0 or high_flags != linux.FD_CLOEXEC) {
+                    reportDiagnostic("fallback {s}, pinned={}: fd99={d}, fd200={d}", .{ @tagName(denied), directory != null, low_flags, high_flags });
+                    linux.exit_group(5);
+                }
+                // Exec's host-descriptor closing must also work on old kernels.
+                closeFdRange(200, 200, false, directory) catch linux.exit_group(6);
+                if (linux.errno(linux.fcntl(200, linux.F.GETFD, 0)) != .BADF) linux.exit_group(7);
+                linux.exit_group(0);
+            }
+            try std.testing.expectEqual(@as(u32, 0), try waitChild(pid));
+        }
+    }
 }
 
 test "linux process settings apply rlimits without changing inherited capabilities" {

@@ -14,6 +14,20 @@ pub fn main(init: std.process.Init.Minimal) void {
     const nnp = linux.prctl(@intFromEnum(linux.PR.GET_NO_NEW_PRIVS), 0, 0, 0, 0);
     if (linux.errno(nnp) != .SUCCESS or nnp != @as(usize, if (std.mem.eql(u8, expected_nnp, "true")) 1 else 0))
         linux.exit_group(11);
+    if (std.mem.eql(u8, mode, "runtime-tools") or std.mem.eql(u8, mode, "runtime-tools-hook")) {
+        // faccessat2 is above the fixture's native maximum. An unpatched
+        // ERRNO filter returns EPERM before the kernel sees this syscall.
+        if (std.mem.eql(u8, mode, "runtime-tools") or nnp == 0) {
+            const result = linux.syscall4(.faccessat2, @bitCast(@as(isize, linux.AT.FDCWD)), @intFromPtr(@as([*:0]const u8, "/")), linux.F_OK, 0);
+            if (linux.errno(result) != .NOSYS) linux.exit_group(28);
+        }
+        if (std.mem.eql(u8, mode, "runtime-tools"))
+            linux.exit_group(0);
+        // A filtered NNP=false hook still cannot call close_range; NNP=true
+        // hooks run before the filter. The hook runner must not need this call.
+        const sweep = linux.syscall3(.close_range, 3, 2, 1 << 2);
+        linux.exit_group(if (linux.errno(sweep) == (if (nnp == 0) linux.E.NOSYS else linux.E.INVAL)) 0 else 29);
+    }
     if (std.mem.eql(u8, mode, "apparmor")) {
         const profile = args.next() orelse linux.exit_group(20);
         if (linux.errno(linux.openat(linux.AT.FDCWD, "/tmp/denied", .{ .ACCMODE = .WRONLY, .CLOEXEC = true }, 0)) != .ACCES)

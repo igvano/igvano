@@ -54,6 +54,15 @@ pub fn timeoutExpired(timeout_seconds: ?u64, elapsed_ns: u128) bool {
 pub fn run(entries: []const Prepared, state: []const u8) Error!void {
     if (entries.len == 0) return;
     if (comptime builtin.os.tag != .linux) return error.NotImplemented;
+    @import("linux.zig").closeExecFrom(3, null) catch return error.SystemResources;
+    return runWithCloexecFds(entries, state);
+}
+
+/// Init has already swept inherited descriptors before seccomp. Every fd
+/// created below is CLOEXEC except the hook child's intentional stdio copies.
+pub fn runWithCloexecFds(entries: []const Prepared, state: []const u8) Error!void {
+    if (entries.len == 0) return;
+    if (comptime builtin.os.tag != .linux) return error.NotImplemented;
     for (entries, 0..) |hook, index| {
         var reported = false;
         runOne(hook, state, index, &reported) catch |err| {
@@ -153,9 +162,6 @@ fn runOne(hook: Prepared, state: []const u8, index: usize, reported: *bool) Erro
     if (pid == 0) {
         for ([_]std.posix.fd_t{ input, output, errors }, 0..) |fd, target|
             if (linux.errno(linux.dup2(fd, @intCast(target))) != .SUCCESS) linux.exit_group(1);
-        // The kernel flag is 1 << 2 (Zig 0.16's packed wrapper differs).
-        if (linux.errno(linux.syscall3(.close_range, 3, std.math.maxInt(u32), 1 << 2)) != .SUCCESS)
-            linux.exit_group(1);
         _ = linux.execve(hook.path, hook.argv.ptr, hook.envp.ptr);
         linux.exit_group(1);
     }

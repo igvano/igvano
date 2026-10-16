@@ -1730,6 +1730,10 @@ fn testSeccompLifecycle(base: []const u8) !void {
     const probe = try cwd.realPathFileAlloc(io, probe_path, allocator);
     try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.prctl(@intFromEnum(linux.PR.SET_CHILD_SUBREAPER), 1, 0, 0, 0)));
     const docker = try std.json.parseFromSlice(oci.Spec.Seccomp, allocator, @embedFile("backend/testdata/docker-default.json"), .{});
+    // runtime-tools generate uses an ERRNO allowlist and leaves NNP unset.
+    // This older-style fixture has 314 names, including statx, but no
+    // close_range, faccessat2 or landlock syscalls to raise the native maximum.
+    const runtime_tools = try std.json.parseFromSlice(oci.Spec.Seccomp, allocator, @embedFile("backend/testdata/runtime-tools-default.json"), .{});
     const restricted: oci.Spec.Seccomp = .{
         .defaultAction = "SCMP_ACT_ALLOW",
         .syscalls = &.{
@@ -1737,7 +1741,7 @@ fn testSeccompLifecycle(base: []const u8) !void {
             .{ .names = &.{"personality"}, .action = "SCMP_ACT_ERRNO", .args = &.{.{ .index = 0, .value = 0, .op = "SCMP_CMP_NE" }} },
         },
     };
-    for ([_]oci.Spec.Seccomp{ restricted, docker.value }, 0..) |profile, profile_index| {
+    for ([_]oci.Spec.Seccomp{ restricted, docker.value, runtime_tools.value }, 0..) |profile, profile_index| {
         for ([_]bool{ false, true }) |nnp| {
             const id = try std.fmt.allocPrint(allocator, "seccomp-{d}-{s}", .{ profile_index, if (nnp) "true" else "false" });
             const bundle = try std.fs.path.join(allocator, &.{ base, id });
@@ -1746,11 +1750,22 @@ fn testSeccompLifecycle(base: []const u8) !void {
             try cwd.createDirPath(io, try std.fs.path.join(allocator, &.{ rootfs, "tmp" }));
             const cgroup = try std.fmt.allocPrint(allocator, "igvano-seccomp-{d}-{s}", .{ linux.getpid(), id });
             const nnp_arg: []const u8 = if (nnp) "true" else "false";
+            var mounts: std.ArrayList(oci.Spec.Mount) = .empty;
+            try mounts.appendSlice(allocator, &.{
+                .{ .destination = "/probe", .source = probe, .type = "bind", .options = &.{ "bind", "ro" } },
+                .{ .destination = "/proc", .source = "proc", .type = "proc" },
+            });
+            if (profile_index == 2) {
+                for ([_][]const u8{ "/bin", "/usr", "/lib", "/lib64" }) |path| {
+                    if (linux.errno(linux.access(try allocator.dupeZ(u8, path), linux.F_OK)) == .SUCCESS)
+                        try mounts.append(allocator, .{ .destination = path, .source = path, .type = "bind", .options = &.{ "rbind", "ro" } });
+                }
+            }
             const spec: oci.Spec = .{
                 .ociVersion = "1.0.2",
                 .root = .{ .path = "rootfs" },
                 .process = .{
-                    .args = &.{ "probe", nnp_arg, if (profile_index == 0) "restricted" else "docker" },
+                    .args = if (profile_index == 2) &.{"/bin/true"} else &.{ "probe", nnp_arg, if (profile_index == 0) "restricted" else "docker" },
                     .env = &.{"PATH=/"},
                     .cwd = "/",
                     .noNewPrivileges = nnp,
@@ -1758,14 +1773,11 @@ fn testSeccompLifecycle(base: []const u8) !void {
                     // Installing the false case after this drop would fail.
                     .capabilities = .{},
                 },
-                .mounts = &.{
-                    .{ .destination = "/probe", .source = probe, .type = "bind", .options = &.{ "bind", "ro" } },
-                    .{ .destination = "/proc", .source = "proc", .type = "proc" },
-                },
+                .mounts = mounts.items,
                 .linux = .{ .cgroupsPath = cgroup, .namespaces = &.{ .{ .type = .mount }, .{ .type = .pid } }, .seccomp = profile },
-                .hooks = if (profile_index == 0) .{ .startContainer = &.{.{
+                .hooks = if (profile_index != 1) .{ .startContainer = &.{.{
                     .path = "/probe",
-                    .args = &.{ "/probe", nnp_arg, "hook" },
+                    .args = &.{ "/probe", nnp_arg, if (profile_index == 0) "hook" else "runtime-tools-hook" },
                     .timeout = 2,
                 }} } else null,
             };
@@ -1794,6 +1806,11 @@ fn testSeccompLifecycle(base: []const u8) !void {
             config.subcommand = .exec;
             config.exec_args = spec.process.?.args;
             try std.testing.expectEqual(@as(u8, 0), try execContainer(allocator, io, backend, config));
+            if (profile_index == 2) {
+                config.exec_args = &.{ "/probe", nnp_arg, "runtime-tools" };
+                try std.testing.expectEqual(@as(u8, 0), try execContainer(allocator, io, backend, config));
+                config.exec_args = spec.process.?.args;
+            }
             config.process_file = try std.fs.path.join(allocator, &.{ bundle, "process.json" });
             try cwd.writeFile(io, .{
                 .sub_path = config.process_file.?,
