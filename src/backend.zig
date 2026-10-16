@@ -220,6 +220,12 @@ pub const Backend = struct {
         killAll: *const fn (ptr: *anyopaque, handle: Handle, signal: i32) Error!void,
         /// The id identifies resources after the container stops and its pid is gone.
         delete: *const fn (ptr: *anyopaque, handle: Handle) Error!void,
+        /// Human-readable detail for the most recent failed operation.
+        diagnostic: *const fn (ptr: *anyopaque) ?[]const u8 = noDiagnostic,
+
+        fn noDiagnostic(_: *anyopaque) ?[]const u8 {
+            return null;
+        }
     };
 
     pub fn create(self: Backend, options: CreateOptions) Error!Handle {
@@ -240,6 +246,11 @@ pub const Backend = struct {
 
     pub fn delete(self: Backend, handle: Handle) Error!void {
         return self.vtable.delete(self.ptr, handle);
+    }
+
+    /// Human-readable detail for the most recent failed operation.
+    pub fn diagnostic(self: Backend) ?[]const u8 {
+        return self.vtable.diagnostic(self.ptr);
     }
 };
 
@@ -263,6 +274,7 @@ test "backend dispatches lifecycle operations through its vtable" {
             .kill = kill,
             .killAll = killAll,
             .delete = delete,
+            .diagnostic = diagnostic,
         };
 
         fn create(ptr: *anyopaque, options: Backend.CreateOptions) Backend.Error!Backend.Handle {
@@ -294,6 +306,11 @@ test "backend dispatches lifecycle operations through its vtable" {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.deleted = handle;
         }
+
+        fn diagnostic(ptr: *anyopaque) ?[]const u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return if (self.fail_create) "test create is unavailable" else null;
+        }
     };
 
     const spec: oci.Spec = .{
@@ -310,6 +327,7 @@ test "backend dispatches lifecycle operations through its vtable" {
     };
     var implementation: TestBackend = .{};
     const backend: Backend = .{ .ptr = &implementation, .vtable = &TestBackend.vtable };
+    try std.testing.expect(backend.diagnostic() == null);
     const handle = try backend.create(options);
     try std.testing.expectEqualStrings("example", handle.id);
     try std.testing.expectEqual(@as(i32, 1234), handle.pid);
@@ -334,4 +352,5 @@ test "backend dispatches lifecycle operations through its vtable" {
 
     implementation.fail_create = true;
     try std.testing.expectError(error.NotImplemented, backend.create(options));
+    try std.testing.expectEqualStrings("test create is unavailable", backend.diagnostic().?);
 }

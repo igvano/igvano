@@ -12,6 +12,58 @@ const ST_RELATIME: usize = 4096; // Unlike MS_RELATIME.
 const OPEN_TREE_CLONE: u32 = 1;
 const OPEN_TREE_CLOEXEC: u32 = 1 << @bitOffsetOf(linux.O, "CLOEXEC");
 
+// Borrowed diagnostic detail for this process; no allocation after fork.
+// ponytail: One backend per process; move this buffer into LinuxBackend if the library ever hosts several.
+var last_diagnostic: [512]u8 = @splat(0);
+var last_diagnostic_len: usize = 0;
+
+fn diagnosticWrite(bytes: []const u8) void {
+    const len = @min(bytes.len, last_diagnostic.len - last_diagnostic_len);
+    @memcpy(last_diagnostic[last_diagnostic_len..][0..len], bytes[0..len]);
+    last_diagnostic_len += len;
+    _ = writeAll(2, bytes);
+}
+
+fn diagnosticDrain(_: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+    for (data[0 .. data.len - 1]) |bytes| diagnosticWrite(bytes);
+    for (0..splat) |_| diagnosticWrite(data[data.len - 1]);
+    return std.Io.Writer.countSplat(data, splat);
+}
+
+/// Formatting and raw writes need neither allocator nor inherited debug locks.
+fn reportDiagnostic(comptime fmt: []const u8, args: anytype) void {
+    last_diagnostic_len = 0;
+    _ = writeAll(2, "igvano: ");
+    var writer: std.Io.Writer = .{ .vtable = &.{ .drain = diagnosticDrain }, .buffer = &.{} };
+    writer.print(fmt, args) catch {};
+    _ = writeAll(2, "\n");
+    if (last_diagnostic_len == last_diagnostic.len) {
+        // Avoid ending a truncated JSON diagnostic halfway through a codepoint.
+        var start = last_diagnostic_len - 1;
+        while (start > 0 and last_diagnostic[start] & 0xc0 == 0x80) start -= 1;
+        const len = std.unicode.utf8ByteSequenceLength(last_diagnostic[start]) catch 1;
+        if (len > last_diagnostic_len - start) last_diagnostic_len = start;
+    }
+}
+
+test "backend diagnostic records formatted detail and truncates safely" {
+    var implementation: LinuxBackend = .{};
+    const backend = implementation.backend();
+    defer last_diagnostic_len = 0;
+    last_diagnostic_len = 0;
+    try std.testing.expect(backend.diagnostic() == null);
+    reportDiagnostic("failed at {s}: {d}", .{ "/proc", 42 });
+    try std.testing.expectEqualStrings("failed at /proc: 42", backend.diagnostic().?);
+    reportDiagnostic("{s}", .{"x" ** 600});
+    try std.testing.expectEqualStrings("x" ** 512, backend.diagnostic().?);
+    reportDiagnostic("{s}{s}", .{ "x" ** 511, "é" });
+    try std.testing.expectEqualStrings("x" ** 511, backend.diagnostic().?);
+    reportDiagnostic("short", .{});
+    try std.testing.expectEqualStrings("short", backend.diagnostic().?);
+    childError(": ", error.CreateFailed);
+    try std.testing.expectEqualStrings(": CreateFailed", backend.diagnostic().?);
+}
+
 const Write = struct { name: []const u8, value: []const u8 };
 const CgroupMode = enum { unified, legacy };
 const V1Write = struct {
@@ -964,7 +1016,7 @@ test "locked atime modes are inherited only when absent and conflicts are reject
 pub fn cgroupMountType(mount_type: []const u8, host_fs_type: usize) Backend.Error![]const u8 {
     if (!std.mem.eql(u8, mount_type, "cgroup") and !std.mem.eql(u8, mount_type, "cgroup2")) return mount_type;
     if (host_fs_type != 0x63677270) {
-        std.debug.print("igvano: mounting cgroup v1 hierarchies inside the container is not implemented yet\n", .{});
+        reportDiagnostic("mounting cgroup v1 hierarchies inside the container is not implemented yet", .{});
         return error.Unsupported;
     }
     return "cgroup2";
@@ -1098,9 +1150,15 @@ pub const LinuxBackend = struct {
         .kill = kill,
         .killAll = killAll,
         .delete = delete,
+        .diagnostic = diagnostic,
     };
 
+    fn diagnostic(_: *anyopaque) ?[]const u8 {
+        return if (last_diagnostic_len == 0) null else last_diagnostic[0..last_diagnostic_len];
+    }
+
     fn create(ptr: *anyopaque, options: Backend.CreateOptions) Backend.Error!Backend.Handle {
+        last_diagnostic_len = 0;
         if (comptime builtin.os.tag == .linux) {
             const flags = try namespaceFlags(options.spec.linux);
             var isolation_flags = flags;
@@ -1108,7 +1166,7 @@ pub const LinuxBackend = struct {
                 isolation_flags |= namespaceFlag(namespace.type);
             const private_mount_namespace = isolation_flags & linux.CLONE.NEWNS != 0;
             if (!private_mount_namespace and options.rootfs_propagation != null) {
-                std.debug.print("igvano: cannot change propagation without a private mount namespace\n", .{});
+                reportDiagnostic("cannot change propagation without a private mount namespace", .{});
                 return error.InvalidConfig;
             }
             if (options.spec.hostname != null and isolation_flags & linux.CLONE.NEWUTS == 0)
@@ -1158,7 +1216,7 @@ pub const LinuxBackend = struct {
                 if (own_stat.dev_major == target_stat.dev_major and
                     own_stat.dev_minor == target_stat.dev_minor and own_stat.ino == target_stat.ino)
                 {
-                    std.debug.print("igvano: cannot join the runtime's own mount namespace\n", .{});
+                    reportDiagnostic("cannot join the runtime's own mount namespace", .{});
                     return error.InvalidConfig;
                 }
             }
@@ -1187,18 +1245,18 @@ pub const LinuxBackend = struct {
                 const size = linux.readlink(fdPath(&fd_buffer, root_fd), &resolved_buffer, resolved_buffer.len);
                 try checkResult(size);
                 if (size == 1 and resolved_buffer[0] == '/') {
-                    std.debug.print("igvano: cannot use / as rootfs without a private mount namespace\n", .{});
+                    reportDiagnostic("cannot use / as rootfs without a private mount namespace", .{});
                     return error.InvalidConfig;
                 }
                 rootfs_mount_before = mountId(root_fd) catch |err| {
                     if (err == error.Unsupported)
-                        std.debug.print("igvano: inheriting the mount namespace requires Linux 6.8+ (unique mount IDs); add a mount namespace to the config\n", .{});
+                        reportDiagnostic("inheriting the mount namespace requires Linux 6.8+ (unique mount IDs); add a mount namespace to the config", .{});
                     return err;
                 };
                 // Probe both APIs before creating any mounts.
                 _ = (statMount(rootfs_mount_before.?) catch |err| {
                     if (err == error.Unsupported)
-                        std.debug.print("igvano: inheriting the mount namespace requires Linux 6.8+ (unique mount IDs); add a mount namespace to the config\n", .{});
+                        reportDiagnostic("inheriting the mount namespace requires Linux 6.8+ (unique mount IDs); add a mount namespace to the config", .{});
                     return err;
                 }) orelse return error.CreateFailed;
                 rootfs_mount_boot_id = try bootId();
@@ -1260,7 +1318,7 @@ pub const LinuxBackend = struct {
             const cgroup_writes: []const Write = if (cgroup_root.mode == .unified) try v2Writes(allocator, options.resources) else &.{};
             defer if (cgroup_root.mode == .unified) freeWrites(allocator, cgroup_writes);
             if (cgroup_root.mode == .legacy and options.resources.unified.len != 0) {
-                std.debug.print("igvano: unified resources require cgroup v2\n", .{});
+                reportDiagnostic("unified resources require cgroup v2", .{});
                 return error.InvalidConfig;
             }
             const v1_writes: []const V1Write = if (cgroup_root.mode == .legacy) try v1Writes(allocator, options.resources, options.devices) else &.{};
@@ -1284,6 +1342,12 @@ pub const LinuxBackend = struct {
             defer if (cgroup) |fd| closeFd(fd);
             var rootfs_mount_id: ?u64 = null;
             errdefer {
+                const saved_diagnostic = last_diagnostic;
+                const saved_len = last_diagnostic_len;
+                defer {
+                    last_diagnostic = saved_diagnostic;
+                    last_diagnostic_len = saved_len;
+                }
                 // Child1 can die before reporting child2's PID. Kill the entire
                 // cgroup before removing it, including any blocked init.
                 if (cgroup) |fd| {
@@ -1427,9 +1491,9 @@ pub const LinuxBackend = struct {
                 closeFd(ready[1]);
                 if (!private_mount_namespace) {
                     var mount_response: CreateResponse = .{};
-                    if (!readAll(ready[0], std.mem.asBytes(&mount_response.rootfs_mount_id))) {
+                    if (!readAll(ready[0], std.mem.asBytes(&mount_response)) or mount_response.failure != 0) {
                         _ = waitChild(child2) catch {};
-                        failCreate(report[1], error.CreateFailed);
+                        failCreate(report[1], mount_response.failureError() orelse error.CreateFailed);
                     }
                     if (!writeAll(report[1], std.mem.asBytes(&mount_response))) {
                         _ = linux.kill(child2, .KILL);
@@ -1437,11 +1501,11 @@ pub const LinuxBackend = struct {
                         linux.exit_group(1);
                     }
                 }
-                var byte: [1]u8 = undefined;
+                var init_response: CreateResponse = .{};
                 // Child2 has applied mounts and waits before child hooks/pivot.
-                if (!readAll(ready[0], &byte)) {
+                if (!readAll(ready[0], std.mem.asBytes(&init_response)) or init_response.failure != 0) {
                     _ = waitChild(child2) catch {};
-                    failCreate(report[1], error.CreateFailed);
+                    failCreate(report[1], init_response.failureError() orelse error.CreateFailed);
                 }
                 // Capture identity while child2 is still our child, so its PID
                 // cannot be recycled even if it has already exited.
@@ -1460,11 +1524,12 @@ pub const LinuxBackend = struct {
                     _ = waitChild(child2) catch {};
                     linux.exit_group(1);
                 }
-                const initialized = readAll(ready[0], &byte);
+                init_response = .{};
+                const initialized = readAll(ready[0], std.mem.asBytes(&init_response));
                 closeFd(ready[0]);
-                if (!initialized) {
+                if (!initialized or init_response.failure != 0) {
                     _ = waitChild(child2) catch {};
-                    failCreate(report[1], error.CreateFailed);
+                    failCreate(report[1], init_response.failureError() orelse error.CreateFailed);
                 }
                 if (!writeAll(report[1], std.mem.asBytes(&response))) {
                     _ = linux.kill(child2, .KILL);
@@ -1508,8 +1573,7 @@ pub const LinuxBackend = struct {
             if (map_writer) |fd| {
                 var mapping_response: CreateResponse = .{};
                 if (!readAll(report[0], std.mem.asBytes(&mapping_response))) return error.CreateFailed;
-                if (mapping_response.failure != 0)
-                    return @errorCast(@errorFromInt(@as(u16, @intCast(mapping_response.failure))));
+                if (mapping_response.failureError()) |err| return err;
                 if (mapping_response.pid <= 0) return error.CreateFailed;
                 try writeUserMappings(mapping_response.pid, gid_map, uid_map);
                 // Init needs ownership as namespace root, even for a non-root process.
@@ -1521,8 +1585,7 @@ pub const LinuxBackend = struct {
             if (rootfs_mount_before) |before| {
                 var mount_response: CreateResponse = .{};
                 if (!readAll(report[0], std.mem.asBytes(&mount_response))) return error.CreateFailed;
-                if (mount_response.failure != 0)
-                    return @errorCast(@errorFromInt(@as(u16, @intCast(mount_response.failure))));
+                if (mount_response.failureError()) |err| return err;
                 if (mount_response.rootfs_mount_id == 0 or mount_response.rootfs_mount_id == before)
                     return error.CreateFailed;
                 rootfs_mount_id = mount_response.rootfs_mount_id;
@@ -1541,10 +1604,14 @@ pub const LinuxBackend = struct {
                 .rootfs_mount_boot_id = rootfs_mount_boot_id,
             };
             errdefer if (reported and handle.pid > 0) {
+                const saved_diagnostic = last_diagnostic;
+                const saved_len = last_diagnostic_len;
                 kill(ptr, handle, 9) catch {};
+                last_diagnostic = saved_diagnostic;
+                last_diagnostic_len = saved_len;
             };
             if (!reported) return error.CreateFailed;
-            if (response.failure != 0) return @errorCast(@errorFromInt(@as(u16, @intCast(response.failure))));
+            if (response.failureError()) |err| return err;
             if (response.pid <= 0) return error.CreateFailed;
             if (options.on_create) |callback| try callback.run(callback.ptr, handle);
             if (!writeAll(create_writer.?, &.{1})) return error.CreateFailed;
@@ -1555,7 +1622,7 @@ pub const LinuxBackend = struct {
             child1_reaped = true;
             const status = try waitChild(child1);
             if (!initialized) return error.CreateFailed;
-            if (response.failure != 0) return @errorCast(@errorFromInt(@as(u16, @intCast(response.failure))));
+            if (response.failureError()) |err| return err;
             if (status != 0 or response.pid <= 0) {
                 return error.CreateFailed;
             }
@@ -1576,6 +1643,7 @@ pub const LinuxBackend = struct {
     }
 
     fn alive(_: *anyopaque, handle: Backend.Handle) Backend.Error!bool {
+        last_diagnostic_len = 0;
         if (comptime builtin.os.tag == .linux) {
             if (handle.pid <= 0) return error.InvalidProcess;
             switch (linux.errno(linux.kill(handle.pid, @enumFromInt(0)))) {
@@ -1597,6 +1665,7 @@ pub const LinuxBackend = struct {
     }
 
     fn kill(ptr: *anyopaque, handle: Backend.Handle, signal: i32) Backend.Error!void {
+        last_diagnostic_len = 0;
         if (comptime builtin.os.tag == .linux) {
             if (handle.pid <= 0) return error.InvalidProcess;
             if (signal < 0 or signal >= linux.NSIG) return error.KillFailed;
@@ -1616,6 +1685,7 @@ pub const LinuxBackend = struct {
     }
 
     fn killAll(ptr: *anyopaque, handle: Backend.Handle, signal: i32) Backend.Error!void {
+        last_diagnostic_len = 0;
         if (comptime builtin.os.tag == .linux) {
             if (signal < 0 or signal >= linux.NSIG) return error.KillFailed;
             const path = handle.cgroup_path orelse {
@@ -1629,6 +1699,8 @@ pub const LinuxBackend = struct {
             const allocator = std.heap.page_allocator;
             const root = try openCgroupRoot();
             defer closeFd(root.fd);
+            // ponytail: cgroup.procs enumeration signals only the leaf's own
+            // members. runc walks descendants; upgrade this path by recursing.
             if (root.mode == .legacy) {
                 const hierarchies = try openV1Hierarchies(allocator);
                 defer freeV1Hierarchies(allocator, hierarchies);
@@ -1665,7 +1737,13 @@ pub const LinuxBackend = struct {
                 }
             }
             // Thaw even after a freeze timeout or a failed read/signal.
-            defer writeCgroupFile(cgroup, "cgroup.freeze", "0", path) catch {};
+            defer {
+                const saved_diagnostic = last_diagnostic;
+                const saved_len = last_diagnostic_len;
+                writeCgroupFile(cgroup, "cgroup.freeze", "0", path) catch {};
+                last_diagnostic = saved_diagnostic;
+                last_diagnostic_len = saved_len;
+            }
             try writeCgroupFile(cgroup, "cgroup.freeze", "1", path);
             const delay: linux.timespec = .{ .sec = 0, .nsec = 10_000_000 };
             for (0..50) |_| {
@@ -1679,9 +1757,13 @@ pub const LinuxBackend = struct {
                 if (frozen) break;
                 _ = linux.nanosleep(&delay, null);
             } else {
+                const saved_diagnostic = last_diagnostic;
+                const saved_len = last_diagnostic_len;
                 writeCgroupFile(cgroup, "cgroup.freeze", "0", path) catch {};
+                last_diagnostic = saved_diagnostic;
+                last_diagnostic_len = saved_len;
             }
-            // The v1 helper also enumerates cgroup.procs when no freezer is supplied.
+            // The v1 helper also enumerates cgroup.procs without a freezer.
             try killV1Members(cgroup, null, signal);
         } else {
             return error.NotImplemented;
@@ -1689,6 +1771,7 @@ pub const LinuxBackend = struct {
     }
 
     fn delete(_: *anyopaque, handle: Backend.Handle) Backend.Error!void {
+        last_diagnostic_len = 0;
         if (comptime builtin.os.tag == .linux) {
             if (handle.cgroup_path) |path| cgroup_cleanup: {
                 try validateCgroupPath(path);
@@ -1996,7 +2079,7 @@ fn openCgroupRoot() Backend.Error!struct { fd: posix.fd_t, fs_type: usize, mode:
     var fs: [32]usize = undefined;
     try checkResult(linux.syscall2(.fstatfs, @intCast(root), @intFromPtr(&fs)));
     const mode = cgroupMode(fs[0]) catch {
-        std.debug.print("igvano: unsupported cgroup filesystem at /sys/fs/cgroup\n", .{});
+        reportDiagnostic("unsupported cgroup filesystem at /sys/fs/cgroup", .{});
         return error.Unsupported;
     };
     // ponytail: hybrid hosts use v1 only, without systemd-unified membership,
@@ -2067,7 +2150,7 @@ fn walkV1Cgroup(allocator: std.mem.Allocator, root: posix.fd_t, path: []const u8
             switch (linux.errno(result)) {
                 .SUCCESS => created = true,
                 .EXIST => if (components.peek() == null) {
-                    std.debug.print("igvano: cgroup '{s}' already exists\n", .{path});
+                    reportDiagnostic("cgroup '{s}' already exists", .{path});
                     return error.CreateFailed;
                 },
                 else => try checkResult(result),
@@ -2134,7 +2217,7 @@ fn writeV1Resource(dir: posix.fd_t, write: V1Write, path: []const u8, kmem_warne
         kmem_warned.* = true;
         return;
     }
-    std.debug.print("igvano: cgroup '{s}' cannot write {s} = '{s}': {s}\n", .{ path, name, write.value, @tagName(err) });
+    reportDiagnostic("cgroup '{s}' cannot write {s} = '{s}': {s}", .{ path, name, write.value, @tagName(err) });
     return error.CgroupWriteFailed;
 }
 
@@ -2178,7 +2261,7 @@ fn applyV1Writes(allocator: std.mem.Allocator, hierarchies: []const V1Hierarchy,
         }
         if (mounted) continue;
         if (requiredV1Controller(write.controller, resources, devices)) {
-            std.debug.print("igvano: cgroup v1 controller {s} is required but not mounted\n", .{write.controller});
+            reportDiagnostic("cgroup v1 controller {s} is required but not mounted", .{write.controller});
             return error.CgroupWriteFailed;
         }
         var warned = false;
@@ -2242,9 +2325,39 @@ fn killV1Members(dir: posix.fd_t, freezer: ?posix.fd_t, signal: i32) Backend.Err
         if (pid <= 0) return error.CgroupDeleteFailed;
         switch (linux.errno(linux.kill(pid, @enumFromInt(@as(u32, @intCast(signal)))))) {
             .SUCCESS, .SRCH => {},
-            else => return error.CgroupDeleteFailed,
+            .PERM => return error.PermissionDenied,
+            else => return error.KillFailed,
         }
     }
+}
+
+test "linux cgroup member signaling distinguishes kill failures from deletion failures" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "leaf", .fromMode(0o755));
+    const members = try std.fmt.allocPrint(std.testing.allocator, "{d}\n", .{linux.getpid()});
+    defer std.testing.allocator.free(members);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "leaf/cgroup.procs", .data = members });
+    const leaf = try openPath(tmp.dir.handle, "leaf", .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true });
+    defer closeFd(leaf);
+    try std.testing.expectError(error.KillFailed, killV1Members(leaf, null, linux.NSIG));
+    if (linux.geteuid() != 0) return;
+    const root = try openPath(tmp.dir.handle, ".", .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true });
+    defer closeFd(root);
+    try checkResult(linux.fchmod(root, 0o755));
+    const pid = try forkProcess();
+    if (pid == 0) {
+        checkResult(linux.setuid(65534)) catch linux.exit_group(1);
+        killV1Members(leaf, null, 0) catch |err| {
+            if (err != error.PermissionDenied) linux.exit_group(2);
+            removeV1Cgroup(root, "leaf", leaf, null) catch |delete_err|
+                linux.exit_group(if (delete_err == error.CgroupDeleteFailed) 0 else 3);
+            linux.exit_group(4);
+        };
+        linux.exit_group(5);
+    }
+    try std.testing.expectEqual(@as(u32, 0), try waitChild(pid));
 }
 
 fn removeV1Cgroups(hierarchies: []const V1Hierarchy, path: []const u8) Backend.Error!void {
@@ -2297,7 +2410,10 @@ fn removeV1Cgroup(root: posix.fd_t, path: []const u8, owned_fd: posix.fd_t, free
         try checkResult(linux.statx(leaf, "", linux.AT.EMPTY_PATH, .{ .INO = true }, &current));
         if (!owned.mask.INO or !current.mask.INO) return error.CgroupDeleteFailed;
         if (owned.dev_major != current.dev_major or owned.dev_minor != current.dev_minor or owned.ino != current.ino) return;
-        try killV1Members(leaf, freezer, @intFromEnum(linux.SIG.KILL));
+        killV1Members(leaf, freezer, @intFromEnum(linux.SIG.KILL)) catch |err| return switch (err) {
+            error.PermissionDenied, error.KillFailed => error.CgroupDeleteFailed,
+            else => err,
+        };
         const result = linux.unlinkat(parent, name, linux.AT.REMOVEDIR);
         switch (linux.errno(result)) {
             .SUCCESS, .NOENT => return,
@@ -2306,7 +2422,7 @@ fn removeV1Cgroup(root: posix.fd_t, path: []const u8, owned_fd: posix.fd_t, free
             else => return error.CgroupDeleteFailed,
         }
     }
-    std.debug.print("igvano: cgroup '{s}' is still busy after waiting for members to exit\n", .{path});
+    reportDiagnostic("cgroup '{s}' is still busy after waiting for members to exit", .{path});
     return error.CgroupDeleteFailed;
 }
 
@@ -2692,7 +2808,7 @@ fn walkCgroup(root: posix.fd_t, path: []const u8, create: bool, writes: []const 
                 .SUCCESS => {},
                 .EXIST => {
                     if (components.peek() == null) {
-                        std.debug.print("igvano: cgroup '{s}' already exists\n", .{path});
+                        reportDiagnostic("cgroup '{s}' already exists", .{path});
                         return error.CreateFailed;
                     }
                 },
@@ -2727,7 +2843,7 @@ fn writeCgroupFile(dir: posix.fd_t, filename: []const u8, value: []const u8, pat
             .SUCCESS => break :open @intCast(result),
             .INTR => continue,
             else => |err| {
-                std.debug.print("igvano: cgroup '{s}' cannot open {s}: {s}\n", .{ path, filename, @tagName(err) });
+                reportDiagnostic("cgroup '{s}' cannot open {s}: {s}", .{ path, filename, @tagName(err) });
                 return error.CgroupWriteFailed;
             },
         }
@@ -2743,7 +2859,7 @@ fn writeCgroupFile(dir: posix.fd_t, filename: []const u8, value: []const u8, pat
             },
             .INTR => continue,
             else => |err| {
-                std.debug.print("igvano: cgroup '{s}' cannot write {s} = '{s}': {s}\n", .{ path, filename, value, @tagName(err) });
+                reportDiagnostic("cgroup '{s}' cannot write {s} = '{s}': {s}", .{ path, filename, value, @tagName(err) });
                 return error.CgroupWriteFailed;
             },
         }
@@ -2816,7 +2932,7 @@ fn removeCgroup(root: posix.fd_t, path: []const u8) Backend.Error!void {
             .NOENT => return,
             .INTR => continue,
             else => |err| {
-                std.debug.print("igvano: cannot open cgroup '{s}' for removal: {s}\n", .{ path, @tagName(err) });
+                reportDiagnostic("cannot open cgroup '{s}' for removal: {s}", .{ path, @tagName(err) });
                 return error.CgroupDeleteFailed;
             },
         }
@@ -2826,12 +2942,12 @@ fn removeCgroup(root: posix.fd_t, path: []const u8) Backend.Error!void {
             .INTR => continue,
             .BUSY, .NOTEMPTY => _ = linux.nanosleep(&delay, null),
             else => |err| {
-                std.debug.print("igvano: cannot remove cgroup '{s}': {s}\n", .{ path, @tagName(err) });
+                reportDiagnostic("cannot remove cgroup '{s}': {s}", .{ path, @tagName(err) });
                 return error.CgroupDeleteFailed;
             },
         }
     }
-    std.debug.print("igvano: cgroup '{s}' is still busy after waiting for members to exit\n", .{path});
+    reportDiagnostic("cgroup '{s}' is still busy after waiting for members to exit", .{path});
     return error.CgroupDeleteFailed;
 }
 
@@ -2845,7 +2961,7 @@ fn removeCgroupChildren(dir: posix.fd_t, path: []const u8) Backend.Error!void {
             .NOENT => return,
             .INTR => continue,
             else => |err| {
-                std.debug.print("igvano: cannot read child cgroups of '{s}': {s}\n", .{ path, @tagName(err) });
+                reportDiagnostic("cannot read child cgroups of '{s}': {s}", .{ path, @tagName(err) });
                 return error.CgroupDeleteFailed;
             },
         }
@@ -2870,6 +2986,15 @@ const CreateResponse = extern struct {
     failure: u32 = 0,
     starttime: u64 = 0,
     rootfs_mount_id: u64 = 0,
+    message: [512]u8 = @splat(0),
+    message_len: u32 = 0,
+
+    fn failureError(self: *const CreateResponse) ?Backend.Error {
+        if (self.failure == 0) return null;
+        last_diagnostic_len = @min(self.message_len, last_diagnostic.len);
+        @memcpy(last_diagnostic[0..last_diagnostic_len], self.message[0..last_diagnostic_len]);
+        return @errorCast(@errorFromInt(@as(u16, @intCast(self.failure))));
+    }
 };
 
 const ProcStat = struct {
@@ -3255,9 +3380,7 @@ fn consolePath(path: [*:0]const u8, flags: linux.O) Backend.Error!posix.fd_t {
 }
 
 fn childError(message: []const u8, err: anyerror) void {
-    _ = writeAll(2, message);
-    _ = writeAll(2, @errorName(err));
-    _ = writeAll(2, "\n");
+    reportDiagnostic("{s}{s}", .{ message, @errorName(err) });
 }
 
 fn mappedRootID(mappings: []const oci.Spec.IDMapping) Backend.Error!u32 {
@@ -3367,7 +3490,8 @@ fn writeAll(fd: posix.fd_t, bytes: []const u8) bool {
 }
 
 fn failCreate(fd: posix.fd_t, err: Backend.Error) noreturn {
-    var response: CreateResponse = .{ .failure = @intFromError(err) };
+    var response: CreateResponse = .{ .failure = @intFromError(err), .message_len = @intCast(last_diagnostic_len) };
+    @memcpy(response.message[0..last_diagnostic_len], last_diagnostic[0..last_diagnostic_len]);
     _ = writeAll(fd, std.mem.asBytes(&response));
     linux.exit_group(1);
 }
@@ -3499,23 +3623,18 @@ const RootfsStep = struct {
     fs_type: ?[]const u8 = null,
 
     fn report(self: RootfsStep, err: anyerror) void {
-        _ = writeAll(2, "igvano: cannot prepare rootfs: ");
-        _ = writeAll(2, self.operation);
-        if (self.source) |source| {
-            _ = writeAll(2, " ");
-            _ = writeAll(2, source);
-            _ = writeAll(2, " ->");
-        }
-        if (self.path.len != 0) {
-            _ = writeAll(2, " ");
-            _ = writeAll(2, self.path);
-        }
-        if (self.fs_type) |fs_type| {
-            _ = writeAll(2, " (");
-            _ = writeAll(2, fs_type);
-            _ = writeAll(2, ")");
-        }
-        childError(": ", err);
+        reportDiagnostic("cannot prepare rootfs: {s}{s}{s}{s}{s}{s}{s}{s}{s}: {s}", .{
+            self.operation,
+            if (self.source != null) " " else "",
+            self.source orelse "",
+            if (self.source != null) " ->" else "",
+            if (self.path.len != 0) " " else "",
+            self.path,
+            if (self.fs_type != null) " (" else "",
+            self.fs_type orelse "",
+            if (self.fs_type != null) ")" else "",
+            @errorName(err),
+        });
     }
 };
 
@@ -3760,13 +3879,11 @@ fn writeSysctl(sys: posix.fd_t, setting: Backend.Sysctl) Backend.Error!void {
 fn applySysctls(settings: []const Backend.Sysctl) Backend.Error!void {
     if (settings.len == 0) return;
     var key = settings[0].key;
-    errdefer |err| {
-        _ = writeAll(2, "igvano: cannot set sysctl ");
-        _ = writeAll(2, key);
-        if (err == error.MissingProcfs)
-            _ = writeAll(2, " (requires procfs mounted at /proc)");
-        childError(": ", err);
-    }
+    errdefer |err| reportDiagnostic("cannot set sysctl {s}{s}: {s}", .{
+        key,
+        if (err == error.MissingProcfs) " (requires procfs mounted at /proc)" else "",
+        @errorName(err),
+    });
     const sys = try sysctlDirectory();
     defer closeFd(sys);
     for (settings) |setting| {
@@ -3832,7 +3949,7 @@ fn makeRootfsParentPrivate(rootfs: [:0]const u8, step: *RootfsStep) Backend.Erro
                 // Report before this stack-backed parent path goes out of scope.
                 step.* = .{ .operation = "mount parent private propagation", .path = "" };
                 var message: [std.fs.max_path_bytes + 80]u8 = undefined;
-                const text = std.fmt.bufPrint(&message, "igvano: cannot prepare rootfs: mount parent private propagation {s}: ", .{buffer[0..end]}) catch unreachable;
+                const text = std.fmt.bufPrint(&message, "cannot prepare rootfs: mount parent private propagation {s}: ", .{buffer[0..end]}) catch unreachable;
                 checkResult(result) catch |err| {
                     childError(text, err);
                     // The enclosing setupRootfs diagnostic was already emitted.
@@ -3871,10 +3988,10 @@ fn setupRootfs(rootfs: [:0]const u8, mounts: []const PreparedMount, devices: []c
         const root_fd = try openPath(linux.AT.FDCWD, rootfs, .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true });
         defer closeFd(root_fd);
         step.operation = "stat rootfs mount";
-        var id = try mountId(root_fd);
+        var response: CreateResponse = .{ .rootfs_mount_id = try mountId(root_fd) };
         step = .{ .operation = "report rootfs mount" };
         if (options.runtime_sync) |sync|
-            if (!writeAll(sync.ready_fd, std.mem.asBytes(&id))) return error.CreateFailed;
+            if (!writeAll(sync.ready_fd, std.mem.asBytes(&response))) return error.CreateFailed;
     }
     // The new self-bind can inherit host peer groups. Isolate only this copy,
     // so configured submounts do not also appear beneath the covered directory.
@@ -3889,7 +4006,8 @@ fn setupRootfs(rootfs: [:0]const u8, mounts: []const PreparedMount, devices: []c
     }
     if (options.runtime_sync) |sync| {
         step = .{ .operation = "create synchronization" };
-        if (!writeAll(sync.ready_fd, &.{1})) return error.CreateFailed;
+        var response: CreateResponse = .{};
+        if (!writeAll(sync.ready_fd, std.mem.asBytes(&response))) return error.CreateFailed;
         var byte: [1]u8 = undefined;
         const released = readAll(sync.go_fd, &byte);
         closeFd(sync.go_fd);
@@ -3935,7 +4053,8 @@ fn setupRootfs(rootfs: [:0]const u8, mounts: []const PreparedMount, devices: []c
     if (options.console_fd) |socket| {
         defer closeFd(socket);
         setupConsole(socket) catch |err| {
-            childError("igvano: cannot set up console (requires devpts mounted at /dev/pts): ", err);
+            childError("cannot set up console (requires devpts mounted at /dev/pts): ", err);
+            if (options.runtime_sync) |sync| failCreate(sync.ready_fd, err);
             linux.exit_group(1);
         };
     }
@@ -3979,23 +4098,22 @@ fn runInit(
     if (flags & linux.CLONE.NEWUTS != 0) {
         if (spec.hostname) |hostname| {
             // Zig 0.16 has no sethostname wrapper.
-            checkResult(linux.syscall2(.sethostname, @intFromPtr(hostname.ptr), hostname.len)) catch linux.exit_group(1);
+            checkResult(linux.syscall2(.sethostname, @intFromPtr(hostname.ptr), hostname.len)) catch |err| failCreate(ready_fd, err);
         }
     }
-    setupRootfs(rootfs, mounts, devices, symlinks, spec.root.readonly, rootfs_options) catch {
-        linux.exit_group(1);
-    };
-    checkResult(linux.chdir(cwd)) catch linux.exit_group(1);
+    setupRootfs(rootfs, mounts, devices, symlinks, spec.root.readonly, rootfs_options) catch |err| failCreate(ready_fd, err);
+    checkResult(linux.chdir(cwd)) catch |err| failCreate(ready_fd, err);
     if (spec.process) |process| {
         // Allow write-only reopen after setuid while keeping readers root-only.
         if (process.user.uid != 0 and !rootfs_options.fifo_writable)
-            checkResult(linux.fchmodat(fd_dir, fifo_name, 0o622)) catch linux.exit_group(1);
+            checkResult(linux.fchmodat(fd_dir, fifo_name, 0o622)) catch |err| failCreate(ready_fd, err);
         applyProcess(process, capabilities, rlimits) catch |err| {
-            childError("igvano: cannot apply process settings: ", err);
-            linux.exit_group(1);
+            childError("cannot apply process settings: ", err);
+            failCreate(ready_fd, err);
         };
     }
-    if (!writeAll(ready_fd, &.{1})) linux.exit_group(1);
+    var response: CreateResponse = .{};
+    if (!writeAll(ready_fd, std.mem.asBytes(&response))) linux.exit_group(1);
     closeFd(ready_fd);
 
     // O_WRONLY blocks until start opens a reader; the byte acknowledges that start.
@@ -4012,13 +4130,13 @@ fn runInit(
     // Opening the writer unblocks start. Acknowledge after hooks pass, then
     // retain the CLOEXEC writer so EOF confirms exec before start succeeds.
     hooks.run(start_hooks, start_hook_state) catch |err| {
-        childError("igvano: start hook failed: ", err);
+        childError("start hook failed: ", err);
         _ = writeAll(fd, &.{0});
         linux.exit_group(1);
     };
     if (!writeAll(fd, &.{1})) linux.exit_group(1);
     runProcess(spec, argv, envp) catch |err| {
-        childError("igvano: cannot execute process: ", err);
+        childError("cannot execute process: ", err);
         _ = writeAll(fd, &.{0});
         linux.exit_group(1);
     };
@@ -5018,6 +5136,64 @@ test "linux create reports child setup failures without leaving an init" {
         try std.testing.expectError(error.CreateFailed, implementation.backend().create(options));
         try std.testing.expectEqual(@as(?posix.fd_t, null), try walkCgroup(cgroup_root.fd, cgroup_path, false, &.{}));
     }
+}
+
+test "linux create retains the init child's rootfs diagnostic" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    try requireTestMountNamespace();
+    const allocator = std.testing.allocator;
+    const cgroup_root = openCgroupRoot() catch return error.SkipZigTest;
+    defer closeFd(cgroup_root.fd);
+    const cgroup_path = try std.fmt.allocPrint(allocator, "igvano-diagnostic-test-{d}", .{linux.getpid()});
+    defer allocator.free(cgroup_path);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "rootfs", .default_dir);
+    const base = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer allocator.free(base);
+    const absolute = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, base, allocator);
+    defer allocator.free(absolute);
+    const rootfs = try std.fs.path.join(allocator, &.{ absolute, "rootfs" });
+    defer allocator.free(rootfs);
+    const fifo = try std.fmt.allocPrintSentinel(allocator, "{s}/exec.fifo", .{absolute}, 0);
+    defer allocator.free(fifo);
+    try checkResult(linux.mknod(fifo, linux.S.IFIFO | 0o600, 0));
+    const spec: oci.Spec = .{
+        .ociVersion = "1.0.2",
+        .root = .{ .path = "rootfs" },
+        .linux = .{ .namespaces = &.{.{ .type = .mount }} },
+    };
+    var implementation: LinuxBackend = .{};
+    const backend = implementation.backend();
+    defer last_diagnostic_len = 0;
+    defer backend.delete(.{ .id = "diagnostic", .pid = 0, .starttime = "", .cgroup_path = cgroup_path }) catch {};
+    var options: Backend.CreateOptions = .{
+        .allocator = allocator,
+        .id = "diagnostic",
+        .rootfs = rootfs,
+        .exec_fifo = fifo,
+        .spec = &spec,
+        .cgroup_path = cgroup_path,
+        .mounts = &.{.{
+            .destination = "/proc",
+            .source = "proc",
+            .type = "igvano-missing-filesystem",
+            .flags = 0,
+            .propagation = 0,
+            .data = "",
+        }},
+    };
+    try std.testing.expectError(error.CreateFailed, backend.create(options));
+    try std.testing.expectEqualStrings(
+        "cannot prepare rootfs: mount /proc (igvano-missing-filesystem): CreateFailed",
+        backend.diagnostic().?,
+    );
+    // Hooks run after the first ready response; failure must survive cleanup
+    // after the runtime has already received the init's PID.
+    options.mounts = &.{};
+    options.create_hooks = &.{.{ .path = "/igvano-missing-create-hook" }};
+    try std.testing.expectError(error.HookFailed, backend.create(options));
+    try std.testing.expectEqualStrings("cannot prepare rootfs: create hooks: HookFailed", backend.diagnostic().?);
 }
 
 test "linux create accepts an empty rootfs and returns a live blocked init" {

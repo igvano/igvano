@@ -4,6 +4,22 @@ const oci = @import("igvano").oci;
 const backend_module = @import("igvano").backend;
 const Backend = backend_module.Backend;
 
+var backend_detail_buffer: [512]u8 = undefined;
+var last_backend_detail: ?[]const u8 = null;
+
+// Copy failed-operation detail before cleanup can change the backend's buffer.
+fn backendResult(backend: Backend, result: anytype) @TypeOf(result) {
+    last_backend_detail = null;
+    return result catch |err| {
+        if (backend.diagnostic()) |detail| {
+            const len = @min(detail.len, backend_detail_buffer.len);
+            @memcpy(backend_detail_buffer[0..len], detail[0..len]);
+            last_backend_detail = backend_detail_buffer[0..len];
+        }
+        return err;
+    };
+}
+
 pub const default_root = "/run/igvano";
 
 const Subcommand = enum {
@@ -411,7 +427,13 @@ fn createContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, c
         .rootfs_propagation = if (settings.rootfsPropagation) |mode| oci.rootfsPropagation(mode) else null,
         .on_create = .{ .ptr = &create_context, .run = CreateContext.run },
     });
-    const handle = created catch |err| return create_context.failure orelse err;
+    const handle = backendResult(backend, created) catch |err| {
+        if (create_context.failure) |failure| {
+            last_backend_detail = null;
+            return failure;
+        }
+        return err;
+    };
     defer allocator.free(handle.starttime);
     errdefer cleanup: {
         if (lock) |file| requireLinkedLock(io, file) catch break :cleanup;
@@ -663,7 +685,7 @@ fn recoverLiveState(allocator: std.mem.Allocator, io: std.Io, backend: Backend, 
             error.InvalidState => if (parsed.value.status == .creating) null else return err,
             else => return err,
         };
-        if (handle == null or !try backend.alive(handle.?)) {
+        if (handle == null or !try backendResult(backend, backend.alive(handle.?))) {
             parsed.value.status = .stopped;
             if (persist_recovery) try oci.saveState(allocator, io, config.root, parsed.value);
         }
@@ -687,6 +709,8 @@ fn startContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, co
     const path = try std.fs.path.join(allocator, &.{ config.root, config.id, oci.exec_fifo_name });
     defer allocator.free(path);
     runHooks(allocator, if (saved_hooks) |entries| entries.value.prestart else null, state.parsed.value) catch |err| {
+        // Cleanup failures must not add backend detail to this frontend failure.
+        defer last_backend_detail = null;
         if (lock) |file| requireLinkedLock(io, file) catch return err;
         stopContainer(io, backend, state.handle) catch |cleanup_err|
             std.debug.print("igvano: warning: cannot stop container after prestart failure: {s}\n", .{@errorName(cleanup_err)});
@@ -731,7 +755,7 @@ fn waitForStart(allocator: std.mem.Allocator, io: std.Io, backend: Backend, hand
         defer allocator.free(path_z);
         const started = std.Io.Clock.awake.now(io);
         const fd: std.posix.fd_t = open: while (true) {
-            try requireStartWait(try backend.alive(handle), started.untilNow(io, .awake));
+            try requireStartWait(try backendResult(backend, backend.alive(handle)), started.untilNow(io, .awake));
             const result = linux.open(path_z, .{ .ACCMODE = .RDONLY, .NONBLOCK = true, .CLOEXEC = true }, 0);
             switch (linux.errno(result)) {
                 .SUCCESS => break :open @intCast(result),
@@ -746,7 +770,7 @@ fn waitForStart(allocator: std.mem.Allocator, io: std.Io, backend: Backend, hand
         var writer_seen = false;
         var acked = false;
         while (true) {
-            const is_alive = try backend.alive(handle);
+            const is_alive = try backendResult(backend, backend.alive(handle));
             const result = linux.read(fd, &byte, byte.len);
             switch (linux.errno(result)) {
                 .SUCCESS => {
@@ -792,9 +816,9 @@ fn killContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, con
     if (config.all) {
         if (state.handle == null)
             state.handle = try stateHandle(allocator, io, config.root, state.parsed.value);
-        try backend.killAll(state.handle.?, signal);
+        try backendResult(backend, backend.killAll(state.handle.?, signal));
     } else {
-        try backend.kill(state.handle.?, signal);
+        try backendResult(backend, backend.kill(state.handle.?, signal));
     }
 }
 
@@ -804,13 +828,13 @@ fn requireDelete(status: oci.Status, force: bool) !void {
 
 fn stopContainer(io: std.Io, backend: Backend, handle: ?Backend.Handle) !void {
     if (handle) |value| {
-        if (try backend.alive(value)) {
-            backend.kill(value, 9) catch |err| switch (err) {
+        if (try backendResult(backend, backend.alive(value))) {
+            backendResult(backend, backend.kill(value, 9)) catch |err| switch (err) {
                 error.ProcessNotFound => {},
                 else => return err,
             };
             const started = std.Io.Clock.awake.now(io);
-            while (try backend.alive(value)) {
+            while (try backendResult(backend, backend.alive(value))) {
                 if (started.untilNow(io, .awake).nanoseconds >= std.Io.Duration.fromSeconds(1).nanoseconds) {
                     std.debug.print("igvano: warning: container init still alive 1s after SIGKILL\n", .{});
                     break;
@@ -882,7 +906,7 @@ fn destroyContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, 
     defer if (state.handle == null) {
         if (rootfs_mount) |mount| allocator.free(mount.path);
     };
-    try backend.delete(state.handle orelse .{
+    try backendResult(backend, backend.delete(state.handle orelse .{
         .id = state.parsed.value.id,
         .pid = state.parsed.value.pid orelse 0,
         .starttime = "",
@@ -890,7 +914,7 @@ fn destroyContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, 
         .rootfs_mount = if (rootfs_mount) |mount| mount.path else null,
         .rootfs_mount_id = if (rootfs_mount) |mount| mount.mount_id_unique else null,
         .rootfs_mount_boot_id = if (rootfs_mount) |mount| mount.boot_id else null,
-    });
+    }));
     state.parsed.value.status = .stopped;
     const path = try std.fs.path.join(allocator, &.{ config.root, config.id });
     defer allocator.free(path);
@@ -957,7 +981,7 @@ pub fn main(init: std.process.Init) !u8 {
         };
         var buffer: [256]u8 = undefined;
         const line = std.fmt.bufPrint(&buffer, "igvano: {s}", .{message}) catch unreachable;
-        emitError(allocator, init.io, log, log_format, line);
+        emitError(allocator, init.io, log, log_format, line, null);
         std.debug.print(
             "Usage: igvano [--root <dir>] [--log <file>] [--log-format text|json] <state|start> <id>\n" ++
                 "       igvano [--root <dir>] [--log <file>] [--log-format text|json] delete [--force] <id>\n" ++
@@ -969,6 +993,7 @@ pub fn main(init: std.process.Init) !u8 {
     };
     var implementation: backend_module.LinuxBackend = .{};
     const backend = implementation.backend();
+    last_backend_detail = null;
     const result = switch (config.subcommand) {
         .state => stateContainer(allocator, init.io, backend, config),
         .create => createContainer(allocator, init.io, backend, config),
@@ -977,13 +1002,13 @@ pub fn main(init: std.process.Init) !u8 {
         .delete => deleteContainer(allocator, init.io, backend, config),
     };
     result catch |err| {
-        reportError(allocator, init.io, config, err);
+        reportError(allocator, init.io, last_backend_detail, config, err);
         return 1;
     };
     return 0;
 }
 
-fn reportError(allocator: std.mem.Allocator, io: std.Io, config: Config, err: anyerror) void {
+fn reportError(allocator: std.mem.Allocator, io: std.Io, diagnostic: ?[]const u8, config: Config, err: anyerror) void {
     const message = (if (err == error.FileNotFound)
         std.fmt.allocPrint(allocator, "igvano: container '{s}' or a required file does not exist", .{config.id})
     else if (err == error.ContainerExists)
@@ -1002,14 +1027,21 @@ fn reportError(allocator: std.mem.Allocator, io: std.Io, config: Config, err: an
         return;
     };
     defer allocator.free(message);
-    emitError(allocator, io, config.log, config.log_format, message);
+    emitError(allocator, io, config.log, config.log_format, message, diagnostic);
 }
 
-fn emitError(allocator: std.mem.Allocator, io: std.Io, log: ?[]const u8, log_format: LogFormat, message: []const u8) void {
+fn emitError(allocator: std.mem.Allocator, io: std.Io, log: ?[]const u8, log_format: LogFormat, message: []const u8, diagnostic: ?[]const u8) void {
     std.debug.print("{s}\n", .{message});
-    if (log) |path| appendErrorLog(allocator, io, path, log_format, message) catch |err| {
-        std.debug.print("igvano: warning: cannot write log '{s}': {s}\n", .{ path, @errorName(err) });
-    };
+    if (log) |path| {
+        const detailed = if (diagnostic) |detail|
+            std.fmt.allocPrint(allocator, "{s}: {s}", .{ message, detail }) catch null
+        else
+            null;
+        defer if (detailed) |bytes| allocator.free(bytes);
+        appendErrorLog(allocator, io, path, log_format, detailed orelse message) catch |err| {
+            std.debug.print("igvano: warning: cannot write log '{s}': {s}\n", .{ path, @errorName(err) });
+        };
+    }
 }
 
 fn appendErrorLog(allocator: std.mem.Allocator, io: std.Io, path: []const u8, log_format: LogFormat, message: []const u8) !void {
@@ -1984,6 +2016,82 @@ test "argument parsing preserves log settings on later failures" {
     try std.testing.expectError(error.InvalidLogFormat, parseArgsWithLog(&.{ "igvano", "--log=runtime.log", "--log-format=bad" }, &log, &log_format));
     try std.testing.expectEqualStrings("runtime.log", log.?);
     try std.testing.expectEqual(LogFormat.text, log_format);
+}
+
+test "reportError includes backend diagnostic in the JSON log" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "runtime.log" });
+    defer std.testing.allocator.free(path);
+    const config: Config = .{ .root = "/unused", .subcommand = .create, .id = "example", .log = path, .log_format = .json };
+    reportError(std.testing.allocator, std.testing.io, null, config, error.Unsupported);
+    reportError(std.testing.allocator, std.testing.io, "mounting cgroup v1 hierarchies inside the container is not implemented yet", config, error.Unsupported);
+    const bytes = try tmp.dir.readFileAlloc(std.testing.io, "runtime.log", std.testing.allocator, .limited(4096));
+    defer std.testing.allocator.free(bytes);
+    var lines = std.mem.tokenizeScalar(u8, bytes, '\n');
+    for ([_][]const u8{
+        "igvano: create for 'example' failed: Unsupported",
+        "igvano: create for 'example' failed: Unsupported: mounting cgroup v1 hierarchies inside the container is not implemented yet",
+    }) |expected| {
+        const parsed = try std.json.parseFromSlice(struct { level: []const u8, msg: []const u8 }, std.testing.allocator, lines.next().?, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings("error", parsed.value.level);
+        try std.testing.expectEqualStrings(expected, parsed.value.msg);
+    }
+    try std.testing.expect(lines.next() == null);
+}
+
+test "backend error detail survives cleanup overwriting the borrowed buffer" {
+    last_backend_detail = null;
+    defer last_backend_detail = null;
+    var detail = "original create failure".*;
+    var implementation: LockTestBackend = .{ .detail = &detail };
+    const backend: Backend = .{ .ptr = &implementation, .vtable = &LockTestBackend.vtable };
+    const spec: oci.Spec = .{ .ociVersion = "1.0.2", .root = .{ .path = "rootfs" } };
+    try std.testing.expectError(error.NotImplemented, backendResult(backend, backend.create(.{
+        .allocator = std.testing.allocator,
+        .id = "example",
+        .rootfs = "/bundle/rootfs",
+        .exec_fifo = "/runtime/example/exec.fifo",
+        .spec = &spec,
+    })));
+    const handle: Backend.Handle = .{ .id = "example", .pid = 1234, .starttime = "alive" };
+    @memset(&detail, 'x');
+    backend.kill(handle, 9) catch {};
+    backend.delete(handle) catch {};
+    try std.testing.expectEqualStrings("original create failure", last_backend_detail.?);
+    try backendResult(backend, backend.delete(handle));
+    try std.testing.expect(last_backend_detail == null);
+}
+
+test "frontend failure after successful liveness does not log stale backend detail" {
+    last_backend_detail = null;
+    defer last_backend_detail = null;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "example", .default_dir);
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer std.testing.allocator.free(root);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ root, "runtime.log" });
+    defer std.testing.allocator.free(path);
+    try oci.saveState(std.testing.allocator, std.testing.io, root, .{
+        .id = "example",
+        .status = .created,
+        .pid = 1234,
+        .bundle = "/bundle",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "example/starttime", .data = "alive" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "example/process", .data = "false\n" });
+    var implementation: LockTestBackend = .{ .detail = "stale backend failure" };
+    const backend: Backend = .{ .ptr = &implementation, .vtable = &LockTestBackend.vtable };
+    const config: Config = .{ .root = root, .subcommand = .start, .id = "example", .log = path };
+    startContainer(std.testing.allocator, std.testing.io, backend, config) catch |err| {
+        try std.testing.expectEqual(error.MissingProcess, err);
+        reportError(std.testing.allocator, std.testing.io, last_backend_detail, config, err);
+    };
+    const bytes = try tmp.dir.readFileAlloc(std.testing.io, "runtime.log", std.testing.allocator, .limited(4096));
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expectEqualStrings("igvano: start for 'example' failed: MissingProcess\n", bytes);
 }
 
 test "json error logs append escaped messages and RFC3339 UTC timestamps" {
@@ -3027,8 +3135,9 @@ const LockTestBackend = struct {
     create_pid: ?i32 = null,
     fail_create: bool = false,
     killed: bool = false,
+    detail: ?[]const u8 = null,
 
-    const vtable: Backend.VTable = .{ .create = create, .alive = alive, .kill = kill, .killAll = kill, .delete = delete };
+    const vtable: Backend.VTable = .{ .create = create, .alive = alive, .kill = kill, .killAll = kill, .delete = delete, .diagnostic = diagnostic };
     fn create(ptr: *anyopaque, options: Backend.CreateOptions) Backend.Error!Backend.Handle {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         const handle: Backend.Handle = .{ .id = options.id, .pid = self.create_pid orelse return error.NotImplemented, .starttime = "alive" };
@@ -3045,6 +3154,10 @@ const LockTestBackend = struct {
         self.killed = true;
     }
     fn delete(_: *anyopaque, _: Backend.Handle) Backend.Error!void {}
+    fn diagnostic(ptr: *anyopaque) ?[]const u8 {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return self.detail;
+    }
 };
 
 const LockTestProcess = struct {
