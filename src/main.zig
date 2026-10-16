@@ -460,6 +460,7 @@ fn createContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, c
     var mount_arena: std.heap.ArenaAllocator = .init(allocator);
     defer mount_arena.deinit();
     const mount_allocator = mount_arena.allocator();
+    const settings: oci.Spec.Linux = parsed.value.linux orelse .{};
     const spec_mounts = parsed.value.mounts orelse &.{};
     const mounts = try mount_allocator.alloc(Backend.Mount, spec_mounts.len);
     for (spec_mounts, mounts) |mount, *prepared| {
@@ -475,9 +476,9 @@ fn createContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, c
             .propagation = options.propagation,
             .data = options.data,
             .recursive_readonly = options.recursive_readonly,
+            .mappings = try oci.mountMappings(mount_allocator, mount, settings),
         };
     }
-    const settings: oci.Spec.Linux = parsed.value.linux orelse .{};
     const seccomp_config = try oci.prepareSeccomp(allocator, settings.seccomp);
     defer oci.freeSeccomp(allocator, seccomp_config);
     const sysctls = try oci.prepareSysctls(mount_allocator, settings);
@@ -4067,6 +4068,11 @@ test "create with inherited mount isolation persists backend resources and rolls
                 bind.flags != (std.os.linux.MS.BIND | std.os.linux.MS.RDONLY) or
                 bind.propagation != (std.os.linux.MS.PRIVATE | std.os.linux.MS.REC))
                 return error.InvalidConfig;
+            const mappings = bind.mappings orelse return error.InvalidConfig;
+            if (mappings.uid.len != 1 or mappings.gid.len != 1 or mappings.recursive or
+                !std.meta.eql(mappings.uid[0], Backend.IDMapping{ .container_id = 1000, .host_id = 0, .size = 1 }) or
+                !std.meta.eql(mappings.gid[0], Backend.IDMapping{ .container_id = 2000, .host_id = 0, .size = 1 }))
+                return error.InvalidConfig;
             const proc = options.mounts[1];
             if (!std.mem.eql(u8, proc.destination, "/proc") or
                 !std.mem.eql(u8, proc.source orelse return error.InvalidConfig, "proc") or
@@ -4142,7 +4148,7 @@ test "create with inherited mount isolation persists backend resources and rolls
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "bundle/config.json",
         .data =
-        \\{"ociVersion":"9.9.9","root":{"path":"rootfs"},"linux":{"cgroupsPath":"/custom/test","devices":[{"path":"/dev/null","type":"c","major":1,"minor":3,"fileMode":384,"uid":1000,"gid":1001}],"resources":{"memory":{"limit":33554432},"pids":{"limit":5}}},"process":{"args":["/bin/sh"],"cwd":"/","user":{"uid":1000,"gid":1000},"capabilities":{"bounding":["CAP_CHOWN","CAP_BPF"],"effective":["CAP_CHOWN"],"inheritable":["CAP_CHOWN"],"permitted":["CAP_CHOWN"],"ambient":["CAP_CHOWN"]},"rlimits":[{"type":"RLIMIT_NOFILE","hard":1024,"soft":512}],"oomScoreAdj":100},"mounts":[{"destination":"/a/../mnt","type":"bind","source":"source","options":["ro","rprivate"]},{"destination":"/proc","type":"proc","source":"proc","options":["nosuid","mode=755"]}],"annotations":{"org.example.description":"hello"}}
+        \\{"ociVersion":"9.9.9","root":{"path":"rootfs"},"linux":{"cgroupsPath":"/custom/test","devices":[{"path":"/dev/null","type":"c","major":1,"minor":3,"fileMode":384,"uid":1000,"gid":1001}],"resources":{"memory":{"limit":33554432},"pids":{"limit":5}}},"process":{"args":["/bin/sh"],"cwd":"/","user":{"uid":1000,"gid":1000},"capabilities":{"bounding":["CAP_CHOWN","CAP_BPF"],"effective":["CAP_CHOWN"],"inheritable":["CAP_CHOWN"],"permitted":["CAP_CHOWN"],"ambient":["CAP_CHOWN"]},"rlimits":[{"type":"RLIMIT_NOFILE","hard":1024,"soft":512}],"oomScoreAdj":100},"mounts":[{"destination":"/a/../mnt","type":"bind","source":"source","options":["ro","rprivate"],"uidMappings":[{"containerID":1000,"hostID":0,"size":1}],"gidMappings":[{"containerID":2000,"hostID":0,"size":1}]},{"destination":"/proc","type":"proc","source":"proc","options":["nosuid","mode=755"]}],"annotations":{"org.example.description":"hello"}}
         ,
     });
     const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });

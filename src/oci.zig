@@ -389,6 +389,8 @@ pub const Spec = struct {
         type: ?[]const u8 = null,
         source: ?[]const u8 = null,
         options: ?[]const []const u8 = null,
+        uidMappings: ?[]const IDMapping = null,
+        gidMappings: ?[]const IDMapping = null,
     };
 
     pub const Linux = struct {
@@ -1820,6 +1822,7 @@ pub const mount_option_table = options: {
         clear: u32 = 0,
         propagation: u32 = 0,
         recursive_readonly: ?bool = null,
+        idmap: ?bool = null,
     }{
         .{ .name = "defaults" },
         .{ .name = "ro", .set = ms.RDONLY },
@@ -1851,6 +1854,8 @@ pub const mount_option_table = options: {
         .{ .name = "runbindable", .propagation = ms.UNBINDABLE | ms.REC },
         .{ .name = "rro", .recursive_readonly = true },
         .{ .name = "rrw", .recursive_readonly = false },
+        .{ .name = "idmap", .idmap = false },
+        .{ .name = "ridmap", .idmap = true },
     };
 };
 
@@ -1932,6 +1937,76 @@ pub fn validateIDMappings(mappings: []const Spec.IDMapping) error{InvalidConfig}
     }
 }
 
+const MountMappingConfig = struct {
+    uid: []const Spec.IDMapping = &.{},
+    gid: []const Spec.IDMapping = &.{},
+    userns_path: ?[]const u8 = null,
+    recursive: bool = false,
+};
+
+fn mountMappingConfig(mount: Spec.Mount, settings: Spec.Linux) !?MountMappingConfig {
+    var bind = mount.type != null and std.mem.eql(u8, mount.type.?, "bind");
+    var recursive: ?bool = null;
+    for (mount.options orelse &.{}) |option| {
+        if (std.mem.eql(u8, option, "bind") or std.mem.eql(u8, option, "rbind")) bind = true;
+        for (mount_option_table) |entry| {
+            if (std.mem.eql(u8, option, entry.name) and entry.idmap != null) recursive = entry.idmap;
+        }
+    }
+    const explicit = mount.uidMappings != null or mount.gidMappings != null;
+    if (!explicit and recursive == null) return null;
+    if (!bind) {
+        std.debug.print("igvano: idmapped mount '{s}' must be a bind mount\n", .{mount.destination});
+        return error.InvalidConfig;
+    }
+    var config: MountMappingConfig = .{ .recursive = recursive orelse false };
+    if (explicit) {
+        config.uid = mount.uidMappings orelse &.{};
+        config.gid = mount.gidMappings orelse &.{};
+    } else {
+        for (settings.namespaces orelse &.{}) |namespace| {
+            if (namespace.type != .user) continue;
+            if (namespace.path) |path| {
+                config.userns_path = path;
+                return config;
+            }
+            config.uid = settings.uidMappings orelse &.{};
+            config.gid = settings.gidMappings orelse &.{};
+            break;
+        }
+    }
+    if (config.uid.len == 0 or config.gid.len == 0) {
+        std.debug.print("igvano: idmapped mount '{s}' requires both uid and gid mappings\n", .{mount.destination});
+        return error.InvalidConfig;
+    }
+    for ([_][]const Spec.IDMapping{ config.uid, config.gid }) |mappings| {
+        validateIDMappings(mappings) catch |err| {
+            std.debug.print("igvano: invalid ID mappings for mount '{s}'\n", .{mount.destination});
+            return err;
+        };
+    }
+    return config;
+}
+
+/// Translate to backend-owned types; the caller owns both mapping slices.
+pub fn mountMappings(allocator: std.mem.Allocator, mount: Spec.Mount, settings: Spec.Linux) !?Backend.MountMappings {
+    const config = (try mountMappingConfig(mount, settings)) orelse return null;
+    const uid = try backendIDMappings(allocator, config.uid);
+    errdefer allocator.free(uid);
+    const gid = try backendIDMappings(allocator, config.gid);
+    return .{ .uid = uid, .gid = gid, .userns_path = config.userns_path, .recursive = config.recursive };
+}
+
+fn backendIDMappings(allocator: std.mem.Allocator, mappings: []const Spec.IDMapping) ![]Backend.IDMapping {
+    const result = try allocator.alloc(Backend.IDMapping, mappings.len);
+    for (mappings, result) |mapping, *converted| converted.* = .{
+        .container_id = mapping.containerID,
+        .host_id = mapping.hostID,
+        .size = mapping.size,
+    };
+    return result;
+}
+
 /// Omitted namespace types are inherited from the runtime.
 pub fn requireCreate(spec: Spec) !void {
     _ = std.SemanticVersion.parse(spec.ociVersion) catch return error.InvalidConfig;
@@ -1964,7 +2039,10 @@ pub fn requireCreate(spec: Spec) !void {
     }
     if (spec.root.path.len == 0) return error.InvalidConfig;
     if (spec.process) |process| try validateProcess(process);
-    for (spec.mounts orelse &.{}) |mount| try validateMountDestination(mount.destination);
+    for (spec.mounts orelse &.{}) |mount| {
+        try validateMountDestination(mount.destination);
+        _ = try mountMappingConfig(mount, settings);
+    }
     for (settings.maskedPaths orelse &.{}) |path| try validateMountDestination(path);
     for (settings.readonlyPaths orelse &.{}) |path| try validateMountDestination(path);
 }
@@ -2307,12 +2385,105 @@ pub fn featuresJson(allocator: std.mem.Allocator) ![]u8 {
             .apparmor = .{ .enabled = true },
             .selinux = .{ .enabled = false },
             .intelRdt = .{ .enabled = false },
-            .mountExtensions = .{ .idmap = .{ .enabled = false } },
+            .mountExtensions = .{ .idmap = .{ .enabled = true } },
         },
     }, .{});
 }
 
-test "features JSON reports parser tables and disables unimplemented isolation" {
+test "mount ID mappings parse without being silently ignored" {
+    const parsed = try std.json.parseFromSlice(Spec, std.testing.allocator,
+        \\{"ociVersion":"1.2.0","root":{"path":"rootfs"},"mounts":[{
+        \\"destination":"/data","source":"/host","options":["bind"],
+        \\"uidMappings":[{"containerID":100000,"hostID":0,"size":1}],
+        \\"gidMappings":[{"containerID":200000,"hostID":0,"size":1}]}]}
+    , .{});
+    defer parsed.deinit();
+    try requireCreate(parsed.value);
+}
+
+test "create rejects incomplete non-bind and invalid mount ID mappings" {
+    for ([_][]const u8{
+        \\{"destination":"/data","type":"tmpfs","uidMappings":[{"containerID":0,"hostID":1000,"size":1}],"gidMappings":[{"containerID":0,"hostID":1000,"size":1}]}
+        ,
+        \\{"destination":"/data","source":"/host","options":["bind"],"uidMappings":[{"containerID":0,"hostID":1000,"size":1}]}
+        ,
+        \\{"destination":"/data","source":"/host","options":["bind"],"gidMappings":[{"containerID":0,"hostID":1000,"size":1}]}
+        ,
+        \\{"destination":"/data","source":"/host","options":["bind"],"uidMappings":[],"gidMappings":[]}
+        ,
+        \\{"destination":"/data","source":"/host","options":["bind"],"uidMappings":[{"containerID":0,"hostID":1000,"size":0}],"gidMappings":[{"containerID":0,"hostID":1000,"size":1}]}
+        ,
+        \\{"destination":"/data","source":"/host","options":["bind","idmap"]}
+        ,
+        \\{"destination":"/data","type":"tmpfs","options":["ridmap"]}
+        ,
+    }) |mount| {
+        const json = try std.fmt.allocPrint(std.testing.allocator, "{{\"ociVersion\":\"1.2.0\",\"root\":{{\"path\":\"rootfs\"}},\"mounts\":[{s}]}}", .{mount});
+        defer std.testing.allocator.free(json);
+        const parsed = try std.json.parseFromSlice(Spec, std.testing.allocator, json, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        try std.testing.expectError(error.InvalidConfig, requireCreate(parsed.value));
+    }
+}
+
+test "idmap and ridmap are runtime mount options" {
+    for ([_][]const u8{ "idmap", "ridmap" }) |option| {
+        const parsed = try parseMountOptions(std.testing.allocator, &.{option}, null);
+        defer std.testing.allocator.free(parsed.data);
+        try std.testing.expectEqualStrings("", parsed.data);
+    }
+}
+
+test "mount mapping translation selects explicit container and joined namespace mappings" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const settings: Spec.Linux = .{
+        .namespaces = &.{.{ .type = .user }},
+        .uidMappings = &.{.{ .containerID = 0, .hostID = 100000, .size = 65536 }},
+        .gidMappings = &.{.{ .containerID = 0, .hostID = 200000, .size = 65536 }},
+    };
+    var mount: Spec.Mount = .{ .destination = "/data", .source = "/host", .type = "bind" };
+    try std.testing.expectEqual(@as(?Backend.MountMappings, null), try mountMappings(arena.allocator(), mount, settings));
+    mount.options = &.{ "rbind", "ridmap", "idmap" };
+    const container = (try mountMappings(arena.allocator(), mount, settings)).?;
+    try std.testing.expect(!container.recursive);
+    try std.testing.expectEqualDeep(Backend.IDMapping{ .container_id = 0, .host_id = 100000, .size = 65536 }, container.uid[0]);
+    try std.testing.expectEqualDeep(Backend.IDMapping{ .container_id = 0, .host_id = 200000, .size = 65536 }, container.gid[0]);
+    mount.options = &.{ "idmap", "ridmap" };
+    mount.uidMappings = &.{.{ .containerID = 100000, .hostID = 0, .size = 1 }};
+    mount.gidMappings = &.{.{ .containerID = 200000, .hostID = 0, .size = 1 }};
+    const explicit = (try mountMappings(arena.allocator(), mount, settings)).?;
+    try std.testing.expect(explicit.recursive);
+    try std.testing.expectEqualDeep(Backend.IDMapping{ .container_id = 100000, .host_id = 0, .size = 1 }, explicit.uid[0]);
+    try std.testing.expectEqualDeep(Backend.IDMapping{ .container_id = 200000, .host_id = 0, .size = 1 }, explicit.gid[0]);
+    // Explicit mappings also work without any container user namespace.
+    _ = try mountMappings(arena.allocator(), mount, .{});
+    mount.uidMappings = null;
+    mount.gidMappings = null;
+    const joined = (try mountMappings(arena.allocator(), mount, .{ .namespaces = &.{.{ .type = .user, .path = "/proc/123/ns/user" }} })).?;
+    try std.testing.expectEqualStrings("/proc/123/ns/user", joined.userns_path.?);
+    try std.testing.expectEqual(@as(usize, 0), joined.uid.len);
+    try std.testing.expectEqual(@as(usize, 0), joined.gid.len);
+    try std.testing.expect(joined.recursive);
+}
+
+test "mount mapping translation frees partial allocations" {
+    const Check = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            const result = (try mountMappings(allocator, .{
+                .destination = "/data",
+                .type = "bind",
+                .uidMappings = &.{.{ .containerID = 0, .hostID = 1000, .size = 1 }},
+                .gidMappings = &.{.{ .containerID = 0, .hostID = 1000, .size = 1 }},
+            }, .{})).?;
+            defer allocator.free(result.uid);
+            defer allocator.free(result.gid);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+}
+
+test "features JSON reports parser tables and supported isolation" {
     const allocator = std.testing.allocator;
     const json = try featuresJson(allocator);
     defer allocator.free(json);
@@ -2324,6 +2495,8 @@ test "features JSON reports parser tables and disables unimplemented isolation" 
     const reported_mounts = root.get("mountOptions").?.array.items;
     try std.testing.expectEqual(mount_option_table.len, reported_mounts.len);
     var has_rro = false;
+    var has_idmap = false;
+    var has_ridmap = false;
     for (mount_option_table, reported_mounts) |entry, reported| {
         try std.testing.expectEqualStrings(entry.name, reported.string);
         const options = try parseMountOptions(allocator, &.{reported.string}, null);
@@ -2333,8 +2506,11 @@ test "features JSON reports parser tables and disables unimplemented isolation" 
             has_rro = true;
             try std.testing.expectEqual(@as(?bool, true), options.recursive_readonly);
         }
+        if (std.mem.eql(u8, reported.string, "idmap")) has_idmap = true;
+        if (std.mem.eql(u8, reported.string, "ridmap")) has_ridmap = true;
     }
     try std.testing.expect(has_rro);
+    try std.testing.expect(has_idmap and has_ridmap);
     const hooks = root.get("hooks").?.array.items;
     const hook_names = std.meta.fieldNames(Spec.Hooks);
     try std.testing.expectEqual(hook_names.len, hooks.len);
@@ -2344,6 +2520,11 @@ test "features JSON reports parser tables and disables unimplemented isolation" 
     const namespace_names = std.meta.fieldNames(@FieldType(Spec.Namespace, "type"));
     try std.testing.expectEqual(namespace_names.len, namespaces.len);
     for (namespace_names, namespaces) |name, reported| try std.testing.expectEqualStrings(name, reported.string);
+    var has_user = false;
+    for (namespaces) |namespace| {
+        if (std.mem.eql(u8, namespace.string, "user")) has_user = true;
+    }
+    try std.testing.expect(has_user);
     const caps = linux.get("capabilities").?.array.items;
     try std.testing.expectEqual(capability_names.len, caps.len);
     for (capability_names, caps, 0..) |name, reported, number| {
@@ -2390,7 +2571,7 @@ test "features JSON reports parser tables and disables unimplemented isolation" 
     try std.testing.expect(linux.get("apparmor").?.object.get("enabled").?.bool);
     for ([_][]const u8{ "selinux", "intelRdt" }) |name|
         try std.testing.expect(!linux.get(name).?.object.get("enabled").?.bool);
-    try std.testing.expect(!linux.get("mountExtensions").?.object.get("idmap").?.object.get("enabled").?.bool);
+    try std.testing.expect(linux.get("mountExtensions").?.object.get("idmap").?.object.get("enabled").?.bool);
 }
 
 test "loadSpec accepts version strings and create validates semantic version syntax" {

@@ -190,6 +190,21 @@ pub const Backend = struct {
         propagation: u32,
         data: []const u8,
         recursive_readonly: ?bool = null,
+        mappings: ?MountMappings = null,
+    };
+
+    pub const IDMapping = struct {
+        container_id: u32,
+        host_id: u32,
+        size: u32,
+    };
+
+    /// Borrowed mappings, or an existing namespace whose mappings should be used.
+    pub const MountMappings = struct {
+        uid: []const IDMapping = &.{},
+        gid: []const IDMapping = &.{},
+        userns_path: ?[]const u8 = null,
+        recursive: bool = false,
     };
 
     /// The id is borrowed. create() allocates starttime with the supplied allocator;
