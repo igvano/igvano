@@ -1012,24 +1012,150 @@ test "locked atime modes are inherited only when absent and conflicts are reject
     try std.testing.expectError(error.InvalidConfig, lockedMountFlags(ms.NOATIME, 0));
 }
 
-/// Pure filesystem selection; mount flags, including read-only, stay unchanged.
+/// Legacy cgroup mounts are expanded during parent-side mount preparation.
 pub fn cgroupMountType(mount_type: []const u8, host_fs_type: usize) Backend.Error![]const u8 {
     if (!std.mem.eql(u8, mount_type, "cgroup") and !std.mem.eql(u8, mount_type, "cgroup2")) return mount_type;
     if (host_fs_type != 0x63677270) {
-        reportDiagnostic("mounting cgroup v1 hierarchies inside the container is not implemented yet", .{});
-        return error.Unsupported;
+        if (std.mem.eql(u8, mount_type, "cgroup2")) {
+            reportDiagnostic("cannot mount cgroup2 on a cgroup v1 host", .{});
+            return error.Unsupported;
+        }
+        return "cgroup";
     }
     return "cgroup2";
 }
 
+/// Strings and symlinks are owned by the caller's preparation arena.
+fn prepareMounts(allocator: std.mem.Allocator, mounts: []const Backend.Mount, host_fs_type: usize, hierarchies: []const V1Hierarchy, cgroup_path: []const u8) Backend.Error![]PreparedMount {
+    var prepared: std.ArrayList(PreparedMount) = .empty;
+    defer prepared.deinit(allocator);
+    for (mounts) |mount| {
+        if (!std.mem.startsWith(u8, mount.destination, "/")) return error.InvalidPath;
+        var mount_type = mount.type;
+        if (mount_type != null and mount.flags & linux.MS.BIND == 0)
+            mount_type = try cgroupMountType(mount_type.?, host_fs_type);
+        if (mount_type != null and std.mem.eql(u8, mount_type.?, "cgroup") and mount.flags & linux.MS.BIND == 0) {
+            const destination = try pathString(allocator, mount.destination);
+            try prepared.append(allocator, .{
+                .destination = destination,
+                .source = "tmpfs",
+                .type = "tmpfs",
+                .flags = mount.flags & ~@as(u32, linux.MS.RDONLY),
+                .propagation = mount.propagation,
+                .data = "mode=755",
+            });
+            var symlinks: std.ArrayList(Backend.Symlink) = .empty;
+            defer symlinks.deinit(allocator);
+            // ponytail: named hierarchies (name=systemd) are not exposed;
+            // discover and join them too if applications need that membership.
+            // ponytail: bind the leaf even with a cgroup namespace; runc mounts
+            // cgroupfs with subsystem options there. Use that if needed.
+            for (hierarchies) |hierarchy| {
+                const basename = std.fs.path.basename(hierarchy.mountpoint);
+                try prepared.append(allocator, .{
+                    .destination = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ destination, basename }, 0),
+                    .source = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ hierarchy.mountpoint, cgroup_path }, 0),
+                    .type = null,
+                    .flags = mount.flags | linux.MS.BIND,
+                    .propagation = 0,
+                    .data = "",
+                    .recursive_readonly = mount.recursive_readonly,
+                });
+                if (std.mem.indexOfScalar(u8, basename, ',') != null) {
+                    var names = std.mem.tokenizeScalar(u8, basename, ',');
+                    while (names.next()) |name| try symlinks.append(allocator, .{
+                        .path = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ destination, name }, 0),
+                        .target = try allocator.dupeZ(u8, basename),
+                    });
+                }
+            }
+            // Finish links after all bind targets exist, preserving any names
+            // already present, then make only the covering tmpfs readonly.
+            prepared.items[prepared.items.len - 1].symlinks = try symlinks.toOwnedSlice(allocator);
+            if (mount.flags & linux.MS.RDONLY != 0) try prepared.append(allocator, .{
+                .destination = destination,
+                .source = null,
+                .type = null,
+                .flags = mount.flags | linux.MS.REMOUNT,
+                .propagation = 0,
+                .data = "",
+            });
+            continue;
+        }
+        try prepared.append(allocator, .{
+            .destination = try pathString(allocator, mount.destination),
+            .source = if (mount.source) |source| try pathString(allocator, source) else null,
+            .type = if (mount_type) |value| try pathString(allocator, value) else null,
+            .flags = mount.flags,
+            .propagation = mount.propagation,
+            .data = try pathString(allocator, mount.data),
+            .recursive_readonly = mount.recursive_readonly,
+        });
+    }
+    return prepared.toOwnedSlice(allocator);
+}
+
 test "cgroup mounts map to cgroup2 only on unified hosts" {
+    defer last_diagnostic_len = 0;
     try std.testing.expectEqualStrings("cgroup2", try cgroupMountType("cgroup", 0x63677270));
     for ([_]usize{ 0x01021994, 0x27e0eb, 0 }) |host_fs_type| {
-        try std.testing.expectError(error.Unsupported, cgroupMountType("cgroup", host_fs_type));
+        try std.testing.expectEqualStrings("cgroup", try cgroupMountType("cgroup", host_fs_type));
     }
     try std.testing.expectEqualStrings("tmpfs", try cgroupMountType("tmpfs", 0x01021994));
     try std.testing.expectError(error.Unsupported, cgroupMountType("cgroup2", 0x01021994));
+    try std.testing.expect(std.mem.indexOf(u8, last_diagnostic[0..last_diagnostic_len], "cgroup2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, last_diagnostic[0..last_diagnostic_len], "v1") != null);
     try std.testing.expectEqualStrings("cgroup2", try cgroupMountType("cgroup2", 0x63677270));
+}
+
+test "v1 cgroup mount expansion binds leaves and links comounted controllers before readonly remount" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const hierarchies = try v1Hierarchies(allocator,
+        \\1 0 0:1 / /sys/fs/cgroup rw - tmpfs tmpfs rw
+        \\2 1 0:2 / /sys/fs/cgroup/cpu,cpuacct rw - cgroup cgroup rw,cpu,cpuacct
+        \\3 1 0:3 / /sys/fs/cgroup/memory rw - cgroup cgroup rw,memory
+        \\4 1 0:4 / /sys/fs/cgroup/systemd rw - cgroup cgroup rw,name=systemd
+        \\5 1 0:5 / /sys/fs/cgroup/unified rw - cgroup2 cgroup rw
+    );
+    const restrictions = linux.MS.NOSUID | linux.MS.NOEXEC | linux.MS.NODEV;
+    for ([_]bool{ false, true }) |readonly| {
+        const flags = restrictions | @as(u32, if (readonly) linux.MS.RDONLY else 0);
+        const mounts = try prepareMounts(allocator, &.{.{
+            .destination = "/custom/cgroups",
+            .source = "cgroup",
+            .type = "cgroup",
+            .flags = flags,
+            .propagation = linux.MS.PRIVATE,
+            .data = "",
+        }}, 0x01021994, hierarchies, "igvano/example");
+        try std.testing.expectEqual(@as(usize, if (readonly) 4 else 3), mounts.len);
+        try std.testing.expectEqualStrings("/custom/cgroups", mounts[0].destination);
+        try std.testing.expectEqualStrings("tmpfs", mounts[0].type.?);
+        try std.testing.expectEqualStrings("mode=755", mounts[0].data);
+        try std.testing.expectEqual(restrictions, mounts[0].flags);
+        try std.testing.expectEqual(@as(u32, linux.MS.PRIVATE), mounts[0].propagation);
+        for ([_]struct { source: []const u8, destination: []const u8 }{
+            .{ .source = "/sys/fs/cgroup/cpu,cpuacct/igvano/example", .destination = "/custom/cgroups/cpu,cpuacct" },
+            .{ .source = "/sys/fs/cgroup/memory/igvano/example", .destination = "/custom/cgroups/memory" },
+        }, mounts[1..3]) |expected, mount| {
+            try std.testing.expectEqualStrings(expected.source, mount.source.?);
+            try std.testing.expectEqualStrings(expected.destination, mount.destination);
+            try std.testing.expectEqual(flags | linux.MS.BIND, mount.flags);
+            try std.testing.expect(mount.type == null);
+        }
+        const links = mounts[2].symlinks;
+        try std.testing.expectEqual(@as(usize, 2), links.len);
+        try std.testing.expectEqualStrings("/custom/cgroups/cpu", links[0].path);
+        try std.testing.expectEqualStrings("/custom/cgroups/cpuacct", links[1].path);
+        for (links) |link| try std.testing.expectEqualStrings("cpu,cpuacct", link.target);
+        if (readonly) {
+            try std.testing.expectEqualStrings("/custom/cgroups", mounts[3].destination);
+            try std.testing.expectEqual(flags | linux.MS.REMOUNT, mounts[3].flags);
+            try std.testing.expect(mounts[3].source == null and mounts[3].type == null);
+        }
+    }
 }
 
 fn needsSetupDev(mounts: anytype) bool {
@@ -1268,23 +1394,9 @@ pub const LinuxBackend = struct {
             if (joined_user_namespace) try checkResult(linux.fchmodat(linux.AT.FDCWD, fifo, 0o622));
             const cgroup_root = try openCgroupRoot();
             defer closeFd(cgroup_root.fd);
-            const mounts = try allocator.alloc(PreparedMount, options.mounts.len);
-            for (options.mounts, mounts) |mount, *prepared| {
-                if (!std.mem.startsWith(u8, mount.destination, "/")) return error.InvalidPath;
-                var mount_type = mount.type;
-                if (mount_type != null and mount.flags & linux.MS.BIND == 0) {
-                    mount_type = try cgroupMountType(mount_type.?, cgroup_root.fs_type);
-                }
-                prepared.* = .{
-                    .destination = try pathString(allocator, mount.destination),
-                    .source = if (mount.source) |source| try pathString(allocator, source) else null,
-                    .type = if (mount_type) |value| try pathString(allocator, value) else null,
-                    .flags = mount.flags,
-                    .propagation = mount.propagation,
-                    .data = try pathString(allocator, mount.data),
-                    .recursive_readonly = mount.recursive_readonly,
-                };
-            }
+            const hierarchies: []V1Hierarchy = if (cgroup_root.mode == .legacy) try openV1Hierarchies(allocator) else &.{};
+            defer if (cgroup_root.mode == .legacy) freeV1Hierarchies(allocator, hierarchies);
+            const mounts = try prepareMounts(allocator, options.mounts, cgroup_root.fs_type, hierarchies, options.cgroup_path);
             const devices = try allocator.alloc(PreparedDevice, options.devices.len);
             for (options.devices, devices) |device, *prepared| {
                 if (!std.mem.startsWith(u8, device.path, "/") or
@@ -1323,8 +1435,6 @@ pub const LinuxBackend = struct {
             }
             const v1_writes: []const V1Write = if (cgroup_root.mode == .legacy) try v1Writes(allocator, options.resources, options.devices) else &.{};
             defer if (cgroup_root.mode == .legacy) freeV1Writes(allocator, v1_writes);
-            const hierarchies: []V1Hierarchy = if (cgroup_root.mode == .legacy) try openV1Hierarchies(allocator) else &.{};
-            defer if (cgroup_root.mode == .legacy) freeV1Hierarchies(allocator, hierarchies);
             const ignored_fields = if (cgroup_root.mode == .unified) try v2IgnoredFields(allocator, options.resources) else try allocator.dupe(u8, "");
             defer allocator.free(ignored_fields);
             if (ignored_fields.len != 0)
@@ -1361,6 +1471,8 @@ pub const LinuxBackend = struct {
                 else
                     .{ .before_create = before }) catch {};
             }
+            // Create every bind source before either fork; child1 joins these
+            // leaves before NEWCGROUP, and child2 mounts them during rootfs setup.
             for (hierarchies) |*hierarchy|
                 hierarchy.leaf = (try walkV1Cgroup(allocator, hierarchy.root.?, options.cgroup_path, true, hierarchy.has("cpuset"))).?;
             for (cgroup_writes) |write|
@@ -1716,7 +1828,7 @@ pub const LinuxBackend = struct {
                         }
                     }
                 }
-                if (members) |fd| try killV1Members(fd, freezer, signal);
+                if (members) |fd| try killV1Members(fd, freezer, signal, path);
                 return;
             }
             const cgroup = (try walkCgroup(root.fd, path, false, &.{})) orelse return;
@@ -1764,7 +1876,7 @@ pub const LinuxBackend = struct {
                 last_diagnostic_len = saved_len;
             }
             // The v1 helper also enumerates cgroup.procs without a freezer.
-            try killV1Members(cgroup, null, signal);
+            try killV1Members(cgroup, null, signal, path);
         } else {
             return error.NotImplemented;
         }
@@ -2298,12 +2410,18 @@ fn applyV1Writes(allocator: std.mem.Allocator, hierarchies: []const V1Hierarchy,
     }
 }
 
-fn killV1Members(dir: posix.fd_t, freezer: ?posix.fd_t, signal: i32) Backend.Error!void {
+fn killV1Members(dir: posix.fd_t, freezer: ?posix.fd_t, signal: i32, path: []const u8) Backend.Error!void {
     const allocator = std.heap.page_allocator;
     // Thaw even after a freeze timeout or a failed read/signal.
-    defer if (freezer) |fd| writeCgroupFile(fd, "freezer.state", "THAWED", "") catch {};
+    defer if (freezer) |fd| {
+        const saved_diagnostic = last_diagnostic;
+        const saved_len = last_diagnostic_len;
+        writeCgroupFile(fd, "freezer.state", "THAWED", path) catch {};
+        last_diagnostic = saved_diagnostic;
+        last_diagnostic_len = saved_len;
+    };
     if (freezer) |fd| {
-        try writeCgroupFile(fd, "freezer.state", "FROZEN", "");
+        try writeCgroupFile(fd, "freezer.state", "FROZEN", path);
         const delay: linux.timespec = .{ .sec = 0, .nsec = 10_000_000 };
         for (0..50) |_| {
             const state = try readCgroupFile(allocator, fd, "freezer.state");
@@ -2311,7 +2429,11 @@ fn killV1Members(dir: posix.fd_t, freezer: ?posix.fd_t, signal: i32) Backend.Err
             if (std.mem.eql(u8, std.mem.trim(u8, state, " \t\n"), "FROZEN")) break;
             _ = linux.nanosleep(&delay, null);
         } else {
-            writeCgroupFile(fd, "freezer.state", "THAWED", "") catch {};
+            const saved_diagnostic = last_diagnostic;
+            const saved_len = last_diagnostic_len;
+            writeCgroupFile(fd, "freezer.state", "THAWED", path) catch {};
+            last_diagnostic = saved_diagnostic;
+            last_diagnostic_len = saved_len;
         }
     }
     // ponytail: without a frozen cgroup, PID reuse between reading
@@ -2331,6 +2453,28 @@ fn killV1Members(dir: posix.fd_t, freezer: ?posix.fd_t, signal: i32) Backend.Err
     }
 }
 
+test "linux v1 failed freeze retains its diagnostic and real cgroup path after thaw fails" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    defer last_diagnostic_len = 0;
+    // /dev/full makes both writes fail with values named in the diagnostic.
+    checkResult(linux.mknodat(tmp.dir.handle, "freezer.state", linux.S.IFCHR | 0o600, 0x107)) catch |err| switch (err) {
+        error.PermissionDenied => return error.SkipZigTest,
+        else => return err,
+    };
+    const probe = openPath(tmp.dir.handle, "freezer.state", .{ .ACCMODE = .WRONLY, .CLOEXEC = true }) catch |err| switch (err) {
+        error.PermissionDenied => return error.SkipZigTest,
+        else => return err,
+    };
+    closeFd(probe);
+    try std.testing.expectError(error.CgroupWriteFailed, killV1Members(tmp.dir.handle, tmp.dir.handle, 9, "igvano/freeze-test"));
+    const diagnostic = last_diagnostic[0..last_diagnostic_len];
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic, "igvano/freeze-test") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic, "FROZEN") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic, "THAWED") == null);
+}
+
 test "linux cgroup member signaling distinguishes kill failures from deletion failures" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
@@ -2341,7 +2485,7 @@ test "linux cgroup member signaling distinguishes kill failures from deletion fa
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "leaf/cgroup.procs", .data = members });
     const leaf = try openPath(tmp.dir.handle, "leaf", .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true });
     defer closeFd(leaf);
-    try std.testing.expectError(error.KillFailed, killV1Members(leaf, null, linux.NSIG));
+    try std.testing.expectError(error.KillFailed, killV1Members(leaf, null, linux.NSIG, "leaf"));
     if (linux.geteuid() != 0) return;
     const root = try openPath(tmp.dir.handle, ".", .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true });
     defer closeFd(root);
@@ -2349,7 +2493,7 @@ test "linux cgroup member signaling distinguishes kill failures from deletion fa
     const pid = try forkProcess();
     if (pid == 0) {
         checkResult(linux.setuid(65534)) catch linux.exit_group(1);
-        killV1Members(leaf, null, 0) catch |err| {
+        killV1Members(leaf, null, 0, "leaf") catch |err| {
             if (err != error.PermissionDenied) linux.exit_group(2);
             removeV1Cgroup(root, "leaf", leaf, null) catch |delete_err|
                 linux.exit_group(if (delete_err == error.CgroupDeleteFailed) 0 else 3);
@@ -2410,7 +2554,7 @@ fn removeV1Cgroup(root: posix.fd_t, path: []const u8, owned_fd: posix.fd_t, free
         try checkResult(linux.statx(leaf, "", linux.AT.EMPTY_PATH, .{ .INO = true }, &current));
         if (!owned.mask.INO or !current.mask.INO) return error.CgroupDeleteFailed;
         if (owned.dev_major != current.dev_major or owned.dev_minor != current.dev_minor or owned.ino != current.ino) return;
-        killV1Members(leaf, freezer, @intFromEnum(linux.SIG.KILL)) catch |err| return switch (err) {
+        killV1Members(leaf, freezer, @intFromEnum(linux.SIG.KILL), path) catch |err| return switch (err) {
             error.PermissionDenied, error.KillFailed => error.CgroupDeleteFailed,
             else => err,
         };
@@ -2442,6 +2586,118 @@ fn cleanupV1TestHierarchies(hierarchies: []const V1Hierarchy, path: []const u8) 
             removeV1Cgroup(hierarchy.root.?, parent, fd, null) catch {};
         }
     }
+}
+
+test "linux v1 create exposes readonly controller leaves containing init" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const root = openCgroupRoot() catch return error.SkipZigTest;
+    closeFd(root.fd);
+    if (root.mode != .legacy) return error.SkipZigTest;
+    try requireTestMountNamespace();
+    const allocator = std.testing.allocator;
+    const hierarchies = try openV1Hierarchies(allocator);
+    defer freeV1Hierarchies(allocator, hierarchies);
+    if (hierarchies.len == 0) return error.SkipZigTest;
+    var selected = hierarchies[0];
+    for (hierarchies) |hierarchy| {
+        if (hierarchy.has("memory")) selected = hierarchy;
+    }
+    const path = try std.fmt.allocPrint(allocator, "igvano-v1-mount-test-{d}", .{linux.getpid()});
+    defer allocator.free(path);
+    defer cleanupV1TestHierarchies(hierarchies, path);
+    // Probe delegation before create, so a failure in mount expansion is fatal.
+    for (hierarchies) |hierarchy| {
+        const leaf = (walkV1Cgroup(allocator, hierarchy.root.?, path, true, hierarchy.has("cpuset")) catch |err| switch (err) {
+            error.PermissionDenied => return error.SkipZigTest,
+            else => return err,
+        }).?;
+        defer closeFd(leaf);
+        try removeV1Cgroup(hierarchy.root.?, path, leaf, null);
+    }
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "rootfs", .default_dir);
+    const base = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer allocator.free(base);
+    const absolute = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, base, allocator);
+    defer allocator.free(absolute);
+    const rootfs = try std.fs.path.join(allocator, &.{ absolute, "rootfs" });
+    defer allocator.free(rootfs);
+    const fifo = try std.fmt.allocPrintSentinel(allocator, "{s}/exec.fifo", .{absolute}, 0);
+    defer allocator.free(fifo);
+    try checkResult(linux.mknod(fifo, linux.S.IFIFO | 0o600, 0));
+    const controller_path = try std.fmt.allocPrintSentinel(allocator, "/sys/fs/cgroup/{s}", .{std.fs.path.basename(selected.mountpoint)}, 0);
+    defer allocator.free(controller_path);
+    const spec: oci.Spec = .{
+        .ociVersion = "1.0.2",
+        .root = .{ .path = "rootfs" },
+        .linux = .{ .namespaces = &.{ .{ .type = .mount }, .{ .type = .cgroup } } },
+    };
+    var implementation: LinuxBackend = .{};
+    const backend = implementation.backend();
+    const handle = try backend.create(.{
+        .allocator = allocator,
+        .id = "v1-mount",
+        .rootfs = rootfs,
+        .exec_fifo = fifo,
+        .spec = &spec,
+        .cgroup_path = path,
+        .mounts = &.{.{
+            .destination = "/sys/fs/cgroup",
+            .source = "cgroup",
+            .type = "cgroup",
+            .flags = linux.MS.RDONLY | linux.MS.NOSUID | linux.MS.NOEXEC | linux.MS.NODEV,
+            .propagation = 0,
+            .data = "",
+        }},
+    });
+    defer allocator.free(handle.starttime);
+    defer {
+        backend.kill(handle, 9) catch {};
+        backend.delete(handle) catch {};
+    }
+    var buffer: [64]u8 = undefined;
+    const namespace_path = try std.fmt.bufPrintZ(&buffer, "/proc/{d}/ns/mnt", .{handle.pid});
+    const namespace = try openPath(linux.AT.FDCWD, namespace_path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true });
+    defer closeFd(namespace);
+    const init_root_path = try std.fmt.bufPrintZ(&buffer, "/proc/{d}/root", .{handle.pid});
+    const init_root = try openPath(linux.AT.FDCWD, init_root_path, .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true });
+    defer closeFd(init_root);
+    const checker = try forkProcess();
+    if (checker == 0) {
+        checkResult(linux.setns(namespace, linux.CLONE.NEWNS)) catch linux.exit_group(1);
+        checkResult(linux.fchdir(init_root)) catch linux.exit_group(2);
+        checkResult(linux.chroot(".")) catch linux.exit_group(3);
+        checkResult(linux.chdir("/")) catch linux.exit_group(4);
+        for (hierarchies) |hierarchy| {
+            const basename = std.fs.path.basename(hierarchy.mountpoint);
+            if (std.mem.indexOfScalar(u8, basename, ',') == null) continue;
+            var names = std.mem.tokenizeScalar(u8, basename, ',');
+            while (names.next()) |name| {
+                var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+                const link = std.fmt.bufPrintZ(&path_buffer, "/sys/fs/cgroup/{s}", .{name}) catch linux.exit_group(12);
+                var target: [256]u8 = undefined;
+                const len = linux.readlink(link, &target, target.len);
+                checkResult(len) catch linux.exit_group(13);
+                if (!std.mem.eql(u8, target[0..len], basename)) linux.exit_group(14);
+            }
+        }
+        const controller = openPath(linux.AT.FDCWD, controller_path, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true }) catch linux.exit_group(5);
+        if (linux.errno(linux.mkdirat(controller, "readonly-probe", 0o755)) != .ROFS) linux.exit_group(6);
+        // The tmpfs itself must be readonly after controller binds and links.
+        if (linux.errno(linux.mkdir("/sys/fs/cgroup/readonly-probe", 0o755)) != .ROFS) linux.exit_group(7);
+        const procs = openPath(controller, "cgroup.procs", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }) catch linux.exit_group(8);
+        var members: [4096]u8 = undefined;
+        const count = linux.read(procs, &members, members.len);
+        checkResult(count) catch linux.exit_group(9);
+        var pids = std.mem.tokenizeAny(u8, members[0..count], " \t\n");
+        while (pids.next()) |pid| {
+            if ((std.fmt.parseInt(i32, pid, 10) catch linux.exit_group(10)) == handle.pid)
+                linux.exit_group(0);
+        }
+        linux.exit_group(11);
+    }
+    try std.testing.expectEqual(@as(u32, 0), try waitChild(checker));
 }
 
 test "linux v1 creates seeds writes joins and deletes each hierarchy" {
@@ -2561,7 +2817,7 @@ test "linux v1 creates seeds writes joins and deletes each hierarchy" {
         if (hierarchy.has("freezer")) {
             // Failed enumeration must thaw the real cgroup, leaving its
             // member alive for delete's subsequent freeze/kill/thaw cycle.
-            try std.testing.expectError(error.CreateFailed, killV1Members(-1, hierarchy.leaf, 9));
+            try std.testing.expectError(error.CreateFailed, killV1Members(-1, hierarchy.leaf, 9, path));
             const state = try readCgroupFile(allocator, hierarchy.leaf.?, "freezer.state");
             defer allocator.free(state);
             try std.testing.expectEqualStrings("THAWED", std.mem.trim(u8, state, " \t\n"));
@@ -3504,6 +3760,8 @@ const PreparedMount = struct {
     propagation: u32,
     data: [:0]const u8,
     recursive_readonly: ?bool = null,
+    /// Created after this mount, before a following tmpfs readonly remount.
+    symlinks: []const Backend.Symlink = &.{},
 };
 
 const PreparedDevice = struct {
@@ -3796,6 +4054,14 @@ fn createDevice(root_fd: posix.fd_t, device: PreparedDevice, private_mount_names
 fn setupDevices(root_fd: posix.fd_t, devices: []const PreparedDevice, symlinks: []const Backend.Symlink, private_mount_namespace: bool, step: *RootfsStep) Backend.Error!void {
     if (comptime builtin.os.tag == .linux) {
         for (devices) |device| try createDevice(root_fd, device, private_mount_namespace, step);
+        try setupSymlinks(root_fd, symlinks, step);
+    } else {
+        return error.NotImplemented;
+    }
+}
+
+fn setupSymlinks(root_fd: posix.fd_t, symlinks: []const Backend.Symlink, step: *RootfsStep) Backend.Error!void {
+    if (comptime builtin.os.tag == .linux) {
         for (symlinks) |link| {
             step.* = .{ .operation = "prepare symlink parent", .path = link.path };
             if (!std.mem.startsWith(u8, link.path, "/")) return error.InvalidPath;
@@ -4003,6 +4269,7 @@ fn setupRootfs(rootfs: [:0]const u8, mounts: []const PreparedMount, devices: []c
         const root_fd = try openPath(linux.AT.FDCWD, rootfs, .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true });
         defer closeFd(root_fd);
         try applyMount(rootfs, root_fd, mount, options.private_mount_namespace, &step);
+        try setupSymlinks(root_fd, mount.symlinks, &step);
     }
     if (options.runtime_sync) |sync| {
         step = .{ .operation = "create synchronization" };
