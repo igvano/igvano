@@ -196,6 +196,16 @@ pub const Emulator = struct {
     pub fn rules(self: Emulator, allocator: std.mem.Allocator) std.mem.Allocator.Error![]Rule {
         return (Emulator{}).transition(allocator, self);
     }
+
+    /// A new cgroup inherits its parent's policy. Reset it, then preserve the
+    /// effective config order so devices.list exposes the same insertion order.
+    pub fn creationRules(self: Emulator, allocator: std.mem.Allocator) std.mem.Allocator.Error![]Rule {
+        const result = try allocator.alloc(Rule, self.entries.items.len + 1);
+        result[0] = .{ .allow = self.default_allow };
+        for (self.entries.items, result[1..]) |entry, *rule|
+            rule.* = entry.rule(!self.default_allow, entry.access);
+        return result;
+    }
 };
 
 /// runc devices/v2.go canSkipEBPFError: check the original, unmerged rules.

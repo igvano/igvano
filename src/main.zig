@@ -1145,30 +1145,55 @@ fn requireUnusedRootfs(allocator: std.mem.Allocator, io: std.Io, backend: Backen
     defer allocator.free(resolved);
     var directory = try cwd.openDir(io, root, .{ .iterate = true });
     defer directory.close(io);
+    // ponytail: sibling creates hold only their own locks; a sibling still in
+    // creating may not have saved its mount record or PID yet (TOCTOU).
     var entries = directory.iterate();
     while (try entries.next(io)) |entry| {
         if (entry.kind != .directory or std.mem.eql(u8, entry.name, id)) continue;
-        const mount = (try loadRootfsMount(allocator, io, root, entry.name)) orelse continue;
+        const mount = (loadRootfsMount(allocator, io, root, entry.name) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            warnRootfsSibling(entry.name, err);
+            continue;
+        }) orelse continue;
         defer allocator.free(mount.path);
-        const mounted_path = try rootfsComparisonPath(allocator, io, mount.path);
+        const mounted_path = rootfsComparisonPath(allocator, io, mount.path) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            warnRootfsSibling(entry.name, err);
+            continue;
+        };
         defer allocator.free(mounted_path);
         if (!std.mem.eql(u8, mounted_path, resolved)) continue;
         const saved = oci.loadState(allocator, io, root, entry.name) catch |err| switch (err) {
             error.FileNotFound => continue, // Concurrent deletion.
-            else => return err,
+            error.OutOfMemory => return err,
+            else => {
+                warnRootfsSibling(entry.name, err);
+                continue;
+            },
         };
         defer saved.deinit();
-        if (!std.mem.eql(u8, saved.value.id, entry.name))
-            return oci.validationError(error.InvalidState, "state.id: does not match rootfs mount owner", .{});
+        if (!std.mem.eql(u8, saved.value.id, entry.name)) {
+            warnRootfsSibling(entry.name, error.InvalidState);
+            continue;
+        }
         if (saved.value.pid == null) continue;
         const handle = stateHandle(allocator, io, root, saved.value, false) catch |err| switch (err) {
             error.FileNotFound => continue,
-            else => return err,
+            error.OutOfMemory => return err,
+            else => {
+                warnRootfsSibling(entry.name, err);
+                continue;
+            },
         };
         defer freeStateHandle(allocator, handle);
         if (try backendResult(backend, backend.alive(handle)))
             return oci.validationError(error.InvalidConfig, "rootfs '{s}' is already used by live container '{s}' in the inherited mount namespace", .{ rootfs, entry.name });
     }
+}
+
+fn warnRootfsSibling(id: []const u8, err: anyerror) void {
+    std.debug.print("igvano: warning: cannot check rootfs ownership for sibling '{s}': {s}; skipping\n", .{ id, @errorName(err) });
+    oci.clearDiagnostic();
 }
 
 test "inherited rootfs ownership rejects live aliases and permits dead or private containers" {
@@ -1224,6 +1249,29 @@ test "inherited rootfs ownership rejects live aliases and permits dead or privat
     try tmp.dir.writeFile(io, .{ .sub_path = "example/starttime", .data = "dead" });
     try requireUnusedRootfs(allocator, io, backend, root, "other", rootfs);
     try tmp.dir.writeFile(io, .{ .sub_path = "example/starttime", .data = "live" });
+    const good_state = try tmp.dir.readFileAlloc(io, "example/state.json", allocator, .unlimited);
+    defer allocator.free(good_state);
+    try tmp.dir.writeFile(io, .{ .sub_path = "example/state.json", .data = "{" });
+    try requireUnusedRootfs(allocator, io, backend, root, "other", rootfs);
+    try std.testing.expect(oci.diagnostic() == null);
+    try oci.saveState(allocator, io, root, .{ .id = "example", .status = .running, .pid = -1, .bundle = root });
+    try requireUnusedRootfs(allocator, io, backend, root, "other", rootfs);
+    try tmp.dir.writeFile(io, .{ .sub_path = "example/state.json", .data =
+        \\{"ociVersion":"1.0.2","id":"wrong","status":"running","pid":1234,"bundle":"/"}
+    });
+    try requireUnusedRootfs(allocator, io, backend, root, "other", rootfs);
+    try tmp.dir.writeFile(io, .{ .sub_path = "example/state.json", .data = good_state });
+    try tmp.dir.deleteFile(io, "example/starttime");
+    try requireUnusedRootfs(allocator, io, backend, root, "other", rootfs);
+    try tmp.dir.writeFile(io, .{ .sub_path = "example/starttime", .data = "live" });
+    try TestBackend.check(allocator, backend, root, rootfs);
+    try tmp.dir.writeFile(io, .{ .sub_path = "example/rootfs_mount", .data = "{" });
+    try requireUnusedRootfs(allocator, io, backend, root, "other", rootfs);
+    try tmp.dir.deleteFile(io, "example/rootfs_mount");
+    try tmp.dir.createDir(io, "example/rootfs_mount", .default_dir);
+    try requireUnusedRootfs(allocator, io, backend, root, "other", rootfs);
+    try tmp.dir.deleteDir(io, "example/rootfs_mount");
+    try tmp.dir.writeFile(io, .{ .sub_path = "example/rootfs_mount", .data = alias });
     try tmp.dir.deleteFile(io, "example/rootfs_mount");
     try requireUnusedRootfs(allocator, io, backend, root, "other", rootfs);
 }

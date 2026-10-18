@@ -259,6 +259,48 @@ fn v1DeviceNumber(buffer: []u8, value: i64) Backend.Error![]const u8 {
     return std.fmt.bufPrint(buffer, "{d}", .{value}) catch return error.InvalidConfig;
 }
 
+test "v1 creation preserves configured device order and round-trips wildcard defaults" {
+    const allocator = std.testing.allocator;
+    const configured = try v2DeviceRules(allocator, &.{
+        .{ .allow = false },
+        .{ .allow = true, .kind = .char, .major = 10, .minor = 229 },
+        .{ .allow = true, .kind = .block, .major = 8, .minor = -1, .access = "rw" },
+    }, &.{});
+    defer allocator.free(configured);
+    var target = try deviceEmulator(allocator, configured);
+    defer target.deinit(allocator);
+    const rules = try target.creationRules(allocator);
+    defer allocator.free(rules);
+    var writes: std.ArrayList(V1Write) = .empty;
+    defer {
+        for (writes.items) |write| {
+            allocator.free(write.name);
+            allocator.free(write.value);
+        }
+        writes.deinit(allocator);
+    }
+    for (rules) |rule| try appendV1DeviceRule(allocator, &writes, rule);
+    const expected = [_][]const u8{
+        "a *:* rwm", "c 10:229 rwm", "b 8:* rw",  "c *:* m",      "b *:* m",
+        "c 1:3 rwm", "c 1:8 rwm",    "c 1:7 rwm", "c 5:0 rwm",    "c 1:5 rwm",
+        "c 1:9 rwm", "c 136:* rwm",  "c 5:2 rwm", "c 10:200 rwm",
+    };
+    try std.testing.expectEqual(expected.len, writes.items.len);
+    var list: std.Io.Writer.Allocating = .init(allocator);
+    defer list.deinit();
+    for (writes.items, expected, 0..) |write, value, index| {
+        try std.testing.expectEqualStrings(value, write.value);
+        try std.testing.expectEqualStrings(if (index == 0) "devices.deny" else "devices.allow", write.name);
+        if (index != 0) try list.writer.print("{s}\n", .{write.value});
+    }
+    var reloaded = try deviceEmulatorFromList(allocator, list.written());
+    defer reloaded.deinit(allocator);
+    try std.testing.expectEqualDeep(target.entries.items, reloaded.entries.items);
+    const round_trip = try reloaded.creationRules(allocator);
+    defer allocator.free(round_trip);
+    try std.testing.expectEqualDeep(rules, round_trip);
+}
+
 fn v1MemorySwapFirst(limit: i64, current_memsw: u64) bool {
     return (if (limit == -1) std.math.maxInt(u64) else @as(u64, @intCast(limit))) > current_memsw;
 }
@@ -2419,9 +2461,17 @@ pub const LinuxBackend = struct {
                     }
                 }
             }
-            const mountinfo = try readMountinfo(allocator);
+            const mountinfo = readMountinfo(allocator) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                reportDiagnostic("cannot kill all members of cgroup '{s}': cannot read /proc/self/mountinfo: {s}", .{ path, @errorName(err) });
+                return error.KillFailed;
+            };
             defer allocator.free(mountinfo);
-            const mount_root = try v2MountRoot(allocator, mountinfo);
+            const mount_root = v2MountRoot(allocator, mountinfo) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                reportDiagnostic("cannot kill all members of cgroup '{s}': cannot determine cgroup v2 mount root from /proc/self/mountinfo: {s}", .{ path, @errorName(err) });
+                return error.KillFailed;
+            };
             defer allocator.free(mount_root);
             try killV2Members(cgroup, signal, mount_root, path);
         } else {
@@ -2476,7 +2526,7 @@ pub const LinuxBackend = struct {
                 }
             };
             try setSystemdResources(allocator, handle, requested, .legacy, false, device_rules);
-            try applyV1Writes(allocator, hierarchies, writes, resources, if (resources.devices.len != 0) handle.device_nodes else null, path);
+            try applyV1Writes(allocator, hierarchies, writes, resources, if (resources.devices.len != 0) handle.device_nodes else null, path, false);
         } else {
             var requested = resources;
             var inferred_memory_limit = false;
@@ -3540,7 +3590,7 @@ fn requiredV1Controller(controller: []const u8, resources: Resources, devices: [
 }
 
 // Null devices selects update: leave an omitted ruleset alone.
-fn applyV1Writes(allocator: std.mem.Allocator, hierarchies: []const V1Hierarchy, writes: []const V1Write, resources: Resources, devices: ?[]const Backend.Device, path: []const u8) Backend.Error!void {
+fn applyV1Writes(allocator: std.mem.Allocator, hierarchies: []const V1Hierarchy, writes: []const V1Write, resources: Resources, devices: ?[]const Backend.Device, path: []const u8, create: bool) Backend.Error!void {
     const has_devices = devices != null or resources.devices.len != 0;
     const nodes = devices orelse &.{};
     const configured = if (has_devices) try v2DeviceRules(allocator, resources.devices, nodes) else &.{};
@@ -3609,7 +3659,7 @@ fn applyV1Writes(allocator: std.mem.Allocator, hierarchies: []const V1Hierarchy,
             defer current.deinit(allocator);
             // ponytail: a deny-list source briefly clears deny exceptions on
             // reset; devices.list cannot reveal them, matching runc's v1 Set.
-            const transition = try current.transition(allocator, target);
+            const transition = if (create) try target.creationRules(allocator) else try current.transition(allocator, target);
             defer allocator.free(transition);
             var device_writes: std.ArrayList(V1Write) = .empty;
             defer {
@@ -3678,7 +3728,7 @@ test "linux v1 device updates verify readback after writing only the transition"
         .leaf = tmp.dir.handle,
     }};
     // Regular files do not apply the transition to devices.list.
-    try std.testing.expectError(error.CgroupWriteFailed, applyV1Writes(std.testing.allocator, hierarchies, writes, resources, null, "test"));
+    try std.testing.expectError(error.CgroupWriteFailed, applyV1Writes(std.testing.allocator, hierarchies, writes, resources, null, "test", false));
     try std.testing.expect(std.mem.indexOf(u8, last_diagnostic[0..last_diagnostic_len], "devices.list does not match") != null);
     const allowed = try tmp.dir.readFileAlloc(std.testing.io, "devices.allow", std.testing.allocator, .limited(64));
     defer std.testing.allocator.free(allowed);
@@ -3705,7 +3755,7 @@ test "linux v1 device updates verify readback after writing only the transition"
         });
     }
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "devices.list", .data = expected.written() });
-    try applyV1Writes(std.testing.allocator, hierarchies, writes, resources, null, "test");
+    try applyV1Writes(std.testing.allocator, hierarchies, writes, resources, null, "test", false);
 }
 
 fn killV2Members(dir: posix.fd_t, signal: i32, mount_root: []const u8, path: []const u8) Backend.Error!void {
@@ -3751,6 +3801,7 @@ fn killV1Members(dir: posix.fd_t, freezer: ?posix.fd_t, signal: i32, mount_root:
     var members: std.ArrayList(i32) = .empty;
     defer members.deinit(allocator);
     try collectCgroupPids(allocator, dir, &members);
+    var matched = false;
     for (members.items) |pid| {
         const pidfd = openPidfd(pid) catch |err| switch (err) {
             error.ProcessNotFound => continue,
@@ -3763,10 +3814,25 @@ fn killV1Members(dir: posix.fd_t, freezer: ?posix.fd_t, signal: i32, mount_root:
             else => return err,
         };
         if (!procCgroupMatches(cgroups, mount_root, path, controller)) continue;
+        matched = true;
         signalPid(pid, pidfd, signal) catch |err| switch (err) {
             error.ProcessNotFound => {},
             else => return err,
         };
+    }
+    if (!matched) {
+        // Members may have exited or moved after enumeration. Verify that the
+        // subtree is still populated before reporting an unverifiable policy.
+        members.clearRetainingCapacity();
+        try collectCgroupPids(allocator, dir, &members);
+        const populated = members.items.len != 0 or if (controller) |name|
+            name.len == 0 and try cgroupPopulated(dir)
+        else
+            false;
+        if (populated) {
+            reportDiagnostic("cgroup '{s}' is populated but no member could be verified in /proc; cgroup namespace paths may not expose mount root '{s}'", .{ path, mount_root });
+            return error.KillFailed;
+        }
     }
     // SIGKILL on v1 needs a thaw after signaling, even for a user pause.
     if (was_frozen and signal == @intFromEnum(linux.SIG.KILL))
@@ -3806,8 +3872,13 @@ test "linux cgroup member signaling distinguishes kill failures from deletion fa
     const leaf = try openPath(tmp.dir.handle, "leaf", .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true });
     defer closeFd(leaf);
     try std.testing.expectError(error.KillFailed, killV1Members(leaf, null, linux.NSIG, "/", "leaf", null));
-    // Stale enumeration must not signal a process in another cgroup.
-    try killV1Members(leaf, null, 0, "/", "igvano/unrelated", null);
+    // A populated leaf without a verified member must not report success.
+    defer last_diagnostic_len = 0;
+    try std.testing.expectError(error.KillFailed, killV1Members(leaf, null, 0, "/", "igvano/unrelated", null));
+    try std.testing.expect(std.mem.indexOf(u8, last_diagnostic[0..last_diagnostic_len], "no member could be verified") != null);
+    try std.testing.expectError(error.CgroupDeleteFailed, removeV1Cgroup(tmp.dir.handle, "/", "leaf", leaf, null, null));
+    try std.testing.expect(std.mem.indexOf(u8, last_diagnostic[0..last_diagnostic_len], "no member could be verified") != null);
+    try std.testing.expect(std.mem.indexOf(u8, last_diagnostic[0..last_diagnostic_len], "still busy") == null);
     var proc_buffer: [64 * 1024]u8 = undefined;
     const cgroups = try readProcFileAt(linux.AT.FDCWD, linux.getpid(), "cgroup", &proc_buffer);
     const first = std.mem.indexOfScalar(u8, cgroups, ':').?;
@@ -3867,8 +3938,47 @@ test "linux pidfds signal the held process and cgroup checks reject stale member
     const members = try std.fmt.allocPrint(std.testing.allocator, "{d}\n", .{children[1]});
     defer std.testing.allocator.free(members);
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "cgroup.procs", .data = members });
-    try killV1Members(tmp.dir.handle, null, 9, "/", "igvano/unrelated", null);
+    defer last_diagnostic_len = 0;
+    try std.testing.expectError(error.KillFailed, killV1Members(tmp.dir.handle, null, 9, "/", "igvano/unrelated", null));
     try std.testing.expect(try backend.alive(handle));
+}
+
+test "linux pidfd_open denied by seccomp falls back to kill" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    for ([_]linux.E{ .PERM, .ACCES }) |denied| {
+        const pid = try forkProcess();
+        if (pid == 0) {
+            const filters = [_]seccomp.Filter{
+                .{ .code = 0x20, .k = 0 },
+                .{ .code = 0x15, .jf = 1, .k = @intFromEnum(linux.SYS.pidfd_open) },
+                .{ .code = 0x06, .k = 0x00050000 | @as(u32, @intFromEnum(denied)) },
+                .{ .code = 0x06, .k = 0x7fff0000 },
+            };
+            checkResult(linux.prctl(@intFromEnum(linux.PR.SET_NO_NEW_PRIVS), 1, 0, 0, 0)) catch linux.exit_group(1);
+            if (seccomp.install(.{ .filters = &filters, .flags = 0 }) != .SUCCESS) linux.exit_group(2);
+            const pidfd = openPidfd(linux.getpid()) catch linux.exit_group(3);
+            if (pidfd != null) linux.exit_group(4);
+            var buffer: [4096]u8 = undefined;
+            const stat = readProcStat(linux.getpid(), &buffer) catch linux.exit_group(5);
+            var implementation: LinuxBackend = .{};
+            implementation.backend().kill(.{ .id = "pidfd-denied", .pid = linux.getpid(), .starttime = stat.starttime }, 0) catch linux.exit_group(6);
+            linux.exit_group(0);
+        }
+        try std.testing.expectEqual(@as(u32, 0), try waitChild(pid));
+    }
+}
+
+test "linux populated v2 cgroup without visible PIDs fails member signaling" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    defer last_diagnostic_len = 0;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "cgroup.procs", .data = "" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "cgroup.events", .data = "populated 1\n" });
+    try std.testing.expectError(error.KillFailed, killV1Members(tmp.dir.handle, null, 0, "/", "igvano/hidden", ""));
+    try std.testing.expect(std.mem.indexOf(u8, last_diagnostic[0..last_diagnostic_len], "igvano/hidden") != null);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "cgroup.events", .data = "populated 0\n" });
+    try killV1Members(tmp.dir.handle, null, 0, "/", "igvano/hidden", "");
 }
 
 fn removeV1Cgroups(hierarchies: []const V1Hierarchy, path: []const u8) Backend.Error!void {
@@ -4138,7 +4248,7 @@ test "linux v1 creates seeds writes joins and deletes each hierarchy" {
     }
     const writes = try v1Writes(allocator, resources);
     defer freeV1Writes(allocator, writes);
-    try applyV1Writes(allocator, hierarchies, writes, resources, &.{}, path);
+    try applyV1Writes(allocator, hierarchies, writes, resources, &.{}, path, true);
     for (hierarchies) |hierarchy| {
         const cases = [_]struct { controller: []const u8, name: [:0]const u8, value: []const u8 }{
             .{ .controller = "memory", .name = "memory.limit_in_bytes", .value = "67108864" },
@@ -4161,11 +4271,11 @@ test "linux v1 creates seeds writes joins and deletes each hierarchy" {
             const lower: Resources = .{ .memory = .{ .limit = 33554432, .swap = 67108864 } };
             const lower_writes = try v1Writes(allocator, lower);
             defer freeV1Writes(allocator, lower_writes);
-            try applyV1Writes(allocator, hierarchies, lower_writes, lower, &.{}, path);
+            try applyV1Writes(allocator, hierarchies, lower_writes, lower, &.{}, path, false);
             const higher: Resources = .{ .memory = .{ .limit = 100663296, .swap = 134217728 } };
             const higher_writes = try v1Writes(allocator, higher);
             defer freeV1Writes(allocator, higher_writes);
-            try applyV1Writes(allocator, hierarchies, higher_writes, higher, &.{}, path);
+            try applyV1Writes(allocator, hierarchies, higher_writes, higher, &.{}, path, false);
         }
     }
     const pipe = try makePipe();
@@ -4605,12 +4715,12 @@ test "linux v1 missing optional controllers are ignored and required limits fail
     }) |resources| {
         const writes = try v1Writes(allocator, resources);
         defer freeV1Writes(allocator, writes);
-        try std.testing.expectError(error.CgroupWriteFailed, applyV1Writes(allocator, &.{}, writes, resources, &.{}, "missing"));
+        try std.testing.expectError(error.CgroupWriteFailed, applyV1Writes(allocator, &.{}, writes, resources, &.{}, "missing", true));
     }
     const resources: Resources = .{ .cpu = .{ .shares = 1024 }, .block_io = .{ .weight = 100 } };
     const writes = try v1Writes(allocator, resources);
     defer freeV1Writes(allocator, writes);
-    try applyV1Writes(allocator, &.{}, writes, resources, &.{}, "missing");
+    try applyV1Writes(allocator, &.{}, writes, resources, &.{}, "missing", true);
 }
 
 test "linux cgroup creation reuses parents but rejects existing leaves" {
@@ -4837,6 +4947,52 @@ test "linux child cgroup cleanup leaves control files and symlinks untouched" {
     _ = try tmp.dir.statFile(std.testing.io, "outside/keep", .{});
 }
 
+test "linux busy child cleanup reports the full descendant path" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    defer last_diagnostic_len = 0;
+    try tmp.dir.createDirPath(std.testing.io, "parent/owned/child/grandchild");
+    // Unlike cgroupfs, a regular control file keeps the directory nonempty.
+    for ([_][]const u8{ "parent/owned/cgroup.procs", "parent/owned/child/cgroup.procs", "parent/owned/child/grandchild/cgroup.procs" }) |path|
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = path, .data = "" });
+    try std.testing.expectError(error.CgroupDeleteFailed, removeCgroup(tmp.dir.handle, "parent/owned"));
+    try std.testing.expect(std.mem.indexOf(u8, last_diagnostic[0..last_diagnostic_len], "parent/owned/child/grandchild") != null);
+    const owned = (try walkCgroup(tmp.dir.handle, "parent/owned", false, &.{})).?;
+    defer closeFd(owned);
+    try std.testing.expectError(error.CgroupDeleteFailed, removeV1Cgroup(tmp.dir.handle, "/", "parent/owned", owned, null, null));
+    try std.testing.expect(std.mem.indexOf(u8, last_diagnostic[0..last_diagnostic_len], "parent/owned/child/grandchild") != null);
+}
+
+test "linux cleanup does not reject descendants longer than the diagnostic buffer" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "owned", .default_dir);
+    var parent = try openPath(tmp.dir.handle, "owned", .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true });
+    defer closeFd(parent);
+    var name_buffer: [256]u8 = @splat('x');
+    name_buffer[255] = 0;
+    const name = name_buffer[0..255 :0];
+    for (0..20) |_| {
+        try checkResult(linux.mkdirat(parent, name, 0o755));
+        const child = try openPath(parent, name, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true });
+        closeFd(parent);
+        parent = child;
+    }
+    try removeCgroup(tmp.dir.handle, "owned");
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, "owned", .{}));
+}
+
+test "linux cgroup-only writes do not require cgroup.controllers" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "parent/leaf");
+    const leaf = (try walkCgroup(tmp.dir.handle, "parent/leaf", false, &.{.{ .name = "cgroup.freeze", .value = "1" }})).?;
+    defer closeFd(leaf);
+}
+
 /// Walk through pinned directory fds so symlinks cannot redirect cgroup writes.
 /// Enable requested controllers in every ancestor before descending to the leaf.
 /// Creation requires a new leaf. Nested paths can still change controllers in
@@ -4845,12 +5001,18 @@ fn walkCgroup(root: posix.fd_t, path: []const u8, create: bool, writes: []const 
     try validateCgroupPath(path);
     var current = try openPath(root, ".", .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true });
     errdefer closeFd(current);
+    const needs_controller = for (writes) |write| {
+        const dot = std.mem.indexOfScalar(u8, write.name, '.') orelse continue;
+        if (!std.mem.eql(u8, write.name[0..dot], "cgroup")) break true;
+    } else false;
     var components = std.mem.tokenizeScalar(u8, path, '/');
     while (components.next()) |component| {
         var buffer: [256]u8 = undefined;
         const name = std.fmt.bufPrintZ(&buffer, "{s}", .{component}) catch return error.InvalidPath;
-        if (writes.len != 0) {
-            const allocator = std.heap.page_allocator;
+        if (needs_controller) {
+            var scratch: [8192]u8 = undefined;
+            var fixed: std.heap.FixedBufferAllocator = .init(&scratch);
+            const allocator = fixed.allocator();
             const available = try readCgroupFile(allocator, current, "cgroup.controllers");
             defer allocator.free(available);
             const controllers = try enabledControllers(allocator, available, writes);
@@ -4982,6 +5144,14 @@ fn removeCreatedCgroup(root: posix.fd_t, path: []const u8, cgroup: posix.fd_t) B
 }
 
 fn removeCgroup(root: posix.fd_t, path: []const u8) Backend.Error!void {
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const len = @min(path.len, path_buffer.len);
+    @memcpy(path_buffer[0..len], path[0..len]);
+    return removeCgroupAt(root, path, &path_buffer, len);
+}
+
+fn removeCgroupAt(root: posix.fd_t, path: []const u8, path_buffer: []u8, path_len: usize) Backend.Error!void {
+    const full_path = path_buffer[0..path_len];
     try validateCgroupPath(path);
     const parent = if (std.fs.path.dirname(path)) |parent_path|
         (try walkCgroup(root, parent_path, false, &.{})) orelse return
@@ -4997,12 +5167,12 @@ fn removeCgroup(root: posix.fd_t, path: []const u8) Backend.Error!void {
             .SUCCESS => {
                 const cgroup: posix.fd_t = @intCast(opened);
                 defer closeFd(cgroup);
-                try removeCgroupChildren(cgroup, path);
+                try removeCgroupChildrenAt(cgroup, path_buffer, path_len);
             },
             .NOENT => return,
             .INTR => continue,
             else => |err| {
-                reportDiagnostic("cannot open cgroup '{s}' for removal: {s}", .{ path, @tagName(err) });
+                reportDiagnostic("cannot open cgroup '{s}' for removal: {s}", .{ full_path, @tagName(err) });
                 return error.CgroupDeleteFailed;
             },
         }
@@ -5012,17 +5182,24 @@ fn removeCgroup(root: posix.fd_t, path: []const u8) Backend.Error!void {
             .INTR => continue,
             .BUSY, .NOTEMPTY => _ = linux.nanosleep(&delay, null),
             else => |err| {
-                reportDiagnostic("cannot remove cgroup '{s}': {s}", .{ path, @tagName(err) });
+                reportDiagnostic("cannot remove cgroup '{s}': {s}", .{ full_path, @tagName(err) });
                 return error.CgroupDeleteFailed;
             },
         }
     }
-    reportDiagnostic("cgroup '{s}' is still busy after waiting for members to exit", .{path});
+    reportDiagnostic("cgroup '{s}' is still busy after waiting for members to exit", .{full_path});
     return error.CgroupDeleteFailed;
 }
 
 /// Remove descendants before their parent, without touching cgroup control files.
 fn removeCgroupChildren(dir: posix.fd_t, path: []const u8) Backend.Error!void {
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const len = @min(path.len, path_buffer.len);
+    @memcpy(path_buffer[0..len], path[0..len]);
+    return removeCgroupChildrenAt(dir, &path_buffer, len);
+}
+
+fn removeCgroupChildrenAt(dir: posix.fd_t, path_buffer: []u8, path_len: usize) Backend.Error!void {
     var buffer: [4096]u8 = undefined;
     while (true) {
         const result = linux.getdents64(dir, &buffer, buffer.len);
@@ -5031,7 +5208,7 @@ fn removeCgroupChildren(dir: posix.fd_t, path: []const u8) Backend.Error!void {
             .NOENT => return,
             .INTR => continue,
             else => |err| {
-                reportDiagnostic("cannot read child cgroups of '{s}': {s}", .{ path, @tagName(err) });
+                reportDiagnostic("cannot read child cgroups of '{s}': {s}", .{ path_buffer[0..path_len], @tagName(err) });
                 return error.CgroupDeleteFailed;
             },
         }
@@ -5046,7 +5223,23 @@ fn removeCgroupChildren(dir: posix.fd_t, path: []const u8) Backend.Error!void {
             const name_len = std.mem.indexOfScalar(u8, padded_name, 0).?;
             const name = name_ptr[0..name_len :0];
             if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
-            try removeCgroup(dir, name);
+            var child_len = path_len + 1 + name.len;
+            var restore_from = path_len;
+            var saved_tail: [260]u8 = undefined;
+            if (child_len <= path_buffer.len) {
+                path_buffer[path_len] = '/';
+                @memcpy(path_buffer[path_len + 1 .. child_len], name);
+            } else {
+                // Long fd-relative paths must not make deletion fail. Share
+                // one path buffer and abbreviate only the diagnostic.
+                restore_from = path_buffer.len - "/.../".len - name.len;
+                @memcpy(saved_tail[0 .. path_len - restore_from], path_buffer[restore_from..path_len]);
+                @memcpy(path_buffer[restore_from..][0.."/.../".len], "/.../");
+                @memcpy(path_buffer[restore_from + "/.../".len ..], name);
+                child_len = path_buffer.len;
+            }
+            defer @memcpy(path_buffer[restore_from..path_len], saved_tail[0 .. path_len - restore_from]);
+            try removeCgroupAt(dir, name, path_buffer, child_len);
         }
     }
 }
@@ -5136,9 +5329,8 @@ fn openPidfd(pid: i32) Backend.Error!?posix.fd_t {
         switch (linux.errno(opened)) {
             .SUCCESS => return @intCast(opened),
             .INTR => continue,
-            .NOSYS => return null,
+            .NOSYS, .PERM, .ACCES => return null,
             .SRCH => return error.ProcessNotFound,
-            .PERM, .ACCES => return error.PermissionDenied,
             else => return error.KillFailed,
         }
     }
@@ -5158,8 +5350,8 @@ fn signalPid(pid: i32, pidfd: ?posix.fd_t, signal: i32) Backend.Error!void {
             }
         }
     }
-    // ponytail: kernels without pidfds (ENOSYS, before Linux 5.3) can reuse
-    // the PID between the identity check and kill().
+    // ponytail: when pidfds are unavailable or denied by seccomp, the PID can
+    // be reused between the identity check and kill().
     switch (linux.errno(linux.kill(pid, sig))) {
         .SUCCESS => {},
         .SRCH => return error.ProcessNotFound,
@@ -5218,6 +5410,7 @@ test "cgroup membership verifies hierarchy and subtree boundaries" {
     try std.testing.expect(!procCgroupMatches("1:name=systemd:/igvano/example\n", "/", "igvano/example", ""));
     try std.testing.expect(!procCgroupMatches("garbage\n0::relative\n", "/", "relative", ""));
     try std.testing.expect(procCgroupMatches("0::/igvano/example:colon\n", "/", "igvano/example:colon", ""));
+    try std.testing.expect(!procCgroupMatches("0::/../..\n", "/", "igvano/example", ""));
     const mounted =
         \\4:cpu,cpuacct:/docker/cid/igvano/example/nested
         \\3:memory:/docker/cid/igvano/other
@@ -10605,7 +10798,7 @@ fn configureCgroup(allocator: std.mem.Allocator, root: posix.fd_t, mode: CgroupM
             if (hierarchy.leaf == null)
                 hierarchy.leaf = (try walkV1Cgroup(allocator, hierarchy.root.?, hierarchy.mount_root, options.cgroup_path, true, hierarchy.has("cpuset"))).?;
         }
-        try applyV1Writes(allocator, hierarchies, v1_writes, options.resources, options.devices, options.cgroup_path);
+        try applyV1Writes(allocator, hierarchies, v1_writes, options.resources, options.devices, options.cgroup_path, true);
     }
 }
 
