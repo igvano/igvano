@@ -380,6 +380,7 @@ pub const exec_fifo_name = "exec.fifo";
 pub const starttime_file_name = "starttime";
 pub const process_file_name = "process";
 pub const cgroup_file_name = "cgroup";
+pub const cgroup_driver_file_name = "cgroup-driver";
 pub const rootfs_mount_file_name = "rootfs_mount";
 pub const hooks_file_name = "hooks.json";
 pub const runtime_oci_version = "1.0.2";
@@ -2512,7 +2513,7 @@ pub fn featuresJson(allocator: std.mem.Allocator) ![]u8 {
         .linux = .{
             .namespaces = std.meta.fieldNames(@FieldType(Spec.Namespace, "type")),
             .capabilities = &capability_names,
-            .cgroup = .{ .v1 = true, .v2 = true, .systemd = false, .systemdUser = false, .rdma = false },
+            .cgroup = .{ .v1 = true, .v2 = true, .systemd = true, .systemdUser = false, .rdma = false },
             .seccomp = .{
                 .enabled = true,
                 .actions = seccomp_actions.keys(),
@@ -2683,7 +2684,8 @@ test "features JSON reports parser tables and supported isolation" {
     const cgroup = linux.get("cgroup").?.object;
     try std.testing.expect(cgroup.get("v1").?.bool);
     try std.testing.expect(cgroup.get("v2").?.bool);
-    for ([_][]const u8{ "systemd", "systemdUser", "rdma" }) |name|
+    try std.testing.expect(cgroup.get("systemd").?.bool);
+    for ([_][]const u8{ "systemdUser", "rdma" }) |name|
         try std.testing.expect(!cgroup.get(name).?.bool);
     const seccomp = linux.get("seccomp").?.object;
     try std.testing.expect(seccomp.get("enabled").?.bool);
@@ -3266,4 +3268,104 @@ test "atomic write replaces complete contents and cleans up after a failed renam
         count += 1;
     }
     try std.testing.expectEqual(@as(usize, 2), count);
+}
+
+test "systemd slices expand like runc and reject malformed components" {
+    for ([_]struct { input: []const u8, path: []const u8 }{
+        .{ .input = "-.slice", .path = "/" },
+        .{ .input = "system.slice", .path = "/system.slice" },
+        .{ .input = "test-a-b.slice", .path = "/test.slice/test-a.slice/test-a-b.slice" },
+        .{ .input = "kubepods-besteffort-pod123.slice", .path = "/kubepods.slice/kubepods-besteffort.slice/kubepods-besteffort-pod123.slice" },
+    }) |case| {
+        const expanded = try expandSystemdSlice(std.testing.allocator, case.input);
+        defer std.testing.allocator.free(expanded);
+        try std.testing.expectEqualStrings(case.path, expanded);
+    }
+    for ([_][]const u8{ "", "system", ".slice", "test--a.slice", "-test.slice", "test-.slice", "test/a.slice", "x\x00.slice" }) |slice|
+        try std.testing.expectError(error.InvalidConfig, expandSystemdSlice(std.testing.allocator, slice));
+}
+
+test "systemd cgroupsPath resolves defaults scope names and nested slices" {
+    for ([_]struct { configured: ?[]const u8, slice: []const u8, unit: []const u8, path: []const u8 }{
+        .{ .configured = null, .slice = "system.slice", .unit = "igvano-id.scope", .path = "system.slice/igvano-id.scope" },
+        .{ .configured = "", .slice = "system.slice", .unit = "igvano-id.scope", .path = "system.slice/igvano-id.scope" },
+        .{ .configured = "system.slice:cri-containerd:abc", .slice = "system.slice", .unit = "cri-containerd-abc.scope", .path = "system.slice/cri-containerd-abc.scope" },
+        .{ .configured = ":test:abc", .slice = "system.slice", .unit = "test-abc.scope", .path = "system.slice/test-abc.scope" },
+        .{ .configured = "a-b.slice:test:abc", .slice = "a-b.slice", .unit = "test-abc.scope", .path = "a.slice/a-b.slice/test-abc.scope" },
+        .{ .configured = "-.slice:test:abc", .slice = "-.slice", .unit = "test-abc.scope", .path = "test-abc.scope" },
+    }) |case| {
+        const result = try parseSystemdCgroupPath(std.testing.allocator, case.configured, "id");
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expectEqualStrings(case.slice, result.slice);
+        try std.testing.expectEqualStrings(case.unit, result.unit);
+        try std.testing.expectEqualStrings(case.path, result.path);
+    }
+    for ([_][]const u8{ "/x", "x:y", "a.slice:p:n:extra", "bad:p:n", "a.slice:p:../escape", "a.slice:p:n\x00" }) |configured|
+        try std.testing.expectError(error.InvalidConfig, parseSystemdCgroupPath(std.testing.allocator, configured, "id"));
+    try std.testing.expectError(error.Unsupported, parseSystemdCgroupPath(std.testing.allocator, "system.slice:test:foo.slice", "id"));
+}
+
+pub const SystemdCgroup = struct {
+    slice: []const u8,
+    unit: []u8,
+    path: []u8,
+
+    pub fn deinit(self: SystemdCgroup, allocator: std.mem.Allocator) void {
+        allocator.free(self.unit);
+        allocator.free(self.path);
+    }
+};
+
+/// runc's ExpandSlice: a-b.slice is /a.slice/a-b.slice; -.slice is root.
+pub fn expandSystemdSlice(allocator: std.mem.Allocator, slice: []const u8) ![]u8 {
+    if (!std.mem.endsWith(u8, slice, ".slice") or slice.len <= ".slice".len or
+        std.mem.indexOfAny(u8, slice, "/\x00") != null)
+        return invalidConfig("linux.cgroupsPath: invalid systemd slice name '{s}'", .{slice});
+    const name = slice[0 .. slice.len - ".slice".len];
+    if (std.mem.eql(u8, name, "-")) return allocator.dupe(u8, "/");
+    var path: std.ArrayList(u8) = .empty;
+    errdefer path.deinit(allocator);
+    var components = std.mem.splitScalar(u8, name, '-');
+    var end: usize = 0;
+    while (components.next()) |component| {
+        if (component.len == 0) return invalidConfig("linux.cgroupsPath: invalid systemd slice name '{s}'", .{slice});
+        end += component.len;
+        if (end + ".slice".len > 255) return invalidConfig("linux.cgroupsPath: systemd slice name is too long", .{});
+        try path.append(allocator, '/');
+        try path.appendSlice(allocator, name[0..end]);
+        try path.appendSlice(allocator, ".slice");
+        end += 1;
+    }
+    return path.toOwnedSlice(allocator);
+}
+
+/// OCI's slice:prefix:name syntax is interpreted only by the frontend.
+pub fn parseSystemdCgroupPath(allocator: std.mem.Allocator, configured: ?[]const u8, id: []const u8) !SystemdCgroup {
+    var slice: []const u8 = "system.slice";
+    var prefix: []const u8 = "igvano";
+    var name = id;
+    if (configured) |path| {
+        if (path.len != 0) {
+            var parts = std.mem.splitScalar(u8, path, ':');
+            const parent = parts.next().?;
+            prefix = parts.next() orelse return invalidConfig("linux.cgroupsPath: expected slice:prefix:name for systemd", .{});
+            name = parts.next() orelse return invalidConfig("linux.cgroupsPath: expected slice:prefix:name for systemd", .{});
+            if (parts.next() != null) return invalidConfig("linux.cgroupsPath: expected slice:prefix:name for systemd", .{});
+            if (parent.len != 0) slice = parent;
+        }
+    }
+    if (std.mem.endsWith(u8, name, ".slice"))
+        return validationError(error.Unsupported, "linux.cgroupsPath: transient systemd slice units are not supported; use a scope name", .{});
+    if (std.mem.indexOfAny(u8, prefix, "/\x00") != null or std.mem.indexOfAny(u8, name, "/\x00") != null)
+        return invalidConfig("linux.cgroupsPath: invalid systemd scope name", .{});
+    const expanded = try expandSystemdSlice(allocator, slice);
+    defer allocator.free(expanded);
+    const unit = try std.fmt.allocPrint(allocator, "{s}-{s}.scope", .{ prefix, name });
+    errdefer allocator.free(unit);
+    if (unit.len > 255) return invalidConfig("linux.cgroupsPath: systemd scope name is too long", .{});
+    const path = if (expanded.len == 1)
+        try allocator.dupe(u8, unit)
+    else
+        try std.fmt.allocPrint(allocator, "{s}/{s}", .{ expanded[1..], unit });
+    return .{ .slice = slice, .unit = unit, .path = path };
 }

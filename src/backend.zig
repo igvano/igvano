@@ -26,6 +26,9 @@ pub const Backend = struct {
         mounts: []const Mount = &.{},
         /// Normalized path relative to each cgroup hierarchy's mount root.
         cgroup_path: []const u8 = "",
+        systemd: bool = false,
+        systemd_slice: []const u8 = "system.slice",
+        systemd_unit: []const u8 = "",
         resources: Resources = .{},
         capabilities: ?Capabilities = null,
         rlimits: []const Rlimit = &.{},
@@ -216,6 +219,7 @@ pub const Backend = struct {
         starttime: []const u8,
         /// Borrowed from create options, or loaded from the runtime state directory.
         cgroup_path: ?[]const u8 = null,
+        systemd: bool = false,
         /// Set only when the container shares the runtime's mount namespace.
         rootfs_mount: ?[]const u8 = null,
         /// STATX_MNT_ID_UNIQUE of the self-bind; null for old handles.

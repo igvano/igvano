@@ -8,6 +8,7 @@ const oci = @import("../oci.zig");
 const hooks = @import("hooks.zig");
 const seccomp = @import("seccomp.zig");
 const devicefilter = @import("devicefilter.zig");
+const dbus = @import("dbus.zig");
 
 // runc libcontainer/specconv.AllowedDevices; /dev/console (5:1) is not included.
 const default_device_rules = [_]Resources.DeviceRule{
@@ -25,6 +26,7 @@ const default_device_rules = [_]Resources.DeviceRule{
 };
 test {
     _ = devicefilter;
+    _ = dbus;
 }
 
 const ST_NOATIME: usize = 1024;
@@ -297,8 +299,12 @@ fn freeV1Hierarchies(allocator: std.mem.Allocator, hierarchies: []const V1Hierar
     allocator.free(hierarchies);
 }
 
-/// Ignore named hierarchies and the hybrid unified mount. Comounts are one entry.
+/// The fs driver ignores named hierarchies; systemd also owns name=systemd.
 fn v1Hierarchies(allocator: std.mem.Allocator, text: []const u8) Backend.Error![]V1Hierarchy {
+    return v1HierarchiesForDriver(allocator, text, false);
+}
+
+fn v1HierarchiesForDriver(allocator: std.mem.Allocator, text: []const u8, systemd: bool) Backend.Error![]V1Hierarchy {
     var result: std.ArrayList(V1Hierarchy) = .empty;
     defer result.deinit(allocator);
     errdefer {
@@ -317,10 +323,12 @@ fn v1Hierarchies(allocator: std.mem.Allocator, text: []const u8) Backend.Error![
         const options = fields.next() orelse return error.CreateFailed;
         var mount_options = std.mem.tokenizeScalar(u8, options, ',');
         var named = false;
+        var systemd_named = false;
         while (mount_options.next()) |option| {
             if (std.mem.startsWith(u8, option, "name=")) named = true;
+            if (std.mem.eql(u8, option, "name=systemd")) systemd_named = true;
         }
-        if (named) continue;
+        if (named and !(systemd and systemd_named)) continue;
         var controllers: std.ArrayList([]const u8) = .empty;
         defer controllers.deinit(allocator);
         errdefer for (controllers.items) |name| allocator.free(name);
@@ -328,7 +336,7 @@ fn v1Hierarchies(allocator: std.mem.Allocator, text: []const u8) Backend.Error![
         while (names.next()) |name| {
             // Only kernel controllers; rw, relatime, xattr, release_agent etc.
             // are mount options rather than subsystem names.
-            for ([_][]const u8{ "cpu", "cpuacct", "cpuset", "memory", "devices", "pids", "blkio", "hugetlb", "net_cls", "net_prio", "freezer", "perf_event", "rdma", "misc", "debug" }) |controller| {
+            for ([_][]const u8{ "cpu", "cpuacct", "cpuset", "memory", "devices", "pids", "blkio", "hugetlb", "net_cls", "net_prio", "freezer", "perf_event", "rdma", "misc", "debug", "name=systemd" }) |controller| {
                 if (std.mem.eql(u8, name, controller)) {
                     const owned = try allocator.dupe(u8, name);
                     errdefer allocator.free(owned);
@@ -1146,8 +1154,6 @@ fn prepareMounts(allocator: std.mem.Allocator, mounts: []const Backend.Mount, ho
             });
             var symlinks: std.ArrayList(Backend.Symlink) = .empty;
             defer symlinks.deinit(allocator);
-            // ponytail: named hierarchies (name=systemd) are not exposed;
-            // discover and join them too if applications need that membership.
             // ponytail: bind the leaf even with a cgroup namespace; runc mounts
             // cgroupfs with subsystem options there. Use that if needed.
             for (hierarchies) |hierarchy| {
@@ -1489,7 +1495,7 @@ pub const LinuxBackend = struct {
         else
             null;
         defer if (cgroup) |fd| closeFd(fd);
-        const hierarchies: []V1Hierarchy = if (cgroup_root.mode == .legacy) try openV1Hierarchies(allocator) else &.{};
+        const hierarchies: []V1Hierarchy = if (cgroup_root.mode == .legacy) try openV1Hierarchies(allocator, handle.systemd) else &.{};
         defer if (cgroup_root.mode == .legacy) freeV1Hierarchies(allocator, hierarchies);
         for (hierarchies) |*hierarchy|
             hierarchy.leaf = (try walkV1Cgroup(allocator, hierarchy.root.?, options.cgroup_path, false, false)) orelse return error.ProcessNotFound;
@@ -1802,10 +1808,20 @@ pub const LinuxBackend = struct {
                 rootfs_mount_boot_id = try bootId();
             }
             try validateCgroupPath(options.cgroup_path);
+            var systemd_client = dbus.Client.init(allocator);
+            defer systemd_client.deinit();
+            if (options.systemd) {
+                if (!std.mem.eql(u8, options.systemd_unit, std.fs.path.basename(options.cgroup_path)) or
+                    !std.mem.endsWith(u8, options.systemd_unit, ".scope") or
+                    !std.mem.endsWith(u8, options.systemd_slice, ".slice") or
+                    std.mem.indexOfAny(u8, options.systemd_slice, "/\x00") != null)
+                    return error.InvalidConfig;
+                systemd_client.connect() catch |err| return systemdFailure(&systemd_client, "create systemd scope", err);
+            }
             if (joined_user_namespace) try checkResult(linux.chown(fifo, fifo_uid, fifo_gid));
             const cgroup_root = try openCgroupRoot();
             defer closeFd(cgroup_root.fd);
-            const hierarchies: []V1Hierarchy = if (cgroup_root.mode == .legacy) try openV1Hierarchies(allocator) else &.{};
+            const hierarchies: []V1Hierarchy = if (cgroup_root.mode == .legacy) try openV1Hierarchies(allocator, options.systemd) else &.{};
             defer if (cgroup_root.mode == .legacy) freeV1Hierarchies(allocator, hierarchies);
             const mounts = try prepareMounts(allocator, options.mounts, cgroup_root.fs_type, hierarchies, options.cgroup_path);
             defer closeMountFds(mounts);
@@ -1870,7 +1886,7 @@ pub const LinuxBackend = struct {
             // traversing the private state directory as a mapped user.
             const fifo_fd = try openPath(linux.AT.FDCWD, fifo, .{ .PATH = true, .NOFOLLOW = true, .CLOEXEC = true });
             defer closeFd(fifo_fd);
-            const cgroup: ?posix.fd_t = if (cgroup_root.mode == .unified) (try walkCgroup(cgroup_root.fd, options.cgroup_path, true, cgroup_writes)).? else null;
+            var cgroup: ?posix.fd_t = null;
             defer if (cgroup) |fd| closeFd(fd);
             var rootfs_mount_id: ?u64 = null;
             errdefer {
@@ -1880,6 +1896,8 @@ pub const LinuxBackend = struct {
                     last_diagnostic = saved_diagnostic;
                     last_diagnostic_len = saved_len;
                 }
+                if (systemd_client.unit_started)
+                    stopSystemdScope(allocator, options.systemd_unit) catch {};
                 // Child1 can die before reporting child2's PID. Kill the entire
                 // cgroup before removing it, including any blocked init.
                 if (cgroup) |fd| {
@@ -1893,19 +1911,10 @@ pub const LinuxBackend = struct {
                 else
                     .{ .before_create = before }) catch {};
             }
-            // Create every bind source before either fork; child1 joins these
-            // leaves before NEWCGROUP, and child2 mounts them during rootfs setup.
-            for (hierarchies) |*hierarchy|
-                hierarchy.leaf = (try walkV1Cgroup(allocator, hierarchy.root.?, options.cgroup_path, true, hierarchy.has("cpuset"))).?;
-            for (cgroup_writes) |write|
-                try writeCgroupFile(cgroup.?, write.name, write.value, options.cgroup_path);
-            if (cgroup_root.mode == .unified and !devicefilter.isAllowAll(options.resources.devices)) {
-                const rules = try v2DeviceRules(allocator, options.resources.devices, options.devices);
-                defer allocator.free(rules);
-                try applyV2DeviceFilter(allocator, cgroup.?, rules, options.cgroup_path, false);
-            }
-            if (cgroup_root.mode == .legacy)
-                try applyV1Writes(allocator, hierarchies, v1_writes, options.resources, options.devices, options.cgroup_path);
+            // fs cgroups are ready before fork; systemd adopts init at the
+            // early mapping exchange, while init is blocked before rootfs work.
+            if (!options.systemd)
+                try configureCgroup(allocator, cgroup_root.fd, cgroup_root.mode, &cgroup, hierarchies, options, cgroup_writes, v1_writes);
             var needs_mount_sources = false;
             for (mounts) |mount| {
                 if (mount.flags & linux.MS.BIND != 0 and
@@ -1942,7 +1951,7 @@ pub const LinuxBackend = struct {
             defer if (owns_create_go) {
                 for (create_go) |fd| closeFd(fd);
             };
-            const map_pipe = if (user_namespace) makePipe() catch |err| {
+            const map_pipe = if (user_namespace or options.systemd) makePipe() catch |err| {
                 for (report) |fd| closeFd(fd);
                 for (ready) |fd| closeFd(fd);
                 return err;
@@ -1956,6 +1965,7 @@ pub const LinuxBackend = struct {
             if (child1 == 0) {
                 checkResult(linux.prctl(@intFromEnum(linux.PR.SET_DUMPABLE), 0, 0, 0, 0)) catch |err| failCreate(report[1], err);
                 if (options.console_fds) |fds| closeFd(fds[0]);
+                if (options.systemd) closeFd(systemd_client.fd);
                 closeFd(create_go[1]);
                 if (map_pipe) |fds| closeFd(fds[1]);
                 closeFd(cgroup_root.fd);
@@ -1966,8 +1976,10 @@ pub const LinuxBackend = struct {
                     writeCgroupFile(fd, "cgroup.procs", "0", options.cgroup_path) catch |err| failCreate(report[1], err);
                     closeFd(fd);
                 } else for (hierarchies) |hierarchy| {
-                    writeCgroupFile(hierarchy.leaf.?, "cgroup.procs", "0", options.cgroup_path) catch |err| failCreate(report[1], err);
-                    closeFd(hierarchy.leaf.?);
+                    if (hierarchy.leaf) |fd| {
+                        writeCgroupFile(fd, "cgroup.procs", "0", options.cgroup_path) catch |err| failCreate(report[1], err);
+                        closeFd(fd);
+                    }
                     closeFd(hierarchy.root.?);
                 }
                 // Set with host privileges before entering user namespaces.
@@ -1975,7 +1987,8 @@ pub const LinuxBackend = struct {
                 applyOomScoreAdj(proc_dir, options.oom_score_adj) catch |err| failCreate(report[1], err);
                 joinNamespacesWithUser(joins.items, joined_user_fd) catch |err| failCreate(report[1], err);
                 // NEWUSER is unshared together with the others so it owns them.
-                if (flags != 0) checkResult(linux.unshare(flags)) catch |err| failCreate(report[1], err);
+                const early_flags = if (options.systemd) flags & ~@as(usize, linux.CLONE.NEWCGROUP) else flags;
+                if (early_flags != 0) checkResult(linux.unshare(early_flags)) catch |err| failCreate(report[1], err);
                 // NEWPID affects the next fork, making child2 pid 1 inside the namespace.
                 const child2 = forkProcess() catch |err| failCreate(report[1], err);
                 if (child2 == 0) {
@@ -2003,6 +2016,10 @@ pub const LinuxBackend = struct {
                         checkResult(linux.setgid(0)) catch linux.exit_group(1);
                         checkResult(linux.setuid(0)) catch linux.exit_group(1);
                     }
+                    // systemd has adopted init before NEWCGROUP captures its
+                    // namespace root. Explicitly joined cgroup namespaces stay joined.
+                    if (options.systemd and flags & linux.CLONE.NEWCGROUP != 0)
+                        checkResult(linux.unshare(linux.CLONE.NEWCGROUP)) catch linux.exit_group(1);
                     if (mount_source_socket) |socket| {
                         const namespace = openPath(proc_dir, "self/ns/mnt", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }) catch |err| failCreate(ready[1], err);
                         receiveMountSources(mounts, socket, namespace) catch |err| failCreate(ready[1], err);
@@ -2139,9 +2156,48 @@ pub const LinuxBackend = struct {
                 if (!readAll(report[0], std.mem.asBytes(&mapping_response))) return error.CreateFailed;
                 if (mapping_response.failureError()) |err| return err;
                 if (mapping_response.pid <= 0) return error.CreateFailed;
-                try writeUserMappings(mapping_response.pid, gid_map, uid_map);
-                // Init needs ownership as namespace root, even for a non-root process.
-                try checkResult(linux.chown(fifo, fifo_uid, fifo_gid));
+                // Child2 cannot exit/reuse its PID while child1 owns it. On
+                // any early failure kill it before closing the release pipe.
+                errdefer _ = linux.kill(mapping_response.pid, .KILL);
+                if (options.systemd) {
+                    const device_rules = if (cgroup_root.mode == .legacy)
+                        try v2DeviceRules(allocator, options.resources.devices, options.devices)
+                    else
+                        &.{};
+                    defer allocator.free(device_rules);
+                    const resource_properties = try systemdProperties(allocator, options.resources, cgroup_root.mode, device_rules);
+                    defer freeSystemdProperties(allocator, resource_properties);
+                    var properties: std.ArrayList(dbus.Property) = .empty;
+                    defer properties.deinit(allocator);
+                    const init_pids = [_]u32{@intCast(mapping_response.pid)};
+                    try properties.appendSlice(allocator, &.{
+                        .{ .name = "Description", .value = .{ .string = try std.fmt.allocPrint(allocator, "igvano container {s}", .{options.id}) } },
+                        .{ .name = "Slice", .value = .{ .string = options.systemd_slice } },
+                        .{ .name = "Delegate", .value = .{ .boolean = true } },
+                        .{ .name = "PIDs", .value = .{ .uint32s = &init_pids } },
+                        .{ .name = "DefaultDependencies", .value = .{ .boolean = false } },
+                        .{ .name = "MemoryAccounting", .value = .{ .boolean = true } },
+                        .{ .name = "CPUAccounting", .value = .{ .boolean = true } },
+                        .{ .name = "IOAccounting", .value = .{ .boolean = true } },
+                        .{ .name = "TasksAccounting", .value = .{ .boolean = true } },
+                    });
+                    if (cgroup_root.mode == .legacy)
+                        try properties.append(allocator, .{ .name = "BlockIOAccounting", .value = .{ .boolean = true } });
+                    try properties.appendSlice(allocator, resource_properties);
+                    systemd_client.start(options.systemd_unit, properties.items) catch |err| return systemdFailure(&systemd_client, "create systemd scope", err);
+                    try configureCgroup(allocator, cgroup_root.fd, cgroup_root.mode, &cgroup, hierarchies, options, cgroup_writes, v1_writes);
+                    if (cgroup_root.mode == .legacy) {
+                        try keepSystemdV1Whitelist(allocator, hierarchies, device_rules, options.cgroup_path);
+                        const pid_text = try std.fmt.allocPrint(allocator, "{d}", .{mapping_response.pid});
+                        for (hierarchies) |hierarchy|
+                            try writeCgroupFile(hierarchy.leaf.?, "cgroup.procs", pid_text, options.cgroup_path);
+                    }
+                }
+                if (user_namespace) {
+                    try writeUserMappings(mapping_response.pid, gid_map, uid_map);
+                    // Init needs ownership as namespace root, even for a non-root process.
+                    try checkResult(linux.chown(fifo, fifo_uid, fifo_gid));
+                }
                 if (!writeAll(fd, &.{1})) return error.CreateFailed;
                 closeFd(fd);
                 map_writer = null;
@@ -2163,6 +2219,7 @@ pub const LinuxBackend = struct {
                 .pid = response.pid,
                 .starttime = starttime,
                 .cgroup_path = options.cgroup_path,
+                .systemd = options.systemd,
                 .rootfs_mount = if (private_mount_namespace) null else options.rootfs,
                 .rootfs_mount_id = rootfs_mount_id,
                 .rootfs_mount_boot_id = rootfs_mount_boot_id,
@@ -2197,6 +2254,7 @@ pub const LinuxBackend = struct {
                 .pid = response.pid,
                 .starttime = owned_starttime,
                 .cgroup_path = options.cgroup_path,
+                .systemd = options.systemd,
                 .rootfs_mount = if (private_mount_namespace) null else options.rootfs,
                 .rootfs_mount_id = rootfs_mount_id,
                 .rootfs_mount_boot_id = rootfs_mount_boot_id,
@@ -2277,7 +2335,7 @@ pub const LinuxBackend = struct {
             // ponytail: cgroup.procs enumeration signals only the leaf's own
             // members. runc walks descendants; upgrade this path by recursing.
             if (root.mode == .legacy) {
-                const hierarchies = try openV1Hierarchies(allocator);
+                const hierarchies = try openV1Hierarchies(allocator, handle.systemd);
                 defer freeV1Hierarchies(allocator, hierarchies);
                 var members: ?posix.fd_t = null;
                 var freezer: ?posix.fd_t = null;
@@ -2337,11 +2395,50 @@ pub const LinuxBackend = struct {
             defer freeV1Writes(allocator, writes);
             // ponytail: Deny-all then allows briefly blocks device opens, and
             // partial lists drop create-time allows. Upgrade to runc's devices emulator.
-            const hierarchies = try openV1Hierarchies(allocator);
+            const hierarchies = try openV1Hierarchies(allocator, handle.systemd);
             defer freeV1Hierarchies(allocator, hierarchies);
             for (hierarchies) |*hierarchy|
                 hierarchy.leaf = (try walkV1Cgroup(allocator, hierarchy.root.?, path, false, false)) orelse return error.ProcessNotFound;
+            var requested = resources;
+            var device_list: ?[]u8 = null;
+            defer if (device_list) |list| allocator.free(list);
+            var device_rules: []const Resources.DeviceRule = &.{};
+            defer allocator.free(device_rules);
+            if (handle.systemd) {
+                if (resources.devices.len != 0) {
+                    device_rules = try v2DeviceRules(allocator, resources.devices, &.{});
+                } else {
+                    // A partial resource update must preserve the current whitelist,
+                    // including linux.devices entries added at creation.
+                    for (hierarchies) |hierarchy| {
+                        if (!hierarchy.has("devices")) continue;
+                        device_list = try readCgroupFile(allocator, hierarchy.leaf.?, "devices.list");
+                        device_rules = try parseV1DeviceList(allocator, device_list.?);
+                        break;
+                    }
+                }
+            }
+            if (handle.systemd) if (requested.cpu) |cpu| {
+                if ((cpu.quota != null or cpu.period != null) and (cpu.quota == null or cpu.period == null)) {
+                    for (hierarchies) |hierarchy| {
+                        if (!hierarchy.has("cpu")) continue;
+                        if (cpu.quota == null) {
+                            const value = try readCgroupFile(allocator, hierarchy.leaf.?, "cpu.cfs_quota_us");
+                            defer allocator.free(value);
+                            requested.cpu.?.quota = std.fmt.parseInt(i64, std.mem.trim(u8, value, " \t\n"), 10) catch return error.CgroupWriteFailed;
+                        }
+                        if (cpu.period == null) {
+                            const value = try readCgroupFile(allocator, hierarchy.leaf.?, "cpu.cfs_period_us");
+                            defer allocator.free(value);
+                            requested.cpu.?.period = std.fmt.parseInt(u64, std.mem.trim(u8, value, " \t\n"), 10) catch return error.CgroupWriteFailed;
+                        }
+                        break;
+                    }
+                }
+            };
+            try setSystemdResources(allocator, handle, requested, .legacy, false, device_rules);
             try applyV1Writes(allocator, hierarchies, writes, resources, &.{}, path);
+            if (handle.systemd) try keepSystemdV1Whitelist(allocator, hierarchies, device_rules, path);
         } else {
             var requested = resources;
             var inferred_memory_limit = false;
@@ -2386,6 +2483,14 @@ pub const LinuxBackend = struct {
                     writes = completed;
                 }
             }
+            var omit_inferred_memory_limit = inferred_memory_limit;
+            for (resources.unified) |entry| {
+                if (std.mem.eql(u8, entry.key, "memory.max")) {
+                    omit_inferred_memory_limit = false;
+                    break;
+                }
+            }
+            try setSystemdResources(allocator, handle, requested, .unified, omit_inferred_memory_limit, &.{});
             for (writes) |write| {
                 // The current limit was needed only to convert total swap.
                 if (inferred_memory_limit and std.mem.eql(u8, write.name, "memory.max")) {
@@ -2416,7 +2521,7 @@ pub const LinuxBackend = struct {
         const root = try openCgroupRoot();
         defer closeFd(root.fd);
         const members = if (root.mode == .legacy) members: {
-            const hierarchies = try openV1Hierarchies(allocator);
+            const hierarchies = try openV1Hierarchies(allocator, handle.systemd);
             defer freeV1Hierarchies(allocator, hierarchies);
             for ([_]?[]const u8{ "freezer", "pids", null }) |controller| {
                 for (hierarchies) |hierarchy| {
@@ -2452,16 +2557,23 @@ pub const LinuxBackend = struct {
         return cgroupFrozen(cgroup.fd, cgroup.mode);
     }
 
-    fn delete(_: *anyopaque, handle: Backend.Handle) Backend.Error!void {
+    fn delete(ptr: *anyopaque, handle: Backend.Handle) Backend.Error!void {
         last_diagnostic_len = 0;
         if (comptime builtin.os.tag == .linux) {
             if (handle.cgroup_path) |path| cgroup_cleanup: {
                 try validateCgroupPath(path);
+                if (handle.systemd) {
+                    // Namespace init ignores the scope's default SIGTERM. Drain
+                    // members first, as fs deletion does, so StopUnit completes
+                    // within the job deadline even when descendants remain.
+                    try killAll(ptr, handle, @intFromEnum(linux.SIG.KILL));
+                    try stopSystemdScope(std.heap.page_allocator, std.fs.path.basename(path));
+                }
                 const root = try openCgroupRoot();
                 defer closeFd(root.fd);
                 if (root.mode == .legacy) {
                     const allocator = std.heap.page_allocator;
-                    const hierarchies = try openV1Hierarchies(allocator);
+                    const hierarchies = try openV1Hierarchies(allocator, handle.systemd);
                     defer freeV1Hierarchies(allocator, hierarchies);
                     for (hierarchies) |*hierarchy| {
                         hierarchy.leaf = try walkV1Cgroup(allocator, hierarchy.root.?, path, false, false);
@@ -2769,10 +2881,10 @@ fn openCgroupRoot() Backend.Error!struct { fd: posix.fd_t, fs_type: usize, mode:
     return .{ .fd = root, .fs_type = fs[0], .mode = mode };
 }
 
-fn openV1Hierarchies(allocator: std.mem.Allocator) Backend.Error![]V1Hierarchy {
+fn openV1Hierarchies(allocator: std.mem.Allocator, systemd: bool) Backend.Error![]V1Hierarchy {
     const text = try readMountinfo(allocator);
     defer allocator.free(text);
-    const hierarchies = try v1Hierarchies(allocator, text);
+    const hierarchies = try v1HierarchiesForDriver(allocator, text, systemd);
     errdefer freeV1Hierarchies(allocator, hierarchies);
     const host_root = try openPath(linux.AT.FDCWD, "/", .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true });
     defer closeFd(host_root);
@@ -3066,7 +3178,7 @@ fn openFreezerCgroup(handle: Backend.Handle) Backend.Error!?struct { fd: posix.f
     defer closeFd(root.fd);
     const fd = if (root.mode == .legacy) freezer: {
         const allocator = std.heap.page_allocator;
-        const hierarchies = try openV1Hierarchies(allocator);
+        const hierarchies = try openV1Hierarchies(allocator, handle.systemd);
         defer freeV1Hierarchies(allocator, hierarchies);
         for (hierarchies) |hierarchy| {
             if (hierarchy.has("freezer"))
@@ -3590,7 +3702,7 @@ test "linux v1 create exposes readonly controller leaves containing init" {
     if (root.mode != .legacy) return error.SkipZigTest;
     try requireTestMountNamespace();
     const allocator = std.testing.allocator;
-    const hierarchies = try openV1Hierarchies(allocator);
+    const hierarchies = try openV1Hierarchies(allocator, false);
     defer freeV1Hierarchies(allocator, hierarchies);
     if (hierarchies.len == 0) return error.SkipZigTest;
     var selected = hierarchies[0];
@@ -3701,7 +3813,7 @@ test "linux v1 creates seeds writes joins and deletes each hierarchy" {
     closeFd(root.fd);
     if (root.mode != .legacy) return error.SkipZigTest;
     const allocator = std.testing.allocator;
-    const hierarchies = try openV1Hierarchies(allocator);
+    const hierarchies = try openV1Hierarchies(allocator, false);
     defer freeV1Hierarchies(allocator, hierarchies);
     if (hierarchies.len == 0) return error.SkipZigTest;
     const path = try std.fmt.allocPrint(allocator, "igvano-v1-test-{d}/leaf", .{linux.getpid()});
@@ -3848,7 +3960,7 @@ test "linux v1 cleanup attempts later hierarchies after the first removal fails"
     closeFd(root.fd);
     if (root.mode != .legacy) return error.SkipZigTest;
     const allocator = std.testing.allocator;
-    const hierarchies = try openV1Hierarchies(allocator);
+    const hierarchies = try openV1Hierarchies(allocator, false);
     defer freeV1Hierarchies(allocator, hierarchies);
     const path = try std.fmt.allocPrint(allocator, "igvano-v1-cleanup-{d}", .{linux.getpid()});
     defer allocator.free(path);
@@ -6585,7 +6697,7 @@ test "linux kill all signals every cgroup member and plain SIGKILL thaws paused 
     defer closeFd(root.fd);
     const path = try std.fmt.allocPrint(allocator, "igvano-kill-all-test-{d}", .{linux.getpid()});
     defer allocator.free(path);
-    const hierarchies: []V1Hierarchy = if (root.mode == .legacy) try openV1Hierarchies(allocator) else &.{};
+    const hierarchies: []V1Hierarchy = if (root.mode == .legacy) try openV1Hierarchies(allocator, false) else &.{};
     defer freeV1Hierarchies(allocator, hierarchies);
     var cgroup: ?posix.fd_t = null;
     defer if (cgroup) |fd| closeFd(fd);
@@ -9660,4 +9772,507 @@ fn requireTestUniqueMountIds() !void {
         error.Unsupported => return error.SkipZigTest,
         else => return err,
     };
+}
+
+test "systemd legacy memory updates keep a strict device policy" {
+    const allocator = std.testing.allocator;
+    const properties = try systemdProperties(allocator, .{ .memory = .{ .limit = 4096 } }, .legacy, &.{});
+    defer freeSystemdProperties(allocator, properties);
+    var strict = false;
+    var device_allow = false;
+    for (properties) |property| {
+        if (std.mem.eql(u8, property.name, "DevicePolicy")) {
+            try std.testing.expectEqualStrings("strict", property.value.string);
+            strict = true;
+        }
+        if (std.mem.eql(u8, property.name, "DeviceAllow")) device_allow = true;
+    }
+    try std.testing.expect(strict);
+    try std.testing.expect(device_allow);
+}
+
+test "systemd legacy device properties preserve defaults and configured devices" {
+    const AllocationTest = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            const rules = try v2DeviceRules(allocator, &.{
+                .{ .allow = false },
+                .{ .allow = true, .kind = .block, .major = 8, .minor = 0, .access = "rw" },
+                .{ .allow = false, .kind = .block, .major = 8, .minor = 0, .access = "w" },
+            }, &.{.{ .path = "/dev/custom", .kind = .character, .major = 10, .minor = 237 }});
+            defer allocator.free(rules);
+            const properties = try systemdProperties(allocator, .{}, .legacy, rules);
+            defer freeSystemdProperties(allocator, properties);
+            try std.testing.expectEqualStrings("DeviceAllow", properties[0].name);
+            try std.testing.expectEqual(@as(usize, 0), properties[0].value.string_pairs.len);
+            try std.testing.expectEqualStrings("DevicePolicy", properties[1].name);
+            try std.testing.expectEqualStrings("strict", properties[1].value.string);
+            const expected: []const [2][]const u8 = &.{
+                .{ "/dev/block/8:0", "r" },
+                .{ "char-*", "m" },
+                .{ "block-*", "m" },
+                .{ "/dev/char/1:3", "rwm" },
+                .{ "/dev/char/1:8", "rwm" },
+                .{ "/dev/char/1:7", "rwm" },
+                .{ "/dev/char/5:0", "rwm" },
+                .{ "/dev/char/1:5", "rwm" },
+                .{ "/dev/char/1:9", "rwm" },
+                .{ "char-136", "rwm" },
+                .{ "/dev/char/5:2", "rwm" },
+                .{ "/dev/char/10:200", "rwm" },
+                .{ "/dev/char/10:237", "rwm" },
+            };
+            try std.testing.expectEqualStrings("DeviceAllow", properties[2].name);
+            try std.testing.expectEqualDeep(expected, properties[2].value.string_pairs);
+        }
+    };
+    try AllocationTest.run(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, AllocationTest.run, .{});
+}
+
+test "systemd legacy partial updates preserve the current device whitelist" {
+    const allocator = std.testing.allocator;
+    const rules = try parseV1DeviceList(allocator, "c *:* m\nb *:* m\nc 1:3 rwm\nc 10:237 rw\n");
+    defer allocator.free(rules);
+    const properties = try systemdProperties(allocator, .{ .memory = .{ .limit = 4096 } }, .legacy, rules);
+    defer freeSystemdProperties(allocator, properties);
+    const expected: []const [2][]const u8 = &.{
+        .{ "char-*", "m" },          .{ "block-*", "m" },
+        .{ "/dev/char/1:3", "rwm" }, .{ "/dev/char/10:237", "rw" },
+    };
+    try std.testing.expectEqualDeep(expected, properties[properties.len - 1].value.string_pairs);
+    try std.testing.expectError(error.Unsupported, parseV1DeviceList(allocator, "a *:* rwm\n"));
+    for ([_][]const u8{ "x 1:3 rwm", "c 1 r", "c 1:3 x", "c -1:3 r", "c 4294967296:3 r", "c 1:3 r extra" }) |invalid|
+        try std.testing.expectError(error.InvalidConfig, parseV1DeviceList(allocator, invalid));
+}
+
+test "systemd device normalization merges permissions and fails closed for unsupported policies" {
+    const allocator = std.testing.allocator;
+    const allows = try systemdDeviceAllows(allocator, &.{
+        .{ .allow = true, .kind = .char, .major = 10, .minor = 237, .access = "r" },
+        .{ .allow = true, .kind = .char, .major = 10, .minor = 237, .access = "w" },
+        .{ .allow = true, .kind = .block, .major = -1, .minor = -1, .access = "m" },
+        .{ .allow = true, .kind = .char, .minor = 5 },
+    });
+    defer freeSystemdValue(allocator, .{ .string_pairs = allows });
+    try std.testing.expectEqualDeep(@as([]const [2][]const u8, &.{
+        .{ "/dev/char/10:237", "rw" }, .{ "block-*", "m" },
+    }), @as([]const [2][]const u8, allows));
+    const blacklist = try systemdDeviceAllows(allocator, &.{
+        .{ .allow = true },
+        .{ .allow = false, .kind = .char, .major = 10, .minor = 237 },
+    });
+    defer freeSystemdValue(allocator, .{ .string_pairs = blacklist });
+    try std.testing.expectEqual(@as(usize, 0), blacklist.len);
+    const all = try systemdDeviceAllows(allocator, &.{.{ .allow = true }});
+    defer freeSystemdValue(allocator, .{ .string_pairs = all });
+    try std.testing.expectEqualDeep(@as([]const [2][]const u8, &.{
+        .{ "char-*", "rwm" }, .{ "block-*", "rwm" },
+    }), @as([]const [2][]const u8, all));
+    try std.testing.expectError(error.InvalidConfig, systemdDeviceAllows(allocator, &.{
+        .{ .allow = true, .kind = .char, .major = 10 },
+        .{ .allow = false, .kind = .char, .major = 10, .minor = 237 },
+    }));
+}
+
+test "systemd properties use hierarchy-specific limits and round CPU quotas up" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const resources: Resources = .{
+        .memory = .{ .limit = 4096, .reservation = 1024, .swap = 8192 },
+        .cpu = .{ .shares = 1024, .quota = 1234, .period = 100000, .cpus = "0-2,8", .mems = "0" },
+        .pids = .{ .limit = -1 },
+    };
+    const unified = try systemdProperties(arena.allocator(), resources, .unified, &.{});
+    const expected = [_]dbus.Property{
+        .{ .name = "MemoryMax", .value = .{ .uint64 = 4096 } },
+        .{ .name = "MemoryLow", .value = .{ .uint64 = 1024 } },
+        .{ .name = "MemorySwapMax", .value = .{ .uint64 = 4096 } },
+        .{ .name = "CPUQuotaPeriodUSec", .value = .{ .uint64 = 100000 } },
+        .{ .name = "CPUQuotaPerSecUSec", .value = .{ .uint64 = 20000 } },
+        .{ .name = "CPUWeight", .value = .{ .uint64 = 39 } },
+        .{ .name = "AllowedCPUs", .value = .{ .bytes = &.{ 7, 1 } } },
+        .{ .name = "AllowedMemoryNodes", .value = .{ .bytes = &.{1} } },
+        .{ .name = "TasksMax", .value = .{ .uint64 = std.math.maxInt(u64) } },
+    };
+    try std.testing.expectEqualDeep(@as([]const dbus.Property, &expected), @as([]const dbus.Property, unified));
+    const legacy = try systemdProperties(arena.allocator(), resources, .legacy, &.{});
+    try std.testing.expectEqualStrings("MemoryLimit", legacy[0].name);
+    try std.testing.expectEqualStrings("CPUShares", legacy[1].name);
+    try std.testing.expectEqual(@as(u64, 1024), legacy[1].value.uint64);
+    for ([_][]const u8{ "a", "1-0", "1-2-3", "1,,2", "65536" }) |invalid|
+        try std.testing.expectError(error.InvalidConfig, systemdCpuSet(arena.allocator(), invalid));
+}
+
+fn systemdFailure(client: *const dbus.Client, operation: []const u8, err: dbus.Error) Backend.Error {
+    if (err == error.OutOfMemory) return error.OutOfMemory;
+    const detail = client.diagnostic();
+    reportDiagnostic("{s}: {s}", .{ operation, if (detail.len != 0) detail else @errorName(err) });
+    return error.CgroupWriteFailed;
+}
+
+/// Properties, CPU-set arrays and DeviceAllow paths are owned by the caller.
+fn freeSystemdProperties(allocator: std.mem.Allocator, properties: []const dbus.Property) void {
+    for (properties) |property| freeSystemdValue(allocator, property.value);
+    allocator.free(properties);
+}
+
+fn freeSystemdValue(allocator: std.mem.Allocator, value: dbus.Value) void {
+    switch (value) {
+        .bytes => |bytes| allocator.free(bytes),
+        .string_pairs => |pairs| {
+            for (pairs) |pair| allocator.free(pair[0]);
+            allocator.free(pairs);
+        },
+        else => {},
+    }
+}
+
+fn setSystemdProperty(allocator: std.mem.Allocator, properties: *std.ArrayList(dbus.Property), property: dbus.Property) Backend.Error!void {
+    errdefer freeSystemdValue(allocator, property.value);
+    for (properties.items) |*existing| {
+        if (!std.mem.eql(u8, existing.name, property.name)) continue;
+        freeSystemdValue(allocator, existing.value);
+        existing.* = property;
+        return;
+    }
+    try properties.append(allocator, property);
+}
+
+fn systemdCpuSet(allocator: std.mem.Allocator, cpus: []const u8) Backend.Error![]u8 {
+    var bits: std.ArrayList(u8) = .empty;
+    errdefer bits.deinit(allocator);
+    if (cpus.len == 0) return bits.toOwnedSlice(allocator);
+    var parts = std.mem.splitScalar(u8, cpus, ',');
+    while (parts.next()) |part| {
+        var range = std.mem.splitScalar(u8, part, '-');
+        const first = std.fmt.parseInt(u32, range.next().?, 10) catch return error.InvalidConfig;
+        const last = if (range.next()) |end| std.fmt.parseInt(u32, end, 10) catch return error.InvalidConfig else first;
+        if (range.next() != null or last < first or last > 65535) return error.InvalidConfig;
+        const length = last / 8 + 1;
+        if (length > bits.items.len) try bits.appendNTimes(allocator, 0, length - bits.items.len);
+        for (first..last + 1) |cpu| bits.items[cpu / 8] |= @as(u8, 1) << @intCast(cpu % 8);
+    }
+    return bits.toOwnedSlice(allocator);
+}
+
+fn systemdQuota(allocator: std.mem.Allocator, properties: *std.ArrayList(dbus.Property), quota: i64, configured_period: u64) Backend.Error!void {
+    if (quota < -1) return error.InvalidConfig;
+    const period = if (configured_period == 0) 100000 else configured_period;
+    if (configured_period != 0)
+        try setSystemdProperty(allocator, properties, .{ .name = "CPUQuotaPeriodUSec", .value = .{ .uint64 = configured_period } });
+    var per_sec: u64 = std.math.maxInt(u64);
+    if (quota > 0) {
+        // runc rounds up to a whole percent; cgroupfs later applies the exact value.
+        const raw = (@as(u128, @intCast(quota)) * 1_000_000) / period;
+        const rounded = ((raw + 9999) / 10000) * 10000;
+        per_sec = std.math.cast(u64, rounded) orelse return error.InvalidConfig;
+    }
+    try setSystemdProperty(allocator, properties, .{ .name = "CPUQuotaPerSecUSec", .value = .{ .uint64 = per_sec } });
+}
+
+fn systemdNumber(value: []const u8) Backend.Error!u64 {
+    const trimmed = std.mem.trim(u8, value, " \t\r\n");
+    if (std.mem.eql(u8, trimmed, "max")) return std.math.maxInt(u64);
+    return std.fmt.parseInt(u64, trimmed, 10) catch error.InvalidConfig;
+}
+
+fn deviceAccessMask(access: []const u8) Backend.Error!u3 {
+    if (access.len == 0) return error.InvalidConfig;
+    var mask: u3 = 0;
+    for (access) |byte| mask |= switch (byte) {
+        'r' => @as(u3, 1),
+        'w' => @as(u3, 2),
+        'm' => @as(u3, 4),
+        else => return error.InvalidConfig,
+    };
+    return mask;
+}
+
+fn deviceRuleNumber(value: ?i64) Backend.Error!?i64 {
+    const number = value orelse return null;
+    if (number == -1) return null;
+    if (number < 0 or number > std.math.maxInt(u32)) return error.InvalidConfig;
+    return number;
+}
+
+fn keepSystemdV1Whitelist(allocator: std.mem.Allocator, hierarchies: []const V1Hierarchy, rules: []const Resources.DeviceRule, path: []const u8) Backend.Error!void {
+    for (rules) |rule| {
+        if (rule.kind == .all and rule.allow) break;
+    } else return;
+    const allows = try systemdDeviceAllows(allocator, rules);
+    defer freeSystemdValue(allocator, .{ .string_pairs = allows });
+    if (allows.len != 2 or
+        !std.mem.eql(u8, allows[0][0], "char-*") or !std.mem.eql(u8, allows[0][1], "rwm") or
+        !std.mem.eql(u8, allows[1][0], "block-*") or !std.mem.eql(u8, allows[1][1], "rwm")) return;
+    // "devices.allow a" changes the kernel to blacklist mode, whose exceptions
+    // devices.list cannot expose. Represent allow-all with the equivalent two
+    // wildcard allows so later partial updates can still reconstruct the policy.
+    for (hierarchies) |hierarchy| {
+        if (!hierarchy.has("devices")) continue;
+        try writeCgroupFile(hierarchy.leaf.?, "devices.deny", "a", path);
+        try writeCgroupFile(hierarchy.leaf.?, "devices.allow", "c *:* rwm", path);
+        try writeCgroupFile(hierarchy.leaf.?, "devices.allow", "b *:* rwm", path);
+    }
+}
+
+/// Borrow access strings from devices.list; its caller keeps the text alive.
+fn parseV1DeviceList(allocator: std.mem.Allocator, text: []const u8) Backend.Error![]Resources.DeviceRule {
+    var rules: std.ArrayList(Resources.DeviceRule) = .empty;
+    errdefer rules.deinit(allocator);
+    var lines = std.mem.tokenizeScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        var fields = std.mem.tokenizeAny(u8, line, " :\t\r");
+        const kind = fields.next() orelse return error.InvalidConfig;
+        // devices.list does not expose deny exceptions in blacklist mode.
+        // Never reconstruct it as allow-all during an unrelated resource update.
+        if (std.mem.eql(u8, kind, "a")) {
+            reportDiagnostic("cannot preserve a cgroup v1 device blacklist through systemd; update must include device rules", .{});
+            return error.Unsupported;
+        }
+        var rule: Resources.DeviceRule = .{
+            .allow = true,
+            .kind = if (std.mem.eql(u8, kind, "c")) .char else if (std.mem.eql(u8, kind, "b")) .block else return error.InvalidConfig,
+        };
+        inline for (.{ "major", "minor" }) |field| {
+            const number = fields.next() orelse return error.InvalidConfig;
+            @field(rule, field) = if (std.mem.eql(u8, number, "*")) null else @as(i64, std.fmt.parseInt(u32, number, 10) catch return error.InvalidConfig);
+        }
+        rule.access = fields.next() orelse return error.InvalidConfig;
+        _ = try deviceAccessMask(rule.access);
+        if (fields.next() != null) return error.InvalidConfig;
+        try rules.append(allocator, rule);
+    }
+    return rules.toOwnedSlice(allocator);
+}
+
+/// Normalize ordered cgroup rules before translating them to systemd's whitelist.
+/// Like runc, unsupported blacklists fall back to strict deny-all; cgroupfs applies
+/// the exact policy afterwards. It must never be broadened on daemon-reload.
+fn systemdDeviceAllows(allocator: std.mem.Allocator, rules: []const Resources.DeviceRule) Backend.Error![][2][]const u8 {
+    const Entry = struct { rule: Resources.DeviceRule, access: u3 };
+    var entries: std.ArrayList(Entry) = .empty;
+    defer entries.deinit(allocator);
+    var default_allow = false;
+    for (rules) |configured| {
+        var rule = configured;
+        rule.major = try deviceRuleNumber(rule.major);
+        rule.minor = try deviceRuleNumber(rule.minor);
+        const access = try deviceAccessMask(rule.access);
+        if (rule.kind == .all) {
+            entries.clearRetainingCapacity();
+            default_allow = rule.allow;
+            continue;
+        }
+        if (rule.allow != default_allow) {
+            for (entries.items) |*entry| {
+                if (entry.rule.kind == rule.kind and entry.rule.major == rule.major and entry.rule.minor == rule.minor) {
+                    entry.access |= access;
+                    break;
+                }
+            } else {
+                try entries.append(allocator, .{ .rule = rule, .access = access });
+            }
+        } else {
+            var index: usize = 0;
+            while (index < entries.items.len) {
+                const entry = &entries.items[index];
+                const overlaps = entry.rule.kind == rule.kind and
+                    (rule.major == null or entry.rule.major == null or rule.major == entry.rule.major) and
+                    (rule.minor == null or entry.rule.minor == null or rule.minor == entry.rule.minor);
+                if (overlaps and entry.access & access != 0) {
+                    if ((rule.major != null and entry.rule.major == null) or
+                        (rule.minor != null and entry.rule.minor == null))
+                    {
+                        reportDiagnostic("cgroup v1 device rules cannot deny part of a wildcard allow", .{});
+                        return error.InvalidConfig;
+                    }
+                    entry.access &= ~access;
+                    if (entry.access == 0) {
+                        _ = entries.orderedRemove(index);
+                        continue;
+                    }
+                }
+                index += 1;
+            }
+        }
+    }
+    if (default_allow) {
+        if (entries.items.len != 0) {
+            std.debug.print("igvano: warning: systemd cannot represent a device blacklist; using a strict deny-all policy before cgroupfs writes\n", .{});
+            return allocator.alloc([2][]const u8, 0);
+        }
+        try entries.appendSlice(allocator, &.{
+            .{ .rule = .{ .allow = true, .kind = .char }, .access = 7 },
+            .{ .rule = .{ .allow = true, .kind = .block }, .access = 7 },
+        });
+    }
+    var allows: std.ArrayList([2][]const u8) = .empty;
+    errdefer {
+        for (allows.items) |pair| allocator.free(pair[0]);
+        allows.deinit(allocator);
+    }
+    for (entries.items) |entry| {
+        const rule = entry.rule;
+        const kind: []const u8 = if (rule.kind == .char) "char" else "block";
+        if (rule.major == null and rule.minor != null) {
+            std.debug.print("igvano: warning: systemd cannot represent a wildcard-major device rule; leaving it to cgroupfs\n", .{});
+            continue;
+        }
+        const path = if (rule.major) |major|
+            if (rule.minor) |minor|
+                try std.fmt.allocPrint(allocator, "/dev/{s}/{d}:{d}", .{ kind, major, minor })
+            else
+                try std.fmt.allocPrint(allocator, "{s}-{d}", .{ kind, major })
+        else
+            try std.fmt.allocPrint(allocator, "{s}-*", .{kind});
+        errdefer allocator.free(path);
+        const permissions = [_][]const u8{ "", "r", "w", "rw", "m", "rm", "wm", "rwm" };
+        try allows.append(allocator, .{ path, permissions[entry.access] });
+    }
+    return allows.toOwnedSlice(allocator);
+}
+
+/// Convert the same values used by cgroupfs, so swap conversion and unified
+/// overrides cannot diverge from the kernel writes. Unknown files stay on fs.
+fn systemdProperties(allocator: std.mem.Allocator, resources: Resources, mode: CgroupMode, device_rules: []const Resources.DeviceRule) Backend.Error![]dbus.Property {
+    var properties: std.ArrayList(dbus.Property) = .empty;
+    errdefer {
+        for (properties.items) |property| freeSystemdValue(allocator, property.value);
+        properties.deinit(allocator);
+    }
+    if (mode == .unified) {
+        const writes = try v2Writes(allocator, resources);
+        defer freeWrites(allocator, writes);
+        for (writes) |write| {
+            if (std.mem.eql(u8, write.name, "cpu.max")) {
+                var fields = std.mem.tokenizeAny(u8, write.value, " \t\r\n");
+                const quota_text = fields.next() orelse return error.InvalidConfig;
+                const quota: i64 = if (std.mem.eql(u8, quota_text, "max")) -1 else std.fmt.parseInt(i64, quota_text, 10) catch return error.InvalidConfig;
+                const period = if (fields.next()) |text| std.fmt.parseInt(u64, text, 10) catch return error.InvalidConfig else 100000;
+                if (fields.next() != null) return error.InvalidConfig;
+                try systemdQuota(allocator, &properties, quota, period);
+                continue;
+            }
+            if (std.mem.eql(u8, write.name, "cpuset.cpus") or std.mem.eql(u8, write.name, "cpuset.mems")) {
+                try setSystemdProperty(allocator, &properties, .{
+                    .name = if (std.mem.eql(u8, write.name, "cpuset.cpus")) "AllowedCPUs" else "AllowedMemoryNodes",
+                    .value = .{ .bytes = try systemdCpuSet(allocator, std.mem.trim(u8, write.value, " \t\r\n")) },
+                });
+                continue;
+            }
+            const mappings = [_][2][]const u8{
+                .{ "memory.max", "MemoryMax" },          .{ "memory.low", "MemoryLow" },
+                .{ "memory.high", "MemoryHigh" },        .{ "memory.min", "MemoryMin" },
+                .{ "memory.swap.max", "MemorySwapMax" }, .{ "cpu.weight", "CPUWeight" },
+                .{ "pids.max", "TasksMax" },
+            };
+            for (mappings) |mapping| {
+                if (std.mem.eql(u8, write.name, mapping[0])) {
+                    try setSystemdProperty(allocator, &properties, .{ .name = mapping[1], .value = .{ .uint64 = try systemdNumber(write.value) } });
+                    break;
+                }
+            }
+        }
+    } else {
+        if (resources.memory) |memory| if (memory.limit) |limit| {
+            if (limit != 0) try setSystemdProperty(allocator, &properties, .{ .name = "MemoryLimit", .value = .{ .uint64 = @bitCast(limit) } });
+        };
+        if (resources.cpu) |cpu| {
+            if (cpu.shares) |shares| if (shares != 0) {
+                _ = try cpuWeight(shares);
+                try setSystemdProperty(allocator, &properties, .{ .name = "CPUShares", .value = .{ .uint64 = shares } });
+            };
+            if (cpu.quota != null or cpu.period != null) try systemdQuota(allocator, &properties, cpu.quota orelse -1, cpu.period orelse 0);
+            inline for (.{ .{ "cpus", "AllowedCPUs" }, .{ "mems", "AllowedMemoryNodes" } }) |field| {
+                if (@field(cpu, field[0])) |value|
+                    try setSystemdProperty(allocator, &properties, .{ .name = field[1], .value = .{ .bytes = try systemdCpuSet(allocator, value) } });
+            }
+        }
+        if (resources.pids) |pids| if (pids.limit) |limit| {
+            if (limit != 0) try setSystemdProperty(allocator, &properties, .{ .name = "TasksMax", .value = .{ .uint64 = @bitCast(limit) } });
+        };
+        if (resources.block_io) |block| if (block.weight) |weight| {
+            if (weight != 0) try setSystemdProperty(allocator, &properties, .{ .name = "BlockIOWeight", .value = .{ .uint64 = weight } });
+        };
+        // DeviceAllow appends in systemd, so clear old entries before replacing
+        // the whitelist. Strict prevents systemd from resetting devices to allow-all.
+        try properties.appendSlice(allocator, &.{
+            .{ .name = "DeviceAllow", .value = .{ .string_pairs = &.{} } },
+            .{ .name = "DevicePolicy", .value = .{ .string = "strict" } },
+        });
+        const allows = try systemdDeviceAllows(allocator, device_rules);
+        errdefer freeSystemdValue(allocator, .{ .string_pairs = allows });
+        try properties.append(allocator, .{ .name = "DeviceAllow", .value = .{ .string_pairs = allows } });
+    }
+    return properties.toOwnedSlice(allocator);
+}
+
+fn setSystemdResources(allocator: std.mem.Allocator, handle: Backend.Handle, resources: Resources, mode: CgroupMode, omit_inferred_memory_limit: bool, device_rules: []const Resources.DeviceRule) Backend.Error!void {
+    if (!handle.systemd) return;
+    const path = handle.cgroup_path orelse return error.InvalidPath;
+    const properties = try systemdProperties(allocator, resources, mode, device_rules);
+    defer freeSystemdProperties(allocator, properties);
+    var selected: std.ArrayList(dbus.Property) = .empty;
+    defer selected.deinit(allocator);
+    if (omit_inferred_memory_limit) {
+        for (properties) |property| {
+            if (!std.mem.eql(u8, property.name, "MemoryMax")) try selected.append(allocator, property);
+        }
+    }
+    const requested_properties = if (omit_inferred_memory_limit) selected.items else properties;
+    if (requested_properties.len == 0) return;
+    var client = dbus.Client.init(allocator);
+    defer client.deinit();
+    client.connect() catch |err| return systemdFailure(&client, "update systemd scope", err);
+    client.setProperties(std.fs.path.basename(path), requested_properties) catch |err| return systemdFailure(&client, "update systemd scope", err);
+}
+
+fn configureCgroup(allocator: std.mem.Allocator, root: posix.fd_t, mode: CgroupMode, cgroup: *?posix.fd_t, hierarchies: []V1Hierarchy, options: Backend.CreateOptions, writes: []const Write, v1_writes: []const V1Write) Backend.Error!void {
+    if (mode == .unified) {
+        cgroup.* = (try walkCgroup(root, options.cgroup_path, !options.systemd, writes)) orelse return error.CreateFailed;
+        for (writes) |write| try writeCgroupFile(cgroup.*.?, write.name, write.value, options.cgroup_path);
+        if (!devicefilter.isAllowAll(options.resources.devices)) {
+            const rules = try v2DeviceRules(allocator, options.resources.devices, options.devices);
+            defer allocator.free(rules);
+            try applyV2DeviceFilter(allocator, cgroup.*.?, rules, options.cgroup_path, false);
+        }
+    } else {
+        for (hierarchies) |*hierarchy| {
+            hierarchy.leaf = if (options.systemd) try walkV1Cgroup(allocator, hierarchy.root.?, options.cgroup_path, false, false) else null;
+            if (hierarchy.leaf == null)
+                hierarchy.leaf = (try walkV1Cgroup(allocator, hierarchy.root.?, options.cgroup_path, true, hierarchy.has("cpuset"))).?;
+        }
+        try applyV1Writes(allocator, hierarchies, v1_writes, options.resources, options.devices, options.cgroup_path);
+    }
+}
+
+fn stopSystemdScope(allocator: std.mem.Allocator, unit: []const u8) Backend.Error!void {
+    var client = dbus.Client.init(allocator);
+    defer client.deinit();
+    client.connect() catch |err| return systemdFailure(&client, "stop systemd scope", err);
+    client.stop(unit) catch |err| return systemdFailure(&client, "stop systemd scope", err);
+}
+
+test "systemd unified overrides replace properties and free replaced CPU sets" {
+    const AllocationTest = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            const properties = try systemdProperties(allocator, .{
+                .memory = .{ .limit = 4096, .swap = 8192 },
+                .cpu = .{ .cpus = "0-2" },
+                .unified = &.{
+                    .{ .key = "memory.max", .value = "8192" },
+                    .{ .key = "cpuset.cpus", .value = "8" },
+                },
+            }, .unified, &.{});
+            defer freeSystemdProperties(allocator, properties);
+            const expected: []const dbus.Property = &.{
+                .{ .name = "MemoryMax", .value = .{ .uint64 = 8192 } },
+                .{ .name = "MemorySwapMax", .value = .{ .uint64 = 4096 } },
+                .{ .name = "AllowedCPUs", .value = .{ .bytes = &.{ 0, 1 } } },
+            };
+            try std.testing.expectEqualDeep(expected, @as([]const dbus.Property, properties));
+        }
+    };
+    try AllocationTest.run(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, AllocationTest.run, .{});
 }

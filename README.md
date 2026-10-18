@@ -9,6 +9,11 @@ double-fork + namespace isolation, pivot_root rootfs, cgroup v2, user namespaces
 default `/dev` population, and lifecycle hooks. Linux only at runtime; the code
 builds and unit-tests on macOS (Linux-specific paths are comptime-guarded).
 
+`--systemd-cgroup` selects systemd scopes without a libsystemd dependency.
+Set `linux.cgroupsPath` to `slice:prefix:name`; an empty path defaults to
+`system.slice:igvano:<id>`. Later commands use the saved driver and resolved
+path. Transient slice units are currently rejected with a diagnostic.
+
 ## Build
 
 The Zig toolchain is pinned (ghostty-style): `minimum_zig_version` in
@@ -40,6 +45,10 @@ nix develop -c zig build test
 # one file's tests directly
 nix develop -c zig test --dep igvano -Mroot=src/main.zig -Migvano=src/lib.zig
 ```
+
+The systemd lifecycle tests require root and `/run/systemd/private`; they skip
+on hosts without systemd and exercise both the private socket and system bus
+fallback on the v1/v2 Lima hosts.
 
 The Linux seccomp lifecycle test needs a static probe. `zig build test` builds
 it in the build cache and passes its path through `IGVANO_SECCOMP_PROBE`;
