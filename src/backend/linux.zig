@@ -1583,6 +1583,18 @@ pub const LinuxBackend = struct {
         defer if (owns_ready) for (ready) |fd| closeFd(fd);
         const helper = try forkProcess();
         if (helper == 0) {
+            // Reset inherited handlers before any descriptor is closed/reused.
+            // The frontend's self-pipe handler must not run in the helper or
+            // grandchild. Keep the mask unchanged so pending signals can run.
+            const default: linux.Sigaction = .{ .handler = .{ .handler = linux.SIG.DFL }, .mask = linux.sigemptyset(), .flags = 0 };
+            for (1..linux.NSIG) |number| {
+                const signal: linux.SIG = @enumFromInt(number);
+                if (signal == .KILL or signal == .STOP) continue;
+                var previous: linux.Sigaction = undefined;
+                checkResult(linux.sigaction(signal, null, &previous)) catch |err| failCreate(report[1], err);
+                if (previous.handler.handler != linux.SIG.DFL and previous.handler.handler != linux.SIG.IGN)
+                    checkResult(linux.sigaction(signal, &default, null)) catch |err| failCreate(report[1], err);
+            }
             // Hide the host runtime and its descriptors from container ptrace/procfs.
             checkResult(linux.prctl(@intFromEnum(linux.PR.SET_DUMPABLE), 0, 0, 0, 0)) catch |err| failCreate(report[1], err);
             closeFd(report[0]);

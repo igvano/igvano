@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const oci = @import("igvano").oci;
 const backend_module = @import("igvano").backend;
 const Backend = backend_module.Backend;
+const attached = @import("attached.zig");
 
 var backend_detail_buffer: [512]u8 = undefined;
 var last_backend_detail: ?[]const u8 = null;
@@ -61,6 +62,7 @@ const Config = struct {
     ps_args: []const []const u8 = &.{},
     process_file: ?[]const u8 = null,
     resources_file: ?[]const u8 = null,
+    resource_flags: oci.Spec.Resources = .{},
     detach: bool = false,
     tty: ?bool = null,
     exec_cwd: ?[]const u8 = null,
@@ -139,6 +141,8 @@ fn parseArgsWithLog(args: []const []const u8, log: *?[]const u8, log_format: *Lo
     var ps_format: PsFormat = .table;
     var process_file: ?[]const u8 = null;
     var resources_file: ?[]const u8 = null;
+    var resource_flags: oci.Spec.Resources = .{};
+    var has_resource_flags = false;
     var detach = false;
     var tty: ?bool = null;
     var exec_cwd: ?[]const u8 = null;
@@ -200,13 +204,61 @@ fn parseArgsWithLog(args: []const []const u8, log: *?[]const u8, log_format: *Lo
     } else if (subcommand == .update) {
         while (index < args.len and std.mem.startsWith(u8, args[index], "-")) : (index += 1) {
             const flag = args[index];
-            if (!std.mem.eql(u8, flag, "--resources") and !std.mem.startsWith(u8, flag, "--resources=") and
-                !std.mem.eql(u8, flag, "-r")) return oci.validationError(error.UnknownOption, "unknown option '{s}'", .{args[index]});
-            // ponytail: Individual runc flags (--memory, --cpu-shares, ...) are
-            // unsupported; translate them into OCI resource fields when needed.
-            resources_file = try optionValue(args, &index, error.MissingResources);
+            const name = flag[0 .. std.mem.indexOfScalar(u8, flag, '=') orelse flag.len];
+            if (std.mem.eql(u8, name, "--resources") or std.mem.eql(u8, name, "-r")) {
+                resources_file = try optionValue(args, &index, error.MissingResources);
+                continue;
+            }
+            const matched = flag: {
+                inline for (.{
+                    .{ "--memory", "limit" },
+                    .{ "--memory-reservation", "reservation" },
+                    .{ "--memory-swap", "swap" },
+                    .{ "--kernel-memory", "kernel" },
+                }) |entry| {
+                    if (std.mem.eql(u8, name, entry[0])) {
+                        const value = try optionValue(args, &index, error.MissingResourceValue);
+                        if (resource_flags.memory == null) resource_flags.memory = .{};
+                        @field(resource_flags.memory.?, entry[1]) = parseMemoryBytes(value) catch
+                            return oci.validationError(error.InvalidResourceValue, "{s}: invalid memory size '{s}'", .{ name, value });
+                        break :flag true;
+                    }
+                }
+                inline for (.{
+                    .{ "--cpu-shares", "shares", u64 },
+                    .{ "--cpu-period", "period", u64 },
+                    .{ "--cpu-quota", "quota", i64 },
+                    .{ "--cpu-rt-period", "realtimePeriod", u64 },
+                    .{ "--cpu-rt-runtime", "realtimeRuntime", i64 },
+                }) |entry| {
+                    if (std.mem.eql(u8, name, entry[0])) {
+                        const value = try optionValue(args, &index, error.MissingResourceValue);
+                        if (resource_flags.cpu == null) resource_flags.cpu = .{};
+                        @field(resource_flags.cpu.?, entry[1]) = try resourceNumber(entry[2], name, value);
+                        break :flag true;
+                    }
+                }
+                inline for (.{ .{ "--cpuset-cpus", "cpus" }, .{ "--cpuset-mems", "mems" } }) |entry| {
+                    if (std.mem.eql(u8, name, entry[0])) {
+                        if (resource_flags.cpu == null) resource_flags.cpu = .{};
+                        @field(resource_flags.cpu.?, entry[1]) = try optionValue(args, &index, error.MissingResourceValue);
+                        break :flag true;
+                    }
+                }
+                if (std.mem.eql(u8, name, "--pids-limit")) {
+                    resource_flags.pids = .{ .limit = try resourceNumber(i64, name, try optionValue(args, &index, error.MissingResourceValue)) };
+                    break :flag true;
+                }
+                if (std.mem.eql(u8, name, "--blkio-weight")) {
+                    resource_flags.blockIO = .{ .weight = try resourceNumber(u16, name, try optionValue(args, &index, error.MissingResourceValue)) };
+                    break :flag true;
+                }
+                break :flag false;
+            };
+            if (!matched) return oci.validationError(error.UnknownOption, "unknown option '{s}'", .{flag});
+            has_resource_flags = true;
         }
-        if (resources_file == null) return oci.validationError(error.MissingResources, "update: requires --resources <file|->", .{});
+        if (resources_file == null and !has_resource_flags) return oci.validationError(error.MissingResources, "update: requires --resources <file|-> or resource flags", .{});
     } else if (subcommand == .delete) {
         while (index < args.len and std.mem.startsWith(u8, args[index], "-")) : (index += 1) {
             if (!std.mem.eql(u8, args[index], "--force")) return oci.validationError(error.UnknownOption, "unknown option '{s}'", .{args[index]});
@@ -230,7 +282,7 @@ fn parseArgsWithLog(args: []const []const u8, log: *?[]const u8, log_format: *Lo
     if (index >= args.len) return oci.validationError(error.MissingId, "container id: required", .{});
     const remaining = args.len - index;
     if (subcommand == .exec) {
-        if (process_file != null and remaining != 1) return oci.validationError(error.UnexpectedArgument, "unexpected argument; global flags must precede the subcommand", .{});
+        if (process_file != null and remaining != 1) return oci.validationError(error.UnexpectedArgument, "exec: --process cannot be combined with command arguments", .{});
         if (process_file == null and remaining == 1) return oci.validationError(error.MissingCommand, "exec: requires a command or --process", .{});
     } else if (subcommand != .ps and remaining != 1 and !(subcommand == .kill and remaining == 2)) return oci.validationError(error.UnexpectedArgument, "unexpected argument; global flags must precede the subcommand", .{});
     const id = args[index];
@@ -241,7 +293,7 @@ fn parseArgsWithLog(args: []const []const u8, log: *?[]const u8, log_format: *Lo
     }
     const signal = if (subcommand == .kill and remaining == 2) args[index + 1] else null;
     if (signal) |value| {
-        if (value.len == 0 or std.mem.startsWith(u8, value, "-")) return oci.validationError(error.UnexpectedArgument, "unexpected argument; global flags must precede the subcommand", .{});
+        if (value.len == 0 or std.mem.startsWith(u8, value, "-")) return oci.validationError(error.UnexpectedArgument, "kill: signal must not be empty or start with '-'", .{});
     }
     return .{
         .root = root,
@@ -260,6 +312,7 @@ fn parseArgsWithLog(args: []const []const u8, log: *?[]const u8, log_format: *Lo
         .ps_args = if (subcommand == .ps) args[index + 1 ..] else &.{},
         .process_file = process_file,
         .resources_file = resources_file,
+        .resource_flags = resource_flags,
         .detach = detach,
         .tty = tty,
         .exec_cwd = exec_cwd,
@@ -272,6 +325,7 @@ fn parseArgsWithLog(args: []const []const u8, log: *?[]const u8, log_format: *Lo
 fn optionValue(args: []const []const u8, index: *usize, comptime missing: error{
     MissingProcessFile,
     MissingResources,
+    MissingResourceValue,
     MissingPidFile,
     MissingConsoleSocket,
     MissingCwd,
@@ -279,18 +333,69 @@ fn optionValue(args: []const []const u8, index: *usize, comptime missing: error{
     MissingUser,
     MissingFormat,
 }) ![]const u8 {
-    const flag = args[index.*];
+    const token = args[index.*];
+    const flag = token[0 .. std.mem.indexOfScalar(u8, token, '=') orelse token.len];
     const value = if (std.mem.indexOfScalar(u8, args[index.*], '=')) |equals|
         args[index.*][equals + 1 ..]
     else value: {
         index.* += 1;
         if (index.* >= args.len) return oci.validationError(missing, "{s}: missing value", .{flag});
         if (std.mem.startsWith(u8, args[index.*], "-") and
-            !(missing == error.MissingResources and std.mem.eql(u8, args[index.*], "-"))) return oci.validationError(missing, "{s}: missing value", .{flag});
+            !(missing == error.MissingResources and std.mem.eql(u8, args[index.*], "-")) and
+            !(missing == error.MissingResourceValue and args[index.*].len > 1 and std.ascii.isDigit(args[index.*][1])))
+            return oci.validationError(missing, "{s}: missing value", .{flag});
         break :value args[index.*];
     };
     if (value.len == 0) return oci.validationError(missing, "{s}: missing value", .{flag});
     return value;
+}
+
+fn resourceNumber(comptime T: type, flag: []const u8, value: []const u8) !T {
+    return std.fmt.parseInt(T, value, 10) catch
+        oci.validationError(error.InvalidResourceValue, "{s}: invalid integer '{s}'", .{ flag, value });
+}
+
+// Decimal digits[.digits], with RAMInBytes' binary, case-insensitive b/k/m/g/t/p
+// units and optional b/ib after k/m/g/t/p. One space may precede a unit.
+fn parseMemoryBytes(value: []const u8) !i64 {
+    // runc also accepts -1 for an unlimited limit.
+    if (std.mem.eql(u8, value, "-1")) return -1;
+    var number_end: usize = 0;
+    while (number_end < value.len and std.ascii.isDigit(value[number_end])) : (number_end += 1) {}
+    if (number_end == 0) return error.InvalidResourceValue;
+    if (number_end < value.len and value[number_end] == '.') {
+        number_end += 1;
+        const fraction_start = number_end;
+        while (number_end < value.len and std.ascii.isDigit(value[number_end])) : (number_end += 1) {}
+        if (number_end == fraction_start) return error.InvalidResourceValue;
+    }
+    var suffix_start = number_end;
+    if (suffix_start < value.len and value[suffix_start] == ' ') {
+        suffix_start += 1;
+        if (suffix_start == value.len) return error.InvalidResourceValue;
+    }
+    const suffix = value[suffix_start..];
+    var amount = std.fmt.parseFloat(f64, value[0..number_end]) catch return error.InvalidResourceValue;
+    if (suffix.len > 0) {
+        if (suffix.len > 3) return error.InvalidResourceValue;
+        if (std.ascii.toLower(suffix[0]) == 'b') {
+            if (suffix.len != 1) return error.InvalidResourceValue;
+        } else {
+            const power: u6 = switch (std.ascii.toLower(suffix[0])) {
+                'k' => 10,
+                'm' => 20,
+                'g' => 30,
+                't' => 40,
+                'p' => 50,
+                else => return error.InvalidResourceValue,
+            };
+            if ((suffix.len == 2 and std.ascii.toLower(suffix[1]) != 'b') or
+                (suffix.len == 3 and !std.ascii.eqlIgnoreCase(suffix[1..], "ib"))) return error.InvalidResourceValue;
+            amount *= @floatFromInt(@as(u64, 1) << power);
+        }
+    }
+    if (!std.math.isFinite(amount) or amount < 0 or amount >= 0x1p63) return error.InvalidResourceValue;
+    return @intFromFloat(amount);
 }
 
 fn boolOption(flag: []const u8) !bool {
@@ -315,8 +420,8 @@ fn numericId(value: []const u8) !u32 {
     return std.fmt.parseInt(u32, value, 10) catch oci.validationError(error.InvalidUser, "--user: ID exceeds u32", .{});
 }
 
-fn prepareProcess(allocator: std.mem.Allocator, process: oci.Spec.Process, socket: ?[]const u8) !Backend.ExecOptions {
-    try validateConsoleSocket(process.terminal, socket);
+fn prepareProcess(allocator: std.mem.Allocator, process: oci.Spec.Process, has_console: bool) !Backend.ExecOptions {
+    try validateConsoleSocket(process.terminal, has_console);
     return .{
         .allocator = allocator,
         .argv = process.args,
@@ -333,10 +438,10 @@ fn prepareProcess(allocator: std.mem.Allocator, process: oci.Spec.Process, socke
     };
 }
 
-fn validateConsoleSocket(terminal: ?bool, socket: ?[]const u8) !void {
+fn validateConsoleSocket(terminal: ?bool, has_console: bool) !void {
     if (terminal orelse false) {
-        if (socket == null) return oci.validationError(error.MissingConsoleSocket, "process.terminal: requires --console-socket", .{});
-    } else if (socket != null) return oci.validationError(error.UnexpectedConsoleSocket, "--console-socket: requires process.terminal=true", .{});
+        if (!has_console) return oci.validationError(error.MissingConsoleSocket, "process.terminal: requires --console-socket", .{});
+    } else if (has_console) return oci.validationError(error.UnexpectedConsoleSocket, "--console-socket: requires process.terminal=true", .{});
 }
 
 fn connectConsoleSocket(path: []const u8) !std.posix.fd_t {
@@ -350,11 +455,40 @@ fn connectConsoleSocket(path: []const u8) !std.posix.fd_t {
     if (linux.errno(opened) != .SUCCESS) return error.ConsoleSocketFailed;
     const fd: std.posix.fd_t = @intCast(opened);
     errdefer _ = linux.close(fd);
+    try connectConsoleSocketFd(fd, &address, @intCast(@offsetOf(linux.sockaddr.un, "path") + path.len + 1), linux);
+    return fd;
+}
+
+fn connectConsoleSocketFd(fd: std.posix.fd_t, address: *const std.os.linux.sockaddr.un, length: std.os.linux.socklen_t, comptime system: type) !void {
+    const linux = std.os.linux;
     while (true) {
-        const result = linux.connect(fd, &address, @intCast(@offsetOf(linux.sockaddr.un, "path") + path.len + 1));
+        const result = system.connect(fd, address, length);
         switch (linux.errno(result)) {
-            .SUCCESS, .ISCONN => return fd,
-            .INTR => continue,
+            .SUCCESS, .ISCONN => return,
+            .INTR, .ALREADY, .INPROGRESS => {},
+            else => return error.ConsoleSocketFailed,
+        }
+        var fds = [_]linux.pollfd{.{ .fd = fd, .events = linux.POLL.OUT, .revents = 0 }};
+        while (true) {
+            switch (linux.errno(system.poll(&fds, fds.len, -1))) {
+                .SUCCESS => break,
+                .INTR => continue,
+                else => return error.ConsoleSocketFailed,
+            }
+        }
+        var socket_error: i32 = 0;
+        var length_out: linux.socklen_t = @sizeOf(i32);
+        while (true) {
+            switch (linux.errno(system.getsockopt(fd, linux.SOL.SOCKET, linux.SO.ERROR, @ptrCast(&socket_error), &length_out))) {
+                .SUCCESS => break,
+                .INTR => continue,
+                else => return error.ConsoleSocketFailed,
+            }
+        }
+        switch (@as(linux.E, @enumFromInt(socket_error))) {
+            // Retry connect too: an interrupted AF_UNIX backlog wait may
+            // leave an unconnected socket with SO_ERROR=0.
+            .SUCCESS, .ALREADY, .INPROGRESS => continue,
             else => return error.ConsoleSocketFailed,
         }
     }
@@ -450,9 +584,9 @@ fn createContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, c
     defer parsed.deinit();
     try oci.requireCreate(parsed.value);
     const process_options = if (parsed.value.process) |process|
-        try prepareProcess(allocator, process, config.console_socket)
+        try prepareProcess(allocator, process, config.console_socket != null)
     else options: {
-        try validateConsoleSocket(null, config.console_socket);
+        try validateConsoleSocket(null, config.console_socket != null);
         break :options @as(?Backend.ExecOptions, null);
     };
     defer if (process_options) |options| allocator.free(options.rlimits);
@@ -1035,6 +1169,35 @@ fn execProcessConfig(allocator: std.mem.Allocator, inherited: oci.Spec.Process, 
 fn execContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, config: Config) !u8 {
     if (comptime builtin.os.tag != .linux) return error.NotImplemented;
     const linux = std.os.linux;
+    if (!config.detach) {
+        // Reserve stdin/stdout before locks, console sockets, or the signal
+        // pipe can reuse their numbers and become attached-loop I/O.
+        for ([_]std.posix.fd_t{ 0, 1 }) |fd| {
+            switch (linux.errno(linux.fcntl(fd, linux.F.GETFD, 0))) {
+                .SUCCESS => continue,
+                .BADF => {},
+                else => return error.ConsoleFailed,
+            }
+            const null_fd: std.posix.fd_t = while (true) {
+                const opened = linux.open("/dev/null", .{ .ACCMODE = .RDWR }, 0);
+                switch (linux.errno(opened)) {
+                    .SUCCESS => break @intCast(opened),
+                    .INTR => continue,
+                    else => return error.ConsoleFailed,
+                }
+            };
+            if (null_fd != fd) {
+                defer _ = linux.close(null_fd);
+                while (true) {
+                    switch (linux.errno(linux.dup2(null_fd, fd))) {
+                        .SUCCESS => break,
+                        .INTR => continue,
+                        else => return error.ConsoleFailed,
+                    }
+                }
+            }
+        }
+    }
     var lock = try openContainerLock(allocator, config, false);
     defer if (lock) |file| file.close(io);
     const locked = if (lock) |file| try lockContainer(file, false) else true;
@@ -1082,7 +1245,8 @@ fn execContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, con
         }
     }
     try oci.validateProcess(process);
-    var options = try prepareProcess(process_allocator, process, config.console_socket);
+    const local_console = (process.terminal orelse false) and !config.detach and config.console_socket == null;
+    var options = try prepareProcess(process_allocator, process, local_console or config.console_socket != null);
     const seccomp = seccomp: {
         const spec = saved_spec orelse break :seccomp null;
         const settings = spec.value.linux orelse break :seccomp null;
@@ -1090,7 +1254,7 @@ fn execContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, con
     };
     options.seccomp = try oci.prepareSeccomp(process_allocator, seccomp);
     options.cgroup_path = state.handle.?.cgroup_path orelse return oci.validationError(error.InvalidState, "exec: saved cgroup path is missing", .{});
-    options.console_fds = if (config.console_socket != null) try backend_module.console.socketpair() else null;
+    options.console_fds = if (process.terminal orelse false) try backend_module.console.socketpair() else null;
     defer if (options.console_fds) |fds| for (fds) |fd| {
         _ = linux.close(fd);
     };
@@ -1106,20 +1270,26 @@ fn execContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, con
         _ = linux.prctl(@intFromEnum(linux.PR.SET_CHILD_SUBREAPER), was_subreaper, 0, 0, 0);
     };
     const pid = try backendResult(backend, backend.exec(state.handle.?, options));
-    {
-        errdefer {
-            _ = linux.kill(pid, .KILL);
-            if (!config.detach) _ = waitExec(pid) catch {};
-        }
-        if (options.console_fds) |fds| {
-            const controller = try backend_module.console.receiveFd(fds[0]);
-            defer _ = linux.close(controller);
-            const peer = try connectConsoleSocket(config.console_socket.?);
+    var reaped = false;
+    errdefer if (!reaped) {
+        _ = linux.kill(pid, .KILL);
+        if (!config.detach) _ = waitExec(pid) catch {};
+    };
+    var controller: ?std.posix.fd_t = null;
+    defer if (controller) |fd| {
+        _ = linux.close(fd);
+    };
+    if (options.console_fds) |fds| {
+        controller = try backend_module.console.receiveFd(fds[0]);
+        if (config.console_socket) |path| {
+            const peer = try connectConsoleSocket(path);
             defer _ = linux.close(peer);
-            try backend_module.console.sendFd(peer, controller);
+            try backend_module.console.sendFd(peer, controller.?);
+            _ = linux.close(controller.?);
+            controller = null;
         }
-        if (config.pid_file) |path| try writePidFile(allocator, io, path, pid);
     }
+    if (config.pid_file) |path| try writePidFile(allocator, io, path, pid);
     // Do not hold the container lock while waiting for a long-running command.
     if (locked) {
         if (lock) |file| {
@@ -1127,8 +1297,10 @@ fn execContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, con
             lock = null;
         }
     }
-    // Attached exec does not forward signals; containerd always uses --detach.
-    return if (config.detach) 0 else try waitExec(pid);
+    if (config.detach) return 0;
+    var signals = try attached.Signals.init();
+    defer signals.deinit();
+    return try attached.wait(pid, &reaped, &signals, controller, 0, 1);
 }
 
 fn waitExec(pid: i32) !u8 {
@@ -1249,9 +1421,9 @@ fn requireDelete(status: oci.Status, force: bool) !void {
 }
 
 fn updateContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, config: Config) !void {
-    const parsed = try oci.loadResources(allocator, io, config.resources_file orelse return oci.validationError(error.MissingResources, "update: requires --resources", .{}));
-    defer parsed.deinit();
-    const resources = try oci.cgroupResources(allocator, parsed.value);
+    const parsed = if (config.resources_file) |path| try oci.loadResources(allocator, io, path) else null;
+    defer if (parsed) |file| file.deinit();
+    const resources = try oci.cgroupResources(allocator, if (parsed) |file| file.value else config.resource_flags);
     defer oci.freeCgroupResources(allocator, resources);
     const lock = try openContainerLock(allocator, config, false);
     defer if (lock) |file| file.close(io);
@@ -1265,6 +1437,34 @@ fn updateContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, c
     defer state.deinit();
     try oci.requireUpdate(state.parsed.value.status);
     try backendResult(backend, backend.update(state.handle.?, resources));
+}
+
+fn filterPsOutput(allocator: std.mem.Allocator, text: []const u8, pids: []const i32) ![]u8 {
+    // ponytail: whitespace in columns before PID is mis-tokenized, as in runc;
+    // parse fixed-width columns if those ps formats need to be supported.
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    const header = lines.next() orelse return error.PsMissingPidColumn;
+    var titles = std.mem.tokenizeAny(u8, header, " \t\r");
+    const pid_column = column: {
+        var index: usize = 0;
+        while (titles.next()) |title| : (index += 1) {
+            if (std.mem.eql(u8, title, "PID")) break :column index;
+        }
+        return error.PsMissingPidColumn;
+    };
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    errdefer output.deinit();
+    try output.writer.print("{s}\n", .{header});
+    while (lines.next()) |line| {
+        if (std.mem.trim(u8, line, " \t\r").len == 0) continue;
+        var fields = std.mem.tokenizeAny(u8, line, " \t\r");
+        for (0..pid_column) |_| _ = fields.next() orelse return error.PsInvalidPid;
+        const pid_text = fields.next() orelse return error.PsInvalidPid;
+        const pid = std.fmt.parseInt(i32, pid_text, 10) catch return error.PsInvalidPid;
+        if (std.mem.indexOfScalar(i32, pids, pid) != null)
+            try output.writer.print("{s}\n", .{line});
+    }
+    return output.toOwnedSlice();
 }
 
 fn psContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, config: Config, output: std.Io.File) !void {
@@ -1285,12 +1485,20 @@ fn psContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, confi
         try output.writeStreamingAll(io, json);
         try output.writeStreamingAll(io, "\n");
     } else {
-        // ponytail: Only PID is printed; runc runs host ps with the supplied ps args and full columns.
-        try output.writeStreamingAll(io, "PID\n");
-        for (pids) |pid| {
-            var buffer: [32]u8 = undefined;
-            try output.writeStreamingAll(io, try std.fmt.bufPrint(&buffer, "{d}\n", .{pid}));
+        const ps_args: []const []const u8 = if (config.ps_args.len == 0) &.{"-ef"} else config.ps_args;
+        const argv = try allocator.alloc([]const u8, ps_args.len + 1);
+        defer allocator.free(argv);
+        argv[0] = "ps";
+        @memcpy(argv[1..], ps_args);
+        const result = try std.process.run(allocator, io, .{ .argv = argv, .expand_arg0 = .expand });
+        defer allocator.free(result.stdout);
+        defer allocator.free(result.stderr);
+        if (result.term != .exited or result.term.exited != 0) {
+            return oci.validationError(error.PsFailed, "ps: {s}", .{std.mem.trim(u8, result.stderr, "\n")});
         }
+        const filtered = try filterPsOutput(allocator, result.stdout, pids);
+        defer allocator.free(filtered);
+        try output.writeStreamingAll(io, filtered);
     }
 }
 
@@ -1482,7 +1690,9 @@ pub fn main(init: std.process.Init) !u8 {
             error.MissingPidFile => "missing value for --pid-file",
             error.MissingConsoleSocket => "missing value for --console-socket",
             error.MissingProcessFile => "missing value for --process",
-            error.MissingResources => "update requires --resources <file|->",
+            error.MissingResources => "update requires --resources <file|-> or resource flags",
+            error.MissingResourceValue => "missing value for resource flag",
+            error.InvalidResourceValue => "invalid resource flag value",
             error.MissingCommand => "exec requires a command or --process",
             error.MissingCwd => "missing value for --cwd",
             error.MissingEnv => "missing value for --env",
@@ -1497,12 +1707,13 @@ pub fn main(init: std.process.Init) !u8 {
         };
         var buffer: [1024]u8 = undefined;
         const line = std.fmt.bufPrint(&buffer, "igvano: {s}", .{oci.diagnosticFor(err) orelse message}) catch unreachable;
-        emitError(allocator, init.io, log, log_format, line, null);
+        emitError(allocator, init.io, log, log_format, line, null, null);
         std.debug.print(
             "Usage: igvano [--root <dir>] [--log <file>] [--log-format text|json] <state|start|pause|resume> <id>\n" ++
                 "       igvano [global flags] features\n" ++
                 "       igvano [global flags] ps [--format table|json] <id> [ps args...]\n" ++
-                "       igvano [global flags] update --resources|-r <file|-> <id>\n" ++
+                "       igvano [global flags] update [--resources|-r <file|->] [resource flags...] <id>\n" ++
+                "              --resources/-r ignores individual resource flags\n" ++
                 "       igvano [--root <dir>] [--log <file>] [--log-format text|json] delete [--force] <id>\n" ++
                 "       igvano [--root <dir>] [--log <file>] [--log-format text|json] kill [--all] <id> [signal]\n" ++
                 "       igvano [--root <dir>] [--log <file>] [--log-format text|json] create [--bundle <path>] [--pid-file <file>] [--console-socket <path>] <id>\n" ++
@@ -1564,16 +1775,17 @@ fn reportError(allocator: std.mem.Allocator, io: std.Io, diagnostic: ?[]const u8
         return;
     };
     defer allocator.free(message);
-    emitError(allocator, io, config.log, config.log_format, message, diagnostic orelse oci.diagnosticFor(err));
+    const frontend_detail = if (diagnostic == null) oci.diagnosticFor(err) else null;
+    emitError(allocator, io, config.log, config.log_format, message, frontend_detail, diagnostic orelse frontend_detail);
 }
 
-fn emitError(allocator: std.mem.Allocator, io: std.Io, log: ?[]const u8, log_format: LogFormat, message: []const u8, diagnostic: ?[]const u8) void {
-    if (diagnostic) |detail|
+fn emitError(allocator: std.mem.Allocator, io: std.Io, log: ?[]const u8, log_format: LogFormat, message: []const u8, stderr_detail: ?[]const u8, log_detail: ?[]const u8) void {
+    if (stderr_detail) |detail|
         std.debug.print("{s}: {s}\n", .{ message, detail })
     else
         std.debug.print("{s}\n", .{message});
     if (log) |path| {
-        const detailed = if (diagnostic) |detail|
+        const detailed = if (log_detail) |detail|
             std.fmt.allocPrint(allocator, "{s}: {s}", .{ message, detail }) catch null
         else
             null;
@@ -1627,15 +1839,57 @@ test "console socket validation matches the terminal setting" {
     for ([_]?bool{ null, false, true }) |terminal| {
         for ([_]?[]const u8{ null, "/tmp/console.sock" }) |socket| {
             if ((terminal orelse false) == (socket != null)) {
-                try validateConsoleSocket(terminal, socket);
+                try validateConsoleSocket(terminal, socket != null);
             } else {
                 try std.testing.expectError(
                     if (socket == null) error.MissingConsoleSocket else error.UnexpectedConsoleSocket,
-                    validateConsoleSocket(terminal, socket),
+                    validateConsoleSocket(terminal, socket != null),
                 );
             }
         }
     }
+}
+
+test "console socket connect retries interruptions and checks pending errors" {
+    const linux = std.os.linux;
+    const System = struct {
+        var connect_calls: usize = 0;
+        var poll_calls: usize = 0;
+        var socket_error: linux.E = .SUCCESS;
+
+        fn failure(err: linux.E) usize {
+            return @bitCast(-@as(isize, @intFromEnum(err)));
+        }
+
+        fn connect(_: i32, _: *const anyopaque, _: linux.socklen_t) usize {
+            const results = [_]linux.E{ .INTR, .ALREADY, .INPROGRESS, .ISCONN };
+            const result = results[@min(connect_calls, results.len - 1)];
+            connect_calls += 1;
+            return failure(result);
+        }
+
+        fn poll(fds: [*]linux.pollfd, count: linux.nfds_t, timeout: i32) usize {
+            std.debug.assert(count == 1 and timeout == -1 and fds[0].events == linux.POLL.OUT);
+            poll_calls += 1;
+            if (poll_calls == 1) return failure(.INTR);
+            fds[0].revents = linux.POLL.OUT;
+            return 1;
+        }
+
+        fn getsockopt(_: i32, level: i32, option: u32, value: [*]u8, length: *linux.socklen_t) usize {
+            std.debug.assert(level == linux.SOL.SOCKET and option == linux.SO.ERROR and length.* == @sizeOf(i32));
+            const code: *i32 = @ptrCast(@alignCast(value));
+            code.* = @intFromEnum(socket_error);
+            return 0;
+        }
+    };
+    const address: linux.sockaddr.un = .{ .path = @splat(0) };
+    try connectConsoleSocketFd(42, &address, @sizeOf(linux.sockaddr.un), System);
+    // A writable socket can still have failed asynchronously.
+    System.connect_calls = 0;
+    System.poll_calls = 0;
+    System.socket_error = .CONNREFUSED;
+    try std.testing.expectError(error.ConsoleSocketFailed, connectConsoleSocketFd(42, &address, @sizeOf(linux.sockaddr.un), System));
 }
 
 test "start FIFO EOF before acknowledgement fails only after a writer was observed" {
@@ -1769,7 +2023,7 @@ test "process validation and typed translation serve create and exec" {
         .apparmorProfile = "igvano-deny-write",
         .oomScoreAdj = 50,
     };
-    const options = try prepareProcess(std.testing.allocator, process, null);
+    const options = try prepareProcess(std.testing.allocator, process, false);
     defer std.testing.allocator.free(options.rlimits);
     try std.testing.expectEqual(@as(u64, 1), options.capabilities.?.bounding);
     try std.testing.expectEqual(@as(u64, 512), options.rlimits[0].soft);
@@ -1788,7 +2042,7 @@ test "process validation and typed translation serve create and exec" {
     try std.testing.expectError(error.InvalidProcess, oci.validateProcess(invalid));
     invalid = process;
     invalid.terminal = true;
-    try std.testing.expectError(error.MissingConsoleSocket, prepareProcess(std.testing.allocator, invalid, null));
+    try std.testing.expectError(error.MissingConsoleSocket, prepareProcess(std.testing.allocator, invalid, false));
 }
 
 test "linux seccomp create exec and start enforce filters with and without noNewPrivileges" {
@@ -2240,6 +2494,7 @@ test "linux exec update ps pause resume and forced delete obey the live containe
             linux.exit_group(1);
         testExecLifecycle(absolute) catch |err| {
             std.debug.print("exec lifecycle test: {s}\n", .{@errorName(err)});
+            if (@errorReturnTrace()) |trace| std.debug.dumpErrorReturnTrace(trace);
             linux.exit_group(1);
         };
         linux.exit_group(0);
@@ -2252,6 +2507,8 @@ test "linux exec update ps pause resume and forced delete obey the live containe
 fn testExecLifecycle(base: []const u8) !void {
     const linux = std.os.linux;
     var threaded: std.Io.Threaded = .init_single_threaded;
+    // Spawning host ps needs storage for its argv, even without I/O workers.
+    threaded.allocator = std.heap.page_allocator;
     const io = threaded.io();
     var arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
     defer arena.deinit();
@@ -2268,6 +2525,8 @@ fn testExecLifecycle(base: []const u8) !void {
         if (linux.errno(linux.access(path_z, linux.F_OK)) == .SUCCESS)
             try mounts.append(allocator, .{ .destination = path, .source = path, .type = "bind", .options = &.{ "rbind", "ro" } });
     }
+    try mounts.append(allocator, .{ .destination = "/dev", .source = "tmpfs", .type = "tmpfs", .options = &.{ "nosuid", "mode=755" } });
+    try mounts.append(allocator, .{ .destination = "/dev/pts", .source = "devpts", .type = "devpts", .options = &.{ "nosuid", "noexec", "newinstance", "ptmxmode=666", "mode=620" } });
     try mounts.append(allocator, .{ .destination = "/proc", .source = "proc", .type = "proc" });
     const spec: oci.Spec = .{
         .ociVersion = "1.0.2",
@@ -2324,6 +2583,7 @@ fn testExecLifecycle(base: []const u8) !void {
     config.subcommand = .start;
     try startContainer(allocator, io, backend, config);
     try testUpdateResources(allocator, io, backend, root, cgroup, base);
+    try testAttachedExec(allocator, io, root);
     // The saved config, rather than the now-missing bundle config, supplies exec defaults.
     try cwd.deleteFile(io, config_path);
     {
@@ -2386,6 +2646,19 @@ fn testExecLifecycle(base: []const u8) !void {
         const detached_pid_text = try cwd.readFileAlloc(io, pid_file, allocator, .limited(32));
         const detached_pid = try std.fmt.parseInt(i32, detached_pid_text, 10);
         try std.testing.expectEqual(case.status, try waitExec(detached_pid));
+    }
+    {
+        const ignored: linux.Sigaction = .{ .handler = .{ .handler = linux.SIG.IGN }, .mask = linux.sigemptyset(), .flags = 0 };
+        var previous: linux.Sigaction = undefined;
+        try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.sigaction(.PIPE, &ignored, &previous)));
+        defer _ = linux.sigaction(.PIPE, &previous, null);
+        const ignored_pipe = try parseArgs(&.{
+            "igvano",                                                                                                                                 "--root", root, "exec", "--detach", "--pid-file", pid_file, "example", "sh", "-c",
+            "while read key value rest; do case \"$key\" in SigIgn:) test $((0x$value & 4096)) -ne 0; exit;; esac; done < /proc/self/status; exit 1",
+        });
+        try std.testing.expectEqual(@as(u8, 0), try execTestCommand(ignored_pipe, null));
+        const ignored_pid_text = try cwd.readFileAlloc(io, pid_file, allocator, .limited(32));
+        try std.testing.expectEqual(@as(u8, 0), try waitExec(try std.fmt.parseInt(i32, ignored_pid_text, 10)));
     }
     const invalid = try parseArgs(&.{ "igvano", "--root", root, "exec", "example", "/igvano-missing-exec" });
     try std.testing.expectError(error.CreateFailed, execContainer(allocator, io, backend, invalid));
@@ -2452,7 +2725,15 @@ fn testExecLifecycle(base: []const u8) !void {
         const table = try parseArgs(&.{ "igvano", "--root", root, "ps", "example", "-ef" });
         try psContainer(allocator, io, backend, table, file);
         const text = try cwd.readFileAlloc(io, ps_path, allocator, .limited(4096));
-        try std.testing.expectEqualStrings(try std.fmt.allocPrint(allocator, "PID\n{d}\n", .{init_pid}), text);
+        try std.testing.expect(std.mem.startsWith(u8, text, "UID"));
+        try std.testing.expect(std.mem.indexOf(u8, text, try std.fmt.allocPrint(allocator, "{d}", .{init_pid})) != null);
+        const custom = try parseArgs(&.{ "igvano", "--root", root, "ps", "example", "-o", "pid,comm", "-e" });
+        const custom_file = try cwd.createFile(io, ps_path, .{});
+        defer custom_file.close(io);
+        try psContainer(allocator, io, backend, custom, custom_file);
+        const custom_text = try cwd.readFileAlloc(io, ps_path, allocator, .limited(4096));
+        try std.testing.expect(std.mem.indexOf(u8, custom_text, "PID") != null);
+        try std.testing.expect(std.mem.indexOf(u8, custom_text, "sleep") != null);
     }
     try pauseContainer(allocator, io, backend, pause);
     config.subcommand = .delete;
@@ -2490,7 +2771,7 @@ fn testUpdateResources(allocator: std.mem.Allocator, io: std.Io, backend: Backen
     });
     const resource_file = try std.fs.path.join(allocator, &.{ base, "resources.json" });
     const update = try parseArgs(&.{ "igvano", "--root", root, "update", "--resources", resource_file, "example" });
-    try cwd.writeFile(io, .{ .sub_path = resource_file, .data = "{\"memory\":{\"limit\":67108864},\"pids\":{\"limit\":50}}" });
+    try cwd.writeFile(io, .{ .sub_path = resource_file, .data = "{\"memory\":{\"limit\":33554432},\"pids\":{\"limit\":50}}" });
     if (unified and std.os.linux.errno(std.os.linux.access("/sys/fs/cgroup/cgroup.type", std.os.linux.F_OK)) == .SUCCESS) {
         const procs = try readTestCgroup(allocator, io, "/sys/fs/cgroup/cgroup.procs");
         if (std.mem.trim(u8, procs, " \t\n").len != 0) {
@@ -2504,6 +2785,9 @@ fn testUpdateResources(allocator: std.mem.Allocator, io: std.Io, backend: Backen
         }
     }
     try updateContainer(allocator, io, backend, update);
+    try std.testing.expectEqualStrings("33554432", std.mem.trim(u8, try readTestCgroup(allocator, io, memory_path), " \t\n"));
+    const memory_flag = try parseArgs(&.{ "igvano", "--root", root, "update", "--memory", "64m", "example" });
+    try updateContainer(allocator, io, backend, memory_flag);
     const memory = try readTestCgroup(allocator, io, memory_path);
     try std.testing.expectEqualStrings("67108864", std.mem.trim(u8, memory, " \t\n"));
     const pids = try readTestCgroup(allocator, io, pids_path);
@@ -2579,6 +2863,246 @@ fn execTestCommand(config: Config, stdout: ?std.posix.fd_t) !u8 {
         linux.exit_group(status);
     }
     return waitExec(child);
+}
+
+fn testAttachedExec(allocator: std.mem.Allocator, io: std.Io, root: []const u8) !void {
+    const linux = std.os.linux;
+    var capture: [2]std.posix.fd_t = undefined;
+    if (linux.errno(linux.pipe2(&capture, .{ .CLOEXEC = true })) != .SUCCESS) return error.SystemResources;
+    defer for (capture) |fd| {
+        _ = linux.close(fd);
+    };
+    // wait is interruptible, so the TERM trap need not wait for sleep to finish.
+    const command = try parseArgs(&.{ "igvano", "--root", root, "exec", "example", "sh", "-c", "trap 'exit 42' TERM; echo ready; sleep 100 & wait" });
+    const runner = std.posix.system.fork();
+    if (std.posix.errno(runner) != .SUCCESS) return error.SystemResources;
+    const runner_pid: i32 = @intCast(runner);
+    if (runner_pid == 0) {
+        if (linux.errno(linux.dup2(capture[1], 1)) != .SUCCESS) linux.exit_group(1);
+        var threaded: std.Io.Threaded = .init_single_threaded;
+        var implementation: backend_module.LinuxBackend = .{};
+        const status = execContainer(std.heap.page_allocator, threaded.io(), implementation.backend(), command) catch linux.exit_group(1);
+        linux.exit_group(status);
+    }
+    var runner_reaped = false;
+    defer if (!runner_reaped) {
+        _ = linux.kill(runner_pid, .KILL);
+        _ = waitExec(runner_pid) catch {};
+    };
+    var poll = [_]linux.pollfd{.{ .fd = capture[0], .events = linux.POLL.IN, .revents = 0 }};
+    var ready: [6]u8 = undefined;
+    var ready_used: usize = 0;
+    while (ready_used < ready.len) {
+        try std.testing.expectEqual(@as(usize, 1), try std.posix.poll(&poll, 5000));
+        const count = linux.read(capture[0], ready[ready_used..].ptr, ready.len - ready_used);
+        switch (linux.errno(count)) {
+            .SUCCESS => if (count == 0) return error.ReadFailed else {
+                ready_used += count;
+            },
+            .INTR => continue,
+            else => return error.ReadFailed,
+        }
+    }
+    try std.testing.expectEqualStrings("ready\n", &ready);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.kill(runner_pid, .TERM)));
+    try std.testing.expectEqual(@as(u8, 42), try waitTestExec(io, runner_pid));
+    runner_reaped = true;
+
+    const terminal = try testPtyPair();
+    defer for (terminal) |fd| {
+        _ = linux.close(fd);
+    };
+    const original = try std.posix.tcgetattr(terminal[1]);
+    const original_flags = linux.fcntl(terminal[1], linux.F.GETFL, 0);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(original_flags));
+    var size: std.posix.winsize = .{ .row = 24, .col = 80, .xpixel = 0, .ypixel = 0 };
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.ioctl(terminal[1], linux.T.IOCSWINSZ, @intFromPtr(&size))));
+    const tty_command = try parseArgs(&.{ "igvano", "--root", root, "exec", "-t", "example", "sh", "-c", "tty; read first; stty size; echo initial; read answer; stty size; echo answer=$answer" });
+    const tty_runner = std.posix.system.fork();
+    if (std.posix.errno(tty_runner) != .SUCCESS) return error.SystemResources;
+    const tty_pid: i32 = @intCast(tty_runner);
+    if (tty_pid == 0) {
+        _ = linux.close(terminal[0]);
+        if (linux.errno(linux.dup2(terminal[1], 0)) != .SUCCESS or linux.errno(linux.dup2(terminal[1], 1)) != .SUCCESS) linux.exit_group(1);
+        var threaded: std.Io.Threaded = .init_single_threaded;
+        var implementation: backend_module.LinuxBackend = .{};
+        const status = execContainer(std.heap.page_allocator, threaded.io(), implementation.backend(), tty_command) catch linux.exit_group(1);
+        linux.exit_group(status);
+    }
+    var tty_reaped = false;
+    defer if (!tty_reaped) {
+        _ = linux.kill(tty_pid, .KILL);
+        _ = waitExec(tty_pid) catch {};
+    };
+    try std.testing.expectEqual(@as(usize, 6), linux.write(terminal[0], "start\n", 6));
+    var output: [4096]u8 = undefined;
+    var used: usize = 0;
+    var resized = false;
+    while (std.mem.indexOf(u8, output[0..used], "answer=hello") == null) {
+        poll[0].fd = terminal[0];
+        try std.testing.expectEqual(@as(usize, 1), try std.posix.poll(&poll, 5000));
+        const count = linux.read(terminal[0], output[used..].ptr, output.len - used);
+        if (linux.errno(count) != .SUCCESS or count == 0) return error.ReadFailed;
+        used += count;
+        if (used == output.len) return error.StreamTooLong;
+        if (!resized and std.mem.indexOf(u8, output[0..used], "initial") != null) {
+            try std.testing.expectEqual(original_flags, linux.fcntl(terminal[1], linux.F.GETFL, 0));
+            size.row = 40;
+            size.col = 100;
+            try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.ioctl(terminal[1], linux.T.IOCSWINSZ, @intFromPtr(&size))));
+            try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.kill(tty_pid, .WINCH)));
+            try std.testing.expectEqual(@as(usize, 6), linux.write(terminal[0], "hello\n", 6));
+            resized = true;
+        }
+    }
+    try std.testing.expect(std.mem.indexOf(u8, output[0..used], "/dev/pts/") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output[0..used], "24 80") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output[0..used], "40 100") != null);
+    try std.testing.expectEqual(@as(u8, 0), try waitTestExec(io, tty_pid));
+    tty_reaped = true;
+    const restored = try std.posix.tcgetattr(terminal[1]);
+    try std.testing.expectEqual(original.lflag, restored.lflag);
+    try std.testing.expectEqual(original.iflag, restored.iflag);
+    try std.testing.expectEqual(original.oflag, restored.oflag);
+    const closed_stdin = try parseArgs(&.{ "igvano", "--root", root, "exec", "-t", "example", "true" });
+    const closed_runner = std.posix.system.fork();
+    if (std.posix.errno(closed_runner) != .SUCCESS) return error.SystemResources;
+    const closed_pid: i32 = @intCast(closed_runner);
+    if (closed_pid == 0) {
+        _ = linux.close(0);
+        var threaded: std.Io.Threaded = .init_single_threaded;
+        var backend: backend_module.LinuxBackend = .{};
+        const status = execContainer(std.heap.page_allocator, threaded.io(), backend.backend(), closed_stdin) catch linux.exit_group(1);
+        linux.exit_group(status);
+    }
+    try std.testing.expectEqual(@as(u8, 0), try waitExec(closed_pid));
+    var implementation: backend_module.LinuxBackend = .{};
+    const detached = try parseArgs(&.{ "igvano", "--root", root, "exec", "--detach", "-t", "example", "tty" });
+    try std.testing.expectError(error.MissingConsoleSocket, execContainer(allocator, io, implementation.backend(), detached));
+}
+
+fn testPtyPair() ![2]std.posix.fd_t {
+    const linux = std.os.linux;
+    const opened = linux.open("/dev/ptmx", .{ .ACCMODE = .RDWR, .NOCTTY = true, .CLOEXEC = true }, 0);
+    if (linux.errno(opened) != .SUCCESS) return error.ConsoleFailed;
+    const controller: std.posix.fd_t = @intCast(opened);
+    errdefer _ = linux.close(controller);
+    var unlock: i32 = 0;
+    if (linux.errno(linux.ioctl(controller, linux.T.IOCSPTLCK, @intFromPtr(&unlock))) != .SUCCESS) return error.ConsoleFailed;
+    const flags: linux.O = .{ .ACCMODE = .RDWR, .NOCTTY = true, .CLOEXEC = true };
+    const replica = linux.ioctl(controller, linux.T.IOCGPTPEER, @as(u32, @bitCast(flags)));
+    if (linux.errno(replica) != .SUCCESS) return error.ConsoleFailed;
+    return .{ controller, @intCast(replica) };
+}
+
+test "attached wait drains buffered output after PTY hangup" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const linux = std.os.linux;
+    const terminal = try testPtyPair();
+    defer _ = linux.close(terminal[0]);
+    var replica: ?std.posix.fd_t = terminal[1];
+    defer if (replica) |fd| {
+        _ = linux.close(fd);
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const output = try tmp.dir.createFile(std.testing.io, "output", .{});
+    defer output.close(std.testing.io);
+    var signals = try attached.Signals.init();
+    defer signals.deinit();
+    const expected = [_]u8{'x'} ** 6000;
+    const forked = std.posix.system.fork();
+    if (std.posix.errno(forked) != .SUCCESS) return error.SystemResources;
+    const pid: i32 = @intCast(forked);
+    if (pid == 0) {
+        if (linux.write(terminal[1], &expected, expected.len) != expected.len) linux.exit_group(1);
+        linux.exit_group(0);
+    }
+    var reaped = false;
+    defer if (!reaped) {
+        _ = linux.kill(pid, .KILL);
+        _ = waitExec(pid) catch {};
+    };
+    _ = linux.close(replica.?);
+    replica = null;
+    // Ensure all output and the hangup are queued before supervision starts.
+    var info: linux.siginfo_t = undefined;
+    while (true) {
+        switch (linux.errno(linux.waitid(.PID, pid, &info, linux.W.EXITED | linux.W.NOWAIT, null))) {
+            .SUCCESS => break,
+            .INTR => continue,
+            else => return error.WaitFailed,
+        }
+    }
+    try std.testing.expectEqual(@as(u8, 0), try attached.wait(pid, &reaped, &signals, terminal[0], -1, output.handle));
+    try std.testing.expect(reaped);
+    const actual = try tmp.dir.readFileAlloc(std.testing.io, "output", std.testing.allocator, .limited(8192));
+    defer std.testing.allocator.free(actual);
+    try std.testing.expectEqualStrings(&expected, actual);
+}
+
+test "attached wait reports reaping even when output draining fails" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const linux = std.os.linux;
+    const terminal = try testPtyPair();
+    defer _ = linux.close(terminal[0]);
+    var replica: ?std.posix.fd_t = terminal[1];
+    defer if (replica) |fd| {
+        _ = linux.close(fd);
+    };
+    var output: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.pipe2(&output, .{ .CLOEXEC = true })));
+    defer _ = linux.close(output[1]);
+    var reader: ?std.posix.fd_t = output[0];
+    defer if (reader) |fd| {
+        _ = linux.close(fd);
+    };
+    var signals = try attached.Signals.init();
+    defer signals.deinit();
+    const forked = std.posix.system.fork();
+    if (std.posix.errno(forked) != .SUCCESS) return error.SystemResources;
+    const pid: i32 = @intCast(forked);
+    if (pid == 0) {
+        if (linux.write(terminal[1], "ready\n", 6) != 6) linux.exit_group(1);
+        linux.exit_group(0);
+    }
+    var reaped = false;
+    defer if (!reaped) {
+        _ = linux.kill(pid, .KILL);
+        _ = waitExec(pid) catch {};
+    };
+    _ = linux.close(replica.?);
+    replica = null;
+    // Leave an exited zombie for attached.wait to collect before it drains the
+    // PTY into a pipe without a reader, which deterministically produces EPIPE.
+    var info: linux.siginfo_t = undefined;
+    while (true) {
+        switch (linux.errno(linux.waitid(.PID, pid, &info, linux.W.EXITED | linux.W.NOWAIT, null))) {
+            .SUCCESS => break,
+            .INTR => continue,
+            else => return error.WaitFailed,
+        }
+    }
+    _ = linux.close(reader.?);
+    reader = null;
+    try std.testing.expectError(error.ConsoleWriteFailed, attached.wait(pid, &reaped, &signals, terminal[0], -1, output[1]));
+    try std.testing.expect(reaped);
+}
+
+fn waitTestExec(io: std.Io, pid: i32) !u8 {
+    const linux = std.os.linux;
+    const start = std.Io.Clock.awake.now(io);
+    while (start.untilNow(io, .awake).nanoseconds < std.Io.Duration.fromSeconds(5).nanoseconds) {
+        var status: u32 = undefined;
+        const result = linux.waitpid(pid, &status, linux.W.NOHANG);
+        switch (linux.errno(result)) {
+            .SUCCESS => if (result != 0) return @intCast(if (status & 0x7f == 0) (status >> 8) & 0xff else 128 + (status & 0x7f)),
+            .INTR => continue,
+            else => return error.WaitFailed,
+        }
+        try std.Io.sleep(io, .fromMilliseconds(10), .awake);
+    }
+    return error.Timeout;
 }
 
 test "hook state templates reproduce state stdout with a host PID" {
@@ -3783,7 +4307,241 @@ test "update parsing accepts resource files stdin and shim global flags" {
     }
 }
 
-test "update parsing requires resources and rejects individual resource flags" {
+test "update parsing accepts every per-field flag with separate and equals values" {
+    const flags = [_]struct { name: []const u8, value: []const u8 }{
+        .{ .name = "--memory", .value = "64m" },
+        .{ .name = "--memory-reservation", .value = "32MiB" },
+        .{ .name = "--memory-swap", .value = "-1" },
+        .{ .name = "--kernel-memory", .value = "1g" },
+        .{ .name = "--cpu-shares", .value = "512" },
+        .{ .name = "--cpu-period", .value = "100000" },
+        .{ .name = "--cpu-quota", .value = "-1" },
+        .{ .name = "--cpu-rt-period", .value = "1000000" },
+        .{ .name = "--cpu-rt-runtime", .value = "-1" },
+        .{ .name = "--cpuset-cpus", .value = "0-2" },
+        .{ .name = "--cpuset-mems", .value = "0" },
+        .{ .name = "--pids-limit", .value = "-1" },
+        .{ .name = "--blkio-weight", .value = "500" },
+    };
+    for (flags) |flag| {
+        const separate = try parseArgs(&.{ "igvano", "update", flag.name, flag.value, "example" });
+        try std.testing.expectEqualStrings("example", separate.id);
+        const equals = try std.fmt.allocPrint(std.testing.allocator, "{s}={s}", .{ flag.name, flag.value });
+        defer std.testing.allocator.free(equals);
+        _ = try parseArgs(&.{ "igvano", "update", equals, "example" });
+        _ = try parseArgs(&.{ "igvano", "update", "--resources=r.json", flag.name, flag.value, "example" });
+        _ = try parseArgs(&.{ "igvano", "update", flag.name, flag.value, "--resources=r.json", "example" });
+    }
+}
+
+test "update flags translate units unlimited and explicit zero to OCI resource fields" {
+    const config = try parseArgs(&.{
+        "igvano",                  "update",              "--memory=64m",      "--memory-reservation", "1.5 MiB",
+        "--memory-swap=-1",        "--kernel-memory=1g",  "--cpu-shares=512",  "--cpu-period=100000",  "--cpu-quota=-1",
+        "--cpu-rt-period=1000000", "--cpu-rt-runtime=-1", "--cpuset-cpus=0-2", "--cpuset-mems=0",      "--pids-limit=-1",
+        "--blkio-weight=500",      "example",
+    });
+    const resources = try oci.cgroupResources(std.testing.allocator, config.resource_flags);
+    defer oci.freeCgroupResources(std.testing.allocator, resources);
+    try std.testing.expectEqual(@as(?i64, 67108864), resources.memory.?.limit);
+    try std.testing.expectEqual(@as(?i64, 1572864), resources.memory.?.reservation);
+    try std.testing.expectEqual(@as(?i64, -1), resources.memory.?.swap);
+    try std.testing.expectEqual(@as(?i64, 1073741824), resources.memory.?.kernel);
+    try std.testing.expectEqual(@as(?u64, 512), resources.cpu.?.shares);
+    try std.testing.expectEqual(@as(?u64, 100000), resources.cpu.?.period);
+    try std.testing.expectEqual(@as(?i64, -1), resources.cpu.?.quota);
+    try std.testing.expectEqual(@as(?u64, 1000000), resources.cpu.?.realtime_period);
+    try std.testing.expectEqual(@as(?i64, -1), resources.cpu.?.realtime_runtime);
+    try std.testing.expectEqualStrings("0-2", resources.cpu.?.cpus.?);
+    try std.testing.expectEqualStrings("0", resources.cpu.?.mems.?);
+    try std.testing.expectEqual(@as(?i64, -1), resources.pids.?.limit);
+    try std.testing.expectEqual(@as(?u16, 500), resources.block_io.?.weight);
+    const zero = try parseArgs(&.{ "igvano", "update", "--memory=0", "--pids-limit=0", "example" });
+    try std.testing.expectEqual(@as(?i64, 0), zero.resource_flags.memory.?.limit);
+    try std.testing.expectEqual(@as(?i64, 0), zero.resource_flags.pids.?.limit);
+    for ([_][]const u8{ "--memory", "--memory-reservation", "--memory-swap", "--kernel-memory" }) |name| {
+        const unlimited = try parseArgs(&.{ "igvano", "update", name, "-1", "example" });
+        const translated = try oci.cgroupResources(std.testing.allocator, unlimited.resource_flags);
+        defer oci.freeCgroupResources(std.testing.allocator, translated);
+    }
+}
+
+test "memory flags use decimal quantities and RAMInBytes units" {
+    const cases = [_]struct { value: []const u8, bytes: i64 }{
+        .{ .value = "64", .bytes = 64 },
+        .{ .value = "64b", .bytes = 64 },
+        .{ .value = "64 B", .bytes = 64 },
+        .{ .value = "1k", .bytes = 1024 },
+        .{ .value = "1KB", .bytes = 1024 },
+        .{ .value = "1KiB", .bytes = 1024 },
+        .{ .value = "1 KIB", .bytes = 1024 },
+        .{ .value = "1.5m", .bytes = 1572864 },
+        .{ .value = "1.5 MiB", .bytes = 1572864 },
+        .{ .value = "1G", .bytes = 1073741824 },
+        .{ .value = "1t", .bytes = 1099511627776 },
+        .{ .value = "1p", .bytes = 1125899906842624 },
+        .{ .value = "0.5b", .bytes = 0 },
+        .{ .value = "-1", .bytes = -1 },
+    };
+    for (cases) |case| {
+        const config = try parseArgs(&.{ "igvano", "update", "--memory", case.value, "example" });
+        try std.testing.expectEqual(@as(?i64, case.bytes), config.resource_flags.memory.?.limit);
+    }
+    for ([_][]const u8{
+        "-2",     "64mbb",               "1ki",  "1e",    "nan",   "inf",
+        "8192p",  "9223372036854775808", "1 m ", "1e5",   "1e5kb", "0x10",
+        "0x10b",  "1 ",                  "1.5 ", "1kb ",  "1.",    ".5m",
+        "1.2.3m", "+1",                  " 1",   "1  kb", "1\tkb", "1_000",
+        "1bkb",
+    }) |value|
+        try std.testing.expectError(error.InvalidResourceValue, parseArgs(&.{ "igvano", "update", "--memory", value, "example" }));
+    for ([_][]const u8{ "--cpu-shares", "--cpu-period", "--cpu-rt-period", "--blkio-weight" }) |name|
+        try std.testing.expectError(error.InvalidResourceValue, parseArgs(&.{ "igvano", "update", name, "-1", "example" }));
+    try std.testing.expectError(error.InvalidResourceValue, parseArgs(&.{ "igvano", "update", "--blkio-weight=65536", "example" }));
+    try std.testing.expectError(error.MissingResourceValue, parseArgs(&.{ "igvano", "update", "--memory=", "example" }));
+    try std.testing.expectError(error.MissingResourceValue, parseArgs(&.{ "igvano", "update", "--memory", "--cpu-shares=512", "example" }));
+}
+
+test "resource JSON ignores individual flags regardless of argument order" {
+    const TestBackend = struct {
+        var empty = false;
+
+        fn update(_: *anyopaque, _: Backend.Handle, resources: Backend.Resources) Backend.Error!void {
+            check(resources) catch return error.InvalidConfig;
+        }
+
+        fn check(resources: Backend.Resources) !void {
+            if (empty) {
+                try std.testing.expect(resources.memory == null and resources.cpu == null and resources.block_io == null);
+                return;
+            }
+            try std.testing.expectEqual(@as(?i64, 32), resources.memory.?.limit);
+            try std.testing.expectEqual(@as(?i64, 134217728), resources.memory.?.swap);
+            try std.testing.expectEqual(@as(?u64, 1024), resources.cpu.?.shares);
+            try std.testing.expectEqual(@as(?u64, 100000), resources.cpu.?.period);
+            try std.testing.expectEqualStrings("0", resources.cpu.?.cpus.?);
+            try std.testing.expectEqual(@as(?i64, 50), resources.pids.?.limit);
+            try std.testing.expectEqual(@as(?u16, 100), resources.block_io.?.weight);
+            try std.testing.expectEqual(@as(?u16, 200), resources.block_io.?.leaf_weight);
+            try std.testing.expectEqual(@as(u64, 4096), resources.hugepage_limits[0].limit);
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "example", .default_dir);
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer std.testing.allocator.free(root);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ root, "r.json" });
+    defer std.testing.allocator.free(path);
+    try oci.saveState(std.testing.allocator, std.testing.io, root, .{
+        .id = "example",
+        .status = .running,
+        .pid = 1234,
+        .bundle = "/unused",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "example/starttime", .data = "alive" });
+    var implementation: LockTestBackend = .{};
+    var vtable = LockTestBackend.vtable;
+    vtable.update = TestBackend.update;
+    const backend: Backend = .{ .ptr = &implementation, .vtable = &vtable };
+    const json =
+        \\{"memory":{"limit":32,"swap":134217728},"cpu":{"shares":1024,"period":100000,"cpus":"0"},"pids":{"limit":50},"blockIO":{"weight":100,"leafWeight":200},"hugepageLimits":[{"pageSize":"2MB","limit":4096}]}
+    ;
+    for ([_][]const []const u8{
+        &.{ "igvano", "update", "--resources=r.json", "--memory=64m", "--cpu-shares=512", "--blkio-weight=500", "example" },
+        &.{ "igvano", "update", "--memory=64m", "--cpu-shares=512", "--blkio-weight=500", "--resources=r.json", "example" },
+    }) |args| {
+        var config = try parseArgs(args);
+        config.root = root;
+        config.resources_file = path;
+        TestBackend.empty = false;
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "r.json", .data = json });
+        try updateContainer(std.testing.allocator, std.testing.io, backend, config);
+        TestBackend.empty = true;
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "r.json", .data = "{}" });
+        try updateContainer(std.testing.allocator, std.testing.io, backend, config);
+    }
+}
+
+test "ps table filters host rows by the header PID column and preserves formatting" {
+    const sample =
+        "UID          PID    PPID  C STIME TTY          TIME CMD\n" ++
+        "root          12       1  0 10:00 ?        00:00:00 sleep 100\n" ++
+        "user          99      12  0 10:01 ?        00:00:00 sh -c echo 12\n" ++
+        "root         123       1  0 10:02 ?        00:00:00 echo 99\n";
+    const filtered = try filterPsOutput(std.testing.allocator, sample, &.{ 12, 123 });
+    defer std.testing.allocator.free(filtered);
+    try std.testing.expectEqualStrings(
+        "UID          PID    PPID  C STIME TTY          TIME CMD\n" ++
+            "root          12       1  0 10:00 ?        00:00:00 sleep 100\n" ++
+            "root         123       1  0 10:02 ?        00:00:00 echo 99\n",
+        filtered,
+    );
+    const custom = try filterPsOutput(std.testing.allocator, "    PID COMMAND\n     12 sh\n     99 sleep\n", &.{99});
+    defer std.testing.allocator.free(custom);
+    try std.testing.expectEqualStrings("    PID COMMAND\n     99 sleep\n", custom);
+    const last = try filterPsOutput(std.testing.allocator, "COMMAND PID\nsh 12", &.{12});
+    defer std.testing.allocator.free(last);
+    try std.testing.expectEqualStrings("COMMAND PID\nsh 12\n", last);
+    const empty = try filterPsOutput(std.testing.allocator, "PID COMMAND\n12 sh\n", &.{});
+    defer std.testing.allocator.free(empty);
+    try std.testing.expectEqualStrings("PID COMMAND\n", empty);
+    try std.testing.expectError(error.PsMissingPidColumn, filterPsOutput(std.testing.allocator, "COMMAND\nsh\n", &.{12}));
+    try std.testing.expectError(error.PsInvalidPid, filterPsOutput(std.testing.allocator, "UID PID COMMAND\nroot\n", &.{12}));
+    try std.testing.expectError(error.PsInvalidPid, filterPsOutput(std.testing.allocator, "PID COMMAND\nabc sh\n", &.{12}));
+}
+
+test "argument diagnostics identify the offending exec option command or kill signal" {
+    defer oci.clearDiagnostic();
+    try std.testing.expectError(error.MissingEnv, parseArgs(&.{ "igvano", "exec", "--env=" }));
+    try std.testing.expectEqualStrings("--env: missing value", oci.diagnosticFor(error.MissingEnv).?);
+    try std.testing.expectError(error.UnexpectedArgument, parseArgs(&.{ "igvano", "exec", "--process=p.json", "example", "true" }));
+    try std.testing.expect(std.mem.indexOf(u8, oci.diagnosticFor(error.UnexpectedArgument).?, "global flags") == null);
+    try std.testing.expectError(error.UnexpectedArgument, parseArgs(&.{ "igvano", "kill", "example", "-TERM" }));
+    try std.testing.expect(std.mem.indexOf(u8, oci.diagnosticFor(error.UnexpectedArgument).?, "signal") != null);
+    try std.testing.expect(std.mem.indexOf(u8, oci.diagnosticFor(error.UnexpectedArgument).?, "global flags") == null);
+}
+
+test "error reporting prints frontend detail once and keeps backend detail only in the log" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer std.testing.allocator.free(root);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ root, "runtime.log" });
+    defer std.testing.allocator.free(path);
+    const config: Config = .{ .root = root, .subcommand = .create, .id = "example", .log = path };
+    var capture: [2]std.posix.fd_t = undefined;
+    if (std.posix.errno(std.posix.system.pipe(&capture)) != .SUCCESS) return error.SystemResources;
+    defer for (capture) |fd| (std.Io.File{ .handle = fd, .flags = .{ .nonblocking = false } }).close(std.testing.io);
+    const saved = std.posix.system.dup(2);
+    if (std.posix.errno(saved) != .SUCCESS) return error.SystemResources;
+    const saved_fd: std.posix.fd_t = @intCast(saved);
+    defer (std.Io.File{ .handle = saved_fd, .flags = .{ .nonblocking = false } }).close(std.testing.io);
+    if (std.posix.errno(std.posix.system.dup2(capture[1], 2)) != .SUCCESS) return error.SystemResources;
+    {
+        defer _ = std.posix.system.dup2(saved_fd, 2);
+        reportError(std.testing.allocator, std.testing.io, "backend detail already printed", config, error.Unsupported);
+        oci.recordDiagnostic(error.InvalidConfig, "frontend detail", .{});
+        defer oci.clearDiagnostic();
+        reportError(std.testing.allocator, std.testing.io, null, config, error.InvalidConfig);
+    }
+    var bytes: [512]u8 = undefined;
+    const read = std.posix.system.read(capture[0], &bytes, bytes.len);
+    if (std.posix.errno(read) != .SUCCESS) return error.ReadFailed;
+    const count: usize = @intCast(read);
+    try std.testing.expectEqualStrings(
+        "igvano: create for 'example' failed: Unsupported\n" ++
+            "igvano: create for 'example' failed: InvalidConfig: frontend detail\n",
+        bytes[0..count],
+    );
+    const log = try tmp.dir.readFileAlloc(std.testing.io, "runtime.log", std.testing.allocator, .limited(4096));
+    defer std.testing.allocator.free(log);
+    try std.testing.expect(std.mem.indexOf(u8, log, "Unsupported: backend detail already printed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, log, "InvalidConfig: frontend detail") != null);
+}
+
+test "update parsing requires resources or flags and rejects malformed options" {
     const cases = [_]struct { args: []const []const u8, expected: anyerror }{
         .{ .args = &.{ "igvano", "update", "example" }, .expected = error.MissingResources },
         .{ .args = &.{ "igvano", "update", "--resources" }, .expected = error.MissingResources },
@@ -3793,8 +4551,7 @@ test "update parsing requires resources and rejects individual resource flags" {
         .{ .args = &.{ "igvano", "update", "--resources=-" }, .expected = error.MissingId },
         .{ .args = &.{ "igvano", "update", "--resources=-", "../example" }, .expected = error.InvalidId },
         .{ .args = &.{ "igvano", "update", "--resources=-", "example", "extra" }, .expected = error.UnexpectedArgument },
-        .{ .args = &.{ "igvano", "update", "--resources=-", "--memory", "64m", "example" }, .expected = error.UnknownOption },
-        .{ .args = &.{ "igvano", "update", "--cpu-shares=512", "example" }, .expected = error.UnknownOption },
+        .{ .args = &.{ "igvano", "update", "--resources=-", "--unknown", "64m", "example" }, .expected = error.UnknownOption },
         .{ .args = &.{ "igvano", "--resources=-", "update", "example" }, .expected = error.UnknownOption },
     };
     for (cases) |case| try std.testing.expectError(case.expected, parseArgs(case.args));
