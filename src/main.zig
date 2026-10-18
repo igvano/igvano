@@ -643,6 +643,13 @@ fn createContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, c
     _ = try cwd.createDirPathStatus(io, config.root, .fromMode(0o700));
     const root = try cwd.realPathFileAlloc(io, config.root, allocator);
     defer allocator.free(root);
+    const inherits_mounts = inherits: {
+        for (settings.namespaces orelse &.{}) |namespace| {
+            if (namespace.type == .mount) break :inherits false;
+        }
+        break :inherits true;
+    };
+    if (inherits_mounts) try requireUnusedRootfs(allocator, io, backend, root, config.id, rootfs);
     const state_dir = try std.fs.path.join(allocator, &.{ root, config.id });
     defer allocator.free(state_dir);
     var state: oci.State = .{
@@ -1121,6 +1128,106 @@ fn loadRootfsMount(allocator: std.mem.Allocator, io: std.Io, root: []const u8, i
     };
 }
 
+fn rootfsComparisonPath(allocator: std.mem.Allocator, io: std.Io, path: []const u8) ![:0]u8 {
+    return std.Io.Dir.cwd().realPathFileAlloc(io, path, allocator) catch |err| switch (err) {
+        error.FileNotFound => normalized: {
+            const resolved = try std.fs.path.resolve(allocator, &.{path});
+            defer allocator.free(resolved);
+            break :normalized try allocator.dupeZ(u8, resolved);
+        },
+        else => return err,
+    };
+}
+
+fn requireUnusedRootfs(allocator: std.mem.Allocator, io: std.Io, backend: Backend, root: []const u8, id: []const u8, rootfs: []const u8) !void {
+    const cwd = std.Io.Dir.cwd();
+    const resolved = try rootfsComparisonPath(allocator, io, rootfs);
+    defer allocator.free(resolved);
+    var directory = try cwd.openDir(io, root, .{ .iterate = true });
+    defer directory.close(io);
+    var entries = directory.iterate();
+    while (try entries.next(io)) |entry| {
+        if (entry.kind != .directory or std.mem.eql(u8, entry.name, id)) continue;
+        const mount = (try loadRootfsMount(allocator, io, root, entry.name)) orelse continue;
+        defer allocator.free(mount.path);
+        const mounted_path = try rootfsComparisonPath(allocator, io, mount.path);
+        defer allocator.free(mounted_path);
+        if (!std.mem.eql(u8, mounted_path, resolved)) continue;
+        const saved = oci.loadState(allocator, io, root, entry.name) catch |err| switch (err) {
+            error.FileNotFound => continue, // Concurrent deletion.
+            else => return err,
+        };
+        defer saved.deinit();
+        if (!std.mem.eql(u8, saved.value.id, entry.name))
+            return oci.validationError(error.InvalidState, "state.id: does not match rootfs mount owner", .{});
+        if (saved.value.pid == null) continue;
+        const handle = stateHandle(allocator, io, root, saved.value, false) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return err,
+        };
+        defer freeStateHandle(allocator, handle);
+        if (try backendResult(backend, backend.alive(handle)))
+            return oci.validationError(error.InvalidConfig, "rootfs '{s}' is already used by live container '{s}' in the inherited mount namespace", .{ rootfs, entry.name });
+    }
+}
+
+test "inherited rootfs ownership rejects live aliases and permits dead or private containers" {
+    defer oci.clearDiagnostic();
+    const TestBackend = struct {
+        fn alive(_: *anyopaque, handle: Backend.Handle) Backend.Error!bool {
+            return std.mem.eql(u8, handle.starttime, "live");
+        }
+        fn check(allocator: std.mem.Allocator, backend: Backend, root: []const u8, rootfs: []const u8) !void {
+            requireUnusedRootfs(allocator, std.testing.io, backend, root, "other", rootfs) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                try std.testing.expectEqual(error.InvalidConfig, err);
+                return;
+            };
+            return error.TestUnexpectedResult;
+        }
+    };
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    try tmp.dir.createDirPath(io, "example");
+    try tmp.dir.createDirPath(io, "rootfs");
+    try tmp.dir.symLink(io, "rootfs", "alias", .{ .is_directory = true });
+    const rootfs = try std.fs.path.join(allocator, &.{ root, "rootfs" });
+    defer allocator.free(rootfs);
+    const alias = try std.fs.path.join(allocator, &.{ root, "alias" });
+    defer allocator.free(alias);
+    const state_dir = try std.fs.path.join(allocator, &.{ root, "example" });
+    defer allocator.free(state_dir);
+    try saveRootfsMount(allocator, io, state_dir, .{
+        .id = "example",
+        .pid = 1234,
+        .starttime = "live",
+        .rootfs_mount = alias,
+        .rootfs_mount_id = 12345,
+        .rootfs_mount_boot_id = "00000000-0000-0000-0000-000000000000".*,
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "example/starttime", .data = "live" });
+    var implementation: LockTestBackend = .{};
+    var vtable = LockTestBackend.vtable;
+    vtable.alive = TestBackend.alive;
+    const backend: Backend = .{ .ptr = &implementation, .vtable = &vtable };
+    for ([_]oci.Status{ .creating, .created, .running, .paused }) |status| {
+        try oci.saveState(allocator, io, root, .{ .id = "example", .status = status, .pid = 1234, .bundle = root });
+        try TestBackend.check(allocator, backend, root, rootfs);
+    }
+    try std.testing.checkAllAllocationFailures(allocator, TestBackend.check, .{ backend, root, rootfs });
+    try requireUnusedRootfs(allocator, io, backend, root, "example", rootfs);
+    try requireUnusedRootfs(allocator, io, backend, root, "other", "/unrelated/rootfs");
+    try tmp.dir.writeFile(io, .{ .sub_path = "example/starttime", .data = "dead" });
+    try requireUnusedRootfs(allocator, io, backend, root, "other", rootfs);
+    try tmp.dir.writeFile(io, .{ .sub_path = "example/starttime", .data = "live" });
+    try tmp.dir.deleteFile(io, "example/rootfs_mount");
+    try requireUnusedRootfs(allocator, io, backend, root, "other", rootfs);
+}
+
 fn freeStateHandle(allocator: std.mem.Allocator, handle: Backend.Handle) void {
     allocator.free(handle.starttime);
     if (handle.cgroup_path) |path| allocator.free(path);
@@ -1573,7 +1680,8 @@ fn updateContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, c
     defer state.deinit();
     try oci.requireUpdate(state.parsed.value.status);
     var handle = state.handle.?;
-    handle.device_nodes = try loadDeviceNodes(allocator, io, config.root, config.id);
+    if (resources.devices.len != 0)
+        handle.device_nodes = try loadDeviceNodes(allocator, io, config.root, config.id);
     defer oci.freeDevices(allocator, handle.device_nodes);
     try backendResult(backend, backend.update(handle, resources));
 }
@@ -4549,16 +4657,22 @@ test "memory flags use decimal quantities and RAMInBytes units" {
 }
 
 test "resource JSON ignores individual flags regardless of argument order" {
+    defer oci.clearDiagnostic();
     const TestBackend = struct {
         var empty = false;
+        var memory_only = false;
 
         fn update(_: *anyopaque, handle: Backend.Handle, resources: Backend.Resources) Backend.Error!void {
-            if (handle.device_nodes.len != 1 or handle.device_nodes[0].major != 10 or
-                handle.device_nodes[0].minor != 237) return error.InvalidConfig;
+            if (handle.device_nodes.len != 0) return error.InvalidConfig;
             check(resources) catch return error.InvalidConfig;
         }
 
         fn check(resources: Backend.Resources) !void {
+            if (memory_only) {
+                try std.testing.expectEqual(@as(?i64, 64), resources.memory.?.limit);
+                try std.testing.expect(resources.cpu == null and resources.devices.len == 0);
+                return;
+            }
             if (empty) {
                 try std.testing.expect(resources.memory == null and resources.cpu == null and resources.block_io == null);
                 return;
@@ -4590,9 +4704,7 @@ test "resource JSON ignores individual flags regardless of argument order" {
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "example/starttime", .data = "alive" });
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "example/devices.json",
-        .data =
-        \\[{"path":"/dev/custom","kind":"character","major":10,"minor":237}]
-        ,
+        .data = "{corrupt",
     });
     var implementation: LockTestBackend = .{};
     var vtable = LockTestBackend.vtable;
@@ -4615,6 +4727,21 @@ test "resource JSON ignores individual flags regardless of argument order" {
         try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "r.json", .data = "{}" });
         try updateContainer(std.testing.allocator, std.testing.io, backend, config);
     }
+    TestBackend.memory_only = true;
+    try updateContainer(std.testing.allocator, std.testing.io, backend, .{
+        .root = root,
+        .subcommand = .update,
+        .id = "example",
+        .resource_flags = .{ .memory = .{ .limit = 64 } },
+    });
+    // Explicit device updates still require a readable device snapshot.
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "r.json", .data = "{\"devices\":[{\"allow\":true}]}" });
+    try std.testing.expectError(error.InvalidState, updateContainer(std.testing.allocator, std.testing.io, backend, .{
+        .root = root,
+        .subcommand = .update,
+        .id = "example",
+        .resources_file = path,
+    }));
 }
 
 test "ps table filters host rows by the header PID column and preserves formatting" {
@@ -5262,6 +5389,20 @@ test "create with inherited mount isolation persists backend resources and rolls
     const bad_pid_file = try std.fs.path.join(std.testing.allocator, &.{ root, "missing", "init.pid" });
     defer std.testing.allocator.free(bad_pid_file);
     config.id = "other";
+    try std.testing.expectError(error.InvalidConfig, createContainer(std.testing.allocator, std.testing.io, backend, config));
+    try std.testing.expect(std.mem.indexOf(u8, oci.diagnostic().?, "already used by live container 'example'") != null);
+    try std.testing.expect(!implementation.killed);
+    try std.testing.expect(!implementation.deleted);
+    // A private mount namespace can safely use the same rootfs.
+    const private_config = parsedSpec: {
+        const spec = try oci.loadSpec(std.testing.allocator, std.testing.io, absolute_bundle);
+        defer spec.deinit();
+        var value = spec.value;
+        value.linux.?.namespaces = &.{.{ .type = .mount }};
+        break :parsedSpec try std.json.Stringify.valueAlloc(std.testing.allocator, value, .{});
+    };
+    defer std.testing.allocator.free(private_config);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "bundle/config.json", .data = private_config });
     config.pid_file = bad_pid_file;
     try std.testing.expectError(error.FileNotFound, createContainer(std.testing.allocator, std.testing.io, backend, config));
     try std.testing.expect(implementation.killed);

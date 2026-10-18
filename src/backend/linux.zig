@@ -126,10 +126,9 @@ fn v1Limit(allocator: std.mem.Allocator, limit: i64) Backend.Error![]u8 {
     return std.fmt.allocPrint(allocator, "{d}", .{limit});
 }
 
-/// Pure legacy mapping, including the devices that rootfs setup will create.
+/// Pure legacy resource mapping; devices use the emulator's transition separately.
 /// Memory/memsw order is finalized by the writer after reading the current limit.
-// Null devices selects update: replace an explicit ruleset, leave an omitted one alone.
-fn v1Writes(allocator: std.mem.Allocator, resources: Resources, devices: ?[]const Backend.Device) Backend.Error![]V1Write {
+fn v1Writes(allocator: std.mem.Allocator, resources: Resources) Backend.Error![]V1Write {
     if (resources.unified.len != 0) return error.InvalidConfig;
     var policy = try deviceEmulator(allocator, resources.devices);
     defer policy.deinit(allocator);
@@ -234,16 +233,6 @@ fn v1Writes(allocator: std.mem.Allocator, resources: Resources, devices: ?[]cons
             try appendV1Write(allocator, &writes, "net_prio", "net_prio.ifpriomap", try std.fmt.allocPrint(allocator, "{s} {d}", .{ priority.name, priority.priority }), null, false);
         }
     }
-    for (resources.devices) |rule|
-        try appendV1DeviceRule(allocator, &writes, rule);
-    if (devices != null or resources.devices.len != 0) {
-        for (default_device_rules) |rule|
-            try appendV1DeviceRule(allocator, &writes, rule);
-    }
-    for (devices orelse &.{}) |device| {
-        if (device.kind == .fifo) continue;
-        try appendV1Write(allocator, &writes, "devices", "devices.allow", try std.fmt.allocPrint(allocator, "{c} {d}:{d} rwm", .{ @as(u8, if (device.kind == .character) 'c' else 'b'), device.major, device.minor }), null, false);
-    }
     return writes.toOwnedSlice(allocator);
 }
 
@@ -276,6 +265,7 @@ fn v1MemorySwapFirst(limit: i64, current_memsw: u64) bool {
 
 const V1Hierarchy = struct {
     mountpoint: []const u8,
+    mount_root: []const u8,
     controllers: []const []const u8,
     root: ?posix.fd_t = null,
     leaf: ?posix.fd_t = null,
@@ -297,6 +287,7 @@ fn freeV1Hierarchies(allocator: std.mem.Allocator, hierarchies: []const V1Hierar
         for (hierarchy.controllers) |name| allocator.free(name);
         allocator.free(hierarchy.controllers);
         allocator.free(hierarchy.mountpoint);
+        allocator.free(hierarchy.mount_root);
     }
     allocator.free(hierarchies);
 }
@@ -314,6 +305,7 @@ fn v1HierarchiesForDriver(allocator: std.mem.Allocator, text: []const u8, system
             for (hierarchy.controllers) |name| allocator.free(name);
             allocator.free(hierarchy.controllers);
             allocator.free(hierarchy.mountpoint);
+            allocator.free(hierarchy.mount_root);
         }
     }
     var lines = std.mem.tokenizeScalar(u8, text, '\n');
@@ -352,6 +344,8 @@ fn v1HierarchiesForDriver(allocator: std.mem.Allocator, text: []const u8, system
         var buffer: [std.fs.max_path_bytes]u8 = undefined;
         const mountpoint = try allocator.dupe(u8, try mountinfoPath(&buffer, mount.mountpoint));
         errdefer allocator.free(mountpoint);
+        const mount_root = try allocator.dupe(u8, try mountinfoPath(&buffer, mount.root));
+        errdefer allocator.free(mount_root);
         const owned_controllers = try controllers.toOwnedSlice(allocator);
         errdefer {
             for (owned_controllers) |name| allocator.free(name);
@@ -366,9 +360,10 @@ fn v1HierarchiesForDriver(allocator: std.mem.Allocator, text: []const u8, system
             for (owned_controllers) |name| allocator.free(name);
             allocator.free(owned_controllers);
             allocator.free(mountpoint);
+            allocator.free(mount_root);
             continue;
         }
-        try result.append(allocator, .{ .mountpoint = mountpoint, .controllers = owned_controllers });
+        try result.append(allocator, .{ .mountpoint = mountpoint, .mount_root = mount_root, .controllers = owned_controllers });
     }
     return result.toOwnedSlice(allocator);
 }
@@ -378,7 +373,7 @@ test "v1 writes preserve native memory limits and CPU ordering" {
         .memory = .{ .limit = -1, .reservation = 32, .swap = -1, .kernel = 64, .kernel_tcp = 128, .swappiness = 50, .disable_oom_killer = true },
         .cpu = .{ .shares = 1024, .period = 100000, .quota = 50000, .realtime_period = 1000000, .realtime_runtime = 950000, .cpus = "0-2,4", .mems = "0,2" },
         .pids = .{ .limit = -1 },
-    }, &.{});
+    });
     defer freeV1Writes(std.testing.allocator, writes);
     try std.testing.expectEqualDeep(&[_]V1Write{
         .{ .controller = "memory", .name = "memory.limit_in_bytes", .value = "-1" },
@@ -396,7 +391,7 @@ test "v1 writes preserve native memory limits and CPU ordering" {
         .{ .controller = "cpuset", .name = "cpuset.cpus", .value = "0-2,4" },
         .{ .controller = "cpuset", .name = "cpuset.mems", .value = "0,2" },
         .{ .controller = "pids", .name = "pids.max", .value = "max" },
-    }, writes[0 .. writes.len - 11]);
+    }, writes);
 }
 
 test "v1 writes retain block IO weights with BFQ alternatives and separate throttle devices" {
@@ -408,7 +403,7 @@ test "v1 writes retain block IO weights with BFQ alternatives and separate throt
         .throttle_write_bps = &.{.{ .major = 8, .minor = 0, .rate = 3000 }},
         .throttle_read_iops = &.{.{ .major = 8, .minor = 0, .rate = 40 }},
         .throttle_write_iops = &.{.{ .major = 8, .minor = 1, .rate = 50 }},
-    } }, &.{});
+    } });
     defer freeV1Writes(std.testing.allocator, writes);
     try std.testing.expectEqualDeep(&[_]V1Write{
         .{ .controller = "blkio", .name = "blkio.weight", .value = "100", .fallback = "blkio.bfq.weight" },
@@ -420,10 +415,10 @@ test "v1 writes retain block IO weights with BFQ alternatives and separate throt
         .{ .controller = "blkio", .name = "blkio.throttle.write_bps_device", .value = "8:0 3000" },
         .{ .controller = "blkio", .name = "blkio.throttle.read_iops_device", .value = "8:0 40" },
         .{ .controller = "blkio", .name = "blkio.throttle.write_iops_device", .value = "8:1 50" },
-    }, writes[0 .. writes.len - 11]);
+    }, writes);
 }
 
-test "v1 writes map hugepages network and ordered device rules before allowed devices" {
+test "v1 writes map hugepages and network while devices use the transition writer" {
     const writes = try v1Writes(std.testing.allocator, .{
         .hugepage_limits = &.{ .{ .page_size = "2MB", .limit = 4194304 }, .{ .page_size = "1GB", .limit = 0 } },
         .network = .{ .class_id = 1048577, .priorities = &.{ .{ .name = "eth0", .priority = 2 }, .{ .name = "lo", .priority = 3 } } },
@@ -432,10 +427,6 @@ test "v1 writes map hugepages network and ordered device rules before allowed de
             .{ .allow = true, .kind = .block, .major = 8, .minor = 0, .access = "rw" },
             .{ .allow = false, .kind = .char, .major = 10, .access = "m" },
         },
-    }, &.{
-        .{ .path = "/disk", .kind = .block, .major = 8, .minor = 1 },
-        .{ .path = "/dev/custom", .kind = .character, .major = 10, .minor = 200 },
-        .{ .path = "/pipe", .kind = .fifo },
     });
     defer freeV1Writes(std.testing.allocator, writes);
     try std.testing.expectEqualDeep(&[_]V1Write{
@@ -444,44 +435,22 @@ test "v1 writes map hugepages network and ordered device rules before allowed de
         .{ .controller = "net_cls", .name = "net_cls.classid", .value = "1048577" },
         .{ .controller = "net_prio", .name = "net_prio.ifpriomap", .value = "eth0 2" },
         .{ .controller = "net_prio", .name = "net_prio.ifpriomap", .value = "lo 3" },
-        .{ .controller = "devices", .name = "devices.deny", .value = "a *:* rwm" },
-        .{ .controller = "devices", .name = "devices.allow", .value = "b 8:0 rw" },
-        .{ .controller = "devices", .name = "devices.deny", .value = "c 10:* m" },
-        .{ .controller = "devices", .name = "devices.allow", .value = "c *:* m" },
-        .{ .controller = "devices", .name = "devices.allow", .value = "b *:* m" },
-        .{ .controller = "devices", .name = "devices.allow", .value = "c 1:3 rwm" },
-        .{ .controller = "devices", .name = "devices.allow", .value = "c 1:8 rwm" },
-        .{ .controller = "devices", .name = "devices.allow", .value = "c 1:7 rwm" },
-        .{ .controller = "devices", .name = "devices.allow", .value = "c 5:0 rwm" },
-        .{ .controller = "devices", .name = "devices.allow", .value = "c 1:5 rwm" },
-        .{ .controller = "devices", .name = "devices.allow", .value = "c 1:9 rwm" },
-        .{ .controller = "devices", .name = "devices.allow", .value = "c 136:* rwm" },
-        .{ .controller = "devices", .name = "devices.allow", .value = "c 5:2 rwm" },
-        .{ .controller = "devices", .name = "devices.allow", .value = "c 10:200 rwm" },
-        .{ .controller = "devices", .name = "devices.allow", .value = "b 8:1 rwm" },
-        .{ .controller = "devices", .name = "devices.allow", .value = "c 10:200 rwm" },
     }, writes);
 }
 
-test "v1 create and update reject holes in wildcard device allows" {
+test "v1 resource validation rejects holes in wildcard device allows" {
     const allocator = std.testing.allocator;
     defer last_diagnostic_len = 0;
-    for ([_]?[]const Backend.Device{ &.{}, null }) |devices| {
-        for ([_]Resources.DeviceRule{
-            .{ .allow = true, .kind = .char, .major = 10 },
-            .{ .allow = true, .kind = .char, .major = 10, .minor = -1 },
-            .{ .allow = true, .kind = .char, .minor = 237 },
-        }) |allow| {
-            const result = v1Writes(allocator, .{ .devices = &.{
-                allow,
-                .{ .allow = false, .kind = .char, .major = 10, .minor = 237 },
-            } }, devices);
-            defer if (result) |writes| {
-                freeV1Writes(allocator, writes);
-            } else |_| {};
-            try std.testing.expectError(error.InvalidConfig, result);
-            try std.testing.expect(std.mem.indexOf(u8, last_diagnostic[0..last_diagnostic_len], "cannot punch hole in existing wildcard rule") != null);
-        }
+    for ([_]Resources.DeviceRule{
+        .{ .allow = true, .kind = .char, .major = 10 },
+        .{ .allow = true, .kind = .char, .major = 10, .minor = -1 },
+        .{ .allow = true, .kind = .char, .minor = 237 },
+    }) |allow| {
+        try std.testing.expectError(error.InvalidConfig, v1Writes(allocator, .{ .devices = &.{
+            allow,
+            .{ .allow = false, .kind = .char, .major = 10, .minor = 237 },
+        } }));
+        try std.testing.expect(std.mem.indexOf(u8, last_diagnostic[0..last_diagnostic_len], "cannot punch hole in existing wildcard rule") != null);
     }
 }
 
@@ -509,11 +478,10 @@ test "v1 wildcard device rules permit exact subtraction and nonoverlapping denie
             .{ .allow = false, .kind = .char, .major = 10, .minor = 237 },
         },
     }) |rules| {
-        const writes = try v1Writes(std.testing.allocator, .{ .devices = rules }, null);
+        const writes = try v1Writes(std.testing.allocator, .{ .devices = rules });
         defer freeV1Writes(std.testing.allocator, writes);
-        // Mapping retains the inputs; only the writer computes a transition.
-        try std.testing.expectEqualStrings("devices.allow", writes[0].name);
-        try std.testing.expectEqual(rules.len + default_device_rules.len, writes.len);
+        // Device writes are emitted only by the transition writer.
+        try std.testing.expectEqual(@as(usize, 0), writes.len);
     }
 }
 
@@ -524,23 +492,28 @@ test "v1 memory ordering raises memsw first only when the new limit exceeds curr
     try std.testing.expect(v1MemorySwapFirst(-1, 64));
 }
 
-test "v1 hierarchy discovery excludes named and unified mounts and combines controllers" {
+test "v1 hierarchy discovery retains unescaped roots and excludes duplicate named and unified mounts" {
     const text =
         \\1 0 0:1 / /sys/fs/cgroup rw - tmpfs tmpfs rw
-        \\2 1 0:2 / /sys/fs/cgroup/cpu,cpuacct rw - cgroup cgroup rw,cpu,cpuacct
-        \\3 1 0:3 / /sys/fs/cgroup/net\040class rw shared:1 - cgroup cgroup rw,net_cls,net_prio
+        \\2 1 0:2 /docker/cid /sys/fs/cgroup/cpu,cpuacct rw - cgroup cgroup rw,cpu,cpuacct
+        \\3 1 0:3 /docker/a\040b /sys/fs/cgroup/net\040class rw shared:1 - cgroup cgroup rw,net_cls,net_prio
         \\4 1 0:4 / /sys/fs/cgroup/systemd rw - cgroup cgroup rw,xattr,name=systemd
         \\5 1 0:5 / /sys/fs/cgroup/unified rw - cgroup2 cgroup rw
         \\6 1 0:6 / /sys/fs/cgroup/memory rw - cgroup memory rw,memory
+        \\7 1 0:2 /docker/duplicate /copy rw - cgroup cgroup rw,cpu,cpuacct
     ;
-    const hierarchies = try v1Hierarchies(std.testing.allocator, text);
+    const hierarchies = try v1HierarchiesForDriver(std.testing.allocator, text, false);
     defer freeV1Hierarchies(std.testing.allocator, hierarchies);
     try std.testing.expectEqual(@as(usize, 3), hierarchies.len);
     try std.testing.expectEqualStrings("/sys/fs/cgroup/cpu,cpuacct", hierarchies[0].mountpoint);
+    try std.testing.expectEqualStrings("/docker/cid", hierarchies[0].mount_root);
     try std.testing.expectEqualDeep(&[_][]const u8{ "cpu", "cpuacct" }, hierarchies[0].controllers);
     try std.testing.expectEqualStrings("/sys/fs/cgroup/net class", hierarchies[1].mountpoint);
+    try std.testing.expectEqualStrings("/docker/a b", hierarchies[1].mount_root);
     try std.testing.expectEqualDeep(&[_][]const u8{ "net_cls", "net_prio" }, hierarchies[1].controllers);
+    try std.testing.expectEqualStrings("/", hierarchies[2].mount_root);
     try std.testing.expectEqualDeep(&[_][]const u8{"memory"}, hierarchies[2].controllers);
+    try std.testing.expectError(error.CreateFailed, v1HierarchiesForDriver(std.testing.allocator, text ++ "\ninvalid", false));
 }
 
 test "cgroup mode detects unified and legacy roots" {
@@ -563,13 +536,13 @@ test "v1 mapping rejects unified and malformed resources and preserves wildcard 
         .{ .devices = &.{.{ .allow = true, .major = -2 }} },
         .{ .devices = &.{.{ .allow = true, .access = "x" }} },
     }) |resources|
-        try std.testing.expectError(error.InvalidConfig, v1Writes(std.testing.allocator, resources, &.{}));
-    const writes = try v1Writes(std.testing.allocator, .{ .devices = &.{.{ .allow = true, .kind = .char, .major = -1, .minor = -1 }} }, &.{});
+        try std.testing.expectError(error.InvalidConfig, v1Writes(std.testing.allocator, resources));
+    const writes = try v1Writes(std.testing.allocator, .{ .devices = &.{.{ .allow = true, .kind = .char, .major = -1, .minor = -1 }} });
     defer freeV1Writes(std.testing.allocator, writes);
-    try std.testing.expectEqualStrings("c *:* rwm", writes[0].value);
-    const unset = try v1Writes(std.testing.allocator, .{ .memory = .{ .limit = 0, .swap = 0, .disable_oom_killer = false }, .cpu = .{ .shares = 0, .period = 0, .quota = 0 }, .pids = .{ .limit = 0 } }, &.{});
+    try std.testing.expectEqual(@as(usize, 0), writes.len);
+    const unset = try v1Writes(std.testing.allocator, .{ .memory = .{ .limit = 0, .swap = 0, .disable_oom_killer = false }, .cpu = .{ .shares = 0, .period = 0, .quota = 0 }, .pids = .{ .limit = 0 } });
     defer freeV1Writes(std.testing.allocator, unset);
-    try std.testing.expectEqual(@as(usize, 11), unset.len);
+    try std.testing.expectEqual(@as(usize, 0), unset.len);
 }
 
 test "linux update requires a persisted cgroup path" {
@@ -586,7 +559,7 @@ test "linux update requires a persisted cgroup path" {
 
 test "resource updates write only requested limits and replace explicit v1 device rules" {
     const resources: Resources = .{ .cpu = .{ .shares = 512 } };
-    const v1 = try v1Writes(std.testing.allocator, resources, null);
+    const v1 = try v1Writes(std.testing.allocator, resources);
     defer freeV1Writes(std.testing.allocator, v1);
     try std.testing.expectEqual(@as(usize, 1), v1.len);
     try std.testing.expectEqualStrings("cpu.shares", v1[0].name);
@@ -598,12 +571,9 @@ test "resource updates write only requested limits and replace explicit v1 devic
     try std.testing.expectEqualStrings("20", v2[0].value);
     const devices = try v1Writes(std.testing.allocator, .{
         .devices = &.{.{ .allow = true, .kind = .block, .major = 8, .minor = 0, .access = "rw" }},
-    }, null);
+    });
     defer freeV1Writes(std.testing.allocator, devices);
-    try std.testing.expectEqualStrings("devices.allow", devices[0].name);
-    try std.testing.expectEqualStrings("b 8:0 rw", devices[0].value);
-    try std.testing.expectEqualStrings("c *:* m", devices[1].value);
-    try std.testing.expectEqualStrings("c 1:3 rwm", devices[3].value);
+    try std.testing.expectEqual(@as(usize, 0), devices.len);
 }
 
 test "v1 mapping and hierarchy discovery release partial allocations" {
@@ -617,11 +587,11 @@ test "v1 mapping and hierarchy discovery release partial allocations" {
                 .hugepage_limits = &.{.{ .page_size = "2MB", .limit = 1 }},
                 .network = .{ .class_id = 1, .priorities = &.{.{ .name = "lo", .priority = 0 }} },
                 .devices = &.{.{ .allow = false }},
-            }, &.{.{ .path = "/disk", .kind = .block, .major = 8, .minor = 0 }});
+            });
             defer freeV1Writes(allocator, writes);
             const hierarchies = try v1Hierarchies(allocator,
-                \\1 0 0:1 / /sys/fs/cgroup/cpu rw - cgroup cgroup rw,cpu,cpuacct
-                \\2 0 0:1 / /copy rw - cgroup cgroup rw,cpu,cpuacct
+                \\1 0 0:1 /docker/cid /sys/fs/cgroup/cpu rw - cgroup cgroup rw,cpu,cpuacct
+                \\2 0 0:1 /docker/a\040b /copy rw - cgroup cgroup rw,cpu,cpuacct
                 \\3 0 0:2 / /sys/fs/cgroup/memory rw - cgroup cgroup rw,memory
             );
             defer freeV1Hierarchies(allocator, hierarchies);
@@ -789,26 +759,22 @@ fn appendIgnoredField(allocator: std.mem.Allocator, fields: *std.ArrayList(u8), 
     try fields.appendSlice(allocator, name);
 }
 
-fn enabledControllers(buffer: *[64]u8, writes: []const Write) []const u8 {
-    var len: usize = 0;
-    const controllers = [_]struct { prefix: []const u8, enable: []const u8 }{
-        .{ .prefix = "memory.", .enable = "+memory " },
-        .{ .prefix = "cpu.", .enable = "+cpu " },
-        .{ .prefix = "pids.", .enable = "+pids " },
-        .{ .prefix = "cpuset.", .enable = "+cpuset " },
-        .{ .prefix = "io.", .enable = "+io " },
-        .{ .prefix = "hugetlb.", .enable = "+hugetlb " },
-    };
-    for (controllers) |controller| {
+fn enabledControllers(allocator: std.mem.Allocator, available: []const u8, writes: []const Write) Backend.Error![]u8 {
+    var result: std.ArrayList(u8) = .empty;
+    errdefer result.deinit(allocator);
+    var controllers = std.mem.tokenizeAny(u8, available, " \t\n");
+    while (controllers.next()) |controller| {
         for (writes) |write| {
-            if (std.mem.startsWith(u8, write.name, controller.prefix)) {
-                @memcpy(buffer[len..][0..controller.enable.len], controller.enable);
-                len += controller.enable.len;
+            const dot = std.mem.indexOfScalar(u8, write.name, '.') orelse continue;
+            if (std.mem.eql(u8, write.name[0..dot], controller)) {
+                try result.append(allocator, '+');
+                try result.appendSlice(allocator, controller);
+                try result.append(allocator, ' ');
                 break;
             }
         }
     }
-    return buffer[0..len];
+    return result.toOwnedSlice(allocator);
 }
 
 test "cpu shares map to cgroup2 weights without underflow or overflow" {
@@ -1095,8 +1061,9 @@ test "v2 ignored field collection cleans up on allocation failure" {
 }
 
 test "v2 controller selection uses write prefixes and enables each controller once" {
-    var buffer: [64]u8 = undefined;
-    try std.testing.expectEqualStrings("+memory +cpu +pids +cpuset +io +hugetlb ", enabledControllers(&buffer, &.{
+    const allocator = std.testing.allocator;
+    const available = "memory cpu pids cpuset io hugetlb rdma misc\n";
+    const selected = try enabledControllers(allocator, available, &.{
         .{ .name = "hugetlb.2MB.max", .value = "0" },
         .{ .name = "cpuset.mems", .value = "0" },
         .{ .name = "io.max", .value = "8:0 rbps=1" },
@@ -1107,11 +1074,25 @@ test "v2 controller selection uses write prefixes and enables each controller on
         .{ .name = "cpuset.cpus", .value = "0-1" },
         .{ .name = "io.weight", .value = "1" },
         .{ .name = "cgroup.freeze", .value = "0" },
-    }));
-    try std.testing.expectEqualStrings("", enabledControllers(&buffer, &.{}));
-    const writes = try v2Writes(std.testing.allocator, .{ .unified = &.{.{ .key = "io.max", .value = "8:0 rbps=1" }} });
-    defer freeWrites(std.testing.allocator, writes);
-    try std.testing.expectEqualStrings("+io ", enabledControllers(&buffer, writes));
+        .{ .name = "cgroup.max.depth", .value = "8" },
+        .{ .name = "rdma.max", .value = "mlx5_0 hca_handle=1" },
+        .{ .name = "misc.max", .value = "sev 1" },
+        .{ .name = "unknown.max", .value = "1" },
+        .{ .name = "cpu", .value = "1" },
+    });
+    defer allocator.free(selected);
+    try std.testing.expectEqualStrings("+memory +cpu +pids +cpuset +io +hugetlb +rdma +misc ", selected);
+    const empty = try enabledControllers(allocator, available, &.{});
+    defer allocator.free(empty);
+    try std.testing.expectEqualStrings("", empty);
+    const writes = try v2Writes(allocator, .{ .unified = &.{.{ .key = "io.max", .value = "8:0 rbps=1" }} });
+    defer freeWrites(allocator, writes);
+    const io = try enabledControllers(allocator, available, writes);
+    defer allocator.free(io);
+    try std.testing.expectEqualStrings("+io ", io);
+    const unavailable = try enabledControllers(allocator, "memory\n", writes);
+    defer allocator.free(unavailable);
+    try std.testing.expectEqualStrings("", unavailable);
 }
 
 /// EPERM fallback preserves flags even in an inherited user namespace.
@@ -1552,7 +1533,7 @@ pub const LinuxBackend = struct {
         const hierarchies: []V1Hierarchy = if (cgroup_root.mode == .legacy) try openV1Hierarchies(allocator, handle.systemd) else &.{};
         defer if (cgroup_root.mode == .legacy) freeV1Hierarchies(allocator, hierarchies);
         for (hierarchies) |*hierarchy|
-            hierarchy.leaf = (try walkV1Cgroup(allocator, hierarchy.root.?, options.cgroup_path, false, false)) orelse return error.ProcessNotFound;
+            hierarchy.leaf = (try walkV1Cgroup(allocator, hierarchy.root.?, hierarchy.mount_root, options.cgroup_path, false, false)) orelse return error.ProcessNotFound;
 
         var joins: [8]NamespaceJoin = undefined;
         var ns_fds: [8]posix.fd_t = @splat(-1);
@@ -1937,7 +1918,7 @@ pub const LinuxBackend = struct {
                 reportDiagnostic("unified resources require cgroup v2", .{});
                 return error.InvalidConfig;
             }
-            const v1_writes: []const V1Write = if (cgroup_root.mode == .legacy) try v1Writes(allocator, options.resources, options.devices) else &.{};
+            const v1_writes: []const V1Write = if (cgroup_root.mode == .legacy) try v1Writes(allocator, options.resources) else &.{};
             defer if (cgroup_root.mode == .legacy) freeV1Writes(allocator, v1_writes);
             const ignored_fields = if (cgroup_root.mode == .unified) try v2IgnoredFields(allocator, options.resources) else try allocator.dupe(u8, "");
             defer allocator.free(ignored_fields);
@@ -2353,21 +2334,17 @@ pub const LinuxBackend = struct {
         }
     }
 
-    fn kill(ptr: *anyopaque, handle: Backend.Handle, signal: i32) Backend.Error!void {
+    fn kill(_: *anyopaque, handle: Backend.Handle, signal: i32) Backend.Error!void {
         last_diagnostic_len = 0;
         if (comptime builtin.os.tag == .linux) {
             if (handle.pid <= 0) return error.InvalidProcess;
             if (signal < 0 or signal >= linux.NSIG) return error.KillFailed;
-            // ponytail: PID reuse between alive() and kill() can signal the wrong
-            // process. Fix with pidfd_open before checking identity, then use
-            // pidfd_send_signal on that same descriptor.
-            if (!try alive(ptr, handle)) return error.ProcessNotFound;
-            switch (linux.errno(linux.kill(handle.pid, @enumFromInt(@as(u32, @intCast(signal)))))) {
-                .SUCCESS => {},
-                .SRCH => return error.ProcessNotFound,
-                .PERM => return error.PermissionDenied,
-                else => return error.KillFailed,
-            }
+            const pidfd = try openPidfd(handle.pid);
+            defer if (pidfd) |fd| closeFd(fd);
+            var buffer: [4096]u8 = undefined;
+            const stat = try readProcStat(handle.pid, &buffer);
+            if (!stat.matches(handle.starttime)) return error.ProcessNotFound;
+            try signalPid(handle.pid, pidfd, signal);
             // A v1 freezer holds SIGKILL until the paused cgroup is thawed.
             if (signal == @intFromEnum(linux.SIG.KILL)) {
                 const root = openCgroupRoot() catch return;
@@ -2399,24 +2376,30 @@ pub const LinuxBackend = struct {
             const allocator = std.heap.page_allocator;
             const root = try openCgroupRoot();
             defer closeFd(root.fd);
-            // ponytail: cgroup.procs enumeration signals only the leaf's own
-            // members. runc walks descendants; upgrade this path by recursing.
             if (root.mode == .legacy) {
                 const hierarchies = try openV1Hierarchies(allocator, handle.systemd);
                 defer freeV1Hierarchies(allocator, hierarchies);
                 var members: ?posix.fd_t = null;
+                var member_controller: ?[]const u8 = null;
+                var member_mount_root: []const u8 = "/";
                 var freezer: ?posix.fd_t = null;
                 for (hierarchies) |*hierarchy| {
-                    hierarchy.leaf = try walkV1Cgroup(allocator, hierarchy.root.?, path, false, false);
+                    hierarchy.leaf = try walkV1Cgroup(allocator, hierarchy.root.?, hierarchy.mount_root, path, false, false);
                     if (hierarchy.leaf) |fd| {
-                        if (members == null) members = fd;
+                        if (members == null) {
+                            members = fd;
+                            member_controller = hierarchy.controllers[0];
+                            member_mount_root = hierarchy.mount_root;
+                        }
                         if (hierarchy.has("freezer")) {
                             freezer = fd;
                             members = fd;
+                            member_controller = "freezer";
+                            member_mount_root = hierarchy.mount_root;
                         }
                     }
                 }
-                if (members) |fd| try killV1Members(fd, freezer, signal, path);
+                if (members) |fd| try killV1Members(fd, freezer, signal, member_mount_root, path, member_controller);
                 return;
             }
             const cgroup = (try walkCgroup(root.fd, path, false, &.{})) orelse return;
@@ -2436,7 +2419,11 @@ pub const LinuxBackend = struct {
                     }
                 }
             }
-            try killV2Members(cgroup, signal, path);
+            const mountinfo = try readMountinfo(allocator);
+            defer allocator.free(mountinfo);
+            const mount_root = try v2MountRoot(allocator, mountinfo);
+            defer allocator.free(mount_root);
+            try killV2Members(cgroup, signal, mount_root, path);
         } else {
             return error.NotImplemented;
         }
@@ -2458,12 +2445,12 @@ pub const LinuxBackend = struct {
                 reportDiagnostic("unified resources require cgroup v2", .{});
                 return error.InvalidConfig;
             }
-            const writes = try v1Writes(allocator, resources, if (resources.devices.len != 0) handle.device_nodes else null);
+            const writes = try v1Writes(allocator, resources);
             defer freeV1Writes(allocator, writes);
             const hierarchies = try openV1Hierarchies(allocator, handle.systemd);
             defer freeV1Hierarchies(allocator, hierarchies);
             for (hierarchies) |*hierarchy|
-                hierarchy.leaf = (try walkV1Cgroup(allocator, hierarchy.root.?, path, false, false)) orelse return error.ProcessNotFound;
+                hierarchy.leaf = (try walkV1Cgroup(allocator, hierarchy.root.?, hierarchy.mount_root, path, false, false)) orelse return error.ProcessNotFound;
             var requested = resources;
             var device_rules: []const Resources.DeviceRule = &.{};
             defer allocator.free(device_rules);
@@ -2489,7 +2476,7 @@ pub const LinuxBackend = struct {
                 }
             };
             try setSystemdResources(allocator, handle, requested, .legacy, false, device_rules);
-            try applyV1Writes(allocator, hierarchies, writes, resources, handle.device_nodes, path);
+            try applyV1Writes(allocator, hierarchies, writes, resources, if (resources.devices.len != 0) handle.device_nodes else null, path);
         } else {
             var requested = resources;
             var inferred_memory_limit = false;
@@ -2577,7 +2564,7 @@ pub const LinuxBackend = struct {
                     if (controller) |name| {
                         if (!hierarchy.has(name)) continue;
                     }
-                    if (try walkV1Cgroup(allocator, hierarchy.root.?, path, false, false)) |fd|
+                    if (try walkV1Cgroup(allocator, hierarchy.root.?, hierarchy.mount_root, path, false, false)) |fd|
                         break :members fd;
                 }
             }
@@ -2625,7 +2612,7 @@ pub const LinuxBackend = struct {
                     const hierarchies = try openV1Hierarchies(allocator, handle.systemd or handle.systemd_cleanup);
                     defer freeV1Hierarchies(allocator, hierarchies);
                     for (hierarchies) |*hierarchy| {
-                        hierarchy.leaf = try walkV1Cgroup(allocator, hierarchy.root.?, path, false, false);
+                        hierarchy.leaf = try walkV1Cgroup(allocator, hierarchy.root.?, hierarchy.mount_root, path, false, false);
                     }
                     try removeV1Cgroups(hierarchies, path);
                     break :cgroup_cleanup;
@@ -2702,6 +2689,47 @@ fn mountinfoPath(buffer: []u8, escaped: []const u8) Backend.Error![]const u8 {
         used += 1;
     }
     return buffer[0..used];
+}
+
+fn v2MountRoot(allocator: std.mem.Allocator, text: []const u8) Backend.Error![]u8 {
+    var root: ?[]const u8 = null;
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    var lines = std.mem.tokenizeScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        const separator = std.mem.indexOf(u8, line, " - ") orelse return error.CreateFailed;
+        var fields = std.mem.tokenizeScalar(u8, line[separator + 3 ..], ' ');
+        if (!std.mem.eql(u8, fields.next() orelse return error.CreateFailed, "cgroup2")) continue;
+        const mount = try MountInfo.parse(line);
+        if (std.mem.eql(u8, try mountinfoPath(&buffer, mount.mountpoint), "/sys/fs/cgroup"))
+            root = mount.root;
+    }
+    return allocator.dupe(u8, try mountinfoPath(&buffer, root orelse return error.CreateFailed));
+}
+
+test "v2 mount roots are unescaped and use the last mount at the cgroup root" {
+    for ([_]struct { text: []const u8, root: []const u8 }{
+        .{ .text = "1 0 0:1 / /sys/fs/cgroup rw - cgroup2 cgroup rw", .root = "/" },
+        .{ .text = "1 0 0:1 /docker/cid /sys/fs/cgroup rw - cgroup2 cgroup rw", .root = "/docker/cid" },
+        .{ .text = "1 0 0:1 /docker/a\\040b /sys/fs/cgr\\157up rw - cgroup2 cgroup rw", .root = "/docker/a b" },
+        .{
+            .text =
+            \\1 0 0:1 / /sys/fs/cgroup rw - cgroup2 cgroup rw
+            \\2 1 0:2 /docker/cid /sys/fs/cgroup rw - cgroup2 cgroup rw
+            \\3 2 0:3 /other /sys/fs/cgroup/other rw - cgroup2 cgroup rw
+            \\4 2 0:4 /legacy /sys/fs/cgroup rw - cgroup cgroup rw,cpu
+            ,
+            .root = "/docker/cid",
+        },
+    }) |case| {
+        const root = try v2MountRoot(std.testing.allocator, case.text);
+        defer std.testing.allocator.free(root);
+        try std.testing.expectEqualStrings(case.root, root);
+    }
+    for ([_][]const u8{
+        "",
+        "1 0 0:1 / /sys/fs/cgroup rw - tmpfs tmpfs rw",
+        "1 0 0:1 / /sys/fs/cgroup/unified rw - cgroup2 cgroup rw",
+    }) |text| try std.testing.expectError(error.CreateFailed, v2MountRoot(std.testing.allocator, text));
 }
 
 /// A self-bind has the same filesystem root as its directory in the parent
@@ -3085,17 +3113,15 @@ fn queryDevicePrograms(allocator: std.mem.Allocator, cgroup: posix.fd_t, path: [
 }
 
 fn applyV2DeviceFilter(allocator: std.mem.Allocator, cgroup: posix.fd_t, rules: []const Resources.DeviceRule, path: []const u8, update: bool) Backend.Error!void {
-    const insns = devicefilter.compile(allocator, rules) catch |err| {
-        return switch (err) {
-            error.InvalidConfig, error.CannotPunchHole => invalid: {
-                reportDiagnostic("cgroup '{s}' has invalid v2 device rules", .{path});
-                // Reapply solely to retain runc's detailed wildcard-hole error.
-                var emu = try deviceEmulator(allocator, rules);
-                defer emu.deinit(allocator);
-                break :invalid error.InvalidConfig;
-            },
-            else => |other| other,
-        };
+    var emu = deviceEmulator(allocator, rules) catch |err| {
+        if (err == error.InvalidConfig and last_diagnostic_len == 0)
+            reportDiagnostic("cgroup '{s}' has invalid v2 device rules", .{path});
+        return err;
+    };
+    defer emu.deinit(allocator);
+    const insns = devicefilter.compileEmulator(allocator, emu) catch |err| return switch (err) {
+        error.CannotPunchHole => error.InvalidConfig,
+        else => |other| other,
     };
     defer allocator.free(insns);
     var log: []u8 = &.{};
@@ -3196,9 +3222,12 @@ fn collectCgroupPids(allocator: std.mem.Allocator, dir: posix.fd_t, result: *std
         if (pid <= 0) return error.InvalidProcess;
         if (std.mem.indexOfScalar(i32, result.items, pid) == null) try result.append(allocator, pid);
     }
+    // Keep the caller's directory offset untouched for later cleanup or ps.
+    const directory = try openPath(dir, ".", .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true });
+    defer closeFd(directory);
     var buffer: [4096]u8 = undefined;
     while (true) {
-        const count = linux.getdents64(dir, &buffer, buffer.len);
+        const count = linux.getdents64(directory, &buffer, buffer.len);
         if (linux.errno(count) == .INTR) continue;
         try checkResult(count);
         if (count == 0) return;
@@ -3235,7 +3264,7 @@ fn openFreezerCgroup(handle: Backend.Handle) Backend.Error!?struct { fd: posix.f
         defer freeV1Hierarchies(allocator, hierarchies);
         for (hierarchies) |hierarchy| {
             if (hierarchy.has("freezer"))
-                break :freezer (try walkV1Cgroup(allocator, hierarchy.root.?, path, false, false)) orelse return null;
+                break :freezer (try walkV1Cgroup(allocator, hierarchy.root.?, hierarchy.mount_root, path, false, false)) orelse return null;
         }
         return null;
     } else (try walkCgroup(root.fd, path, false, &.{})) orelse return null;
@@ -3264,6 +3293,8 @@ fn cgroupFrozen(dir: posix.fd_t, mode: CgroupMode) Backend.Error!bool {
         used += count;
     }
     const state = std.mem.trim(u8, buffer[0..used], " \t\n");
+    // v2 paused reflects our own freeze request, not an ancestor's freeze,
+    // matching runc's v2 freezer GetState.
     if (mode == .unified) return std.mem.eql(u8, state, "1");
     return std.mem.eql(u8, state, "FROZEN") or std.mem.eql(u8, state, "FREEZING");
 }
@@ -3373,7 +3404,7 @@ test "linux v2 kill all retains a pending user freeze request" {
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "cgroup.events", .data = "populated 0\nfrozen 0\n" });
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "cgroup.procs", .data = "" });
     for ([_]i32{ 0, 9, 15 }) |signal| {
-        try killV2Members(tmp.dir.handle, signal, "igvano/pending-pause-test");
+        try killV2Members(tmp.dir.handle, signal, "/", "igvano/pending-pause-test");
         const state = try readCgroupFile(std.testing.allocator, tmp.dir.handle, "cgroup.freeze");
         defer std.testing.allocator.free(state);
         try std.testing.expectEqualStrings("1", state);
@@ -3392,7 +3423,7 @@ fn seedV1Cpuset(allocator: std.mem.Allocator, parent: posix.fd_t, child: posix.f
 }
 
 /// Seed each newly created cpuset directory before descending into its child.
-fn walkV1Cgroup(allocator: std.mem.Allocator, root: posix.fd_t, path: []const u8, create: bool, cpuset: bool) Backend.Error!?posix.fd_t {
+fn walkV1Cgroup(allocator: std.mem.Allocator, root: posix.fd_t, mount_root: []const u8, path: []const u8, create: bool, cpuset: bool) Backend.Error!?posix.fd_t {
     try validateCgroupPath(path);
     var current = try openPath(root, ".", .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true });
     errdefer closeFd(current);
@@ -3424,7 +3455,7 @@ fn walkV1Cgroup(allocator: std.mem.Allocator, root: posix.fd_t, path: []const u8
         }
         const child: posix.fd_t = @intCast(opened);
         errdefer closeFd(child);
-        errdefer if (created and components.peek() == null) removeV1Cgroup(root, path, child, null) catch {};
+        errdefer if (created and components.peek() == null) removeV1Cgroup(root, mount_root, path, child, null, null) catch {};
         if (created and cpuset) try seedV1Cpuset(allocator, current, child, path);
         closeFd(current);
         current = child;
@@ -3508,15 +3539,27 @@ fn requiredV1Controller(controller: []const u8, resources: Resources, devices: [
     return false;
 }
 
-fn applyV1Writes(allocator: std.mem.Allocator, hierarchies: []const V1Hierarchy, writes: []const V1Write, resources: Resources, devices: []const Backend.Device, path: []const u8) Backend.Error!void {
-    var has_devices = false;
-    for (writes) |write| {
-        if (std.mem.eql(u8, write.controller, "devices")) has_devices = true;
-    }
-    const configured = if (has_devices) try v2DeviceRules(allocator, resources.devices, devices) else &.{};
+// Null devices selects update: leave an omitted ruleset alone.
+fn applyV1Writes(allocator: std.mem.Allocator, hierarchies: []const V1Hierarchy, writes: []const V1Write, resources: Resources, devices: ?[]const Backend.Device, path: []const u8) Backend.Error!void {
+    const has_devices = devices != null or resources.devices.len != 0;
+    const nodes = devices orelse &.{};
+    const configured = if (has_devices) try v2DeviceRules(allocator, resources.devices, nodes) else &.{};
     defer allocator.free(configured);
     var target = try deviceEmulator(allocator, configured);
     defer target.deinit(allocator);
+    if (has_devices) {
+        var mounted = false;
+        for (hierarchies) |hierarchy| {
+            if (hierarchy.has("devices")) mounted = true;
+        }
+        if (!mounted) {
+            if (requiredV1Controller("devices", resources, nodes)) {
+                reportDiagnostic("cgroup v1 controller devices is required but not mounted", .{});
+                return error.CgroupWriteFailed;
+            }
+            std.debug.print("igvano: warning: cgroup v1 controller devices is not mounted; ignoring\n", .{});
+        }
+    }
     // Warn once per missing controller, including controllers with many writes.
     for (writes, 0..) |write, index| {
         var mounted = false;
@@ -3524,7 +3567,7 @@ fn applyV1Writes(allocator: std.mem.Allocator, hierarchies: []const V1Hierarchy,
             if (hierarchy.has(write.controller)) mounted = true;
         }
         if (mounted) continue;
-        if (requiredV1Controller(write.controller, resources, devices)) {
+        if (requiredV1Controller(write.controller, resources, nodes)) {
             reportDiagnostic("cgroup v1 controller {s} is required but not mounted", .{write.controller});
             return error.CgroupWriteFailed;
         }
@@ -3553,7 +3596,6 @@ fn applyV1Writes(allocator: std.mem.Allocator, hierarchies: []const V1Hierarchy,
         }
         for (writes, 0..) |write, index| {
             if (!hierarchy.has(write.controller)) continue;
-            if (std.mem.eql(u8, write.controller, "devices")) continue;
             if (swap_first) |swap| {
                 if (index == swap) continue;
                 if (index == limit_write.?) try writeV1Resource(hierarchy.leaf.?, writes[swap], path, &kmem_warned);
@@ -3565,6 +3607,8 @@ fn applyV1Writes(allocator: std.mem.Allocator, hierarchies: []const V1Hierarchy,
             defer allocator.free(list);
             var current = try deviceEmulatorFromList(allocator, list);
             defer current.deinit(allocator);
+            // ponytail: a deny-list source briefly clears deny exceptions on
+            // reset; devices.list cannot reveal them, matching runc's v1 Set.
             const transition = try current.transition(allocator, target);
             defer allocator.free(transition);
             var device_writes: std.ArrayList(V1Write) = .empty;
@@ -3578,15 +3622,31 @@ fn applyV1Writes(allocator: std.mem.Allocator, hierarchies: []const V1Hierarchy,
             for (transition) |rule| try appendV1DeviceRule(allocator, &device_writes, rule);
             for (device_writes.items) |write|
                 try writeV1Resource(hierarchy.leaf.?, write, path, &kmem_warned);
+            const updated_list = try readCgroupFile(allocator, hierarchy.leaf.?, "devices.list");
+            defer allocator.free(updated_list);
+            var updated = try deviceEmulatorFromList(allocator, updated_list);
+            defer updated.deinit(allocator);
+            const matches = if (target.default_allow)
+                updated.default_allow
+            else matches: {
+                const remaining = try updated.transition(allocator, target);
+                defer allocator.free(remaining);
+                break :matches remaining.len == 0;
+            };
+            if (!matches) {
+                reportDiagnostic("cgroup '{s}' devices.list does not match the requested device policy after update", .{path});
+                return error.CgroupWriteFailed;
+            }
         }
     }
 }
 
-test "linux v1 device updates write only the transition from devices.list" {
+test "linux v1 device updates verify readback after writing only the transition" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     if (runningInUserNamespace()) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
+    defer last_diagnostic_len = 0;
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "devices.list",
         .data =
@@ -3609,22 +3669,46 @@ test "linux v1 device updates write only the transition from devices.list" {
     const resources: Resources = .{ .devices = &.{
         .{ .allow = true, .kind = .char, .major = 10, .minor = 237, .access = "rw" },
     } };
-    const writes = try v1Writes(std.testing.allocator, resources, null);
+    const writes = try v1Writes(std.testing.allocator, resources);
     defer freeV1Writes(std.testing.allocator, writes);
-    try applyV1Writes(std.testing.allocator, &.{.{
+    const hierarchies: []const V1Hierarchy = &.{.{
         .mountpoint = "/test/devices",
+        .mount_root = "/",
         .controllers = &.{"devices"},
         .leaf = tmp.dir.handle,
-    }}, writes, resources, &.{}, "test");
+    }};
+    // Regular files do not apply the transition to devices.list.
+    try std.testing.expectError(error.CgroupWriteFailed, applyV1Writes(std.testing.allocator, hierarchies, writes, resources, null, "test"));
+    try std.testing.expect(std.mem.indexOf(u8, last_diagnostic[0..last_diagnostic_len], "devices.list does not match") != null);
     const allowed = try tmp.dir.readFileAlloc(std.testing.io, "devices.allow", std.testing.allocator, .limited(64));
     defer std.testing.allocator.free(allowed);
     try std.testing.expectEqualStrings("c 10:237 w", allowed);
     const denied = try tmp.dir.readFileAlloc(std.testing.io, "devices.deny", std.testing.allocator, .limited(64));
     defer std.testing.allocator.free(denied);
     try std.testing.expectEqualStrings("untouched", denied);
+    const configured = try v2DeviceRules(std.testing.allocator, resources.devices, &.{});
+    defer std.testing.allocator.free(configured);
+    var target = try deviceEmulator(std.testing.allocator, configured);
+    defer target.deinit(std.testing.allocator);
+    const rules = try target.rules(std.testing.allocator);
+    defer std.testing.allocator.free(rules);
+    var expected: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer expected.deinit();
+    for (rules) |rule| {
+        var major: [24]u8 = undefined;
+        var minor: [24]u8 = undefined;
+        try expected.writer.print("{c} {s}:{s} {s}\n", .{
+            @as(u8, if (rule.kind == .char) 'c' else 'b'),
+            if (rule.major) |n| try v1DeviceNumber(&major, n) else "*",
+            if (rule.minor) |n| try v1DeviceNumber(&minor, n) else "*",
+            rule.access,
+        });
+    }
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "devices.list", .data = expected.written() });
+    try applyV1Writes(std.testing.allocator, hierarchies, writes, resources, null, "test");
 }
 
-fn killV2Members(dir: posix.fd_t, signal: i32, path: []const u8) Backend.Error!void {
+fn killV2Members(dir: posix.fd_t, signal: i32, mount_root: []const u8, path: []const u8) Backend.Error!void {
     const was_frozen = try cgroupFrozen(dir, .unified);
     // Only undo a freeze owned by this operation.
     defer if (!was_frozen) {
@@ -3639,11 +3723,12 @@ fn killV2Members(dir: posix.fd_t, signal: i32, path: []const u8) Backend.Error!v
         _ = try waitFrozen(dir, .unified, true, 50);
     }
     // The v1 helper also enumerates cgroup.procs without a freezer.
-    try killV1Members(dir, null, signal, path);
+    try killV1Members(dir, null, signal, mount_root, path, "");
 }
 
-fn killV1Members(dir: posix.fd_t, freezer: ?posix.fd_t, signal: i32, path: []const u8) Backend.Error!void {
+fn killV1Members(dir: posix.fd_t, freezer: ?posix.fd_t, signal: i32, mount_root: []const u8, path: []const u8, controller: ?[]const u8) Backend.Error!void {
     const allocator = std.heap.page_allocator;
+    if (signal < 0 or signal >= linux.NSIG) return error.KillFailed;
     const was_frozen = if (freezer) |fd| try cgroupFrozen(fd, .legacy) else false;
     const owned_freezer = if (!was_frozen) freezer else null;
     defer if (owned_freezer) |fd| {
@@ -3663,20 +3748,25 @@ fn killV1Members(dir: posix.fd_t, freezer: ?posix.fd_t, signal: i32, path: []con
             last_diagnostic_len = saved_len;
         }
     }
-    // ponytail: without a frozen cgroup, PID reuse between reading
-    // cgroup.procs and kill can signal an unrelated host process. This is the
-    // safety ceiling of the fallback; pidfds would pin each process identity.
-    const text = try readCgroupFile(allocator, dir, "cgroup.procs");
-    defer allocator.free(text);
-    var pids = std.mem.tokenizeAny(u8, text, " \t\n");
-    while (pids.next()) |text_pid| {
-        const pid = std.fmt.parseInt(i32, text_pid, 10) catch return error.CgroupDeleteFailed;
-        if (pid <= 0) return error.CgroupDeleteFailed;
-        switch (linux.errno(linux.kill(pid, @enumFromInt(@as(u32, @intCast(signal)))))) {
-            .SUCCESS, .SRCH => {},
-            .PERM => return error.PermissionDenied,
-            else => return error.KillFailed,
-        }
+    var members: std.ArrayList(i32) = .empty;
+    defer members.deinit(allocator);
+    try collectCgroupPids(allocator, dir, &members);
+    for (members.items) |pid| {
+        const pidfd = openPidfd(pid) catch |err| switch (err) {
+            error.ProcessNotFound => continue,
+            else => return err,
+        };
+        defer if (pidfd) |fd| closeFd(fd);
+        var buffer: [64 * 1024]u8 = undefined;
+        const cgroups = readProcFileAt(linux.AT.FDCWD, pid, "cgroup", &buffer) catch |err| switch (err) {
+            error.ProcessNotFound => continue,
+            else => return err,
+        };
+        if (!procCgroupMatches(cgroups, mount_root, path, controller)) continue;
+        signalPid(pid, pidfd, signal) catch |err| switch (err) {
+            error.ProcessNotFound => {},
+            else => return err,
+        };
     }
     // SIGKILL on v1 needs a thaw after signaling, even for a user pause.
     if (was_frozen and signal == @intFromEnum(linux.SIG.KILL))
@@ -3698,7 +3788,7 @@ test "linux v1 failed freeze retains its diagnostic and real cgroup path after t
         else => return err,
     };
     closeFd(probe);
-    try std.testing.expectError(error.CgroupWriteFailed, killV1Members(tmp.dir.handle, tmp.dir.handle, 9, "igvano/freeze-test"));
+    try std.testing.expectError(error.CgroupWriteFailed, killV1Members(tmp.dir.handle, tmp.dir.handle, 9, "/", "igvano/freeze-test", null));
     const diagnostic = last_diagnostic[0..last_diagnostic_len];
     try std.testing.expect(std.mem.indexOf(u8, diagnostic, "igvano/freeze-test") != null);
     try std.testing.expect(std.mem.indexOf(u8, diagnostic, "FROZEN") != null);
@@ -3715,7 +3805,15 @@ test "linux cgroup member signaling distinguishes kill failures from deletion fa
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "leaf/cgroup.procs", .data = members });
     const leaf = try openPath(tmp.dir.handle, "leaf", .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true });
     defer closeFd(leaf);
-    try std.testing.expectError(error.KillFailed, killV1Members(leaf, null, linux.NSIG, "leaf"));
+    try std.testing.expectError(error.KillFailed, killV1Members(leaf, null, linux.NSIG, "/", "leaf", null));
+    // Stale enumeration must not signal a process in another cgroup.
+    try killV1Members(leaf, null, 0, "/", "igvano/unrelated", null);
+    var proc_buffer: [64 * 1024]u8 = undefined;
+    const cgroups = try readProcFileAt(linux.AT.FDCWD, linux.getpid(), "cgroup", &proc_buffer);
+    const first = std.mem.indexOfScalar(u8, cgroups, ':').?;
+    const second = std.mem.indexOfScalarPos(u8, cgroups, first + 1, ':').?;
+    const end = std.mem.indexOfScalarPos(u8, cgroups, second + 1, '\n') orelse cgroups.len;
+    const member_path = cgroups[second + 2 .. end];
     if (linux.geteuid() != 0) return;
     const root = try openPath(tmp.dir.handle, ".", .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true });
     defer closeFd(root);
@@ -3723,15 +3821,54 @@ test "linux cgroup member signaling distinguishes kill failures from deletion fa
     const pid = try forkProcess();
     if (pid == 0) {
         checkResult(linux.setuid(65534)) catch linux.exit_group(1);
-        killV1Members(leaf, null, 0, "leaf") catch |err| {
+        killV1Members(leaf, null, 0, "/", member_path, null) catch |err| {
             if (err != error.PermissionDenied) linux.exit_group(2);
-            removeV1Cgroup(root, "leaf", leaf, null) catch |delete_err|
+            removeV1Cgroup(root, "/", "leaf", leaf, null, null) catch |delete_err|
                 linux.exit_group(if (delete_err == error.CgroupDeleteFailed) 0 else 3);
             linux.exit_group(4);
         };
         linux.exit_group(5);
     }
     try std.testing.expectEqual(@as(u32, 0), try waitChild(pid));
+}
+
+test "linux pidfds signal the held process and cgroup checks reject stale members" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var children = [_]i32{ 0, 0 };
+    defer for (children) |pid| {
+        if (pid > 0) {
+            _ = linux.kill(pid, .KILL);
+            _ = waitChild(pid) catch {};
+        }
+    };
+    for (&children) |*child| {
+        child.* = try forkProcess();
+        if (child.* == 0) {
+            const delay: linux.timespec = .{ .sec = 60, .nsec = 0 };
+            while (true) _ = linux.nanosleep(&delay, null);
+        }
+    }
+    const pidfd = (try openPidfd(children[0])) orelse return error.SkipZigTest;
+    defer closeFd(pidfd);
+    // Even a different numeric PID cannot redirect signalling through this fd.
+    try signalPid(children[1], pidfd, 9);
+    try std.testing.expectEqual(@as(u32, 9), try waitChild(children[0]));
+    children[0] = 0;
+    var buffer: [4096]u8 = undefined;
+    const stat = try readProcStat(children[1], &buffer);
+    const starttime = try std.testing.allocator.dupe(u8, stat.starttime);
+    defer std.testing.allocator.free(starttime);
+    var implementation: LinuxBackend = .{};
+    const backend = implementation.backend();
+    const handle: Backend.Handle = .{ .id = "survivor", .pid = children[1], .starttime = starttime };
+    try std.testing.expect(try backend.alive(handle));
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const members = try std.fmt.allocPrint(std.testing.allocator, "{d}\n", .{children[1]});
+    defer std.testing.allocator.free(members);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "cgroup.procs", .data = members });
+    try killV1Members(tmp.dir.handle, null, 9, "/", "igvano/unrelated", null);
+    try std.testing.expect(try backend.alive(handle));
 }
 
 fn removeV1Cgroups(hierarchies: []const V1Hierarchy, path: []const u8) Backend.Error!void {
@@ -3743,13 +3880,13 @@ fn removeV1Cgroups(hierarchies: []const V1Hierarchy, path: []const u8) Backend.E
     // Retain the freezer leaf until every other hierarchy has been drained.
     for (hierarchies) |hierarchy| {
         if (hierarchy.has("freezer")) continue;
-        if (hierarchy.leaf) |fd| removeV1Cgroup(hierarchy.root.?, path, fd, freezer) catch |err| {
+        if (hierarchy.leaf) |fd| removeV1Cgroup(hierarchy.root.?, hierarchy.mount_root, path, fd, freezer, hierarchy.controllers[0]) catch |err| {
             if (failure == null) failure = err;
         };
     }
     for (hierarchies) |hierarchy| {
         if (hierarchy.has("freezer")) {
-            if (hierarchy.leaf) |fd| removeV1Cgroup(hierarchy.root.?, path, fd, freezer) catch |err| {
+            if (hierarchy.leaf) |fd| removeV1Cgroup(hierarchy.root.?, hierarchy.mount_root, path, fd, freezer, hierarchy.controllers[0]) catch |err| {
                 if (failure == null) failure = err;
             };
         }
@@ -3758,7 +3895,7 @@ fn removeV1Cgroups(hierarchies: []const V1Hierarchy, path: []const u8) Backend.E
 }
 
 /// Only remove our leaf, checking identity against the pinned fd on every retry.
-fn removeV1Cgroup(root: posix.fd_t, path: []const u8, owned_fd: posix.fd_t, freezer: ?posix.fd_t) Backend.Error!void {
+fn removeV1Cgroup(root: posix.fd_t, mount_root: []const u8, path: []const u8, owned_fd: posix.fd_t, freezer: ?posix.fd_t, controller: ?[]const u8) Backend.Error!void {
     try validateCgroupPath(path);
     const parent = if (std.fs.path.dirname(path)) |parent_path|
         (try walkCgroup(root, parent_path, false, &.{})) orelse return
@@ -3784,10 +3921,11 @@ fn removeV1Cgroup(root: posix.fd_t, path: []const u8, owned_fd: posix.fd_t, free
         try checkResult(linux.statx(leaf, "", linux.AT.EMPTY_PATH, .{ .INO = true }, &current));
         if (!owned.mask.INO or !current.mask.INO) return error.CgroupDeleteFailed;
         if (owned.dev_major != current.dev_major or owned.dev_minor != current.dev_minor or owned.ino != current.ino) return;
-        killV1Members(leaf, freezer, @intFromEnum(linux.SIG.KILL), path) catch |err| return switch (err) {
+        killV1Members(leaf, freezer, @intFromEnum(linux.SIG.KILL), mount_root, path, controller) catch |err| return switch (err) {
             error.PermissionDenied, error.KillFailed => error.CgroupDeleteFailed,
             else => err,
         };
+        try removeCgroupChildren(leaf, path);
         const result = linux.unlinkat(parent, name, linux.AT.REMOVEDIR);
         switch (linux.errno(result)) {
             .SUCCESS, .NOENT => return,
@@ -3813,7 +3951,7 @@ fn cleanupV1TestHierarchies(hierarchies: []const V1Hierarchy, path: []const u8) 
         if (std.fs.path.dirname(path)) |parent| {
             const fd = (walkCgroup(hierarchy.root.?, parent, false, &.{}) catch null) orelse continue;
             defer closeFd(fd);
-            removeV1Cgroup(hierarchy.root.?, parent, fd, null) catch {};
+            removeV1Cgroup(hierarchy.root.?, hierarchy.mount_root, parent, fd, null, null) catch {};
         }
     }
 }
@@ -3837,12 +3975,12 @@ test "linux v1 create exposes readonly controller leaves containing init" {
     defer cleanupV1TestHierarchies(hierarchies, path);
     // Probe delegation before create, so a failure in mount expansion is fatal.
     for (hierarchies) |hierarchy| {
-        const leaf = (walkV1Cgroup(allocator, hierarchy.root.?, path, true, hierarchy.has("cpuset")) catch |err| switch (err) {
+        const leaf = (walkV1Cgroup(allocator, hierarchy.root.?, hierarchy.mount_root, path, true, hierarchy.has("cpuset")) catch |err| switch (err) {
             error.PermissionDenied => return error.SkipZigTest,
             else => return err,
         }).?;
         defer closeFd(leaf);
-        try removeV1Cgroup(hierarchy.root.?, path, leaf, null);
+        try removeV1Cgroup(hierarchy.root.?, hierarchy.mount_root, path, leaf, null, null);
     }
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3943,11 +4081,11 @@ test "linux v1 creates seeds writes joins and deletes each hierarchy" {
     defer allocator.free(path);
     defer cleanupV1TestHierarchies(hierarchies, path);
     for (hierarchies) |*hierarchy| {
-        hierarchy.leaf = (walkV1Cgroup(allocator, hierarchy.root.?, path, true, hierarchy.has("cpuset")) catch |err| switch (err) {
+        hierarchy.leaf = (walkV1Cgroup(allocator, hierarchy.root.?, hierarchy.mount_root, path, true, hierarchy.has("cpuset")) catch |err| switch (err) {
             error.PermissionDenied => return error.SkipZigTest,
             else => return err,
         }).?;
-        try std.testing.expectError(error.CreateFailed, walkV1Cgroup(allocator, hierarchy.root.?, path, true, hierarchy.has("cpuset")));
+        try std.testing.expectError(error.CreateFailed, walkV1Cgroup(allocator, hierarchy.root.?, hierarchy.mount_root, path, true, hierarchy.has("cpuset")));
         if (hierarchy.has("cpuset")) {
             const parent = (try walkCgroup(hierarchy.root.?, std.fs.path.dirname(path).?, false, &.{})).?;
             defer closeFd(parent);
@@ -3968,10 +4106,10 @@ test "linux v1 creates seeds writes joins and deletes each hierarchy" {
     // replacement. Hold the old descriptor so its inode cannot be reused.
     const first = &hierarchies[0];
     const original = first.leaf.?;
-    try removeV1Cgroup(first.root.?, path, original, null);
-    first.leaf = (try walkV1Cgroup(allocator, first.root.?, path, true, first.has("cpuset"))).?;
+    try removeV1Cgroup(first.root.?, first.mount_root, path, original, null, null);
+    first.leaf = (try walkV1Cgroup(allocator, first.root.?, first.mount_root, path, true, first.has("cpuset"))).?;
     defer closeFd(original);
-    try removeV1Cgroup(first.root.?, path, original, null);
+    try removeV1Cgroup(first.root.?, first.mount_root, path, original, null, null);
     const replacement = (try walkCgroup(first.root.?, path, false, &.{})).?;
     closeFd(replacement);
 
@@ -3998,7 +4136,7 @@ test "linux v1 creates seeds writes joins and deletes each hierarchy" {
         }
         if (!has_weight) resources.block_io.?.weight = null;
     }
-    const writes = try v1Writes(allocator, resources, &.{});
+    const writes = try v1Writes(allocator, resources);
     defer freeV1Writes(allocator, writes);
     try applyV1Writes(allocator, hierarchies, writes, resources, &.{}, path);
     for (hierarchies) |hierarchy| {
@@ -4021,11 +4159,11 @@ test "linux v1 creates seeds writes joins and deletes each hierarchy" {
             // Exercise both orders against a real kernel constraint: lower
             // limit+memsw, then raise limit beyond the current memsw.
             const lower: Resources = .{ .memory = .{ .limit = 33554432, .swap = 67108864 } };
-            const lower_writes = try v1Writes(allocator, lower, &.{});
+            const lower_writes = try v1Writes(allocator, lower);
             defer freeV1Writes(allocator, lower_writes);
             try applyV1Writes(allocator, hierarchies, lower_writes, lower, &.{}, path);
             const higher: Resources = .{ .memory = .{ .limit = 100663296, .swap = 134217728 } };
-            const higher_writes = try v1Writes(allocator, higher, &.{});
+            const higher_writes = try v1Writes(allocator, higher);
             defer freeV1Writes(allocator, higher_writes);
             try applyV1Writes(allocator, hierarchies, higher_writes, higher, &.{}, path);
         }
@@ -4061,7 +4199,7 @@ test "linux v1 creates seeds writes joins and deletes each hierarchy" {
         if (hierarchy.has("freezer")) {
             // Failed enumeration must thaw the real cgroup, leaving its
             // member alive for delete's subsequent freeze/kill/thaw cycle.
-            try std.testing.expectError(error.CreateFailed, killV1Members(-1, hierarchy.leaf, 9, path));
+            try std.testing.expectError(error.CreateFailed, killV1Members(-1, hierarchy.leaf, 9, hierarchy.mount_root, path, null));
             const state = try readCgroupFile(allocator, hierarchy.leaf.?, "freezer.state");
             defer allocator.free(state);
             try std.testing.expectEqualStrings("THAWED", std.mem.trim(u8, state, " \t\n"));
@@ -4092,7 +4230,7 @@ test "linux v1 cleanup attempts later hierarchies after the first removal fails"
     var count: usize = 0;
     for (hierarchies) |*hierarchy| {
         if (hierarchy.has("freezer")) continue;
-        hierarchy.leaf = (walkV1Cgroup(allocator, hierarchy.root.?, path, true, hierarchy.has("cpuset")) catch |err| switch (err) {
+        hierarchy.leaf = (walkV1Cgroup(allocator, hierarchy.root.?, hierarchy.mount_root, path, true, hierarchy.has("cpuset")) catch |err| switch (err) {
             error.PermissionDenied => return error.SkipZigTest,
             else => return err,
         }).?;
@@ -4465,12 +4603,12 @@ test "linux v1 missing optional controllers are ignored and required limits fail
     for ([_]Resources{
         .{ .memory = .{ .limit = 64 } }, .{ .pids = .{ .limit = 32 } }, .{ .devices = &.{.{ .allow = false }} },
     }) |resources| {
-        const writes = try v1Writes(allocator, resources, &.{});
+        const writes = try v1Writes(allocator, resources);
         defer freeV1Writes(allocator, writes);
         try std.testing.expectError(error.CgroupWriteFailed, applyV1Writes(allocator, &.{}, writes, resources, &.{}, "missing"));
     }
     const resources: Resources = .{ .cpu = .{ .shares = 1024 }, .block_io = .{ .weight = 100 } };
-    const writes = try v1Writes(allocator, resources, &.{});
+    const writes = try v1Writes(allocator, resources);
     defer freeV1Writes(allocator, writes);
     try applyV1Writes(allocator, &.{}, writes, resources, &.{}, "missing");
 }
@@ -4505,18 +4643,25 @@ test "linux cgroup creation enables requested controllers and ordinary lookups l
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDir(std.testing.io, "parent", .default_dir);
+    for ([_][]const u8{ "cgroup.controllers", "parent/cgroup.controllers" }) |path|
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = path, .data = "pids rdma misc\n" });
     for ([_][]const u8{ "cgroup.subtree_control", "parent/cgroup.subtree_control" }) |path|
         try tmp.dir.writeFile(std.testing.io, .{ .sub_path = path, .data = "" });
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "parent/cgroup.type", .data = "domain\n" });
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "parent/cgroup.procs", .data = "" });
     const root = try openPath(tmp.dir.handle, ".", .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true });
     defer closeFd(root);
-    const owned = (try walkCgroup(root, "parent/owned", true, &.{.{ .name = "pids.max", .value = "5" }})).?;
+    const owned = (try walkCgroup(root, "parent/owned", true, &.{
+        .{ .name = "pids.max", .value = "5" },
+        .{ .name = "rdma.max", .value = "mlx5_0 hca_handle=1" },
+        .{ .name = "misc.max", .value = "sev 1" },
+        .{ .name = "cgroup.max.depth", .value = "8" },
+    })).?;
     closeFd(owned);
     for ([_][]const u8{ "cgroup.subtree_control", "parent/cgroup.subtree_control" }) |path| {
         const enabled = try tmp.dir.readFileAlloc(std.testing.io, path, std.testing.allocator, .limited(256));
         defer std.testing.allocator.free(enabled);
-        try std.testing.expectEqualStrings("+pids ", enabled);
+        try std.testing.expectEqualStrings("+pids +rdma +misc ", enabled);
         try tmp.dir.writeFile(std.testing.io, .{ .sub_path = path, .data = "sentinel" });
     }
     try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, "parent/owned/cgroup.subtree_control", .{}));
@@ -4541,6 +4686,7 @@ test "linux cgroup activation never follows subtree control symlinks" {
     defer last_diagnostic_len = 0;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "cgroup.controllers", .data = "pids\n" });
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "outside", .data = "sentinel" });
     try tmp.dir.symLink(std.testing.io, "outside", "cgroup.subtree_control", .{});
     const root = try openPath(tmp.dir.handle, ".", .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true });
@@ -4558,6 +4704,8 @@ test "linux cgroup activation refuses populated non-root parents even for thread
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDir(std.testing.io, "parent", .default_dir);
+    for ([_][]const u8{ "cgroup.controllers", "parent/cgroup.controllers" }) |path|
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = path, .data = "pids cpu\n" });
     for ([_][]const u8{ "cgroup.subtree_control", "parent/cgroup.subtree_control" }) |path|
         try tmp.dir.writeFile(std.testing.io, .{ .sub_path = path, .data = "" });
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "parent/cgroup.type", .data = "domain\n" });
@@ -4594,6 +4742,8 @@ test "linux cgroup update walk enables only ancestors without creating missing d
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(std.testing.io, "parent/owned");
+    for ([_][]const u8{ "cgroup.controllers", "parent/cgroup.controllers" }) |path|
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = path, .data = "memory\n" });
     for ([_][]const u8{ "cgroup.subtree_control", "parent/cgroup.subtree_control" }) |path|
         try tmp.dir.writeFile(std.testing.io, .{ .sub_path = path, .data = "" });
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "parent/cgroup.type", .data = "domain\n" });
@@ -4695,13 +4845,18 @@ fn walkCgroup(root: posix.fd_t, path: []const u8, create: bool, writes: []const 
     try validateCgroupPath(path);
     var current = try openPath(root, ".", .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true });
     errdefer closeFd(current);
-    var controller_buffer: [64]u8 = undefined;
-    const controllers = enabledControllers(&controller_buffer, writes);
     var components = std.mem.tokenizeScalar(u8, path, '/');
     while (components.next()) |component| {
         var buffer: [256]u8 = undefined;
         const name = std.fmt.bufPrintZ(&buffer, "{s}", .{component}) catch return error.InvalidPath;
-        if (controllers.len != 0) try enableCgroupControllers(current, controllers, path);
+        if (writes.len != 0) {
+            const allocator = std.heap.page_allocator;
+            const available = try readCgroupFile(allocator, current, "cgroup.controllers");
+            defer allocator.free(available);
+            const controllers = try enabledControllers(allocator, available, writes);
+            defer allocator.free(controllers);
+            if (controllers.len != 0) try enableCgroupControllers(current, controllers, path);
+        }
         if (create) {
             const result = linux.mkdirat(current, name, 0o755);
             switch (linux.errno(result)) {
@@ -4940,11 +5095,15 @@ fn readProcStat(pid: i32, buffer: []u8) Backend.Error!ProcStat {
 }
 
 fn readProcStatAt(proc_dir: posix.fd_t, pid: i32, buffer: []u8) Backend.Error!ProcStat {
+    return parseProcStat(try readProcFileAt(proc_dir, pid, "stat", buffer));
+}
+
+fn readProcFileAt(proc_dir: posix.fd_t, pid: i32, comptime filename: []const u8, buffer: []u8) Backend.Error![]const u8 {
     var path_buffer: [64]u8 = undefined;
     const path = if (proc_dir == linux.AT.FDCWD)
-        std.fmt.bufPrintZ(&path_buffer, "/proc/{d}/stat", .{pid}) catch unreachable
+        std.fmt.bufPrintZ(&path_buffer, "/proc/{d}/" ++ filename, .{pid}) catch unreachable
     else
-        std.fmt.bufPrintZ(&path_buffer, "{d}/stat", .{pid}) catch unreachable;
+        std.fmt.bufPrintZ(&path_buffer, "{d}/" ++ filename, .{pid}) catch unreachable;
     const fd: posix.fd_t = open: while (true) {
         const result = linux.openat(proc_dir, path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
         switch (linux.errno(result)) {
@@ -4960,7 +5119,7 @@ fn readProcStatAt(proc_dir: posix.fd_t, pid: i32, buffer: []u8) Backend.Error!Pr
         const result = linux.read(fd, buffer[used..].ptr, buffer.len - used);
         switch (linux.errno(result)) {
             .SUCCESS => {
-                if (result == 0) return parseProcStat(buffer[0..used]);
+                if (result == 0) return buffer[0..used];
                 used += result;
             },
             .INTR => continue,
@@ -4969,6 +5128,117 @@ fn readProcStatAt(proc_dir: posix.fd_t, pid: i32, buffer: []u8) Backend.Error!Pr
         }
     }
     return error.LivenessFailed;
+}
+
+fn openPidfd(pid: i32) Backend.Error!?posix.fd_t {
+    while (true) {
+        const opened = linux.pidfd_open(pid, 0);
+        switch (linux.errno(opened)) {
+            .SUCCESS => return @intCast(opened),
+            .INTR => continue,
+            .NOSYS => return null,
+            .SRCH => return error.ProcessNotFound,
+            .PERM, .ACCES => return error.PermissionDenied,
+            else => return error.KillFailed,
+        }
+    }
+}
+
+fn signalPid(pid: i32, pidfd: ?posix.fd_t, signal: i32) Backend.Error!void {
+    const sig: linux.SIG = @enumFromInt(@as(u32, @intCast(signal)));
+    if (pidfd) |fd| {
+        while (true) {
+            switch (linux.errno(linux.pidfd_send_signal(fd, sig, null, 0))) {
+                .SUCCESS => return,
+                .INTR => continue,
+                .NOSYS => break,
+                .SRCH => return error.ProcessNotFound,
+                .PERM => return error.PermissionDenied,
+                else => return error.KillFailed,
+            }
+        }
+    }
+    // ponytail: kernels without pidfds (ENOSYS, before Linux 5.3) can reuse
+    // the PID between the identity check and kill().
+    switch (linux.errno(linux.kill(pid, sig))) {
+        .SUCCESS => {},
+        .SRCH => return error.ProcessNotFound,
+        .PERM => return error.PermissionDenied,
+        else => return error.KillFailed,
+    }
+}
+
+fn procCgroupMatches(text: []const u8, mount_root: []const u8, path: []const u8, controller: ?[]const u8) bool {
+    var lines = std.mem.tokenizeScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        const first = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const second = std.mem.indexOfScalarPos(u8, line, first + 1, ':') orelse continue;
+        if (controller) |name| {
+            const controllers = line[first + 1 .. second];
+            if (name.len == 0) {
+                if (!std.mem.eql(u8, line[0..first], "0") or controllers.len != 0) continue;
+            } else {
+                var names = std.mem.tokenizeScalar(u8, controllers, ',');
+                var found = false;
+                while (names.next()) |candidate| {
+                    if (std.mem.eql(u8, candidate, name)) found = true;
+                }
+                if (!found) continue;
+            }
+        }
+        const member = line[second + 1 ..];
+        if (member.len == 0 or member[0] != '/') continue;
+        const relative = if (std.mem.eql(u8, mount_root, "/"))
+            member[1..]
+        else if (std.mem.startsWith(u8, member, mount_root) and member.len > mount_root.len and member[mount_root.len] == '/')
+            member[mount_root.len + 1 ..]
+        else
+            continue;
+        if (std.mem.startsWith(u8, relative, path) and
+            (relative.len == path.len or relative[path.len] == '/')) return true;
+    }
+    return false;
+}
+
+test "cgroup membership verifies hierarchy and subtree boundaries" {
+    const text =
+        \\4:cpu,cpuacct:/igvano/example/nested
+        \\3:memory:/igvano/other
+        \\0::/igvano/example/nested/grandchild
+    ;
+    try std.testing.expect(procCgroupMatches(text, "/", "igvano/example", "cpu"));
+    try std.testing.expect(procCgroupMatches(text, "/", "igvano/example/nested", "cpuacct"));
+    try std.testing.expect(procCgroupMatches(text, "/", "igvano/example", ""));
+    try std.testing.expect(procCgroupMatches(text, "/", "igvano/example/nested/grandchild", ""));
+    try std.testing.expect(!procCgroupMatches(text, "/", "igvano/example", "memory"));
+    try std.testing.expect(!procCgroupMatches(text, "/", "igvano/exam", "cpu"));
+    try std.testing.expect(!procCgroupMatches(text, "/", "igvano/example2", ""));
+    try std.testing.expect(!procCgroupMatches("4:cpu,cpuacct:/igvano/example2\n", "/", "igvano/example", "cpu"));
+    try std.testing.expect(!procCgroupMatches("0::/igvano/example2\n", "/", "igvano/example", ""));
+    try std.testing.expect(!procCgroupMatches("1:name=systemd:/igvano/example\n", "/", "igvano/example", ""));
+    try std.testing.expect(!procCgroupMatches("garbage\n0::relative\n", "/", "relative", ""));
+    try std.testing.expect(procCgroupMatches("0::/igvano/example:colon\n", "/", "igvano/example:colon", ""));
+    const mounted =
+        \\4:cpu,cpuacct:/docker/cid/igvano/example/nested
+        \\3:memory:/docker/cid/igvano/other
+        \\1:name=systemd:/docker/cid/igvano/example
+        \\0::/docker/cid/igvano/example/child/grandchild
+    ;
+    try std.testing.expect(procCgroupMatches(mounted, "/docker/cid", "igvano/example", "cpu"));
+    try std.testing.expect(procCgroupMatches(mounted, "/docker/cid", "igvano/example/nested", "cpuacct"));
+    try std.testing.expect(procCgroupMatches(mounted, "/docker/cid", "igvano/example", ""));
+    try std.testing.expect(procCgroupMatches(mounted, "/docker/cid", "igvano/example/child", ""));
+    try std.testing.expect(procCgroupMatches(mounted, "/docker/cid", "igvano/example/child/grandchild", ""));
+    try std.testing.expect(!procCgroupMatches(mounted, "/docker/cid", "igvano/example", "memory"));
+    try std.testing.expect(!procCgroupMatches(mounted, "/docker/cid", "igvano/example", "cpuset"));
+    try std.testing.expect(!procCgroupMatches(mounted, "/docker/cid", "igvano/exam", "cpu"));
+    try std.testing.expect(!procCgroupMatches(mounted, "/docker/cid", "igvano/example2", ""));
+    try std.testing.expect(!procCgroupMatches("4:cpu,cpuacct:/igvano/example\n", "/docker/cid", "igvano/example", "cpu"));
+    try std.testing.expect(!procCgroupMatches("4:cpu,cpuacct:/docker/cid2/igvano/example\n", "/docker/cid", "igvano/example", "cpu"));
+    try std.testing.expect(!procCgroupMatches("4:cpu,cpuacct:/docker/cid/igvano/example2\n", "/docker/cid", "igvano/example", "cpu"));
+    try std.testing.expect(!procCgroupMatches("0::/docker/cid/igvano/example2\n", "/docker/cid", "igvano/example", ""));
+    try std.testing.expect(!procCgroupMatches("3:memory:/docker/cid/igvano/example\n", "/docker/cid", "igvano/example", "cpu"));
+    try std.testing.expect(!procCgroupMatches("1:name=systemd:/docker/cid/igvano/example\n", "/docker/cid", "igvano/example", ""));
 }
 
 fn processString(allocator: std.mem.Allocator, value: []const u8) Backend.Error![:0]u8 {
@@ -6815,6 +7085,9 @@ test "linux pid enumeration includes nested descendants and ignores control file
     defer pids.deinit(allocator);
     try collectCgroupPids(allocator, dir, &pids);
     try std.testing.expectEqualSlices(i32, &.{ 1234, 1235, 1236 }, pids.items);
+    pids.clearRetainingCapacity();
+    try collectCgroupPids(allocator, dir, &pids);
+    try std.testing.expectEqualSlices(i32, &.{ 1234, 1235, 1236 }, pids.items);
 }
 
 test "linux kill all signals every cgroup member and plain SIGKILL thaws paused v1" {
@@ -6836,9 +7109,27 @@ test "linux kill all signals every cgroup member and plain SIGKILL thaws paused 
     if (root.mode == .legacy) {
         if (hierarchies.len == 0) return error.SkipZigTest;
         for (hierarchies) |*hierarchy|
-            hierarchy.leaf = (walkV1Cgroup(allocator, hierarchy.root.?, path, true, hierarchy.has("cpuset")) catch return error.SkipZigTest).?;
+            hierarchy.leaf = (walkV1Cgroup(allocator, hierarchy.root.?, hierarchy.mount_root, path, true, hierarchy.has("cpuset")) catch return error.SkipZigTest).?;
     } else {
         cgroup = (walkCgroup(root.fd, path, true, &.{}) catch return error.SkipZigTest).?;
+    }
+    const nested_path = try std.fmt.allocPrint(allocator, "{s}/child/grandchild", .{path});
+    defer allocator.free(nested_path);
+    var nested: std.ArrayList(posix.fd_t) = .empty;
+    defer {
+        for (nested.items) |fd| closeFd(fd);
+        nested.deinit(allocator);
+    }
+    if (root.mode == .legacy) {
+        for (hierarchies) |hierarchy| {
+            const fd = (try walkV1Cgroup(allocator, hierarchy.root.?, hierarchy.mount_root, nested_path, true, hierarchy.has("cpuset"))).?;
+            errdefer closeFd(fd);
+            try nested.append(allocator, fd);
+        }
+    } else {
+        const fd = (try walkCgroup(root.fd, nested_path, true, &.{})).?;
+        errdefer closeFd(fd);
+        try nested.append(allocator, fd);
     }
     var implementation: LinuxBackend = .{};
     const backend = implementation.backend();
@@ -6871,11 +7162,14 @@ test "linux kill all signals every cgroup member and plain SIGKILL thaws paused 
                 }
             }
         }
-        for (&children) |*child| {
+        for (&children, 0..) |*child, index| {
             child.* = try forkProcess();
             if (child.* == 0) {
                 closeFd(ready[0]);
-                if (cgroup) |fd| {
+                if (index != 0) {
+                    for (nested.items) |fd|
+                        writeCgroupFile(fd, "cgroup.procs", "0", nested_path) catch linux.exit_group(1);
+                } else if (cgroup) |fd| {
                     writeCgroupFile(fd, "cgroup.procs", "0", path) catch linux.exit_group(1);
                 } else {
                     for (hierarchies) |hierarchy|
@@ -6894,6 +7188,9 @@ test "linux kill all signals every cgroup member and plain SIGKILL thaws paused 
         var buffer: [4096]u8 = undefined;
         const stat = try readProcStat(children[0], &buffer);
         const handle: Backend.Handle = .{ .id = "kill-all", .pid = children[0], .starttime = stat.starttime, .cgroup_path = path };
+        const subtree_pids = try backend.pids(handle, allocator);
+        defer allocator.free(subtree_pids);
+        for (children) |pid| try std.testing.expect(std.mem.indexOfScalar(i32, subtree_pids, pid) != null);
         try backend.killAll(handle, 0);
         try std.testing.expect(try backend.alive(handle));
         if (signal == 15) {
@@ -9959,7 +10256,7 @@ test "systemd device normalization merges permissions and delegates deny-lists" 
         .{ .allow = true, .kind = .char, .major = 10, .minor = 237, .access = "r" },
         .{ .allow = true, .kind = .char, .major = 10, .minor = 237, .access = "w" },
         .{ .allow = true, .kind = .block, .major = -1, .minor = -1, .access = "m" },
-    }, .legacy);
+    });
     defer freeSystemdValue(allocator, .{ .string_pairs = allows });
     try std.testing.expectEqualDeep(@as([]const [2][]const u8, &.{
         .{ "block-*", "m" }, .{ "/dev/char/10:237", "rw" },
@@ -9968,7 +10265,7 @@ test "systemd device normalization merges permissions and delegates deny-lists" 
         .{ .allow = true },
         .{ .allow = false, .kind = .char, .major = 10, .minor = 237 },
     };
-    try std.testing.expectError(error.Unsupported, systemdDeviceAllows(allocator, denylist_rules, .legacy));
+    try std.testing.expectError(error.Unsupported, systemdDeviceAllows(allocator, denylist_rules));
     const properties = try systemdProperties(allocator, .{}, .legacy, denylist_rules);
     defer freeSystemdProperties(allocator, properties);
     try std.testing.expectEqual(@as(usize, 2), properties.len);
@@ -9977,10 +10274,10 @@ test "systemd device normalization merges permissions and delegates deny-lists" 
     try std.testing.expectEqualStrings("strict", properties[1].value.string);
     const wildcard = try systemdDeviceAllows(allocator, &.{
         .{ .allow = true, .kind = .char, .minor = 5 },
-    }, .legacy);
+    });
     defer freeSystemdValue(allocator, .{ .string_pairs = wildcard });
     try std.testing.expectEqual(@as(usize, 0), wildcard.len);
-    const all = try systemdDeviceAllows(allocator, &.{.{ .allow = true }}, .legacy);
+    const all = try systemdDeviceAllows(allocator, &.{.{ .allow = true }});
     defer freeSystemdValue(allocator, .{ .string_pairs = all });
     try std.testing.expectEqualDeep(@as([]const [2][]const u8, &.{
         .{ "char-*", "rwm" }, .{ "block-*", "rwm" },
@@ -9989,9 +10286,8 @@ test "systemd device normalization merges permissions and delegates deny-lists" 
         .{ .allow = true, .kind = .char, .major = 10 },
         .{ .allow = false, .kind = .char, .major = 10, .minor = 237 },
     };
-    try std.testing.expectError(error.InvalidConfig, systemdDeviceAllows(allocator, rules, .legacy));
+    try std.testing.expectError(error.InvalidConfig, systemdDeviceAllows(allocator, rules));
     try std.testing.expectError(error.InvalidConfig, systemdProperties(allocator, .{}, .legacy, rules));
-    try std.testing.expectError(error.InvalidConfig, systemdDeviceAllows(allocator, rules, .unified));
 }
 
 test "systemd wildcard subtraction changes only exact exceptions" {
@@ -10002,7 +10298,7 @@ test "systemd wildcard subtraction changes only exact exceptions" {
         .{ .allow = true, .kind = .char, .major = 1, .minor = 3, .access = "rw" },
         .{ .allow = false, .kind = .char, .major = 1, .access = "w" },
         .{ .allow = true, .kind = .block, .major = 8, .minor = 0, .access = "rw" },
-    }, .unified);
+    });
     defer freeSystemdValue(allocator, .{ .string_pairs = allows });
     try std.testing.expectEqualDeep(@as([]const [2][]const u8, &.{
         .{ "char-*", "r" }, .{ "/dev/char/1:3", "rw" }, .{ "/dev/block/8:0", "rw" },
@@ -10154,7 +10450,7 @@ fn deviceEmulatorFromList(allocator: std.mem.Allocator, list: []const u8) Backen
 /// systemd cannot express deny-lists or wildcard-major/concrete-minor rules.
 /// Deny-lists use a temporary strict policy; wildcard-major rules are skipped.
 /// The caller then applies exact cgroupfs rules.
-fn systemdDeviceAllows(allocator: std.mem.Allocator, rules: []const Resources.DeviceRule, _: CgroupMode) Backend.Error![][2][]const u8 {
+fn systemdDeviceAllows(allocator: std.mem.Allocator, rules: []const Resources.DeviceRule) Backend.Error![][2][]const u8 {
     var policy = try deviceEmulator(allocator, rules);
     defer policy.deinit(allocator);
     if (policy.default_allow and !policy.isAllowAll()) return error.Unsupported;
@@ -10254,7 +10550,7 @@ fn systemdProperties(allocator: std.mem.Allocator, resources: Resources, mode: C
     if (mode == .legacy and device_rules.len != 0) {
         // As in runc, deny-lists temporarily use a strict deny-all policy.
         // The v1 manager then applies the exact policy.
-        const allows = systemdDeviceAllows(allocator, device_rules, mode) catch |err| switch (err) {
+        const allows = systemdDeviceAllows(allocator, device_rules) catch |err| switch (err) {
             error.Unsupported => {
                 try properties.appendSlice(allocator, &.{
                     .{ .name = "DeviceAllow", .value = .{ .string_pairs = &.{} } },
@@ -10305,9 +10601,9 @@ fn configureCgroup(allocator: std.mem.Allocator, root: posix.fd_t, mode: CgroupM
         }
     } else {
         for (hierarchies) |*hierarchy| {
-            hierarchy.leaf = if (options.systemd) try walkV1Cgroup(allocator, hierarchy.root.?, options.cgroup_path, false, false) else null;
+            hierarchy.leaf = if (options.systemd) try walkV1Cgroup(allocator, hierarchy.root.?, hierarchy.mount_root, options.cgroup_path, false, false) else null;
             if (hierarchy.leaf == null)
-                hierarchy.leaf = (try walkV1Cgroup(allocator, hierarchy.root.?, options.cgroup_path, true, hierarchy.has("cpuset"))).?;
+                hierarchy.leaf = (try walkV1Cgroup(allocator, hierarchy.root.?, hierarchy.mount_root, options.cgroup_path, true, hierarchy.has("cpuset"))).?;
         }
         try applyV1Writes(allocator, hierarchies, v1_writes, options.resources, options.devices, options.cgroup_path);
     }

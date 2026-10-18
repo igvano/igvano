@@ -56,6 +56,10 @@ pub fn isAllowAll(rules: []const Rule) bool {
 pub fn compile(allocator: std.mem.Allocator, configured: []const Rule) devices.Error![]Insn {
     var emu = try devices.Emulator.init(allocator, configured);
     defer emu.deinit(allocator);
+    return compileEmulator(allocator, emu);
+}
+
+pub fn compileEmulator(allocator: std.mem.Allocator, emu: devices.Emulator) devices.Error![]Insn {
     const rules = try emu.rules(allocator);
     defer allocator.free(rules);
     var insns: std.ArrayList(Insn) = .empty;
@@ -74,8 +78,7 @@ pub fn compile(allocator: std.mem.Allocator, configured: []const Rule) devices.E
         const mask = try devices.accessMask(rule.access);
         const major = try deviceNumber(rule.major);
         const minor = try deviceNumber(rule.minor);
-        if (rule.kind != .all)
-            try insns.append(allocator, Insn.init(op.jne_imm, 2, 0, 0, if (rule.kind == .block) 1 else 2));
+        try insns.append(allocator, Insn.init(op.jne_imm, 2, 0, 0, if (rule.kind == .block) 1 else 2));
         if (mask != 7) {
             // Allows require every requested bit; a deny exception blocks overlap.
             try insns.appendSlice(allocator, &.{
