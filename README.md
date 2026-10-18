@@ -14,6 +14,11 @@ Set `linux.cgroupsPath` to `slice:prefix:name`; an empty path defaults to
 `system.slice:igvano:<id>`. Later commands use the saved driver and resolved
 path. Transient slice units are currently rejected with a diagnostic.
 
+Bind sources opened by the mount-source helper with host credentials in a
+joined container mount namespace must contain no symlinks (including `/proc`
+magic links). Symlinked source paths remain supported for ordinary bind mounts
+opened in the runtime's own namespace.
+
 ## Build
 
 The Zig toolchain is pinned (ghostty-style): `minimum_zig_version` in

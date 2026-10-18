@@ -197,8 +197,8 @@ pub const Emulator = struct {
         return (Emulator{}).transition(allocator, self);
     }
 
-    /// A new cgroup inherits its parent's policy. Reset it, then preserve the
-    /// effective config order so devices.list exposes the same insertion order.
+    /// Always begin with a reset rule, replacing inherited or existing leaf
+    /// policy, then preserve the effective config order for devices.list.
     pub fn creationRules(self: Emulator, allocator: std.mem.Allocator) std.mem.Allocator.Error![]Rule {
         const result = try allocator.alloc(Rule, self.entries.items.len + 1);
         result[0] = .{ .allow = self.default_allow };

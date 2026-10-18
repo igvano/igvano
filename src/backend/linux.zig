@@ -35,6 +35,15 @@ const ST_NOATIME: usize = 1024;
 const ST_RELATIME: usize = 4096; // Unlike MS_RELATIME.
 const OPEN_TREE_CLONE: u32 = 1;
 const OPEN_TREE_CLOEXEC: u32 = 1 << @bitOffsetOf(linux.O, "CLOEXEC");
+const RESOLVE_NO_XDEV: u64 = 0x01;
+const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
+const RESOLVE_NO_SYMLINKS: u64 = 0x04;
+const RESOLVE_BENEATH: u64 = 0x08;
+const OpenHow = extern struct {
+    flags: u64,
+    mode: u64 = 0,
+    resolve: u64,
+};
 const MOUNT_ATTR_IDMAP: u64 = 0x00100000;
 const MountAttr = extern struct {
     attr_set: u64 = 0,
@@ -43,10 +52,10 @@ const MountAttr = extern struct {
     userns_fd: u64 = 0,
 };
 
-// Borrowed diagnostic detail for this process; no allocation after fork.
-// ponytail: One backend per process; move this buffer into LinuxBackend if the library ever hosts several.
-var last_diagnostic: [512]u8 = @splat(0);
-var last_diagnostic_len: usize = 0;
+// Borrowed diagnostic detail for this thread; no allocation after fork.
+// ponytail: One backend per thread; use per-instance storage if a thread hosts several.
+threadlocal var last_diagnostic: [512]u8 = @splat(0);
+threadlocal var last_diagnostic_len: usize = 0;
 
 fn diagnosticWrite(bytes: []const u8) void {
     const len = @min(bytes.len, last_diagnostic.len - last_diagnostic_len);
@@ -93,6 +102,19 @@ test "backend diagnostic records formatted detail and truncates safely" {
     try std.testing.expectEqualStrings("short", backend.diagnostic().?);
     childError(": ", error.CreateFailed);
     try std.testing.expectEqualStrings(": CreateFailed", backend.diagnostic().?);
+}
+
+test "backend diagnostics are isolated between threads" {
+    defer last_diagnostic_len = 0;
+    reportDiagnostic("main thread", .{});
+    const worker = try std.Thread.spawn(.{}, struct {
+        fn run() void {
+            reportDiagnostic("worker thread", .{});
+        }
+    }.run, .{});
+    worker.join();
+    var implementation: LinuxBackend = .{};
+    try std.testing.expectEqualStrings("main thread", implementation.backend().diagnostic().?);
 }
 
 const Write = struct { name: []const u8, value: []const u8 };
@@ -1723,7 +1745,10 @@ pub const LinuxBackend = struct {
                 };
             }
             closeFd(ready[1]);
-            // EOF closes the grandchild's CLOEXEC writer, on exec or death.
+            // EOF on this CLOEXEC pipe means execve succeeded or the child died
+            // before execve without reporting an error. runc's setnsProcess.start
+            // similarly accepts sync-socket EOF after procReady (parseSync).
+            // Leave either child for the caller to reap.
             waitExecReady(ready[0]) catch |err| {
                 _ = linux.kill(child, .KILL);
                 _ = waitChild(child) catch {};
@@ -2987,6 +3012,28 @@ fn cgroupMode(fs_type: usize) Backend.Error!CgroupMode {
     };
 }
 
+/// statfs starts with native words, except s390x's packed u32 type/bsize.
+fn statfsType(fs: *const [32]usize) usize {
+    if (comptime builtin.cpu.arch == .s390x) {
+        const words: *const [64]u32 = @ptrCast(fs);
+        return words[0];
+    }
+    return fs[0];
+}
+
+test "statfs type excludes the adjacent block size on s390x" {
+    var fs: [32]usize = @splat(0);
+    if (comptime builtin.cpu.arch == .s390x) {
+        const words: *[64]u32 = @ptrCast(&fs);
+        words[0] = 0x9fa0;
+        words[1] = 4096;
+    } else {
+        fs[0] = 0x9fa0;
+        fs[1] = 4096;
+    }
+    try std.testing.expectEqual(@as(usize, 0x9fa0), statfsType(&fs));
+}
+
 fn openCgroupRoot() Backend.Error!struct { fd: posix.fd_t, fs_type: usize, mode: CgroupMode } {
     const opened = linux.openat(linux.AT.FDCWD, "/sys/fs/cgroup", .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .NOFOLLOW = true, .CLOEXEC = true }, 0);
     switch (linux.errno(opened)) {
@@ -2996,16 +3043,17 @@ fn openCgroupRoot() Backend.Error!struct { fd: posix.fd_t, fs_type: usize, mode:
     }
     const root: posix.fd_t = @intCast(opened);
     errdefer closeFd(root);
-    // Zig has no statfs wrapper. f_type is the first native word of Linux statfs.
+    // Zig has no statfs wrapper; reserve enough storage for each kernel ABI.
     var fs: [32]usize = undefined;
     try checkResult(linux.syscall2(.fstatfs, @intCast(root), @intFromPtr(&fs)));
-    const mode = cgroupMode(fs[0]) catch {
+    const fs_type = statfsType(&fs);
+    const mode = cgroupMode(fs_type) catch {
         reportDiagnostic("unsupported cgroup filesystem at /sys/fs/cgroup", .{});
         return error.Unsupported;
     };
     // ponytail: hybrid hosts use v1 only, without systemd-unified membership,
     // like runc's fs driver without systemd.
-    return .{ .fd = root, .fs_type = fs[0], .mode = mode };
+    return .{ .fd = root, .fs_type = fs_type, .mode = mode };
 }
 
 fn openV1Hierarchies(allocator: std.mem.Allocator, systemd: bool) Backend.Error![]V1Hierarchy {
@@ -3022,7 +3070,7 @@ fn openV1Hierarchies(allocator: std.mem.Allocator, systemd: bool) Backend.Error!
         hierarchy.root = (try walkCgroup(host_root, hierarchy.mountpoint[1..], false, &.{})) orelse return error.CreateFailed;
         var fs: [32]usize = undefined;
         try checkResult(linux.syscall2(.fstatfs, @intCast(hierarchy.root.?), @intFromPtr(&fs)));
-        if (fs[0] != 0x27e0eb) return error.Unsupported; // CGROUP_SUPER_MAGIC
+        if (statfsType(&fs) != 0x27e0eb) return error.Unsupported; // CGROUP_SUPER_MAGIC
     }
     return hierarchies;
 }
@@ -3823,6 +3871,8 @@ fn killV1Members(dir: posix.fd_t, freezer: ?posix.fd_t, signal: i32, mount_root:
     if (!matched) {
         // Members may have exited or moved after enumeration. Verify that the
         // subtree is still populated before reporting an unverifiable policy.
+        // V1 cannot detect members hidden by our PID namespace; only v2's
+        // cgroup.events reports population independently of PID visibility.
         members.clearRetainingCapacity();
         try collectCgroupPids(allocator, dir, &members);
         const populated = members.items.len != 0 or if (controller) |name|
@@ -5010,12 +5060,17 @@ fn walkCgroup(root: posix.fd_t, path: []const u8, create: bool, writes: []const 
         var buffer: [256]u8 = undefined;
         const name = std.fmt.bufPrintZ(&buffer, "{s}", .{component}) catch return error.InvalidPath;
         if (needs_controller) {
+            // 8 KiB bounds controller discovery and the enabled-name list.
+            // This runs after fork too: exhaustion is a policy-size failure,
+            // not heap OOM, and must retain a useful cgroup diagnostic.
             var scratch: [8192]u8 = undefined;
             var fixed: std.heap.FixedBufferAllocator = .init(&scratch);
             const allocator = fixed.allocator();
-            const available = try readCgroupFile(allocator, current, "cgroup.controllers");
+            const available = readCgroupFile(allocator, current, "cgroup.controllers") catch |err|
+                return controllerBufferError(err, path);
             defer allocator.free(available);
-            const controllers = try enabledControllers(allocator, available, writes);
+            const controllers = enabledControllers(allocator, available, writes) catch |err|
+                return controllerBufferError(err, path);
             defer allocator.free(controllers);
             if (controllers.len != 0) try enableCgroupControllers(current, controllers, path);
         }
@@ -5047,6 +5102,22 @@ fn walkCgroup(root: posix.fd_t, path: []const u8, create: bool, writes: []const 
         }
     }
     return current;
+}
+
+fn controllerBufferError(err: Backend.Error, path: []const u8) Backend.Error {
+    if (err != error.OutOfMemory) return err;
+    reportDiagnostic("cannot enable cgroup controllers for '{s}': controller data exceeds the 8 KiB buffer", .{path});
+    return error.CgroupWriteFailed;
+}
+
+test "linux controller buffer overflow reports a cgroup failure" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    defer last_diagnostic_len = 0;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "cgroup.controllers", .data = "cpu " ** 2300 });
+    try std.testing.expectError(error.CgroupWriteFailed, walkCgroup(tmp.dir.handle, "leaf", false, &.{.{ .name = "cpu.max", .value = "max 100000" }}));
+    try std.testing.expect(std.mem.indexOf(u8, last_diagnostic[0..last_diagnostic_len], "8 KiB") != null);
 }
 
 // A populated non-root cgroup cannot hold domain controllers, and threaded
@@ -5223,6 +5294,7 @@ fn removeCgroupChildrenAt(dir: posix.fd_t, path_buffer: []u8, path_len: usize) B
             const name_len = std.mem.indexOfScalar(u8, padded_name, 0).?;
             const name = name_ptr[0..name_len :0];
             if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
+            if (name.len > 255) return error.CgroupDeleteFailed; // NAME_MAX
             var child_len = path_len + 1 + name.len;
             var restore_from = path_len;
             var saved_tail: [260]u8 = undefined;
@@ -5233,6 +5305,7 @@ fn removeCgroupChildrenAt(dir: posix.fd_t, path_buffer: []u8, path_len: usize) B
                 // Long fd-relative paths must not make deletion fail. Share
                 // one path buffer and abbreviate only the diagnostic.
                 restore_from = path_buffer.len - "/.../".len - name.len;
+                // NAME_MAX bounds path_len - restore_from to 5..260.
                 @memcpy(saved_tail[0 .. path_len - restore_from], path_buffer[restore_from..path_len]);
                 @memcpy(path_buffer[restore_from..][0.."/.../".len], "/.../");
                 @memcpy(path_buffer[restore_from + "/.../".len ..], name);
@@ -5590,6 +5663,10 @@ pub const console = struct {
     }
 
     pub fn receiveFd(socket: posix.fd_t) Backend.Error!posix.fd_t {
+        return (try receiveFdOrEof(socket)) orelse error.ConsoleFailed;
+    }
+
+    fn receiveFdOrEof(socket: posix.fd_t) Backend.Error!?posix.fd_t {
         if (comptime builtin.os.tag != .linux) return error.NotImplemented;
         var rights: Rights = std.mem.zeroes(Rights);
         var data: [4]u8 = undefined;
@@ -5611,6 +5688,7 @@ pub const console = struct {
                 else => return error.ConsoleFailed,
             }
         };
+        if (count == 0) return null;
         if (message.controllen < rights_len or rights.header.level != linux.SOL.SOCKET or
             rights.header.type != linux.SCM.RIGHTS or rights.header.len < rights_len)
             return error.ConsoleFailed;
@@ -5624,9 +5702,12 @@ pub const console = struct {
             closeFd(extra);
         }
         errdefer closeFd(rights.fd);
-        if (rights.header.len != rights_len or message.flags & linux.MSG.CTRUNC != 0 or count == 0)
+        if (rights.header.len != rights_len or message.flags & linux.MSG.CTRUNC != 0)
             return error.ConsoleFailed;
-        if (count < data.len and !readAll(socket, data[count..])) return error.ConsoleFailed;
+        if (count < data.len and !readAll(socket, data[count..])) {
+            closeFd(rights.fd);
+            return null;
+        }
         if (!std.mem.eql(u8, &data, "ptmx")) return error.ConsoleFailed;
         return rights.fd;
     }
@@ -5732,7 +5813,7 @@ fn setupConsole(socket: posix.fd_t, mount_console: bool) Backend.Error!void {
     defer closeFd(pts);
     var fs: [32]usize = undefined;
     try checkResult(linux.syscall2(.fstatfs, @intCast(pts), @intFromPtr(&fs)));
-    if (fs[0] != 0x1cd1) return error.MissingDevpts; // DEVPTS_SUPER_MAGIC
+    if (statfsType(&fs) != 0x1cd1) return error.MissingDevpts; // DEVPTS_SUPER_MAGIC
     const controller = try consolePath("/dev/ptmx", .{ .ACCMODE = .RDWR, .NOCTTY = true, .CLOEXEC = true });
     defer closeFd(controller);
     var unlock: i32 = 0;
@@ -6010,6 +6091,8 @@ fn prepareIDMappedMounts(allocator: std.mem.Allocator, mounts: []PreparedMount) 
 /// Join only init's mount namespace: opening sources there pins its locked
 /// mounts, rather than unlocked host mounts. In particular, a mount namespace
 /// joined by path resolves bind sources there, just as ordinary binds do.
+/// Sources opened with host credentials in this mode must contain no symlinks.
+/// Ordinary bind mounts opened in the runtime's own namespace still allow them.
 fn startMountSourceHelper(mounts: []const PreparedMount) Backend.Error!struct { pid: i32, socket: posix.fd_t } {
     const sockets = try console.socketpair();
     errdefer for (sockets) |fd| closeFd(fd);
@@ -6033,7 +6116,7 @@ fn sendMountSources(mounts: []const PreparedMount, socket: posix.fd_t) Backend.E
         var step: RootfsStep = .{ .operation = "open bind source", .source = mount.source, .path = mount.destination };
         errdefer |err| if (step.operation.len != 0) step.report(err);
         const source = mount.source orelse return error.InvalidConfig;
-        const source_fd = try openPath(linux.AT.FDCWD, source, .{ .PATH = true, .CLOEXEC = true });
+        const source_fd = try openResolved(linux.AT.FDCWD, source, .{ .PATH = true, .CLOEXEC = true }, RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS);
         defer closeFd(source_fd);
         var prepared = mount;
         prepared.source_fd = source_fd;
@@ -6051,10 +6134,97 @@ fn receiveMountSources(mounts: []PreparedMount, socket: posix.fd_t, namespace: p
     for (mounts) |*mount| {
         if (mount.flags & linux.MS.BIND == 0) continue;
         var response: CreateResponse = .{};
-        if (!readAll(socket, std.mem.asBytes(&response))) return error.CreateFailed;
+        if (!readAll(socket, std.mem.asBytes(&response))) return mountSourceHelperExited();
         if (response.failureError()) |err| return err;
-        const fd = try console.receiveFd(socket);
+        const fd = (try console.receiveFdOrEof(socket)) orelse return mountSourceHelperExited();
         if (mount.mappings != null) mount.mount_fd = fd else mount.source_fd = fd;
+    }
+}
+
+fn mountSourceHelperExited() Backend.Error {
+    reportDiagnostic("mount source helper exited unexpectedly", .{});
+    return error.CreateFailed;
+}
+
+test "linux mount source helper EOF retains a specific diagnostic" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    defer last_diagnostic_len = 0;
+    const namespace = try openPath(linux.AT.FDCWD, "/proc/self/ns/mnt", .{ .ACCMODE = .RDONLY, .CLOEXEC = true });
+    defer closeFd(namespace);
+    for (0..3) |stage| {
+        const sockets = try console.socketpair();
+        const child = try forkProcess();
+        if (child == 0) {
+            closeFd(sockets[0]);
+            const fd = console.receiveFd(sockets[1]) catch linux.exit_group(1);
+            closeFd(fd);
+            if (stage != 0) {
+                const response: CreateResponse = .{};
+                if (!writeAll(sockets[1], std.mem.asBytes(&response))) linux.exit_group(2);
+            }
+            if (stage == 2) {
+                // Die after sending rights but before completing their payload.
+                var rights: console.Rights = .{
+                    .header = .{ .len = console.rights_len, .level = linux.SOL.SOCKET, .type = linux.SCM.RIGHTS },
+                    .fd = namespace,
+                };
+                const data = "p";
+                const iov = [_]posix.iovec_const{.{ .base = data.ptr, .len = data.len }};
+                const message: linux.msghdr_const = .{
+                    .name = null,
+                    .namelen = 0,
+                    .iov = &iov,
+                    .iovlen = 1,
+                    .control = &rights,
+                    .controllen = @sizeOf(console.Rights),
+                    .flags = 0,
+                };
+                checkResult(linux.sendmsg(sockets[1], &message, linux.MSG.NOSIGNAL)) catch linux.exit_group(3);
+            }
+            linux.exit_group(0);
+        }
+        closeFd(sockets[1]);
+        defer closeFd(sockets[0]);
+        defer _ = waitChild(child) catch {};
+        var mounts = [_]PreparedMount{.{
+            .destination = "/data",
+            .source = "/unused",
+            .type = null,
+            .flags = linux.MS.BIND,
+            .propagation = 0,
+            .data = "",
+        }};
+        try std.testing.expectError(error.CreateFailed, receiveMountSources(&mounts, sockets[0], namespace));
+        try std.testing.expectEqualStrings("mount source helper exited unexpectedly", last_diagnostic[0..last_diagnostic_len]);
+    }
+}
+
+test "linux mount source helper rejects directory and final symlinks" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    defer last_diagnostic_len = 0;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "source", .default_dir);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "source/item", .data = "unchanged" });
+    try tmp.dir.symLink(std.testing.io, "source", "alias", .{});
+    try tmp.dir.symLink(std.testing.io, "source/item", "link", .{});
+    const sockets = try console.socketpair();
+    defer for (sockets) |fd| closeFd(fd);
+    for ([_][]const u8{ "alias/item", "link" }) |suffix| {
+        const path = try std.fmt.allocPrintSentinel(std.testing.allocator, ".zig-cache/tmp/{s}/{s}", .{ tmp.sub_path, suffix }, 0);
+        defer std.testing.allocator.free(path);
+        const mounts = [_]PreparedMount{.{
+            .destination = "/data",
+            .source = path,
+            .type = null,
+            .flags = linux.MS.BIND,
+            .propagation = 0,
+            .data = "",
+        }};
+        if (sendMountSources(&mounts, sockets[0])) return error.TestUnexpectedResult else |_| {}
+        // Ordinary sources opened by the runtime still follow symlinks.
+        const ordinary = try openPath(linux.AT.FDCWD, path, .{ .PATH = true, .CLOEXEC = true });
+        closeFd(ordinary);
     }
 }
 
@@ -6242,6 +6412,13 @@ fn openPath(dir_fd: posix.fd_t, path: [*:0]const u8, flags: linux.O) Backend.Err
     return @intCast(result);
 }
 
+fn openResolved(dir_fd: posix.fd_t, path: [*:0]const u8, flags: linux.O, resolve: u64) Backend.Error!posix.fd_t {
+    const how: OpenHow = .{ .flags = @as(u32, @bitCast(flags)), .resolve = resolve };
+    const result = linux.syscall4(.openat2, @bitCast(@as(isize, dir_fd)), @intFromPtr(path), @intFromPtr(&how), @sizeOf(OpenHow));
+    try checkResult(result);
+    return @intCast(result);
+}
+
 fn fileType(fd: posix.fd_t) Backend.Error!u16 {
     var stat: linux.Statx = undefined;
     try checkResult(linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .TYPE = true }, &stat));
@@ -6301,20 +6478,21 @@ fn fdPath(buffer: []u8, fd: posix.fd_t) [:0]u8 {
 
 fn remountFlags(target_fd: posix.fd_t, requested: u32) Backend.Error!u32 {
     if (comptime builtin.os.tag == .linux) {
-        // Linux statfs uses native words, except for the two-int fsid.
+        // s390x uses u32 for metadata words and native words for counters.
+        const Word = if (builtin.cpu.arch == .s390x) u32 else usize;
         const Statfs = extern struct {
-            type: usize,
-            bsize: usize,
+            type: Word,
+            bsize: Word,
             blocks: usize,
             bfree: usize,
             bavail: usize,
             files: usize,
             ffree: usize,
             fsid: [2]i32,
-            namelen: usize,
-            frsize: usize,
-            flags: usize,
-            spare: [4]usize,
+            namelen: Word,
+            frsize: Word,
+            flags: Word,
+            spare: [if (builtin.cpu.arch == .s390x) 5 else 4]Word,
         };
         var fs: Statfs = undefined;
         try checkResult(linux.syscall2(.fstatfs, @intCast(target_fd), @intFromPtr(&fs)));
@@ -6567,66 +6745,176 @@ const RootfsOptions = struct {
     runtime_sync: ?struct { ready_fd: posix.fd_t, go_fd: posix.fd_t } = null,
 };
 
-fn sysctlDirectory() Backend.Error!posix.fd_t {
-    const opened = linux.openat(linux.AT.FDCWD, "/proc", .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .NOFOLLOW = true, .CLOEXEC = true }, 0);
-    if (linux.errno(opened) == .NOENT or linux.errno(opened) == .NOTDIR or linux.errno(opened) == .LOOP) return error.MissingProcfs;
-    try checkResult(opened);
-    const proc: posix.fd_t = @intCast(opened);
-    defer closeFd(proc);
-    var fs: [32]usize = undefined;
-    try checkResult(linux.syscall2(.fstatfs, @intCast(proc), @intFromPtr(&fs)));
-    if (fs[0] != 0x9fa0) return error.MissingProcfs; // PROC_SUPER_MAGIC
-    const sys = try openPath(proc, "sys", .{ .PATH = true, .DIRECTORY = true, .NOFOLLOW = true, .CLOEXEC = true });
-    errdefer closeFd(sys);
-    try checkResult(linux.syscall2(.fstatfs, @intCast(sys), @intFromPtr(&fs)));
-    if (fs[0] != 0x9fa0) return error.MissingProcfs;
-    return sys;
-}
+/// Created by the init/exec child after entering its PID and mount namespaces,
+/// before dropping credentials. A detached procfs cannot be overmounted by the
+/// container. All buffers and syscalls here are safe to use after fork.
+const Procfs = struct {
+    fd: posix.fd_t,
+    /// Only the fallback uses a visible mount, requiring statx verification.
+    mount_id: ?u64 = null,
 
-/// Namespace policy belongs to the frontend. Walk the translated key beneath
-/// a pinned /proc/sys, rejecting symlinks in directories and the final file.
-fn writeSysctl(sys: posix.fd_t, setting: Backend.Sysctl) Backend.Error!void {
-    if (std.mem.indexOfAny(u8, setting.key, "/\x00") != null or
-        std.mem.indexOfAny(u8, setting.value, "\x00\n") != null) return error.InvalidConfig;
-    var current = try openPath(sys, ".", .{ .PATH = true, .DIRECTORY = true, .NOFOLLOW = true, .CLOEXEC = true });
-    defer closeFd(current);
-    var components = std.mem.splitScalar(u8, setting.key, '.');
-    while (components.next()) |component| {
-        if (component.len == 0) return error.InvalidConfig;
-        var buffer: [256]u8 = undefined;
-        const name = std.fmt.bufPrintZ(&buffer, "{s}", .{component}) catch return error.InvalidPath;
-        if (components.peek() != null) {
-            const next = try openPath(current, name, .{ .PATH = true, .DIRECTORY = true, .NOFOLLOW = true, .CLOEXEC = true });
-            closeFd(current);
-            current = next;
-        } else {
-            const fd = try openPath(current, name, .{ .ACCMODE = .WRONLY, .NOFOLLOW = true, .CLOEXEC = true });
-            defer closeFd(fd);
-            var offset: usize = 0;
-            while (offset < setting.value.len) {
-                const result = linux.write(fd, setting.value[offset..].ptr, setting.value.len - offset);
-                if (linux.errno(result) == .INTR) continue;
-                try checkResult(result);
-                if (result == 0) return error.CreateFailed;
-                offset += result;
+    fn open(subset_pid: bool) Backend.Error!Procfs {
+        if (try privateProcfs(subset_pid)) |fd| return .{ .fd = fd };
+        const opened = linux.openat(linux.AT.FDCWD, "/proc", .{ .PATH = true, .DIRECTORY = true, .NOFOLLOW = true, .CLOEXEC = true }, 0);
+        if (linux.errno(opened) != .SUCCESS) {
+            reportDiagnostic("cannot open fallback /proc: {s}", .{@tagName(linux.errno(opened))});
+            return error.MissingProcfs;
+        }
+        const fd: posix.fd_t = @intCast(opened);
+        errdefer closeFd(fd);
+        return fallback(fd);
+    }
+
+    fn fallback(fd: posix.fd_t) Backend.Error!Procfs {
+        var fs: [32]usize = undefined;
+        try checkResult(linux.syscall2(.fstatfs, @intCast(fd), @intFromPtr(&fs)));
+        if (statfsType(&fs) != 0x9fa0) {
+            reportDiagnostic("unsafe fallback /proc: requires the root of a procfs mount", .{});
+            return error.MissingProcfs;
+        }
+        var stat: linux.Statx = undefined;
+        const result = linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .INO = true, .MNT_ID = true }, &stat);
+        if (linux.errno(result) != .SUCCESS or !stat.mask.INO or !stat.mask.MNT_ID or stat.ino != 1) {
+            reportDiagnostic("unsafe fallback /proc: cannot verify procfs root and STATX_MNT_ID", .{});
+            return error.MissingProcfs;
+        }
+        return .{ .fd = fd, .mount_id = stat.mnt_id };
+    }
+
+    fn openWrite(self: Procfs, path: [:0]const u8) Backend.Error!?posix.fd_t {
+        // Fallback allows procfs's own self/thread-self symlinks, but never
+        // crosses a mount. Numeric paths on the private mount need no symlinks.
+        const how: OpenHow = .{
+            .flags = @as(u32, @bitCast(linux.O{ .ACCMODE = .WRONLY, .CLOEXEC = true })),
+            .resolve = RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS |
+                (if (self.mount_id != null) RESOLVE_NO_XDEV else RESOLVE_NO_SYMLINKS),
+        };
+        const opened = linux.syscall4(.openat2, @intCast(self.fd), @intFromPtr(path.ptr), @intFromPtr(&how), @sizeOf(OpenHow));
+        switch (linux.errno(opened)) {
+            .SUCCESS => {},
+            .NOENT => return null,
+            else => {
+                reportDiagnostic("cannot safely open procfs path '{s}': {s} (symlinks or overmounts are forbidden)", .{ path, @tagName(linux.errno(opened)) });
+                return error.MissingProcfs;
+            },
+        }
+        const fd: posix.fd_t = @intCast(opened);
+        errdefer closeFd(fd);
+        if (self.mount_id) |expected| {
+            var stat: linux.Statx = undefined;
+            const result = linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .MNT_ID = true }, &stat);
+            if (linux.errno(result) != .SUCCESS or !stat.mask.MNT_ID or stat.mnt_id != expected) {
+                reportDiagnostic("unsafe procfs path '{s}': mount differs from /proc or STATX_MNT_ID is unavailable", .{path});
+                return error.MissingProcfs;
             }
         }
+        return fd;
     }
+};
+
+/// EPERM is possible in user namespaces even when container /proc is usable.
+/// Old kernels may lack the new mount API or subset=pid; fail closed on other
+/// errors and let the caller verify the visible procfs if mounting is denied.
+fn privateProcfs(subset_pid: bool) Backend.Error!?posix.fd_t {
+    const opened = linux.fsopen("proc", .{ .CLOEXEC = true });
+    if (linux.errno(opened) == .PERM or linux.errno(opened) == .NOSYS) return null;
+    try checkResult(opened);
+    const context: posix.fd_t = @intCast(opened);
+    defer closeFd(context);
+    if (subset_pid) {
+        const result = linux.fsconfig(context, .SET_STRING, "subset", "pid", 0);
+        if (linux.errno(result) == .PERM or linux.errno(result) == .NOSYS) return null;
+        if (linux.errno(result) != .INVAL) try checkResult(result);
+    }
+    const created = linux.fsconfig(context, .CREATE, null, null, 0);
+    if (linux.errno(created) == .PERM or linux.errno(created) == .NOSYS) return null;
+    try checkResult(created);
+    const mounted = linux.fsmount(context, .{ .CLOEXEC = true }, .{
+        .RELATIME = 0,
+        .RDONLY = false,
+        .NOSUID = true,
+        .NODEV = true,
+        .NOEXEC = true,
+        .NOATIME = false,
+        .STRICTATIME = false,
+        .NODIRATIME = false,
+        .IDMAP = false,
+        .NOSYMFOLLOW = false,
+    });
+    if (linux.errno(mounted) == .PERM or linux.errno(mounted) == .NOSYS) return null;
+    try checkResult(mounted);
+    return @intCast(mounted);
+}
+
+fn sysctlPath(buffer: []u8, key: []const u8) Backend.Error![:0]const u8 {
+    if (std.mem.indexOfAny(u8, key, "/\x00") != null) return error.InvalidConfig;
+    var components = std.mem.splitScalar(u8, key, '.');
+    while (components.next()) |component| {
+        if (component.len == 0) return error.InvalidConfig;
+        if (component.len > 255) return error.InvalidPath;
+    }
+    const path = std.fmt.bufPrintZ(buffer, "sys/{s}", .{key}) catch return error.InvalidPath;
+    std.mem.replaceScalar(u8, path["sys/".len..], '.', '/');
+    return path;
+}
+
+test "sysctl paths are relative to procfs and reject traversal and overflow" {
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    try std.testing.expectEqualStrings("sys/kernel/hostname", try sysctlPath(&buffer, "kernel.hostname"));
+    try std.testing.expectEqualStrings("sys/net/ipv4/ip_forward", try sysctlPath(&buffer, "net.ipv4.ip_forward"));
+    for ([_][]const u8{ "", ".kernel", "kernel.", "net..ipv4", "../kernel", "kernel/name", "kernel\x00name" }) |key|
+        try std.testing.expectError(error.InvalidConfig, sysctlPath(&buffer, key));
+    try std.testing.expectError(error.InvalidPath, sysctlPath(&buffer, "x" ** 256));
+    try std.testing.expectError(error.InvalidPath, sysctlPath(buffer[0..8], "kernel.hostname"));
+}
+
+test "linux private subset procfs resolves the child in its PID namespace" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    try requireTestMountNamespace();
+    const helper = try forkProcess();
+    if (helper == 0) {
+        checkResult(linux.unshare(linux.CLONE.NEWNS | linux.CLONE.NEWPID)) catch linux.exit_group(1);
+        const child = forkProcess() catch linux.exit_group(2);
+        if (child == 0) {
+            if (linux.getpid() != 1 or linux.gettid() != 1) linux.exit_group(3);
+            const proc = Procfs.open(true) catch linux.exit_group(4);
+            if (proc.mount_id != null) linux.exit_group(77);
+            const fd = (proc.openWrite("1/task/1/oom_score_adj") catch linux.exit_group(5)) orelse linux.exit_group(6);
+            // Change only this child's score, through the same numeric task
+            // addressing used for AppArmor on a detached subset mount.
+            if (!writeAll(fd, "0")) linux.exit_group(7);
+            closeFd(fd);
+            closeFd(proc.fd);
+            linux.exit_group(0);
+        }
+        const status = waitChild(child) catch linux.exit_group(8);
+        linux.exit_group(if (status == 0) 0 else if (status == 77 << 8) 77 else 9);
+    }
+    const status = try waitChild(helper);
+    if (status == 77 << 8) return error.SkipZigTest;
+    try std.testing.expectEqual(@as(u32, 0), status);
+}
+
+/// Namespace policy belongs to the frontend; only translate and write here.
+fn writeSysctl(proc: Procfs, setting: Backend.Sysctl) Backend.Error!void {
+    if (std.mem.indexOfAny(u8, setting.value, "\x00\n") != null) return error.InvalidConfig;
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try sysctlPath(&buffer, setting.key);
+    const fd = (try proc.openWrite(path)) orelse return error.CreateFailed;
+    defer closeFd(fd);
+    if (!writeAll(fd, setting.value)) return error.CreateFailed;
 }
 
 fn applySysctls(settings: []const Backend.Sysctl) Backend.Error!void {
     if (settings.len == 0) return;
     var key = settings[0].key;
-    errdefer |err| reportDiagnostic("cannot set sysctl {s}{s}: {s}", .{
-        key,
-        if (err == error.MissingProcfs) " (requires procfs mounted at /proc)" else "",
-        @errorName(err),
-    });
-    const sys = try sysctlDirectory();
-    defer closeFd(sys);
+    errdefer |err| if (err != error.MissingProcfs or last_diagnostic_len == 0)
+        reportDiagnostic("cannot set sysctl {s}: {s}", .{ key, @errorName(err) });
+    const proc = try Procfs.open(false);
+    defer closeFd(proc.fd);
     for (settings) |setting| {
         key = setting.key;
-        try writeSysctl(sys, setting);
+        try writeSysctl(proc, setting);
     }
 }
 
@@ -6955,25 +7243,26 @@ fn applyAppArmor(command: ?[]const u8) Backend.Error!void {
     const text = command orelse return;
     const profile = text["exec ".len..];
     var unknown_profile = false;
-    errdefer |err| reportDiagnostic("unable to apply apparmor profile {s}: {s}", .{
-        profile, if (unknown_profile) "profile not loaded" else @errorName(err),
-    });
-    // Open after pivot_root/chroot: this procfs resolves the init/exec child's
-    // own thread, even after entering a PID namespace. No host fd is retained.
-    // Verify procfs so a regular file at /proc cannot silently bypass confinement.
-    const proc = try openPath(linux.AT.FDCWD, "/proc", .{ .PATH = true, .DIRECTORY = true, .NOFOLLOW = true, .CLOEXEC = true });
-    defer closeFd(proc);
-    var fs: [32]usize = undefined;
-    try checkResult(linux.syscall2(.fstatfs, @intCast(proc), @intFromPtr(&fs)));
-    if (fs[0] != 0x9fa0) return error.MissingProcfs;
-    for ([_][*:0]const u8{ "thread-self/attr/apparmor/exec", "self/attr/apparmor/exec", "self/attr/exec" }) |path| {
-        const opened = linux.openat(proc, path, .{ .ACCMODE = .WRONLY, .CLOEXEC = true }, 0);
-        if (linux.errno(opened) == .NOENT) continue;
-        try checkResult(opened);
-        const fd: posix.fd_t = @intCast(opened);
+    errdefer |err| if (err != error.MissingProcfs or last_diagnostic_len == 0)
+        reportDiagnostic("unable to apply apparmor profile {s}: {s}", .{
+            profile, if (unknown_profile) "profile not loaded" else @errorName(err),
+        });
+    const proc = try Procfs.open(true);
+    defer closeFd(proc.fd);
+    for ([_][:0]const u8{ "thread-self/attr/apparmor/exec", "self/attr/apparmor/exec", "self/attr/exec" }, 0..) |fallback_path, i| {
+        var buffer: [96]u8 = undefined;
+        // A private subset mount need not expose thread-self. Numeric IDs
+        // refer to this child in the PID namespace that created the mount.
+        // The visible fallback may use an ancestor PID namespace, so use its
+        // verified self links rather than interpreting getpid() there.
+        const path = if (proc.mount_id != null)
+            fallback_path
+        else
+            std.fmt.bufPrintZ(&buffer, "{d}/task/{d}/attr/{s}exec", .{
+                linux.getpid(), linux.gettid(), if (i < 2) "apparmor/" else "",
+            }) catch unreachable;
+        const fd = (try proc.openWrite(path)) orelse continue;
         defer closeFd(fd);
-        try checkResult(linux.syscall2(.fstatfs, @intCast(fd), @intFromPtr(&fs)));
-        if (fs[0] != 0x9fa0) return error.MissingProcfs;
         while (true) {
             const result = linux.write(fd, text.ptr, text.len);
             if (linux.errno(result) == .INTR) continue;
@@ -7013,6 +7302,8 @@ fn installSeccomp(program: seccomp.Program) Backend.Error!void {
 
 fn applyOomScoreAdj(proc_dir: posix.fd_t, oom_score_adj: ?i32) Backend.Error!void {
     if (comptime builtin.os.tag == .linux) {
+        // The runtime pins this procfs before joining namespaces; this write
+        // precedes isolation, so it never uses the container's /proc.
         const value = oom_score_adj orelse return;
         var buffer: [12]u8 = undefined;
         const text = std.fmt.bufPrint(&buffer, "{d}", .{value}) catch unreachable;
@@ -10153,23 +10444,92 @@ test "linux sysctl writes reject symlinks in every path component" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(std.testing.io, "net/ipv4");
+    try tmp.dir.createDirPath(std.testing.io, "sys/net/ipv4");
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "outside", .data = "unchanged" });
-    try tmp.dir.symLink(std.testing.io, "../../outside", "net/ipv4/ip_forward", .{});
-    try tmp.dir.symLink(std.testing.io, "net", "alias", .{});
+    try tmp.dir.symLink(std.testing.io, "../../../outside", "sys/net/ipv4/ip_forward", .{});
+    try tmp.dir.symLink(std.testing.io, "net", "sys/alias", .{});
     const base = try std.fmt.allocPrintSentinel(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path}, 0);
     defer std.testing.allocator.free(base);
     const root = try openPath(linux.AT.FDCWD, base, .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true });
     defer closeFd(root);
     for ([_][]const u8{ "net.ipv4.ip_forward", "alias.ipv4.ip_forward", "net..outside" }) |key| {
-        if (writeSysctl(root, .{ .key = key, .value = "1" })) return error.TestUnexpectedResult else |_| {}
+        if (writeSysctl(.{ .fd = root }, .{ .key = key, .value = "1" })) return error.TestUnexpectedResult else |_| {}
     }
     const contents = try tmp.dir.readFileAlloc(std.testing.io, "outside", std.testing.allocator, .limited(32));
     defer std.testing.allocator.free(contents);
     try std.testing.expectEqualStrings("unchanged", contents);
 }
 
-test "linux sysctls require procfs mounted inside the rootfs" {
+test "linux procfs writes bypass bind overmounts and the fallback fails closed" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    try requireTestMountNamespace();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "rootfs", .default_dir);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "marker", .data = "unchanged" });
+    const allocator = std.testing.allocator;
+    const base = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer allocator.free(base);
+    const absolute = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, base, allocator);
+    defer allocator.free(absolute);
+    const rootfs = try std.fmt.allocPrintSentinel(allocator, "{s}/rootfs", .{absolute}, 0);
+    defer allocator.free(rootfs);
+    const marker = try std.fmt.allocPrintSentinel(allocator, "{s}/marker", .{absolute}, 0);
+    defer allocator.free(marker);
+    for ([_][:0]const u8{ marker, "/proc/sys/kernel/domainname" }) |source| {
+        const child = try forkProcess();
+        if (child == 0) {
+            // Only this UTS namespace can be affected by either sysctl.
+            checkResult(linux.unshare(linux.CLONE.NEWNS | linux.CLONE.NEWUTS)) catch linux.exit_group(1);
+            var before: linux.utsname = undefined;
+            checkResult(linux.uname(&before)) catch linux.exit_group(2);
+            const mounts = [_]PreparedMount{
+                .{ .destination = "/proc", .source = "proc", .type = "proc", .flags = 0, .propagation = 0, .data = "" },
+                .{ .destination = "/proc/sys/kernel/hostname", .source = source, .type = null, .flags = linux.MS.BIND, .propagation = 0, .data = "" },
+            };
+            // Prepared mounts are the parsed backend config; install the
+            // attack exactly as a configured bind, then write after pivot_root.
+            setupRootfs(rootfs, &mounts, &.{}, &.{}, false, .{}) catch linux.exit_group(3);
+            const root = openPath(linux.AT.FDCWD, "/proc", .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true }) catch linux.exit_group(4);
+            const fallback = Procfs.fallback(root) catch linux.exit_group(5);
+            if (writeSysctl(fallback, .{ .key = "kernel.hostname", .value = "redirected" })) {
+                linux.exit_group(6);
+            } else |err| {
+                if (err != error.MissingProcfs or last_diagnostic_len == 0) linux.exit_group(7);
+            }
+            // Exercise statx verification even when lookup stays on procfs.
+            var wrong_mount = fallback;
+            wrong_mount.mount_id = fallback.mount_id.? + 1;
+            if (writeSysctl(wrong_mount, .{ .key = "kernel.domainname", .value = "redirected" })) {
+                linux.exit_group(8);
+            } else |err| {
+                if (err != error.MissingProcfs) linux.exit_group(9);
+            }
+            closeFd(root);
+            applySysctls(&.{.{ .key = "kernel.hostname", .value = "igvano-private-proc" }}) catch |err| {
+                if (err != error.MissingProcfs) linux.exit_group(10);
+                // Mounting procfs can be forbidden in some user namespaces.
+                // A verified failure is acceptable; neither target may change.
+                var after: linux.utsname = undefined;
+                checkResult(linux.uname(&after)) catch linux.exit_group(11);
+                if (!std.mem.eql(u8, &before.nodename, &after.nodename) or
+                    !std.mem.eql(u8, &before.domainname, &after.domainname)) linux.exit_group(12);
+                linux.exit_group(0);
+            };
+            var after: linux.utsname = undefined;
+            checkResult(linux.uname(&after)) catch linux.exit_group(13);
+            if (!std.mem.eql(u8, std.mem.sliceTo(&after.nodename, 0), "igvano-private-proc") or
+                !std.mem.eql(u8, &before.domainname, &after.domainname)) linux.exit_group(14);
+            linux.exit_group(0);
+        }
+        try std.testing.expectEqual(@as(u32, 0), try waitChild(child));
+        const contents = try tmp.dir.readFileAlloc(std.testing.io, "marker", allocator, .limited(32));
+        defer allocator.free(contents);
+        try std.testing.expectEqualStrings("unchanged", contents);
+    }
+}
+
+test "linux sysctls use private procfs when container proc is absent or covered" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     try requireTestMountNamespace();
     var tmp = std.testing.tmpDir(.{});
@@ -10188,11 +10548,17 @@ test "linux sysctls require procfs mounted inside the rootfs" {
     for ([_]bool{ false, true }) |overmount_sys| {
         const pid = try forkProcess();
         if (pid == 0) {
-            checkResult(linux.unshare(linux.CLONE.NEWNS)) catch linux.exit_group(1);
+            checkResult(linux.unshare(linux.CLONE.NEWNS | linux.CLONE.NEWNET)) catch linux.exit_group(1);
             setupRootfs(rootfs, if (overmount_sys) &mounts else &.{}, &.{}, &.{}, false, .{
                 .sysctls = &.{.{ .key = "net.ipv4.ip_forward", .value = "1" }},
             }) catch |err| linux.exit_group(if (err == error.MissingProcfs) 0 else 2);
-            linux.exit_group(3);
+            // Success requires the private mount; the fallback cannot use the
+            // missing /proc or cross the tmpfs mounted over /proc/sys.
+            const proc = Procfs.open(false) catch linux.exit_group(3);
+            const fd = (proc.openWrite("sys/net/ipv4/ip_forward") catch linux.exit_group(4)) orelse linux.exit_group(5);
+            closeFd(fd);
+            closeFd(proc.fd);
+            linux.exit_group(0);
         }
         try std.testing.expectEqual(@as(u32, 0), try waitChild(pid));
     }

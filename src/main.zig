@@ -1147,6 +1147,8 @@ fn requireUnusedRootfs(allocator: std.mem.Allocator, io: std.Io, backend: Backen
     defer directory.close(io);
     // ponytail: sibling creates hold only their own locks; a sibling still in
     // creating may not have saved its mount record or PID yet (TOCTOU).
+    // Corrupt siblings are skipped, so their rootfs ownership is not detected.
+    // This best-effort check assumes --root is trusted runtime storage.
     var entries = directory.iterate();
     while (try entries.next(io)) |entry| {
         if (entry.kind != .directory or std.mem.eql(u8, entry.name, id)) continue;
