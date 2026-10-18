@@ -5,6 +5,7 @@ pub const LinuxBackend = @import("backend/linux.zig").LinuxBackend;
 pub const apparmorEnabled = @import("backend/linux.zig").apparmorEnabled;
 pub const console = @import("backend/linux.zig").console;
 pub const hooks = @import("backend/hooks.zig");
+pub const systemdCgroupMatches = @import("backend/linux.zig").systemdCgroupMatches;
 
 pub const Backend = struct {
     pub const seccomp = @import("backend/seccomp.zig");
@@ -20,7 +21,7 @@ pub const Backend = struct {
         /// Absolute path to the FIFO created by the frontend.
         exec_fifo: []const u8,
         spec: *const oci.Spec,
-        /// Borrowed socketpair: init sends its PTY master on [1]; the caller
+        /// Borrowed socketpair: init sends its PTY controller on [1]; the caller
         /// receives on [0]. Both ends are CLOEXEC and remain caller-owned.
         console_fds: ?[2]std.posix.fd_t = null,
         mounts: []const Mount = &.{},
@@ -220,6 +221,8 @@ pub const Backend = struct {
         /// Borrowed from create options, or loaded from the runtime state directory.
         cgroup_path: ?[]const u8 = null,
         systemd: bool = false,
+        /// Include the named v1 hierarchy after verified systemd cleanup falls back.
+        systemd_cleanup: bool = false,
         /// Set only when the container shares the runtime's mount namespace.
         rootfs_mount: ?[]const u8 = null,
         /// STATX_MNT_ID_UNIQUE of the self-bind; null for old handles.

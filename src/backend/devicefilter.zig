@@ -214,6 +214,19 @@ test "device filter supports both wildcard spellings and all device types" {
     }
 }
 
+test "v2 device filter enforces holes in wildcard allows exactly" {
+    for ([_]?i64{ null, -1 }) |wildcard| {
+        const rules = [_]Rule{
+            .{ .allow = true, .kind = .char, .major = 10, .minor = wildcard },
+            .{ .allow = false, .kind = .char, .major = 10, .minor = 237 },
+        };
+        try expectDecision(&rules, 2, 10, 237, 7, false);
+        try expectDecision(&rules, 2, 10, 236, 7, true);
+        try expectDecision(&rules, 2, 10, 238, 7, true);
+        try expectDecision(&rules, 1, 10, 238, 7, false);
+    }
+}
+
 test "device filter allow rules match access subsets rather than any overlapping permission" {
     const cases = [_]struct { access: []const u8, allowed: [7]bool }{
         .{ .access = "m", .allowed = .{ true, false, false, false, false, false, false } },

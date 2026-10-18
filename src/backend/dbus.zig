@@ -48,6 +48,52 @@ test "parsing D-Bus errors retains the name and message" {
     for (0..bytes.len) |len| try std.testing.expectError(error.InvalidMessage, Message.parse(bytes[0..len]));
 }
 
+test "D-Bus replies skip unknown header field 10 with variant alignment" {
+    const bytes = "l\x02\x00\x01\x00\x00\x00\x00\x02\x00\x00\x00\x20\x00\x00\x00" ++
+        "\x0a\x01v\x00\x02at\x00" ++
+        "\x08\x00\x00\x00" ++ "\x00" ** 4 ++
+        "\x2a\x00\x00\x00\x00\x00\x00\x00" ++
+        "\x05\x01u\x00\x01\x00\x00\x00";
+    const message = try Message.parse(bytes);
+    try std.testing.expectEqual(@as(u32, 1), message.reply_serial);
+    try std.testing.expectEqual(@as(usize, 0), message.body.len);
+    for (0..bytes.len) |len|
+        try std.testing.expectError(error.InvalidMessage, Message.parse(bytes[0..len]));
+}
+
+test "D-Bus unknown fields skip structs containing dictionaries and variants" {
+    const bytes = "l\x02\x00\x01\x00\x00\x00\x00\x02\x00\x00\x00\x30\x00\x00\x00" ++
+        "\x0a\x08(ua{sv})\x00" ++ "\x00" ** 5 ++
+        "\x07\x00\x00\x00\x0a\x00\x00\x00" ++
+        "\x01\x00\x00\x00X\x00\x01y\x00\xff" ++ "\x00" ** 6 ++
+        "\x05\x01u\x00\x01\x00\x00\x00";
+    try std.testing.expectEqual(@as(u32, 1), (try Message.parse(bytes)).reply_serial);
+    // The unknown value must still contain exactly one valid complete type.
+    for ([_][]const u8{
+        "\x00\x00",      "\x02()\x00", "\x01a\x00",  "\x04{sv}\x00",
+        "\x05a{vs}\x00", "\x02(u\x00", "\x02uu\x00",
+    }) |variant| {
+        var reader: Reader = .{ .bytes = variant };
+        try std.testing.expectError(error.InvalidMessage, reader.skipVariant(0));
+    }
+}
+
+test "D-Bus big-endian messages are rejected explicitly" {
+    const bytes = "B\x02\x00\x01\x00\x00\x00\x00\x00\x00\x00\x02\x00\x00\x00\x08" ++
+        "\x05\x01u\x00\x00\x00\x00\x01";
+    try std.testing.expectError(error.UnsupportedByteOrder, Message.parse(bytes));
+}
+
+test "D-Bus property operations renew an expired deadline even with no properties" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var client = Client.init(std.testing.allocator);
+    defer client.deinit();
+    client.deadline = 1;
+    const started = try now();
+    try client.setProperties("x.scope", &.{});
+    try std.testing.expect(client.deadline >= started + timeout_ms);
+}
+
 test "JobRemoved parsing reads the job path unit and result" {
     const bytes = "l\x04\x00\x01\x21\x00\x00\x00\x03\x00\x00\x00\x42\x00\x00\x00" ++
         "\x01\x01o\x00\x02\x00\x00\x00/m\x00" ++ "\x00" ** 5 ++
@@ -224,7 +270,7 @@ test "private peer accepts JobRemoved without a sender" {
     try std.testing.expectEqualStrings("done", client.jobs.items[0].result);
 }
 
-pub const Error = error{ NotAvailable, SocketFailed, AuthenticationFailed, Disconnected, Timeout, InvalidMessage, RemoteError, JobFailed } || std.mem.Allocator.Error;
+pub const Error = error{ NotAvailable, SocketFailed, AuthenticationFailed, Disconnected, Timeout, InvalidMessage, UnsupportedByteOrder, RemoteError, JobFailed } || std.mem.Allocator.Error;
 pub const Property = struct { name: []const u8, value: Value };
 pub const Auxiliary = struct { name: []const u8, properties: []const Property };
 
@@ -435,7 +481,82 @@ const Reader = struct {
         if ((try self.take(1))[0] != 0) return error.InvalidMessage;
         return s;
     }
+
+    fn skipVariant(self: *Reader, depth: usize) Error!void {
+        var signature_value = try self.signature();
+        const value_type = try nextType(&signature_value, 0, false);
+        if (signature_value.len != 0) return error.InvalidMessage;
+        try self.skipValue(value_type, depth);
+    }
+
+    fn skipValue(self: *Reader, value_type: []const u8, depth: usize) Error!void {
+        if (depth > 64) return error.InvalidMessage;
+        try self.alignTo(try typeAlignment(value_type));
+        switch (value_type[0]) {
+            'y' => _ = try self.take(1),
+            'n', 'q' => _ = try self.take(2),
+            'b', 'i', 'u', 'h' => _ = try self.take(4),
+            'x', 't', 'd' => _ = try self.take(8),
+            's', 'o' => _ = try self.text(),
+            'g' => _ = try self.signature(),
+            'v' => try self.skipVariant(depth + 1),
+            'a' => {
+                const len = try self.integer(u32);
+                const element = value_type[1..];
+                try self.alignTo(try typeAlignment(element));
+                if (len > self.bytes.len - self.offset) return error.InvalidMessage;
+                const end = self.offset + len;
+                var array: Reader = .{ .bytes = self.bytes[0..end], .offset = self.offset };
+                while (array.offset < end) try array.skipValue(element, depth + 1);
+                self.offset = end;
+            },
+            '(', '{' => {
+                var fields = value_type[1 .. value_type.len - 1];
+                while (fields.len != 0) try self.skipValue(try nextType(&fields, 0, false), depth + 1);
+            },
+            else => return error.InvalidMessage,
+        }
+    }
 };
+
+fn typeAlignment(value_type: []const u8) Error!usize {
+    if (value_type.len == 0) return error.InvalidMessage;
+    return switch (value_type[0]) {
+        'y', 'g', 'v' => 1,
+        'n', 'q' => 2,
+        'b', 'i', 'u', 'h', 's', 'o', 'a' => 4,
+        'x', 't', 'd', '(', '{' => 8,
+        else => error.InvalidMessage,
+    };
+}
+
+/// Consume one complete type; dictionary entries are valid only in arrays.
+fn nextType(signature_value: *[]const u8, depth: usize, dictionary: bool) Error![]const u8 {
+    if (signature_value.len == 0 or depth > 64) return error.InvalidMessage;
+    const start = signature_value.*;
+    signature_value.* = start[1..];
+    switch (start[0]) {
+        'y', 'b', 'n', 'q', 'i', 'u', 'x', 't', 'd', 's', 'o', 'g', 'h', 'v' => {},
+        'a' => _ = try nextType(signature_value, depth + 1, true),
+        '(' => {
+            if (signature_value.len == 0 or signature_value.*[0] == ')') return error.InvalidMessage;
+            while (signature_value.len != 0 and signature_value.*[0] != ')')
+                _ = try nextType(signature_value, depth + 1, false);
+            if (signature_value.len == 0) return error.InvalidMessage;
+            signature_value.* = signature_value.*[1..];
+        },
+        '{' => {
+            if (!dictionary or signature_value.len == 0 or
+                std.mem.indexOfScalar(u8, "ybnqiuxtdsogh", signature_value.*[0]) == null) return error.InvalidMessage;
+            _ = try nextType(signature_value, depth + 1, false);
+            _ = try nextType(signature_value, depth + 1, false);
+            if (signature_value.len == 0 or signature_value.*[0] != '}') return error.InvalidMessage;
+            signature_value.* = signature_value.*[1..];
+        },
+        else => return error.InvalidMessage,
+    }
+    return start[0 .. start.len - signature_value.len];
+}
 
 pub const Message = struct {
     kind: u8,
@@ -449,7 +570,10 @@ pub const Message = struct {
     body: []const u8,
 
     pub fn parse(bytes: []const u8) Error!Message {
-        if (bytes.len < 16 or bytes[0] != 'l' or bytes[1] < 1 or bytes[1] > 4 or bytes[3] != 1 or std.mem.readInt(u32, bytes[8..12], .little) == 0) return error.InvalidMessage;
+        // The encoder and readers support little-endian D-Bus messages only.
+        if (bytes.len < 16) return error.InvalidMessage;
+        if (bytes[0] == 'B') return error.UnsupportedByteOrder;
+        if (bytes[0] != 'l' or bytes[1] < 1 or bytes[1] > 4 or bytes[3] != 1 or std.mem.readInt(u32, bytes[8..12], .little) == 0) return error.InvalidMessage;
         const fields_len: usize = std.mem.readInt(u32, bytes[12..16], .little);
         const body_start = std.mem.alignForward(usize, 16 + fields_len, 8);
         const body_len: usize = std.mem.readInt(u32, bytes[4..8], .little);
@@ -460,7 +584,11 @@ pub const Message = struct {
         while (reader.offset < reader.bytes.len) {
             try reader.alignTo(8);
             const code = (try reader.take(1))[0];
-            if (code == 0 or code > 9) return error.InvalidMessage;
+            if (code == 0) return error.InvalidMessage;
+            if (code > 9) {
+                try reader.skipVariant(0);
+                continue;
+            }
             const bit = @as(u16, 1) << @intCast(code);
             if (seen & bit != 0) return error.InvalidMessage;
             seen |= bit;
@@ -523,8 +651,8 @@ const bus_interface = "org.freedesktop.DBus";
 const timeout_ms = 30_000;
 const max_message = 1024 * 1024;
 
-/// One synchronous connection per operation. Nonblocking I/O shares one
-/// monotonic deadline across authentication, method replies and job signals.
+/// Each public operation gets a fresh monotonic deadline, shared by its
+/// method replies and job signals. Connecting has its own deadline.
 pub const Client = struct {
     allocator: std.mem.Allocator,
     fd: i32 = -1,
@@ -642,7 +770,7 @@ pub const Client = struct {
         try self.send("BEGIN\r\n");
     }
 
-    pub fn call(self: *Client, member: []const u8, values: []const Value) Error![]u8 {
+    fn call(self: *Client, member: []const u8, values: []const Value) Error![]u8 {
         return self.callAt(manager_path, manager_interface, manager_destination, member, values);
     }
 
@@ -705,7 +833,7 @@ pub const Client = struct {
         try self.jobs.append(self.allocator, .{ .path = path, .result = result });
     }
 
-    pub fn resetFailed(self: *Client, unit: []const u8) Error!void {
+    fn resetFailed(self: *Client, unit: []const u8) Error!void {
         const reply = self.call("ResetFailedUnit", &.{.{ .string = unit }}) catch |err| {
             if (err == error.RemoteError and self.isRemote("org.freedesktop.systemd1.NoSuchUnit")) return;
             return err;
@@ -714,11 +842,13 @@ pub const Client = struct {
     }
 
     pub fn start(self: *Client, unit: []const u8, properties: []const Property) Error!void {
+        self.deadline = (try now()) + timeout_ms;
         try self.resetFailed(unit);
         try self.runJob("StartTransientUnit", unit, &.{ .{ .string = unit }, .{ .string = "replace" }, .{ .properties = properties }, .{ .auxiliary = &.{} } });
     }
 
     pub fn stop(self: *Client, unit: []const u8) Error!void {
+        self.deadline = (try now()) + timeout_ms;
         self.runJob("StopUnit", unit, &.{ .{ .string = unit }, .{ .string = "replace" } }) catch |err| {
             if (!(err == error.RemoteError and self.isRemote("org.freedesktop.systemd1.NoSuchUnit"))) return err;
         };
@@ -726,9 +856,36 @@ pub const Client = struct {
     }
 
     pub fn setProperties(self: *Client, unit: []const u8, properties: []const Property) Error!void {
+        self.deadline = (try now()) + timeout_ms;
         if (properties.len == 0) return;
         const reply = try self.call("SetUnitProperties", &.{ .{ .string = unit }, .{ .boolean = true }, .{ .properties = properties } });
         self.allocator.free(reply);
+    }
+
+    /// Compare systemd's absolute ControlGroup with a saved relative cgroup path.
+    pub fn controlGroupMatches(self: *Client, unit: []const u8, cgroup_path: []const u8) Error!bool {
+        self.deadline = (try now()) + timeout_ms;
+        const unit_reply = try self.call("GetUnit", &.{.{ .string = unit }});
+        defer self.allocator.free(unit_reply);
+        const unit_message = try Message.parse(unit_reply);
+        if (!std.mem.eql(u8, unit_message.signature, "o")) return error.InvalidMessage;
+        var unit_reader: Reader = .{ .bytes = unit_message.body };
+        const unit_path = try unit_reader.text();
+        if (unit_path.len == 0 or unit_path[0] != '/' or unit_reader.offset != unit_message.body.len)
+            return error.InvalidMessage;
+        const reply = try self.callAt(unit_path, "org.freedesktop.DBus.Properties", manager_destination, "Get", &.{
+            .{ .string = "org.freedesktop.systemd1.Unit" },
+            .{ .string = "ControlGroup" },
+        });
+        defer self.allocator.free(reply);
+        const message = try Message.parse(reply);
+        if (!std.mem.eql(u8, message.signature, "v")) return error.InvalidMessage;
+        var reader: Reader = .{ .bytes = message.body };
+        if (!std.mem.eql(u8, try reader.signature(), "s")) return error.InvalidMessage;
+        const control_group = try reader.text();
+        if (reader.offset != message.body.len) return error.InvalidMessage;
+        return control_group.len != 0 and control_group[0] == '/' and
+            std.mem.eql(u8, control_group[1..], cgroup_path);
     }
 
     fn runJob(self: *Client, member: []const u8, unit: []const u8, values: []const Value) Error!void {
@@ -764,6 +921,10 @@ pub const Client = struct {
     fn receive(self: *Client) Error![]u8 {
         var header: [16]u8 = undefined;
         try self.read(&header);
+        if (header[0] == 'B') {
+            self.note("big-endian D-Bus messages are unsupported; expected little-endian byte order", .{});
+            return error.UnsupportedByteOrder;
+        }
         if (header[0] != 'l' or header[3] != 1) return error.InvalidMessage;
         const fields: usize = std.mem.readInt(u32, header[12..16], .little);
         const body: usize = std.mem.readInt(u32, header[4..8], .little);
@@ -953,6 +1114,76 @@ test "linux D-Bus method errors carry their remote name and message" {
     try std.testing.expectError(error.RemoteError, client.call("Subscribe", &.{}));
     try std.testing.expect(client.isRemote("x.E"));
     try std.testing.expect(std.mem.indexOf(u8, client.diagnostic(), "x.E: oops") != null);
+}
+
+test "linux ControlGroup lookup uses Unit properties and renews its deadline" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const unit_reply = "l\x02\x00\x01\x07\x00\x00\x00\x01\x00\x00\x00\x0f\x00\x00\x00" ++
+        "\x05\x01u\x00\x01\x00\x00\x00" ++
+        "\x08\x01g\x00\x01o\x00\x00" ++
+        "\x02\x00\x00\x00/u\x00";
+    const property_reply = "l\x02\x00\x01\x2b\x00\x00\x00\x02\x00\x00\x00\x0f\x00\x00\x00" ++
+        "\x05\x01u\x00\x02\x00\x00\x00" ++
+        "\x08\x01g\x00\x01v\x00\x00" ++
+        "\x01s\x00\x00\x22\x00\x00\x00/system.slice/igvano-example.scope\x00";
+    const cases = [_]struct {
+        path: []const u8 = "system.slice/igvano-example.scope",
+        matches: bool = false,
+        unit_signature: u8 = 'o',
+        property_signature: u8 = 'v',
+        value_signature: u8 = 's',
+        invalid: bool = false,
+    }{
+        .{ .matches = true },
+        .{ .path = "user.slice/session-1.scope" },
+        .{ .path = "system.slice/igvano-example.scope/child" },
+        .{ .path = "system.slice/igvano-example.scop" },
+        .{ .unit_signature = 's', .invalid = true },
+        .{ .property_signature = 's', .invalid = true },
+        .{ .value_signature = 'o', .invalid = true },
+    };
+    for (cases) |case| {
+        var fds: [2]i32 = undefined;
+        if (linux.errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK, 0, &fds)) != .SUCCESS)
+            return error.SocketFailed;
+        defer _ = linux.close(fds[1]);
+        var client = Client.init(std.testing.allocator);
+        client.fd = fds[0];
+        defer client.deinit();
+        client.deadline = 1;
+        const started = try now();
+        var reply: [unit_reply.len + property_reply.len]u8 = undefined;
+        @memcpy(reply[0..unit_reply.len], unit_reply);
+        @memcpy(reply[unit_reply.len..], property_reply);
+        reply[29] = case.unit_signature;
+        reply[unit_reply.len + 29] = case.property_signature;
+        reply[unit_reply.len + 33] = case.value_signature;
+        try std.testing.expectEqual(reply.len, linux.write(fds[1], &reply, reply.len));
+        const result = client.controlGroupMatches("igvano-example.scope", case.path);
+        if (case.invalid)
+            try std.testing.expectError(error.InvalidMessage, result)
+        else
+            try std.testing.expectEqual(case.matches, try result);
+        try std.testing.expect(client.deadline >= started + timeout_ms);
+        if (case.invalid) continue;
+        const get_unit = try marshalCall(std.testing.allocator, 1, manager_path, manager_interface, manager_destination, "GetUnit", &.{.{ .string = "igvano-example.scope" }});
+        defer std.testing.allocator.free(get_unit);
+        const get_property = try marshalCall(std.testing.allocator, 2, "/u", "org.freedesktop.DBus.Properties", manager_destination, "Get", &.{
+            .{ .string = "org.freedesktop.systemd1.Unit" },
+            .{ .string = "ControlGroup" },
+        });
+        defer std.testing.allocator.free(get_property);
+        var requests: [1024]u8 = undefined;
+        const length = get_unit.len + get_property.len;
+        var received: usize = 0;
+        while (received < length) {
+            const size = linux.read(fds[1], requests[received..].ptr, length - received);
+            if (linux.errno(size) != .SUCCESS or size == 0) return error.Disconnected;
+            received += size;
+        }
+        try std.testing.expectEqualSlices(u8, get_unit, requests[0..get_unit.len]);
+        try std.testing.expectEqualSlices(u8, get_property, requests[get_unit.len..length]);
+    }
 }
 
 test "linux GetNameOwner errors preserve systemd availability and remote diagnostics" {

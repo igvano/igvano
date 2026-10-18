@@ -629,13 +629,13 @@ fn createContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, c
     try saveRootfsMount(allocator, io, state_dir, handle);
 
     if (console_fds) |fds| {
-        const master = try backend_module.console.receiveFd(fds[0]);
-        defer _ = std.os.linux.close(master);
+        const controller = try backend_module.console.receiveFd(fds[0]);
+        defer _ = std.os.linux.close(controller);
         // Connect after fork so the blocked init cannot keep this connection
         // alive after create closes its copy.
         const peer = try connectConsoleSocket(config.console_socket.?);
         defer _ = std.os.linux.close(peer);
-        try backend_module.console.sendFd(peer, master);
+        try backend_module.console.sendFd(peer, controller);
     }
     state.status = .created;
     if (lock) |file| try requireLinkedLock(io, file);
@@ -751,7 +751,7 @@ fn loadHasProcess(allocator: std.mem.Allocator, io: std.Io, config: Config) !boo
     return oci.validationError(error.InvalidState, "has-process record: expected true or false", .{});
 }
 
-fn stateHandle(allocator: std.mem.Allocator, io: std.Io, root: []const u8, state: oci.State) !Backend.Handle {
+fn stateHandle(allocator: std.mem.Allocator, io: std.Io, root: []const u8, state: oci.State, force_cleanup: bool) !Backend.Handle {
     const pid = state.pid orelse return oci.validationError(error.InvalidState, "state.pid: required for a live container", .{});
     if (pid <= 0) return oci.validationError(error.InvalidState, "state.pid: must be positive", .{});
     const path = try std.fs.path.join(allocator, &.{ root, state.id, oci.starttime_file_name });
@@ -764,7 +764,7 @@ fn stateHandle(allocator: std.mem.Allocator, io: std.Io, root: []const u8, state
     if (starttime.len == 0) return oci.validationError(error.InvalidState, "starttime record: must not be empty", .{});
     const cgroup_path = try loadCgroupPath(allocator, io, root, state.id);
     errdefer if (cgroup_path) |value| allocator.free(value);
-    const systemd = try loadSystemdDriver(allocator, io, root, state.id);
+    const systemd = try loadCleanupSystemdDriver(allocator, io, root, state.id, cgroup_path, force_cleanup);
     const rootfs_mount = try loadRootfsMount(allocator, io, root, state.id);
     return .{
         .id = state.id,
@@ -807,6 +807,46 @@ fn loadSystemdDriver(allocator: std.mem.Allocator, io: std.Io, root: []const u8,
     if (std.mem.eql(u8, driver, "systemd")) return true;
     if (std.mem.eql(u8, driver, "cgroupfs")) return false;
     return oci.validationError(error.InvalidState, "saved cgroup driver: expected systemd or cgroupfs", .{});
+}
+
+fn loadCleanupSystemdDriver(allocator: std.mem.Allocator, io: std.Io, root: []const u8, id: []const u8, cgroup_path: ?[]const u8, force: bool) !bool {
+    return loadSystemdDriver(allocator, io, root, id) catch |err| {
+        if (!force or err == error.OutOfMemory) return err;
+        std.debug.print("igvano: warning: cannot load cgroup driver for '{s}': {s}; checking scope ownership before systemd cleanup\n", .{ id, @errorName(err) });
+        oci.clearDiagnostic();
+        const path = cgroup_path orelse return false;
+        const unit = std.fs.path.basename(path);
+        const state_dir = try std.fs.path.join(allocator, &.{ root, id });
+        defer allocator.free(state_dir);
+        const saved_spec: ?std.json.Parsed(oci.Spec) = oci.loadSpec(allocator, io, state_dir) catch |spec_err| switch (spec_err) {
+            error.OutOfMemory => return spec_err,
+            error.FileNotFound => null,
+            else => {
+                oci.clearDiagnostic();
+                return false;
+            },
+        };
+        defer if (saved_spec) |spec| spec.deinit();
+        const configured = if (saved_spec) |spec| if (spec.value.linux) |settings| settings.cgroupsPath else null else null;
+        if (!try systemdUnitMatchesContainer(allocator, unit, id, configured)) return false;
+        return backend_module.systemdCgroupMatches(allocator, unit, path) catch |query_err| {
+            if (query_err == error.OutOfMemory) return query_err;
+            return false;
+        };
+    };
+}
+
+fn systemdUnitMatchesContainer(allocator: std.mem.Allocator, unit: []const u8, id: []const u8, configured: ?[]const u8) !bool {
+    const suffix = try std.fmt.allocPrint(allocator, "-{s}.scope", .{id});
+    defer allocator.free(suffix);
+    if (!std.mem.endsWith(u8, unit, suffix)) return false;
+    const expected = oci.parseSystemdCgroupPath(allocator, configured, id) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        oci.clearDiagnostic();
+        return false;
+    };
+    defer expected.deinit(allocator);
+    return std.mem.eql(u8, unit, expected.unit);
 }
 
 const RootfsMount = struct {
@@ -889,7 +929,7 @@ fn recoverLiveState(allocator: std.mem.Allocator, io: std.Io, backend: Backend, 
     var handle: ?Backend.Handle = null;
     errdefer if (handle) |value| freeStateHandle(allocator, value);
     if (parsed.value.status == .creating or parsed.value.status == .created or parsed.value.status == .running or parsed.value.status == .paused) {
-        handle = stateHandle(allocator, io, config.root, parsed.value) catch |err| switch (err) {
+        handle = stateHandle(allocator, io, config.root, parsed.value, config.subcommand == .delete and config.force) catch |err| switch (err) {
             error.InvalidState => if (parsed.value.status == .creating) recovered: {
                 oci.clearDiagnostic();
                 break :recovered null;
@@ -1072,11 +1112,11 @@ fn execContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, con
             if (!config.detach) _ = waitExec(pid) catch {};
         }
         if (options.console_fds) |fds| {
-            const master = try backend_module.console.receiveFd(fds[0]);
-            defer _ = linux.close(master);
+            const controller = try backend_module.console.receiveFd(fds[0]);
+            defer _ = linux.close(controller);
             const peer = try connectConsoleSocket(config.console_socket.?);
             defer _ = linux.close(peer);
-            try backend_module.console.sendFd(peer, master);
+            try backend_module.console.sendFd(peer, controller);
         }
         if (config.pid_file) |path| try writePidFile(allocator, io, path, pid);
     }
@@ -1197,7 +1237,7 @@ fn killContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, con
         oci.requireKill(state.parsed.value.status) catch return oci.validationError(error.ContainerNotRunning, "kill: container is not running", .{});
     if (config.all) {
         if (state.handle == null)
-            state.handle = try stateHandle(allocator, io, config.root, state.parsed.value);
+            state.handle = try stateHandle(allocator, io, config.root, state.parsed.value, false);
         try backendResult(backend, backend.killAll(state.handle.?, signal));
     } else {
         try backendResult(backend, backend.kill(state.handle.?, signal));
@@ -1355,8 +1395,8 @@ fn destroyContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, 
     defer if (state.handle == null) {
         if (rootfs_mount) |mount| allocator.free(mount.path);
     };
-    const systemd = if (state.handle) |handle| handle.systemd else try loadSystemdDriver(allocator, io, config.root, config.id);
-    try backendResult(backend, backend.delete(state.handle orelse .{
+    const systemd = if (state.handle) |handle| handle.systemd else try loadCleanupSystemdDriver(allocator, io, config.root, config.id, cgroup_path, config.force);
+    var cleanup_handle = state.handle orelse Backend.Handle{
         .id = state.parsed.value.id,
         .pid = state.parsed.value.pid orelse 0,
         .starttime = "",
@@ -1365,7 +1405,15 @@ fn destroyContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, 
         .rootfs_mount = if (rootfs_mount) |mount| mount.path else null,
         .rootfs_mount_id = if (rootfs_mount) |mount| mount.mount_id_unique else null,
         .rootfs_mount_boot_id = if (rootfs_mount) |mount| mount.boot_id else null,
-    }));
+    };
+    backendResult(backend, backend.delete(cleanup_handle)) catch |err| {
+        if (!config.force or !cleanup_handle.systemd) return err;
+        std.debug.print("igvano: warning: systemd cleanup failed for '{s}': {s}; trying cgroupfs cleanup\n", .{ config.id, @errorName(err) });
+        last_backend_detail = null;
+        cleanup_handle.systemd = false;
+        cleanup_handle.systemd_cleanup = true;
+        try backendResult(backend, backend.delete(cleanup_handle));
+    };
     state.parsed.value.status = .stopped;
     const path = try std.fs.path.join(allocator, &.{ config.root, config.id });
     defer allocator.free(path);
@@ -2244,7 +2292,7 @@ fn testExecLifecycle(base: []const u8) !void {
     }
     const saved = try oci.loadState(allocator, io, root, config.id);
     const init_pid = saved.value.pid.?;
-    const init_handle = try stateHandle(allocator, io, root, saved.value);
+    const init_handle = try stateHandle(allocator, io, root, saved.value, false);
     var init_reaped = false;
     defer if (!init_reaped) {
         _ = linux.kill(init_pid, .KILL);
@@ -3060,12 +3108,12 @@ test "state handle requires a nonempty starttime file" {
     const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
     defer std.testing.allocator.free(root);
     const state: oci.State = .{ .id = "example", .pid = 1234, .status = .created, .bundle = "/bundle" };
-    try std.testing.expectError(error.InvalidState, stateHandle(std.testing.allocator, std.testing.io, root, state));
+    try std.testing.expectError(error.InvalidState, stateHandle(std.testing.allocator, std.testing.io, root, state, false));
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "example/starttime", .data = "" });
-    try std.testing.expectError(error.InvalidState, stateHandle(std.testing.allocator, std.testing.io, root, state));
+    try std.testing.expectError(error.InvalidState, stateHandle(std.testing.allocator, std.testing.io, root, state, false));
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "example/starttime", .data = "987654321" });
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "example/cgroup", .data = "/custom/from-state" });
-    const handle = try stateHandle(std.testing.allocator, std.testing.io, root, state);
+    const handle = try stateHandle(std.testing.allocator, std.testing.io, root, state, false);
     defer freeStateHandle(std.testing.allocator, handle);
     try std.testing.expectEqualStrings("987654321", handle.starttime);
     try std.testing.expectEqualStrings("custom/from-state", handle.cgroup_path.?);
@@ -3075,7 +3123,7 @@ test "state handle requires a nonempty starttime file" {
         .sub_path = "example/rootfs_mount",
         .data = "{\"path\":\"/bundle/rootfs\",\"mount_id_unique\":12345,\"boot_id\":\"00000000-0000-0000-0000-000000000000\"}",
     });
-    const mounted_handle = try stateHandle(std.testing.allocator, std.testing.io, root, state);
+    const mounted_handle = try stateHandle(std.testing.allocator, std.testing.io, root, state, false);
     defer freeStateHandle(std.testing.allocator, mounted_handle);
     try std.testing.expectEqualStrings("/bundle/rootfs", mounted_handle.rootfs_mount.?);
     try std.testing.expectEqual(@as(?u64, 12345), mounted_handle.rootfs_mount_id);
@@ -3085,18 +3133,18 @@ test "state handle requires a nonempty starttime file" {
         .sub_path = "example/rootfs_mount",
         .data = "{\"path\":\"/bundle/rootfs\",\"mount_id\":12345}",
     });
-    const old_id_handle = try stateHandle(std.testing.allocator, std.testing.io, root, state);
+    const old_id_handle = try stateHandle(std.testing.allocator, std.testing.io, root, state, false);
     defer freeStateHandle(std.testing.allocator, old_id_handle);
     try std.testing.expectEqualStrings("/bundle/rootfs", old_id_handle.rootfs_mount.?);
     try std.testing.expect(old_id_handle.rootfs_mount_id == null);
     try std.testing.expect(old_id_handle.rootfs_mount_boot_id == null);
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "example/rootfs_mount", .data = "/bundle/rootfs" });
-    const legacy_handle = try stateHandle(std.testing.allocator, std.testing.io, root, state);
+    const legacy_handle = try stateHandle(std.testing.allocator, std.testing.io, root, state, false);
     defer freeStateHandle(std.testing.allocator, legacy_handle);
     try std.testing.expectEqualStrings("/bundle/rootfs", legacy_handle.rootfs_mount.?);
     try std.testing.expect(legacy_handle.rootfs_mount_id == null);
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "example/rootfs_mount", .data = "relative" });
-    try std.testing.expectError(error.InvalidState, stateHandle(std.testing.allocator, std.testing.io, root, state));
+    try std.testing.expectError(error.InvalidState, stateHandle(std.testing.allocator, std.testing.io, root, state, false));
 }
 
 test "loading rootfs mounts rejects invalid ownership records" {
@@ -5470,7 +5518,7 @@ test "saved systemd driver survives commands without the global flag" {
         .pid = 42,
         .status = .created,
         .bundle = "/bundle",
-    });
+    }, false);
     defer freeStateHandle(std.testing.allocator, handle);
     try std.testing.expect(handle.systemd);
     try std.testing.expectEqualStrings("system.slice/test-example.scope", handle.cgroup_path.?);
@@ -5478,6 +5526,108 @@ test "saved systemd driver survives commands without the global flag" {
     try std.testing.expectError(error.InvalidState, loadSystemdDriver(std.testing.allocator, std.testing.io, root, "example"));
     try tmp.dir.deleteFile(std.testing.io, "example/cgroup-driver");
     try std.testing.expect(!try loadSystemdDriver(std.testing.allocator, std.testing.io, root, "example"));
+}
+
+test "forced deletion recovers corrupt and unreadable cgroup drivers" {
+    const TestBackend = struct {
+        stopped_scope: bool = false,
+        cleaned: bool = false,
+        systemd_cleanup: bool = false,
+        const vtable: Backend.VTable = .{ .create = create, .alive = alive, .kill = kill, .killAll = kill, .delete = delete };
+        fn create(_: *anyopaque, _: Backend.CreateOptions) Backend.Error!Backend.Handle {
+            return error.NotImplemented;
+        }
+        fn alive(_: *anyopaque, _: Backend.Handle) Backend.Error!bool {
+            return false;
+        }
+        fn kill(_: *anyopaque, _: Backend.Handle, _: i32) Backend.Error!void {}
+        fn delete(ptr: *anyopaque, handle: Backend.Handle) Backend.Error!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (handle.systemd) {
+                self.stopped_scope = true;
+                return error.CgroupWriteFailed;
+            }
+            self.cleaned = true;
+            self.systemd_cleanup = handle.systemd_cleanup;
+        }
+    };
+    for ([_]oci.Status{ .stopped, .created }) |status| {
+        for ([_]bool{ false, true }) |unreadable| {
+            for ([_][]const u8{ "/user.slice/session-1.scope", "system.slice/test-other.scope", "igvano/example" }) |cgroup| {
+                var tmp = std.testing.tmpDir(.{});
+                defer tmp.cleanup();
+                try tmp.dir.createDir(std.testing.io, "example", .default_dir);
+                try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "example/starttime", .data = "123" });
+                try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "example/cgroup", .data = cgroup });
+                if (unreadable)
+                    try tmp.dir.createDir(std.testing.io, "example/cgroup-driver", .default_dir)
+                else
+                    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "example/cgroup-driver", .data = "unknown" });
+                const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+                defer std.testing.allocator.free(root);
+                try oci.saveState(std.testing.allocator, std.testing.io, root, .{
+                    .id = "example",
+                    .pid = 42,
+                    .status = status,
+                    .bundle = "/bundle",
+                });
+                var implementation: TestBackend = .{};
+                const backend: Backend = .{ .ptr = &implementation, .vtable = &TestBackend.vtable };
+                var config: Config = .{ .root = root, .id = "example", .subcommand = .delete };
+                if (!unreadable) {
+                    try std.testing.expectError(error.InvalidState, deleteContainer(std.testing.allocator, std.testing.io, backend, config));
+                    try std.testing.expect(!implementation.cleaned);
+                }
+                config.force = true;
+                try deleteContainer(std.testing.allocator, std.testing.io, backend, config);
+                try std.testing.expect(implementation.cleaned);
+                try std.testing.expect(!implementation.stopped_scope);
+                try std.testing.expect(!implementation.systemd_cleanup);
+                try std.testing.expectError(error.FileNotFound, tmp.dir.openDir(std.testing.io, "example", .{}));
+            }
+        }
+    }
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "example", .default_dir);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "example/cgroup", .data = "system.slice/test-example.scope" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "example/cgroup-driver", .data = "systemd" });
+    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer std.testing.allocator.free(root);
+    try oci.saveState(std.testing.allocator, std.testing.io, root, .{
+        .id = "example",
+        .status = .stopped,
+        .bundle = "/bundle",
+    });
+    var implementation: TestBackend = .{};
+    const backend: Backend = .{ .ptr = &implementation, .vtable = &TestBackend.vtable };
+    try deleteContainer(std.testing.allocator, std.testing.io, backend, .{
+        .root = root,
+        .id = "example",
+        .subcommand = .delete,
+        .force = true,
+    });
+    try std.testing.expect(implementation.stopped_scope);
+    try std.testing.expect(implementation.cleaned);
+    try std.testing.expect(implementation.systemd_cleanup);
+}
+
+test "inferred systemd cleanup requires the scope name create would use for this id" {
+    for ([_]struct { unit: []const u8, id: []const u8 = "example", configured: ?[]const u8 = null, matches: bool = false }{
+        .{ .unit = "igvano-example.scope", .matches = true },
+        .{ .unit = "test-prefix-example.scope", .configured = ":test-prefix:example", .matches = true },
+        .{ .unit = "test-prefix-example.scope" },
+        .{ .unit = "igvano-example-other.scope", .id = "example-other", .matches = true },
+        .{ .unit = "session-1.scope" },
+        .{ .unit = "session-1.scope", .id = "1" },
+        .{ .unit = "igvano-other.scope" },
+        .{ .unit = "test-other.scope", .configured = ":test:other" },
+        .{ .unit = "igvano-example-other.scope" },
+        .{ .unit = "example.scope" },
+        .{ .unit = "bad prefix-example.scope" },
+        .{ .unit = "p" ** 242 ++ "-example.scope" },
+    }) |case|
+        try std.testing.expectEqual(case.matches, try systemdUnitMatchesContainer(std.testing.allocator, case.unit, case.id, case.configured));
 }
 
 test "linux systemd cgroup scope lifecycle applies limits and removes the unit" {
@@ -5546,7 +5696,7 @@ fn testSystemdLifecycleDeletion(base: []const u8, kill_before_delete: bool) !voi
     defer deleteContainer(allocator, io, backend, remove) catch {};
     const saved = try oci.loadState(allocator, io, root, id);
     defer saved.deinit();
-    const handle = try stateHandle(allocator, io, root, saved.value);
+    const handle = try stateHandle(allocator, io, root, saved.value, false);
     try std.testing.expect(handle.systemd);
     try std.testing.expectEqualStrings(path, handle.cgroup_path.?);
     var reaped = false;
@@ -5578,7 +5728,7 @@ fn testSystemdLifecycleDeletion(base: []const u8, kill_before_delete: bool) !voi
         const reload = try std.process.run(allocator, io, .{ .argv = &.{ "systemctl", "daemon-reload" } });
         try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, reload.term);
         try checkSystemdV1Devices(allocator, io, path, "c 10:237 rw\n", "c 10:238 rwm\n");
-        // A new whitelist must clear cached DeviceAllow entries, so reload
+        // A new allowlist must clear cached DeviceAllow entries, so reload
         // cannot restore devices removed by an explicit resource update.
         try cwd.writeFile(io, .{ .sub_path = update_path, .data = "{\"devices\":[{\"allow\":false},{\"allow\":true,\"type\":\"c\",\"major\":10,\"minor\":239,\"access\":\"rw\"}]}" });
         try updateContainer(allocator, io, backend, update);

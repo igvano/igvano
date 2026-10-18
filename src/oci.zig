@@ -3305,6 +3305,33 @@ test "systemd cgroupsPath resolves defaults scope names and nested slices" {
     try std.testing.expectError(error.Unsupported, parseSystemdCgroupPath(std.testing.allocator, "system.slice:test:foo.slice", "id"));
 }
 
+test "systemd cgroupsPath validates component characters and unit length limits" {
+    const allocator = std.testing.allocator;
+    for ([_][]const u8{
+        "bad space.slice:p:n",       "bad!.slice:p:n",
+        "system.slice:bad prefix:n", "system.slice:p:bad name",
+        "system.slice:p:n\n",
+        "system.slice:p:日本語",
+        "system.slice:p:n?",         "system.slice:p:n*",
+        "system.slice:p:n%",
+    }) |configured| {
+        clearDiagnostic();
+        try std.testing.expectError(error.InvalidConfig, parseSystemdCgroupPath(allocator, configured, "id"));
+        try std.testing.expect(diagnosticFor(error.InvalidConfig) != null);
+    }
+    const valid = try parseSystemdCgroupPath(allocator, "test_A.0\\x40.slice:prefix_1:Name.2@x\\x2d", "id");
+    defer valid.deinit(allocator);
+    try std.testing.expectEqualStrings("prefix_1-Name.2@x\\x2d.scope", valid.unit);
+    const scope = try parseSystemdCgroupPath(allocator, "system.slice:p:" ++ "n" ** 247, "id");
+    defer scope.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 255), scope.unit.len);
+    try std.testing.expectError(error.InvalidConfig, parseSystemdCgroupPath(allocator, "system.slice:p:" ++ "n" ** 248, "id"));
+    const slice = try expandSystemdSlice(allocator, "s" ** 249 ++ ".slice");
+    defer allocator.free(slice);
+    try std.testing.expectError(error.InvalidConfig, expandSystemdSlice(allocator, "s" ** 250 ++ ".slice"));
+    try std.testing.expectError(error.InvalidConfig, parseSystemdCgroupPath(allocator, null, "bad id"));
+}
+
 pub const SystemdCgroup = struct {
     slice: []const u8,
     unit: []u8,
@@ -3319,8 +3346,9 @@ pub const SystemdCgroup = struct {
 /// runc's ExpandSlice: a-b.slice is /a.slice/a-b.slice; -.slice is root.
 pub fn expandSystemdSlice(allocator: std.mem.Allocator, slice: []const u8) ![]u8 {
     if (!std.mem.endsWith(u8, slice, ".slice") or slice.len <= ".slice".len or
-        std.mem.indexOfAny(u8, slice, "/\x00") != null)
+        !systemdUnitCharacters(slice))
         return invalidConfig("linux.cgroupsPath: invalid systemd slice name '{s}'", .{slice});
+    if (slice.len > 255) return invalidConfig("linux.cgroupsPath: systemd slice name is too long", .{});
     const name = slice[0 .. slice.len - ".slice".len];
     if (std.mem.eql(u8, name, "-")) return allocator.dupe(u8, "/");
     var path: std.ArrayList(u8) = .empty;
@@ -3337,6 +3365,14 @@ pub fn expandSystemdSlice(allocator: std.mem.Allocator, slice: []const u8) ![]u8
         end += 1;
     }
     return path.toOwnedSlice(allocator);
+}
+
+fn systemdUnitCharacters(name: []const u8) bool {
+    for (name) |byte| {
+        if (!std.ascii.isAlphanumeric(byte) and std.mem.indexOfScalar(u8, ":_.\\@-", byte) == null)
+            return false;
+    }
+    return true;
 }
 
 /// OCI's slice:prefix:name syntax is interpreted only by the frontend.
@@ -3356,7 +3392,7 @@ pub fn parseSystemdCgroupPath(allocator: std.mem.Allocator, configured: ?[]const
     }
     if (std.mem.endsWith(u8, name, ".slice"))
         return validationError(error.Unsupported, "linux.cgroupsPath: transient systemd slice units are not supported; use a scope name", .{});
-    if (std.mem.indexOfAny(u8, prefix, "/\x00") != null or std.mem.indexOfAny(u8, name, "/\x00") != null)
+    if (!systemdUnitCharacters(prefix) or !systemdUnitCharacters(name))
         return invalidConfig("linux.cgroupsPath: invalid systemd scope name", .{});
     const expanded = try expandSystemdSlice(allocator, slice);
     defer allocator.free(expanded);
