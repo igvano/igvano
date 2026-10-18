@@ -7,6 +7,25 @@ const Resources = Backend.Resources;
 const oci = @import("../oci.zig");
 const hooks = @import("hooks.zig");
 const seccomp = @import("seccomp.zig");
+const devicefilter = @import("devicefilter.zig");
+
+// runc libcontainer/specconv.AllowedDevices; /dev/console (5:1) is not included.
+const default_device_rules = [_]Resources.DeviceRule{
+    .{ .allow = true, .kind = .char, .access = "m" },
+    .{ .allow = true, .kind = .block, .access = "m" },
+    .{ .allow = true, .kind = .char, .major = 1, .minor = 3 },
+    .{ .allow = true, .kind = .char, .major = 1, .minor = 8 },
+    .{ .allow = true, .kind = .char, .major = 1, .minor = 7 },
+    .{ .allow = true, .kind = .char, .major = 5, .minor = 0 },
+    .{ .allow = true, .kind = .char, .major = 1, .minor = 5 },
+    .{ .allow = true, .kind = .char, .major = 1, .minor = 9 },
+    .{ .allow = true, .kind = .char, .major = 136 },
+    .{ .allow = true, .kind = .char, .major = 5, .minor = 2 },
+    .{ .allow = true, .kind = .char, .major = 10, .minor = 200 },
+};
+test {
+    _ = devicefilter;
+}
 
 const ST_NOATIME: usize = 1024;
 const ST_RELATIME: usize = 4096; // Unlike MS_RELATIME.
@@ -211,31 +230,34 @@ fn v1Writes(allocator: std.mem.Allocator, resources: Resources, devices: ?[]cons
     }
     if (devices == null and resources.devices.len != 0)
         try appendV1Write(allocator, &writes, "devices", "devices.deny", try allocator.dupe(u8, "a *:* rwm"), null, false);
-    for (resources.devices) |rule| {
-        if (rule.access.len == 0) return error.InvalidConfig;
-        for (rule.access) |access| {
-            if (std.mem.indexOfScalar(u8, "rwm", access) == null) return error.InvalidConfig;
-        }
-        var major_buffer: [24]u8 = undefined;
-        var minor_buffer: [24]u8 = undefined;
-        const major = if (rule.major) |value| try v1DeviceNumber(&major_buffer, value) else "*";
-        const minor = if (rule.minor) |value| try v1DeviceNumber(&minor_buffer, value) else "*";
-        const kind: u8 = switch (rule.kind) {
-            .all => 'a',
-            .block => 'b',
-            .char => 'c',
-        };
-        try appendV1Write(allocator, &writes, "devices", if (rule.allow) "devices.allow" else "devices.deny", try std.fmt.allocPrint(allocator, "{c} {s}:{s} {s}", .{ kind, major, minor, rule.access }), null, false);
-    }
+    for (resources.devices) |rule|
+        try appendV1DeviceRule(allocator, &writes, rule);
     if (devices != null or resources.devices.len != 0) {
-        for ([_][]const u8{ "c 1:3 rwm", "c 1:5 rwm", "c 1:7 rwm", "c 1:8 rwm", "c 1:9 rwm", "c 5:0 rwm", "c 5:2 rwm", "c 136:* rwm" }) |value|
-            try appendV1Write(allocator, &writes, "devices", "devices.allow", try allocator.dupe(u8, value), null, false);
+        for (default_device_rules) |rule|
+            try appendV1DeviceRule(allocator, &writes, rule);
     }
     for (devices orelse &.{}) |device| {
         if (device.kind == .fifo) continue;
         try appendV1Write(allocator, &writes, "devices", "devices.allow", try std.fmt.allocPrint(allocator, "{c} {d}:{d} rwm", .{ @as(u8, if (device.kind == .character) 'c' else 'b'), device.major, device.minor }), null, false);
     }
     return writes.toOwnedSlice(allocator);
+}
+
+fn appendV1DeviceRule(allocator: std.mem.Allocator, writes: *std.ArrayList(V1Write), rule: Resources.DeviceRule) Backend.Error!void {
+    if (rule.access.len == 0) return error.InvalidConfig;
+    for (rule.access) |access| {
+        if (std.mem.indexOfScalar(u8, "rwm", access) == null) return error.InvalidConfig;
+    }
+    var major_buffer: [24]u8 = undefined;
+    var minor_buffer: [24]u8 = undefined;
+    const major = if (rule.major) |value| try v1DeviceNumber(&major_buffer, value) else "*";
+    const minor = if (rule.minor) |value| try v1DeviceNumber(&minor_buffer, value) else "*";
+    const kind: u8 = switch (rule.kind) {
+        .all => 'a',
+        .block => 'b',
+        .char => 'c',
+    };
+    try appendV1Write(allocator, writes, "devices", if (rule.allow) "devices.allow" else "devices.deny", try std.fmt.allocPrint(allocator, "{c} {s}:{s} {s}", .{ kind, major, minor, rule.access }), null, false);
 }
 
 fn v1DeviceNumber(buffer: []u8, value: i64) Backend.Error![]const u8 {
@@ -364,7 +386,7 @@ test "v1 writes preserve native memory limits and CPU ordering" {
         .{ .controller = "cpuset", .name = "cpuset.cpus", .value = "0-2,4" },
         .{ .controller = "cpuset", .name = "cpuset.mems", .value = "0,2" },
         .{ .controller = "pids", .name = "pids.max", .value = "max" },
-    }, writes[0 .. writes.len - 8]);
+    }, writes[0 .. writes.len - 11]);
 }
 
 test "v1 writes retain block IO weights with BFQ alternatives and separate throttle devices" {
@@ -388,7 +410,7 @@ test "v1 writes retain block IO weights with BFQ alternatives and separate throt
         .{ .controller = "blkio", .name = "blkio.throttle.write_bps_device", .value = "8:0 3000" },
         .{ .controller = "blkio", .name = "blkio.throttle.read_iops_device", .value = "8:0 40" },
         .{ .controller = "blkio", .name = "blkio.throttle.write_iops_device", .value = "8:1 50" },
-    }, writes[0 .. writes.len - 8]);
+    }, writes[0 .. writes.len - 11]);
 }
 
 test "v1 writes map hugepages network and ordered device rules before allowed devices" {
@@ -415,14 +437,17 @@ test "v1 writes map hugepages network and ordered device rules before allowed de
         .{ .controller = "devices", .name = "devices.deny", .value = "a *:* rwm" },
         .{ .controller = "devices", .name = "devices.allow", .value = "b 8:0 rw" },
         .{ .controller = "devices", .name = "devices.deny", .value = "c 10:* m" },
+        .{ .controller = "devices", .name = "devices.allow", .value = "c *:* m" },
+        .{ .controller = "devices", .name = "devices.allow", .value = "b *:* m" },
         .{ .controller = "devices", .name = "devices.allow", .value = "c 1:3 rwm" },
-        .{ .controller = "devices", .name = "devices.allow", .value = "c 1:5 rwm" },
-        .{ .controller = "devices", .name = "devices.allow", .value = "c 1:7 rwm" },
         .{ .controller = "devices", .name = "devices.allow", .value = "c 1:8 rwm" },
-        .{ .controller = "devices", .name = "devices.allow", .value = "c 1:9 rwm" },
+        .{ .controller = "devices", .name = "devices.allow", .value = "c 1:7 rwm" },
         .{ .controller = "devices", .name = "devices.allow", .value = "c 5:0 rwm" },
-        .{ .controller = "devices", .name = "devices.allow", .value = "c 5:2 rwm" },
+        .{ .controller = "devices", .name = "devices.allow", .value = "c 1:5 rwm" },
+        .{ .controller = "devices", .name = "devices.allow", .value = "c 1:9 rwm" },
         .{ .controller = "devices", .name = "devices.allow", .value = "c 136:* rwm" },
+        .{ .controller = "devices", .name = "devices.allow", .value = "c 5:2 rwm" },
+        .{ .controller = "devices", .name = "devices.allow", .value = "c 10:200 rwm" },
         .{ .controller = "devices", .name = "devices.allow", .value = "b 8:1 rwm" },
         .{ .controller = "devices", .name = "devices.allow", .value = "c 10:200 rwm" },
     }, writes);
@@ -480,7 +505,7 @@ test "v1 mapping rejects unified and malformed resources and preserves wildcard 
     try std.testing.expectEqualStrings("c *:* rwm", writes[0].value);
     const unset = try v1Writes(std.testing.allocator, .{ .memory = .{ .limit = 0, .swap = 0, .disable_oom_killer = false }, .cpu = .{ .shares = 0, .period = 0, .quota = 0 }, .pids = .{ .limit = 0 } }, &.{});
     defer freeV1Writes(std.testing.allocator, unset);
-    try std.testing.expectEqual(@as(usize, 8), unset.len);
+    try std.testing.expectEqual(@as(usize, 11), unset.len);
 }
 
 test "linux update requires a persisted cgroup path" {
@@ -515,7 +540,8 @@ test "resource updates write only requested limits and replace explicit v1 devic
     try std.testing.expectEqualStrings("a *:* rwm", devices[0].value);
     try std.testing.expectEqualStrings("devices.allow", devices[1].name);
     try std.testing.expectEqualStrings("b 8:0 rw", devices[1].value);
-    try std.testing.expectEqualStrings("c 1:3 rwm", devices[2].value);
+    try std.testing.expectEqualStrings("c *:* m", devices[2].value);
+    try std.testing.expectEqualStrings("c 1:3 rwm", devices[4].value);
 }
 
 test "v1 mapping and hierarchy discovery release partial allocations" {
@@ -629,8 +655,6 @@ fn v2Writes(allocator: std.mem.Allocator, resources: Resources) Backend.Error![]
         defer allocator.free(name);
         try appendWrite(allocator, &writes, name, try std.fmt.allocPrint(allocator, "{d}", .{page.limit}));
     }
-    // ponytail: device rules remain unenforced on v2; add an eBPF
-    // BPF_CGROUP_DEVICE filter when device access enforcement is required.
     // Raw settings are last so they override any typed resource mapping.
     for (resources.unified) |entry|
         try appendWrite(allocator, &writes, entry.key, try allocator.dupe(u8, entry.value));
@@ -1875,6 +1899,11 @@ pub const LinuxBackend = struct {
                 hierarchy.leaf = (try walkV1Cgroup(allocator, hierarchy.root.?, options.cgroup_path, true, hierarchy.has("cpuset"))).?;
             for (cgroup_writes) |write|
                 try writeCgroupFile(cgroup.?, write.name, write.value, options.cgroup_path);
+            if (cgroup_root.mode == .unified and !devicefilter.isAllowAll(options.resources.devices)) {
+                const rules = try v2DeviceRules(allocator, options.resources.devices, options.devices);
+                defer allocator.free(rules);
+                try applyV2DeviceFilter(allocator, cgroup.?, rules, options.cgroup_path, false);
+            }
             if (cgroup_root.mode == .legacy)
                 try applyV1Writes(allocator, hierarchies, v1_writes, options.resources, options.devices, options.cgroup_path);
             var needs_mount_sources = false;
@@ -2365,6 +2394,13 @@ pub const LinuxBackend = struct {
                 }
                 try writeCgroupFile(cgroup, write.name, write.value, path);
             }
+            if (resources.devices.len != 0) {
+                // Like v1, update re-appends only built-in defaults, not the
+                // container's linux.devices entries.
+                const rules = try v2DeviceRules(allocator, resources.devices, &.{});
+                defer allocator.free(rules);
+                try applyV2DeviceFilter(allocator, cgroup, rules, path, true);
+            }
         }
     }
 
@@ -2767,6 +2803,222 @@ fn readCgroupFile(allocator: std.mem.Allocator, dir: posix.fd_t, filename: [:0]c
         }
         if (result == 0) return text.toOwnedSlice(allocator);
         try text.appendSlice(allocator, buffer[0..result]);
+    }
+}
+
+/// As on v1, append required device allows after the user's policy.
+fn v2DeviceRules(allocator: std.mem.Allocator, rules: []const Resources.DeviceRule, devices: []const Backend.Device) Backend.Error![]Resources.DeviceRule {
+    var result: std.ArrayList(Resources.DeviceRule) = .empty;
+    defer result.deinit(allocator);
+    if (rules.len == 0) try result.append(allocator, .{ .allow = false });
+    try result.appendSlice(allocator, rules);
+    try result.appendSlice(allocator, &default_device_rules);
+    for (devices) |device| {
+        if (device.kind == .fifo) continue;
+        try result.append(allocator, .{
+            .allow = true,
+            .kind = if (device.kind == .character) .char else .block,
+            .major = device.major,
+            .minor = device.minor,
+        });
+    }
+    return result.toOwnedSlice(allocator);
+}
+
+test "v2 device rules append default and configured allows after explicit denies" {
+    const allocator = std.testing.allocator;
+    const rules = try v2DeviceRules(allocator, &.{
+        .{ .allow = false },
+        .{ .allow = false, .kind = .char, .major = 1, .minor = 3 },
+        .{ .allow = false, .kind = .block, .major = 8, .minor = 0 },
+    }, &.{
+        .{ .path = "/dev/custom", .kind = .character, .major = 10, .minor = 237 },
+        .{ .path = "/dev/disk", .kind = .block, .major = 8, .minor = 0 },
+        .{ .path = "/dev/fifo", .kind = .fifo },
+    });
+    defer allocator.free(rules);
+    const expected: []const Resources.DeviceRule = &.{
+        .{ .allow = false },
+        .{ .allow = false, .kind = .char, .major = 1, .minor = 3 },
+        .{ .allow = false, .kind = .block, .major = 8, .minor = 0 },
+        .{ .allow = true, .kind = .char, .access = "m" },
+        .{ .allow = true, .kind = .block, .access = "m" },
+        .{ .allow = true, .kind = .char, .major = 1, .minor = 3 },
+        .{ .allow = true, .kind = .char, .major = 1, .minor = 8 },
+        .{ .allow = true, .kind = .char, .major = 1, .minor = 7 },
+        .{ .allow = true, .kind = .char, .major = 5, .minor = 0 },
+        .{ .allow = true, .kind = .char, .major = 1, .minor = 5 },
+        .{ .allow = true, .kind = .char, .major = 1, .minor = 9 },
+        .{ .allow = true, .kind = .char, .major = 136 },
+        .{ .allow = true, .kind = .char, .major = 5, .minor = 2 },
+        .{ .allow = true, .kind = .char, .major = 10, .minor = 200 },
+        .{ .allow = true, .kind = .char, .major = 10, .minor = 237 },
+        .{ .allow = true, .kind = .block, .major = 8, .minor = 0 },
+    };
+    try std.testing.expectEqualDeep(expected, @as([]const Resources.DeviceRule, rules));
+}
+
+test "linux v2 device filter loads a large rule set without overflowing the verifier log" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const root = openCgroupRoot() catch return error.SkipZigTest;
+    defer closeFd(root.fd);
+    if (root.mode != .unified) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const path = try std.fmt.allocPrint(allocator, "igvano-v2-many-devices-{d}", .{linux.getpid()});
+    defer allocator.free(path);
+    const cgroup = (walkCgroup(root.fd, path, true, &.{}) catch |err| switch (err) {
+        error.PermissionDenied => return error.SkipZigTest,
+        else => return err,
+    }).?;
+    defer closeFd(cgroup);
+    defer removeCgroup(root.fd, path) catch {};
+    var rules: [200]Resources.DeviceRule = undefined;
+    for (&rules, 0..) |*rule, minor|
+        rule.* = .{ .allow = true, .kind = .char, .major = 1, .minor = @intCast(minor), .access = "rw" };
+    try applyV2DeviceFilter(allocator, cgroup, &rules, path, false);
+    const ids = try queryDevicePrograms(allocator, cgroup, path);
+    defer allocator.free(ids);
+    try std.testing.expectEqual(@as(usize, 1), ids.len);
+}
+
+fn deviceBpfError(path: []const u8, operation: []const u8, err: linux.E) Backend.Error {
+    reportDiagnostic("cgroup '{s}' cannot enforce v2 devices: {s}(BPF_CGROUP_DEVICE): {s}", .{ path, operation, @tagName(err) });
+    return error.CgroupWriteFailed;
+}
+
+fn skipDeviceBpfError(rules: []const Resources.DeviceRule, path: []const u8, operation: []const u8, err: linux.E) bool {
+    // Stricter than runc's canSkipEBPFError: fail closed on any deny rule,
+    // even inside a user namespace.
+    if (err != .PERM) return false;
+    for (rules) |rule| {
+        if (!rule.allow) return false;
+    }
+    var stat: linux.Statx = undefined;
+    if (linux.errno(linux.statx(linux.AT.FDCWD, "/proc/self/ns/user", 0, .{ .INO = true }, &stat)) != .SUCCESS)
+        return false;
+    // PROC_USER_INIT_INO identifies the initial user namespace, even when
+    // /proc/1 belongs to the same nested namespace as this process.
+    if (!stat.mask.INO or stat.ino == 0xeffffffd) return false;
+    reportDiagnostic("warning: cgroup '{s}' {s}(BPF_CGROUP_DEVICE): EPERM in a user namespace; proceeding without a device filter", .{ path, operation });
+    return true;
+}
+
+/// Query only this cgroup's programs, never effective filters inherited from
+/// ancestors. Retry if the kernel reports a larger list than our buffer.
+fn queryDevicePrograms(allocator: std.mem.Allocator, cgroup: posix.fd_t, path: []const u8) Backend.Error![]u32 {
+    var ids = try allocator.alloc(u32, 64);
+    errdefer allocator.free(ids);
+    for (0..10) |_| {
+        var attr: linux.BPF.Attr = .{ .query = std.mem.zeroes(linux.BPF.QueryAttr) };
+        attr.query.target_fd = cgroup;
+        attr.query.attach_type = @intFromEnum(linux.BPF.AttachType.cgroup_device);
+        attr.query.prog_ids = @intFromPtr(ids.ptr);
+        attr.query.prog_cnt = @intCast(ids.len);
+        const err = linux.errno(linux.bpf(.prog_query, &attr, @sizeOf(linux.BPF.QueryAttr)));
+        switch (err) {
+            .SUCCESS => return allocator.realloc(ids, attr.query.prog_cnt),
+            .NOSPC => ids = try allocator.realloc(ids, attr.query.prog_cnt),
+            .INTR => continue,
+            else => return deviceBpfError(path, "BPF_PROG_QUERY", err),
+        }
+    }
+    reportDiagnostic("cgroup '{s}' cannot query a stable list of BPF_CGROUP_DEVICE programs", .{path});
+    return error.CgroupWriteFailed;
+}
+
+fn applyV2DeviceFilter(allocator: std.mem.Allocator, cgroup: posix.fd_t, rules: []const Resources.DeviceRule, path: []const u8, update: bool) Backend.Error!void {
+    const insns = devicefilter.compile(allocator, rules) catch |err| {
+        if (err == error.InvalidConfig)
+            reportDiagnostic("cgroup '{s}' has invalid v2 device rules", .{path});
+        return err;
+    };
+    defer allocator.free(insns);
+    var log: []u8 = &.{};
+    defer allocator.free(log);
+    var load: linux.BPF.Attr = .{ .prog_load = std.mem.zeroes(linux.BPF.ProgLoadAttr) };
+    load.prog_load.prog_type = @intFromEnum(linux.BPF.ProgType.cgroup_device);
+    load.prog_load.insn_cnt = @intCast(insns.len);
+    load.prog_load.insns = @intFromPtr(insns.ptr);
+    // Same MODULE_LICENSE string as runc's devicefilter.go.
+    load.prog_load.license = @intFromPtr("Apache");
+    // Older kernels charge BPF allocations to memlock. Restore both limits
+    // immediately after loading so init cannot inherit the temporary increase.
+    var original: linux.rlimit = undefined;
+    try checkResult(linux.getrlimit(.MEMLOCK, &original));
+    const memlock: linux.rlimit = .{ .cur = linux.RLIM.INFINITY, .max = linux.RLIM.INFINITY };
+    const raised = linux.errno(linux.setrlimit(.MEMLOCK, &memlock)) == .SUCCESS;
+    // A valid large program can overflow a fixed verifier log. Enable logging
+    // only for a diagnostic retry after a load with all log fields zero fails.
+    var loaded = linux.bpf(.prog_load, &load, @sizeOf(linux.BPF.ProgLoadAttr));
+    if (linux.errno(loaded) != .SUCCESS) {
+        log = allocator.alloc(u8, 64 * 1024) catch |err| {
+            if (raised) try checkResult(linux.setrlimit(.MEMLOCK, &original));
+            return err;
+        };
+        @memset(log, 0);
+        load.prog_load.log_level = 1;
+        load.prog_load.log_size = @intCast(log.len);
+        load.prog_load.log_buf = @intFromPtr(log.ptr);
+        loaded = linux.bpf(.prog_load, &load, @sizeOf(linux.BPF.ProgLoadAttr));
+    }
+    if (raised) {
+        const restored = linux.errno(linux.setrlimit(.MEMLOCK, &original));
+        if (restored != .SUCCESS) {
+            if (linux.errno(loaded) == .SUCCESS) closeFd(@intCast(loaded));
+            reportDiagnostic("cgroup '{s}' cannot restore RLIMIT_MEMLOCK after BPF_PROG_LOAD: {s}", .{ path, @tagName(restored) });
+            return error.CgroupWriteFailed;
+        }
+    }
+    if (linux.errno(loaded) != .SUCCESS) {
+        if (skipDeviceBpfError(rules, path, "BPF_PROG_LOAD", linux.errno(loaded))) return;
+        const detail = std.mem.sliceTo(log, 0);
+        reportDiagnostic("cgroup '{s}' cannot enforce v2 devices: BPF_PROG_LOAD(BPF_CGROUP_DEVICE): {s}; verifier: {s}", .{ path, @tagName(linux.errno(loaded)), detail });
+        return error.CgroupWriteFailed;
+    }
+    const program: posix.fd_t = @intCast(loaded);
+    defer closeFd(program);
+    const ids: []const u32 = if (update) try queryDevicePrograms(allocator, cgroup, path) else &.{};
+    defer if (update) allocator.free(ids);
+    var old: std.ArrayList(posix.fd_t) = .empty;
+    defer {
+        for (old.items) |fd| closeFd(fd);
+        old.deinit(allocator);
+    }
+    for (ids) |id| {
+        var attr: linux.BPF.Attr = .{ .get_id = std.mem.zeroes(linux.BPF.GetIdAttr) };
+        attr.get_id.id.prog_id = id;
+        const fd = linux.bpf(.prog_get_fd_by_id, &attr, @sizeOf(linux.BPF.GetIdAttr));
+        switch (linux.errno(fd)) {
+            .SUCCESS => {
+                const owned: posix.fd_t = @intCast(fd);
+                errdefer closeFd(owned);
+                try old.append(allocator, owned);
+            },
+            // Like runc, leave LSM-protected programs alone. Other attached
+            // programs can only restrict our new policy further.
+            .ACCES, .PERM => continue,
+            else => |err| return deviceBpfError(path, "BPF_PROG_GET_FD_BY_ID", err),
+        }
+    }
+    var attach: linux.BPF.Attr = .{ .prog_attach = std.mem.zeroes(linux.BPF.ProgAttachAttr) };
+    attach.prog_attach.target_fd = cgroup;
+    attach.prog_attach.attach_bpf_fd = program;
+    attach.prog_attach.attach_type = @intFromEnum(linux.BPF.AttachType.cgroup_device);
+    attach.prog_attach.attach_flags = linux.BPF.F_ALLOW_MULTI;
+    const err = linux.errno(linux.bpf(.prog_attach, &attach, @sizeOf(linux.BPF.ProgAttachAttr)));
+    if (err != .SUCCESS) {
+        if (skipDeviceBpfError(rules, path, "BPF_PROG_ATTACH", err)) return;
+        return deviceBpfError(path, "BPF_PROG_ATTACH", err);
+    }
+    // Keep the new program attached even if detaching an old one fails:
+    // stacked device programs are ANDed, so this fails closed.
+    for (old.items) |fd| {
+        var detach: linux.BPF.Attr = .{ .prog_attach = std.mem.zeroes(linux.BPF.ProgAttachAttr) };
+        detach.prog_attach.target_fd = cgroup;
+        detach.prog_attach.attach_bpf_fd = fd;
+        detach.prog_attach.attach_type = @intFromEnum(linux.BPF.AttachType.cgroup_device);
+        const detached = linux.errno(linux.bpf(.prog_detach, &detach, @sizeOf(linux.BPF.ProgAttachAttr)));
+        if (detached != .SUCCESS) return deviceBpfError(path, "BPF_PROG_DETACH", detached);
     }
 }
 
@@ -3488,7 +3740,7 @@ test "linux v1 creates seeds writes joins and deletes each hierarchy" {
     const replacement = (try walkCgroup(first.root.?, path, false, &.{})).?;
     closeFd(replacement);
 
-    const resources: Resources = .{
+    var resources: Resources = .{
         .memory = .{ .limit = 67108864, .reservation = 33554432, .swap = 134217728, .swappiness = 50 },
         .cpu = .{ .shares = 1024, .period = 100000, .quota = 50000 },
         .pids = .{ .limit = 32 },
@@ -3497,6 +3749,20 @@ test "linux v1 creates seeds writes joins and deletes each hierarchy" {
         .network = .{ .class_id = 1048577, .priorities = &.{.{ .name = "lo", .priority = 2 }} },
         .devices = &.{.{ .allow = false }},
     };
+    // blkio.weight and blkio.bfq.weight depend on the I/O scheduler.
+    for (hierarchies) |hierarchy| {
+        if (!hierarchy.has("blkio")) continue;
+        var has_weight = false;
+        for ([_][:0]const u8{ "blkio.weight", "blkio.bfq.weight" }) |name| {
+            const result = linux.faccessat(hierarchy.leaf.?, name, linux.F_OK, 0);
+            switch (linux.errno(result)) {
+                .SUCCESS => has_weight = true,
+                .NOENT => {},
+                else => try checkResult(result),
+            }
+        }
+        if (!has_weight) resources.block_io.?.weight = null;
+    }
     const writes = try v1Writes(allocator, resources, &.{});
     defer freeV1Writes(allocator, writes);
     try applyV1Writes(allocator, hierarchies, writes, resources, &.{}, path);
@@ -3676,6 +3942,279 @@ test "linux v1 container allowlist opens dev null while a denied device fails" {
     // Delete must rediscover hierarchies even when the saved init PID is gone.
     try backend.delete(.{ .id = handle.id, .pid = 0, .starttime = "", .cgroup_path = path });
     try std.testing.expect(!try backend.alive(handle));
+}
+
+test "linux v2 container device filter preserves defaults and replaces unlisted device policy on update" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const root = openCgroupRoot() catch return error.SkipZigTest;
+    defer closeFd(root.fd);
+    if (root.mode != .unified) return error.SkipZigTest;
+    try requireTestMountNamespace();
+    const device_probe = openPath(linux.AT.FDCWD, "/dev/loop-control", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }) catch return error.SkipZigTest;
+    closeFd(device_probe);
+    const allocator = std.testing.allocator;
+    const path = try std.fmt.allocPrint(allocator, "igvano-v2-devices-{d}", .{linux.getpid()});
+    defer allocator.free(path);
+    // Probe delegation before create; filter failures must fail the test.
+    const probe = (walkCgroup(root.fd, path, true, &.{}) catch |err| switch (err) {
+        error.PermissionDenied => return error.SkipZigTest,
+        else => return err,
+    }).?;
+    closeFd(probe);
+    try removeCgroup(root.fd, path);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "rootfs/dev");
+    const base = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer allocator.free(base);
+    const absolute = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, base, allocator);
+    defer allocator.free(absolute);
+    const rootfs = try std.fmt.allocPrint(allocator, "{s}/rootfs", .{absolute});
+    defer allocator.free(rootfs);
+    const fifo = try std.fmt.allocPrintSentinel(allocator, "{s}/exec.fifo", .{absolute}, 0);
+    defer allocator.free(fifo);
+    try checkResult(linux.mknod(fifo, linux.S.IFIFO | 0o600, 0));
+    const rules = [_]Resources.DeviceRule{
+        .{ .allow = false },
+        .{ .allow = true, .kind = .char, .major = 1, .minor = 3 },
+        .{ .allow = true, .kind = .char, .major = 10, .minor = 237 },
+    };
+    const spec: oci.Spec = .{
+        .ociVersion = "1.0.2",
+        .root = .{ .path = "rootfs" },
+        .linux = .{ .namespaces = &.{.{ .type = .mount }} },
+    };
+    var implementation: LinuxBackend = .{};
+    const backend = implementation.backend();
+    var original_memlock: linux.rlimit = undefined;
+    try checkResult(linux.getrlimit(.MEMLOCK, &original_memlock));
+    const limited_memlock: linux.rlimit = .{ .cur = @min(original_memlock.cur, 64 * 1024), .max = original_memlock.max };
+    try checkResult(linux.setrlimit(.MEMLOCK, &limited_memlock));
+    defer _ = linux.setrlimit(.MEMLOCK, &original_memlock);
+    const handle = try backend.create(.{
+        .allocator = allocator,
+        .id = "v2-devices",
+        .rootfs = rootfs,
+        .exec_fifo = fifo,
+        .spec = &spec,
+        .cgroup_path = path,
+        .devices = &.{.{ .path = "/dev/null", .kind = .character, .major = 1, .minor = 3 }},
+        .mounts = &.{
+            .{ .destination = "/dev", .source = "tmpfs", .type = "tmpfs", .flags = linux.MS.NOSUID, .propagation = 0, .data = "mode=755" },
+            .{ .destination = "/dev/pts", .source = "devpts", .type = "devpts", .flags = linux.MS.NOSUID | linux.MS.NOEXEC, .propagation = 0, .data = "newinstance,ptmxmode=666,mode=620" },
+        },
+        .device_symlinks = &.{.{ .path = "/dev/ptmx", .target = "pts/ptmx" }},
+        .resources = .{ .devices = rules[0..2] },
+    });
+    defer allocator.free(handle.starttime);
+    defer {
+        backend.kill(handle, 9) catch {};
+        backend.delete(handle) catch {};
+    }
+    var inherited_memlock: linux.rlimit = undefined;
+    try checkResult(linux.prlimit(handle.pid, .MEMLOCK, null, &inherited_memlock));
+    try std.testing.expectEqual(limited_memlock.cur, inherited_memlock.cur);
+    try std.testing.expectEqual(limited_memlock.max, inherited_memlock.max);
+    const cgroup = (try walkCgroup(root.fd, path, false, &.{})).?;
+    defer closeFd(cgroup);
+    var buffer: [64]u8 = undefined;
+    const ns_path = try std.fmt.bufPrintZ(&buffer, "/proc/{d}/ns/mnt", .{handle.pid});
+    const namespace = try openPath(linux.AT.FDCWD, ns_path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true });
+    defer closeFd(namespace);
+    const root_path = try std.fmt.bufPrintZ(&buffer, "/proc/{d}/root", .{handle.pid});
+    const init_root = try openPath(linux.AT.FDCWD, root_path, .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true });
+    defer closeFd(init_root);
+    try checkV2TestDevices(cgroup, namespace, init_root, false);
+    try checkV2TestDefaultDevices(cgroup, namespace, init_root);
+    try backend.update(handle, .{});
+    try checkV2TestDevices(cgroup, namespace, init_root, false);
+    try backend.update(handle, .{ .devices = &rules });
+    try checkV2TestDevices(cgroup, namespace, init_root, true);
+    try backend.update(handle, .{ .devices = &rules });
+    try checkV2TestDevices(cgroup, namespace, init_root, true);
+    try backend.update(handle, .{ .devices = &.{.{ .allow = false }} });
+    try checkV2TestDevices(cgroup, namespace, init_root, false);
+    try checkV2TestDefaultDevices(cgroup, namespace, init_root);
+    // An unrestricted update must also replace the old restrictive program.
+    try backend.update(handle, .{ .devices = &.{.{ .allow = true }} });
+    const ids = try queryDevicePrograms(allocator, cgroup, path);
+    defer allocator.free(ids);
+    try std.testing.expectEqual(@as(usize, 1), ids.len);
+    var actual_memlock: linux.rlimit = undefined;
+    try checkResult(linux.getrlimit(.MEMLOCK, &actual_memlock));
+    try std.testing.expectEqual(limited_memlock.cur, actual_memlock.cur);
+    try std.testing.expectEqual(limited_memlock.max, actual_memlock.max);
+}
+
+fn checkV2TestDevices(cgroup: posix.fd_t, namespace: posix.fd_t, root: posix.fd_t, allowed: bool) !void {
+    const ids = try queryDevicePrograms(std.testing.allocator, cgroup, "device-test");
+    defer std.testing.allocator.free(ids);
+    try std.testing.expectEqual(@as(usize, 1), ids.len);
+    const pid = try forkProcess();
+    if (pid == 0) {
+        checkResult(linux.setns(namespace, linux.CLONE.NEWNS)) catch linux.exit_group(1);
+        checkResult(linux.fchdir(root)) catch linux.exit_group(2);
+        checkResult(linux.chroot(".")) catch linux.exit_group(3);
+        checkResult(linux.chdir("/")) catch linux.exit_group(4);
+        // Seed a visible node from outside the container's device cgroup.
+        const created = linux.errno(linux.mknod("/dev/denied", linux.S.IFCHR | 0o600, (10 << 8) | 237));
+        if (created != .SUCCESS and created != .EXIST) linux.exit_group(5);
+        _ = linux.unlink("/dev/denied-new");
+        writeCgroupFile(cgroup, "cgroup.procs", "0", "device-test") catch linux.exit_group(6);
+        const null_fd = openPath(linux.AT.FDCWD, "/dev/null", .{ .ACCMODE = .RDWR, .CLOEXEC = true }) catch linux.exit_group(7);
+        closeFd(null_fd);
+        const zero_node = linux.errno(linux.mknod("/dev/zero", linux.S.IFCHR | 0o600, 0x105));
+        if (zero_node != .SUCCESS and zero_node != .EXIST) linux.exit_group(11);
+        const zero = openPath(linux.AT.FDCWD, "/dev/zero", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }) catch linux.exit_group(12);
+        closeFd(zero);
+        const denied = linux.open("/dev/denied", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+        if (linux.errno(denied) != (if (allowed) linux.E.SUCCESS else linux.E.PERM)) linux.exit_group(8);
+        if (allowed) closeFd(@intCast(denied));
+        const node = linux.errno(linux.mknod("/dev/zero-new", linux.S.IFCHR | 0o600, 0x105));
+        if (node != .SUCCESS and node != .EXIST) linux.exit_group(13);
+        const denied_node = linux.errno(linux.mknod("/dev/denied-new", linux.S.IFCHR | 0o600, (10 << 8) | 237));
+        // Runc's defaults permit mknod even for devices denied read/write.
+        if (denied_node != .SUCCESS) linux.exit_group(9);
+        linux.exit_group(0);
+    }
+    try std.testing.expectEqual(@as(u32, 0), try waitChild(pid));
+}
+
+fn checkV2TestDefaultDevices(cgroup: posix.fd_t, namespace: posix.fd_t, root: posix.fd_t) !void {
+    const pid = try forkProcess();
+    if (pid == 0) {
+        checkResult(linux.setns(namespace, linux.CLONE.NEWNS)) catch linux.exit_group(1);
+        checkResult(linux.fchdir(root)) catch linux.exit_group(2);
+        checkResult(linux.chroot(".")) catch linux.exit_group(3);
+        checkResult(linux.chdir("/")) catch linux.exit_group(4);
+        writeCgroupFile(cgroup, "cgroup.procs", "0", "default-device-test") catch linux.exit_group(5);
+        for ([_]struct { path: [:0]const u8, dev: u32 }{
+            .{ .path = "/dev/null", .dev = 0x103 },
+            .{ .path = "/dev/zero", .dev = 0x105 },
+            .{ .path = "/dev/full", .dev = 0x107 },
+            .{ .path = "/dev/random", .dev = 0x108 },
+            .{ .path = "/dev/urandom", .dev = 0x109 },
+        }) |device| {
+            const err = linux.errno(linux.mknod(device.path, linux.S.IFCHR | 0o666, device.dev));
+            if (err != .SUCCESS and err != .EXIST) linux.exit_group(6);
+            const fd = openPath(linux.AT.FDCWD, device.path, .{ .ACCMODE = .RDWR, .CLOEXEC = true }) catch linux.exit_group(7);
+            closeFd(fd);
+        }
+        // Opening ptmx and its peer exercises both 5:2 and 136:*.
+        const controller = openPath(linux.AT.FDCWD, "/dev/ptmx", .{ .ACCMODE = .RDWR, .NOCTTY = true, .CLOEXEC = true }) catch linux.exit_group(8);
+        var unlock: i32 = 0;
+        checkResult(linux.ioctl(controller, linux.T.IOCSPTLCK, @intFromPtr(&unlock))) catch linux.exit_group(9);
+        var number: u32 = 0;
+        checkResult(linux.ioctl(controller, linux.T.IOCGPTN, @intFromPtr(&number))) catch linux.exit_group(10);
+        var buffer: [64]u8 = undefined;
+        const path = std.fmt.bufPrintZ(&buffer, "/dev/pts/{d}", .{number}) catch linux.exit_group(11);
+        const peer = openPath(linux.AT.FDCWD, path, .{ .ACCMODE = .RDWR, .NOCTTY = true, .CLOEXEC = true }) catch linux.exit_group(12);
+        checkResult(linux.setsid()) catch linux.exit_group(13);
+        checkResult(linux.ioctl(peer, linux.T.IOCSCTTY, 0)) catch linux.exit_group(14);
+        const tty_node = linux.errno(linux.mknod("/dev/tty", linux.S.IFCHR | 0o666, 0x500));
+        if (tty_node != .SUCCESS and tty_node != .EXIST) linux.exit_group(15);
+        const tty = openPath(linux.AT.FDCWD, "/dev/tty", .{ .ACCMODE = .RDWR, .CLOEXEC = true }) catch linux.exit_group(16);
+        closeFd(tty);
+        const console_node = linux.errno(linux.mknod("/dev/console", linux.S.IFCHR | 0o600, 0x501));
+        if (console_node != .SUCCESS and console_node != .EXIST) linux.exit_group(17);
+        // Console is not in runc's built-in defaults.
+        const console_fd = linux.open("/dev/console", .{ .ACCMODE = .RDWR, .NOCTTY = true, .CLOEXEC = true }, 0);
+        if (linux.errno(console_fd) != .PERM) linux.exit_group(18);
+        linux.exit_group(0);
+    }
+    try std.testing.expectEqual(@as(u32, 0), try waitChild(pid));
+}
+
+test "linux v2 device filter fails closed when bpf is forbidden in the initial user namespace" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var stat: linux.Statx = undefined;
+    try checkResult(linux.statx(linux.AT.FDCWD, "/proc/self/ns/user", 0, .{ .INO = true }, &stat));
+    if (!stat.mask.INO or stat.ino != 0xeffffffd) return error.SkipZigTest;
+    const root = openCgroupRoot() catch return error.SkipZigTest;
+    closeFd(root.fd);
+    if (root.mode != .unified) return error.SkipZigTest;
+    const pid = try forkProcess();
+    if (pid == 0) {
+        const filters = [_]seccomp.Filter{
+            .{ .code = 0x20, .k = 0 }, // seccomp_data.nr
+            .{ .code = 0x15, .jf = 1, .k = @intFromEnum(linux.SYS.bpf) },
+            .{ .code = 0x06, .k = 0x00050001 }, // EPERM
+            .{ .code = 0x06, .k = 0x7fff0000 }, // ALLOW
+        };
+        var original: linux.rlimit = undefined;
+        checkResult(linux.getrlimit(.MEMLOCK, &original)) catch linux.exit_group(6);
+        const limited: linux.rlimit = .{ .cur = 0, .max = original.max };
+        checkResult(linux.setrlimit(.MEMLOCK, &limited)) catch linux.exit_group(7);
+        checkResult(linux.prctl(@intFromEnum(linux.PR.SET_NO_NEW_PRIVS), 1, 0, 0, 0)) catch linux.exit_group(1);
+        if (seccomp.install(.{ .filters = &filters, .flags = 0 }) != .SUCCESS) linux.exit_group(2);
+        const allocator = std.heap.page_allocator;
+        for ([_][]const Resources.DeviceRule{
+            &.{.{ .allow = true }},
+            &.{.{ .allow = false }},
+            &.{.{ .allow = true, .kind = .char }},
+            &.{ .{ .allow = true }, .{ .allow = true } },
+        }) |rules| {
+            applyV2DeviceFilter(allocator, -1, rules, "bpf-forbidden-test", false) catch |err| {
+                if (err != error.CgroupWriteFailed or
+                    std.mem.indexOf(u8, last_diagnostic[0..last_diagnostic_len], "BPF_PROG_LOAD") == null or
+                    std.mem.indexOf(u8, last_diagnostic[0..last_diagnostic_len], "PERM") == null)
+                    linux.exit_group(4);
+                var actual: linux.rlimit = undefined;
+                checkResult(linux.getrlimit(.MEMLOCK, &actual)) catch linux.exit_group(8);
+                if (actual.cur != limited.cur or actual.max != limited.max) linux.exit_group(9);
+                continue;
+            };
+            linux.exit_group(5);
+        }
+        linux.exit_group(0);
+    }
+    try std.testing.expectEqual(@as(u32, 0), try waitChild(pid));
+}
+
+test "linux v2 device filter ignores load EPERM in a user namespace only without deny rules" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const pid = try forkProcess();
+    if (pid == 0) {
+        const unshared = linux.errno(linux.unshare(linux.CLONE.NEWUSER));
+        if (unshared == .PERM) linux.exit_group(77);
+        if (unshared != .SUCCESS) linux.exit_group(1);
+        const filters = [_]seccomp.Filter{
+            .{ .code = 0x20, .k = 0 },
+            .{ .code = 0x15, .jf = 1, .k = @intFromEnum(linux.SYS.bpf) },
+            .{ .code = 0x06, .k = 0x00050001 }, // EPERM
+            .{ .code = 0x06, .k = 0x7fff0000 },
+        };
+        checkResult(linux.prctl(@intFromEnum(linux.PR.SET_NO_NEW_PRIVS), 1, 0, 0, 0)) catch linux.exit_group(2);
+        if (seccomp.install(.{ .filters = &filters, .flags = 0 }) != .SUCCESS) linux.exit_group(3);
+        const allocator = std.heap.page_allocator;
+        var original: linux.rlimit = undefined;
+        checkResult(linux.getrlimit(.MEMLOCK, &original)) catch linux.exit_group(4);
+        for ([_][]const Resources.DeviceRule{
+            &.{.{ .allow = true, .kind = .char, .major = 1, .minor = 3 }},
+            &.{ .{ .allow = true, .access = "r" }, .{ .allow = true, .access = "w" } },
+        }) |rules| {
+            applyV2DeviceFilter(allocator, -1, rules, "rootless-device-test", false) catch linux.exit_group(5);
+            if (std.mem.indexOf(u8, last_diagnostic[0..last_diagnostic_len], "warning:") == null)
+                linux.exit_group(6);
+        }
+        for ([_][]const Resources.DeviceRule{
+            &.{.{ .allow = false }},
+            &.{ .{ .allow = false }, .{ .allow = true } },
+        }) |rules| {
+            applyV2DeviceFilter(allocator, -1, rules, "rootless-device-test", false) catch |err| {
+                if (err == error.CgroupWriteFailed) continue;
+                linux.exit_group(7);
+            };
+            linux.exit_group(8);
+        }
+        var actual: linux.rlimit = undefined;
+        checkResult(linux.getrlimit(.MEMLOCK, &actual)) catch linux.exit_group(9);
+        if (actual.cur != original.cur or actual.max != original.max) linux.exit_group(10);
+        linux.exit_group(0);
+    }
+    const status = try waitChild(pid);
+    if (status == 77 << 8) return error.SkipZigTest;
+    try std.testing.expectEqual(@as(u32, 0), status);
 }
 
 test "linux v1 missing optional controllers are ignored and required limits fail" {
