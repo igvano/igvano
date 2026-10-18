@@ -226,6 +226,7 @@ fn parseArgsWithLog(args: []const []const u8, log: *?[]const u8, log_format: *Lo
                 }
                 inline for (.{
                     .{ "--cpu-shares", "shares", u64 },
+                    .{ "--cpu-share", "shares", u64 },
                     .{ "--cpu-period", "period", u64 },
                     .{ "--cpu-quota", "quota", i64 },
                     .{ "--cpu-rt-period", "realtimePeriod", u64 },
@@ -690,6 +691,11 @@ fn createContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, c
     const config_json = try std.json.Stringify.valueAlloc(allocator, parsed.value, .{ .emit_null_optional_fields = false });
     defer allocator.free(config_json);
     try oci.atomicWrite(io, saved_config, config_json);
+    const devices_path = try std.fs.path.join(allocator, &.{ state_dir, "devices.json" });
+    defer allocator.free(devices_path);
+    const devices_json = try std.json.Stringify.valueAlloc(allocator, devices, .{});
+    defer allocator.free(devices_json);
+    try oci.atomicWrite(io, devices_path, devices_json);
     const fifo = try std.fs.path.join(allocator, &.{ state_dir, oci.exec_fifo_name });
     defer allocator.free(fifo);
     try makeExecFifo(allocator, fifo);
@@ -910,6 +916,86 @@ fn stateHandle(allocator: std.mem.Allocator, io: std.Io, root: []const u8, state
         .rootfs_mount_id = if (rootfs_mount) |mount| mount.mount_id_unique else null,
         .rootfs_mount_boot_id = if (rootfs_mount) |mount| mount.boot_id else null,
     };
+}
+
+fn loadDeviceNodes(allocator: std.mem.Allocator, io: std.Io, root: []const u8, id: []const u8) ![]const Backend.Device {
+    const path = try std.fs.path.join(allocator, &.{ root, id, "devices.json" });
+    defer allocator.free(path);
+    // Prepared records include defaults and fields absent from compact config.json.
+    const text = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(4 << 20)) catch |err| switch (err) {
+        error.FileNotFound => {
+            // Older containers already captured their create-time config for exec.
+            const saved = oci.loadSpec(allocator, io, std.fs.path.dirname(path).?) catch |load_err| switch (load_err) {
+                error.FileNotFound => return &.{},
+                else => return load_err,
+            };
+            defer saved.deinit();
+            return oci.prepareDevices(allocator, if (saved.value.linux) |settings| settings.devices else null);
+        },
+        else => return err,
+    };
+    defer allocator.free(text);
+    const parsed = std.json.parseFromSlice([]Backend.Device, allocator, text, .{}) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        return oci.validationError(error.InvalidState, "saved device nodes: invalid JSON or schema ({s})", .{@errorName(err)});
+    };
+    defer parsed.deinit();
+    const result = try allocator.alloc(Backend.Device, parsed.value.len);
+    var used: usize = 0;
+    errdefer {
+        for (result[0..used]) |device| allocator.free(device.path);
+        allocator.free(result);
+    }
+    for (parsed.value, result) |device, *copy| {
+        copy.* = device;
+        copy.path = try allocator.dupe(u8, device.path);
+        used += 1;
+    }
+    return result;
+}
+
+test "saved device nodes survive reload and allocation failure, with legacy snapshot fallback" {
+    const AllocationTest = struct {
+        fn run(allocator: std.mem.Allocator, root: []const u8) !void {
+            const nodes = try loadDeviceNodes(allocator, std.testing.io, root, "example");
+            defer oci.freeDevices(allocator, nodes);
+            for (nodes) |node| {
+                if (std.mem.eql(u8, node.path, "/dev/custom")) {
+                    try std.testing.expectEqual(Backend.Device.Kind.character, node.kind);
+                    try std.testing.expectEqual(@as(u32, 10), node.major);
+                    try std.testing.expectEqual(@as(u32, 237), node.minor);
+                    return;
+                }
+            }
+            return error.TestUnexpectedResult;
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const allocator = std.testing.allocator;
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root);
+    try tmp.dir.createDir(std.testing.io, "example", .default_dir);
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "example/devices.json",
+        .data =
+        \\[{"path":"/dev/custom","kind":"character","major":10,"minor":237}]
+        ,
+    });
+    try AllocationTest.run(allocator, root);
+    try std.testing.checkAllAllocationFailures(allocator, AllocationTest.run, .{root});
+    try tmp.dir.deleteFile(std.testing.io, "example/devices.json");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "example/config.json",
+        .data =
+        \\{"ociVersion":"1.0.2","root":{"path":"/"},"linux":{"devices":[{"path":"/dev/custom","type":"c","major":10,"minor":237}]}}
+        ,
+    });
+    try AllocationTest.run(allocator, root);
+    try std.testing.checkAllAllocationFailures(allocator, AllocationTest.run, .{root});
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "example/devices.json", .data = "{" });
+    defer oci.clearDiagnostic();
+    try std.testing.expectError(error.InvalidState, loadDeviceNodes(allocator, std.testing.io, root, "example"));
 }
 
 fn loadCgroupPath(allocator: std.mem.Allocator, io: std.Io, root: []const u8, id: []const u8) !?[]u8 {
@@ -1170,30 +1256,21 @@ fn execContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, con
     if (comptime builtin.os.tag != .linux) return error.NotImplemented;
     const linux = std.os.linux;
     if (!config.detach) {
-        // Reserve stdin/stdout before locks, console sockets, or the signal
+        // Reserve stdio before locks, console sockets, or the signal
         // pipe can reuse their numbers and become attached-loop I/O.
-        for ([_]std.posix.fd_t{ 0, 1 }) |fd| {
+        for ([_]std.posix.fd_t{ 0, 1, 2 }) |fd| {
             switch (linux.errno(linux.fcntl(fd, linux.F.GETFD, 0))) {
                 .SUCCESS => continue,
                 .BADF => {},
                 else => return error.ConsoleFailed,
             }
-            const null_fd: std.posix.fd_t = while (true) {
+            // open returns the lowest free fd; earlier stdio slots are reserved.
+            while (true) {
                 const opened = linux.open("/dev/null", .{ .ACCMODE = .RDWR }, 0);
                 switch (linux.errno(opened)) {
-                    .SUCCESS => break @intCast(opened),
+                    .SUCCESS => break,
                     .INTR => continue,
                     else => return error.ConsoleFailed,
-                }
-            };
-            if (null_fd != fd) {
-                defer _ = linux.close(null_fd);
-                while (true) {
-                    switch (linux.errno(linux.dup2(null_fd, fd))) {
-                        .SUCCESS => break,
-                        .INTR => continue,
-                        else => return error.ConsoleFailed,
-                    }
                 }
             }
         }
@@ -1269,6 +1346,8 @@ fn execContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, con
     defer if (!config.detach) {
         _ = linux.prctl(@intFromEnum(linux.PR.SET_CHILD_SUBREAPER), was_subreaper, 0, 0, 0);
     };
+    var signals: ?attached.Signals = if (!config.detach) try attached.Signals.init() else null;
+    defer if (signals) |*handler| handler.deinit();
     const pid = try backendResult(backend, backend.exec(state.handle.?, options));
     var reaped = false;
     errdefer if (!reaped) {
@@ -1298,9 +1377,7 @@ fn execContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, con
         }
     }
     if (config.detach) return 0;
-    var signals = try attached.Signals.init();
-    defer signals.deinit();
-    return try attached.wait(pid, &reaped, &signals, controller, 0, 1);
+    return try attached.wait(pid, &reaped, &signals.?, controller, 0, 1);
 }
 
 fn waitExec(pid: i32) !u8 {
@@ -1316,6 +1393,65 @@ fn waitExec(pid: i32) !u8 {
             .INTR => continue,
             else => return error.WaitFailed,
         }
+    }
+}
+
+test "attached exec catches signals inside backend exec while detached exec has no handler" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const linux = std.os.linux;
+    const TestBackend = struct {
+        var detached = false;
+
+        fn exec(_: *anyopaque, _: Backend.Handle, _: Backend.ExecOptions) Backend.Error!i32 {
+            for ([_]linux.SIG{ .TERM, .HUP }) |signal| {
+                var action: linux.Sigaction = undefined;
+                if (linux.errno(linux.sigaction(signal, null, &action)) != .SUCCESS)
+                    return error.ExecFailed;
+                if ((action.handler.handler == linux.SIG.DFL) != detached)
+                    return error.InvalidProcess;
+                // Delivered before backend.exec returns; the attached frontend
+                // must already supervise signals even on the failure path.
+                if (!detached) _ = linux.kill(@intCast(linux.getpid()), signal);
+            }
+            return error.ExecFailed;
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const allocator = std.testing.allocator;
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root);
+    try tmp.dir.createDir(std.testing.io, "example", .default_dir);
+    try oci.saveState(allocator, std.testing.io, root, .{ .id = "example", .status = .running, .pid = 1234, .bundle = "/unused" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "example/starttime", .data = "alive" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "example/cgroup", .data = "example" });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "process.json",
+        .data =
+        \\{"args":["true"],"cwd":"/","user":{"uid":0,"gid":0}}
+        ,
+    });
+    const process_file = try std.fs.path.join(allocator, &.{ root, "process.json" });
+    defer allocator.free(process_file);
+    for ([_]bool{ false, true }) |detached| {
+        const forked = std.posix.system.fork();
+        if (std.posix.errno(forked) != .SUCCESS) return error.SystemResources;
+        const pid: i32 = @intCast(forked);
+        if (pid == 0) {
+            TestBackend.detached = detached;
+            const action: linux.Sigaction = .{ .handler = .{ .handler = linux.SIG.DFL }, .mask = linux.sigemptyset(), .flags = 0 };
+            for ([_]linux.SIG{ .TERM, .HUP }) |signal| _ = linux.sigaction(signal, &action, null);
+            var threaded: std.Io.Threaded = .init_single_threaded;
+            var implementation: LockTestBackend = .{};
+            var vtable = LockTestBackend.vtable;
+            vtable.exec = TestBackend.exec;
+            const backend: Backend = .{ .ptr = &implementation, .vtable = &vtable };
+            const config: Config = .{ .root = root, .id = "example", .subcommand = .exec, .process_file = process_file, .detach = detached };
+            _ = execContainer(std.heap.page_allocator, threaded.io(), backend, config) catch |err|
+                linux.exit_group(if (err == error.ExecFailed) 0 else 1);
+            linux.exit_group(2);
+        }
+        try std.testing.expectEqual(@as(u8, 0), try waitExec(pid));
     }
 }
 
@@ -1436,7 +1572,10 @@ fn updateContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, c
     const state = try readLiveState(allocator, io, backend, config, locked);
     defer state.deinit();
     try oci.requireUpdate(state.parsed.value.status);
-    try backendResult(backend, backend.update(state.handle.?, resources));
+    var handle = state.handle.?;
+    handle.device_nodes = try loadDeviceNodes(allocator, io, config.root, config.id);
+    defer oci.freeDevices(allocator, handle.device_nodes);
+    try backendResult(backend, backend.update(handle, resources));
 }
 
 fn filterPsOutput(allocator: std.mem.Allocator, text: []const u8, pids: []const i32) ![]u8 {
@@ -2969,7 +3108,7 @@ fn testAttachedExec(allocator: std.mem.Allocator, io: std.Io, root: []const u8) 
     if (std.posix.errno(closed_runner) != .SUCCESS) return error.SystemResources;
     const closed_pid: i32 = @intCast(closed_runner);
     if (closed_pid == 0) {
-        _ = linux.close(0);
+        for ([_]std.posix.fd_t{ 0, 1, 2 }) |fd| _ = linux.close(fd);
         var threaded: std.Io.Threaded = .init_single_threaded;
         var backend: backend_module.LinuxBackend = .{};
         const status = execContainer(std.heap.page_allocator, threaded.io(), backend.backend(), closed_stdin) catch linux.exit_group(1);
@@ -4348,6 +4487,13 @@ test "update flags translate units unlimited and explicit zero to OCI resource f
     try std.testing.expectEqual(@as(?i64, -1), resources.memory.?.swap);
     try std.testing.expectEqual(@as(?i64, 1073741824), resources.memory.?.kernel);
     try std.testing.expectEqual(@as(?u64, 512), resources.cpu.?.shares);
+    for ([_][]const []const u8{
+        &.{ "igvano", "update", "--cpu-share", "512", "example" },
+        &.{ "igvano", "update", "--cpu-share=512", "example" },
+    }) |args| {
+        const alias = try parseArgs(args);
+        try std.testing.expectEqual(config.resource_flags.cpu.?.shares, alias.resource_flags.cpu.?.shares);
+    }
     try std.testing.expectEqual(@as(?u64, 100000), resources.cpu.?.period);
     try std.testing.expectEqual(@as(?i64, -1), resources.cpu.?.quota);
     try std.testing.expectEqual(@as(?u64, 1000000), resources.cpu.?.realtime_period);
@@ -4406,7 +4552,9 @@ test "resource JSON ignores individual flags regardless of argument order" {
     const TestBackend = struct {
         var empty = false;
 
-        fn update(_: *anyopaque, _: Backend.Handle, resources: Backend.Resources) Backend.Error!void {
+        fn update(_: *anyopaque, handle: Backend.Handle, resources: Backend.Resources) Backend.Error!void {
+            if (handle.device_nodes.len != 1 or handle.device_nodes[0].major != 10 or
+                handle.device_nodes[0].minor != 237) return error.InvalidConfig;
             check(resources) catch return error.InvalidConfig;
         }
 
@@ -4440,6 +4588,12 @@ test "resource JSON ignores individual flags regardless of argument order" {
         .bundle = "/unused",
     });
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "example/starttime", .data = "alive" });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "example/devices.json",
+        .data =
+        \\[{"path":"/dev/custom","kind":"character","major":10,"minor":237}]
+        ,
+    });
     var implementation: LockTestBackend = .{};
     var vtable = LockTestBackend.vtable;
     vtable.update = TestBackend.update;
@@ -4735,6 +4889,9 @@ test "create uses private state directories and preserves existing root permissi
             const stat = std.Io.Dir.cwd().statFile(std.testing.io, state_dir, .{}) catch return error.InvalidPath;
             // Inspect the real directory before setup failure rolls it back.
             self.state_mode = stat.permissions.toMode() & 0o7777;
+            const device_nodes = loadDeviceNodes(std.testing.allocator, std.testing.io, std.fs.path.dirname(state_dir).?, options.id) catch return error.InvalidConfig;
+            defer oci.freeDevices(std.testing.allocator, device_nodes);
+            std.testing.expectEqualDeep(options.devices, device_nodes) catch return error.InvalidConfig;
             return error.NotImplemented;
         }
         fn alive(_: *anyopaque, _: Backend.Handle) Backend.Error!bool {
@@ -4753,7 +4910,7 @@ test "create uses private state directories and preserves existing root permissi
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "bundle/config.json",
         .data =
-        \\{"ociVersion":"1.0.2","root":{"path":"/"},"linux":{"namespaces":[{"type":"mount"}]}}
+        \\{"ociVersion":"1.0.2","root":{"path":"/"},"linux":{"namespaces":[{"type":"mount"}],"devices":[{"path":"/dev/custom","type":"c","major":10,"minor":237}]}}
         ,
     });
     const base = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
@@ -6491,10 +6648,10 @@ fn testSystemdLifecycleDeletion(base: []const u8, kill_before_delete: bool) !voi
         try updateContainer(allocator, io, backend, update);
         const reload_updated = try std.process.run(allocator, io, .{ .argv = &.{ "systemctl", "daemon-reload" } });
         try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, reload_updated.term);
-        try checkSystemdV1Devices(allocator, io, path, "c 10:239 rw\n", null);
+        // Create-time linux.devices allows survive explicit resource updates.
+        try checkSystemdV1Devices(allocator, io, path, "c 10:239 rw\n", "c 10:238 rwm\n");
         const devices = try readTestCgroup(allocator, io, try std.fmt.allocPrint(allocator, "/sys/fs/cgroup/devices/{s}/devices.list", .{path}));
         try std.testing.expect(std.mem.indexOf(u8, devices, "10:237") == null);
-        try std.testing.expect(std.mem.indexOf(u8, devices, "10:238") == null);
         // Privileged allow-all containers also need memory-only updates to work.
         try cwd.writeFile(io, .{ .sub_path = update_path, .data = "{\"devices\":[{\"allow\":true}]}" });
         try updateContainer(allocator, io, backend, update);

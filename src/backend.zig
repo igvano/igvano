@@ -229,6 +229,9 @@ pub const Backend = struct {
         rootfs_mount_id: ?u64 = null,
         /// Kernel boot ID, since unique mount IDs reset on reboot.
         rootfs_mount_boot_id: ?[36]u8 = null,
+        /// Create-time device nodes, restored by the frontend for updates.
+        /// Borrowed; only their type and numbers enter the device policy.
+        device_nodes: []const Device = &.{},
     };
 
     pub const Error = error{

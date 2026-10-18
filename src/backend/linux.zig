@@ -8,6 +8,7 @@ const oci = @import("../oci.zig");
 const hooks = @import("hooks.zig");
 const seccomp = @import("seccomp.zig");
 const devicefilter = @import("devicefilter.zig");
+const devices_emulator = @import("devices.zig");
 const dbus = @import("dbus.zig");
 
 // runc libcontainer/specconv.AllowedDevices; /dev/console (5:1) is not included.
@@ -26,6 +27,7 @@ const default_device_rules = [_]Resources.DeviceRule{
 };
 test {
     _ = devicefilter;
+    _ = devices_emulator;
     _ = dbus;
 }
 
@@ -129,8 +131,8 @@ fn v1Limit(allocator: std.mem.Allocator, limit: i64) Backend.Error![]u8 {
 // Null devices selects update: replace an explicit ruleset, leave an omitted one alone.
 fn v1Writes(allocator: std.mem.Allocator, resources: Resources, devices: ?[]const Backend.Device) Backend.Error![]V1Write {
     if (resources.unified.len != 0) return error.InvalidConfig;
-    const policy = try normalizeDeviceRules(allocator, resources.devices, .legacy);
-    defer allocator.free(policy.entries);
+    var policy = try deviceEmulator(allocator, resources.devices);
+    defer policy.deinit(allocator);
     var writes: std.ArrayList(V1Write) = .empty;
     defer writes.deinit(allocator);
     errdefer for (writes.items) |write| {
@@ -232,8 +234,6 @@ fn v1Writes(allocator: std.mem.Allocator, resources: Resources, devices: ?[]cons
             try appendV1Write(allocator, &writes, "net_prio", "net_prio.ifpriomap", try std.fmt.allocPrint(allocator, "{s} {d}", .{ priority.name, priority.priority }), null, false);
         }
     }
-    if (devices == null and resources.devices.len != 0)
-        try appendV1Write(allocator, &writes, "devices", "devices.deny", try allocator.dupe(u8, "a *:* rwm"), null, false);
     for (resources.devices) |rule|
         try appendV1DeviceRule(allocator, &writes, rule);
     if (devices != null or resources.devices.len != 0) {
@@ -511,8 +511,9 @@ test "v1 wildcard device rules permit exact subtraction and nonoverlapping denie
     }) |rules| {
         const writes = try v1Writes(std.testing.allocator, .{ .devices = rules }, null);
         defer freeV1Writes(std.testing.allocator, writes);
-        try std.testing.expectEqualStrings("devices.deny", writes[0].name);
-        try std.testing.expectEqualStrings("a *:* rwm", writes[0].value);
+        // Mapping retains the inputs; only the writer computes a transition.
+        try std.testing.expectEqualStrings("devices.allow", writes[0].name);
+        try std.testing.expectEqual(rules.len + default_device_rules.len, writes.len);
     }
 }
 
@@ -599,12 +600,10 @@ test "resource updates write only requested limits and replace explicit v1 devic
         .devices = &.{.{ .allow = true, .kind = .block, .major = 8, .minor = 0, .access = "rw" }},
     }, null);
     defer freeV1Writes(std.testing.allocator, devices);
-    try std.testing.expectEqualStrings("devices.deny", devices[0].name);
-    try std.testing.expectEqualStrings("a *:* rwm", devices[0].value);
-    try std.testing.expectEqualStrings("devices.allow", devices[1].name);
-    try std.testing.expectEqualStrings("b 8:0 rw", devices[1].value);
-    try std.testing.expectEqualStrings("c *:* m", devices[2].value);
-    try std.testing.expectEqualStrings("c 1:3 rwm", devices[4].value);
+    try std.testing.expectEqualStrings("devices.allow", devices[0].name);
+    try std.testing.expectEqualStrings("b 8:0 rw", devices[0].value);
+    try std.testing.expectEqualStrings("c *:* m", devices[1].value);
+    try std.testing.expectEqualStrings("c 1:3 rwm", devices[3].value);
 }
 
 test "v1 mapping and hierarchy discovery release partial allocations" {
@@ -2286,6 +2285,7 @@ pub const LinuxBackend = struct {
                 .starttime = starttime,
                 .cgroup_path = options.cgroup_path,
                 .systemd = options.systemd,
+                .device_nodes = options.devices,
                 .rootfs_mount = if (private_mount_namespace) null else options.rootfs,
                 .rootfs_mount_id = rootfs_mount_id,
                 .rootfs_mount_boot_id = rootfs_mount_boot_id,
@@ -2321,6 +2321,7 @@ pub const LinuxBackend = struct {
                 .starttime = owned_starttime,
                 .cgroup_path = options.cgroup_path,
                 .systemd = options.systemd,
+                .device_nodes = options.devices,
                 .rootfs_mount = if (private_mount_namespace) null else options.rootfs,
                 .rootfs_mount_id = rootfs_mount_id,
                 .rootfs_mount_boot_id = rootfs_mount_boot_id,
@@ -2457,10 +2458,8 @@ pub const LinuxBackend = struct {
                 reportDiagnostic("unified resources require cgroup v2", .{});
                 return error.InvalidConfig;
             }
-            const writes = try v1Writes(allocator, resources, null);
+            const writes = try v1Writes(allocator, resources, if (resources.devices.len != 0) handle.device_nodes else null);
             defer freeV1Writes(allocator, writes);
-            // ponytail: Deny-all then allows briefly blocks device opens, and
-            // partial lists drop create-time allows. Upgrade to runc's devices emulator.
             const hierarchies = try openV1Hierarchies(allocator, handle.systemd);
             defer freeV1Hierarchies(allocator, hierarchies);
             for (hierarchies) |*hierarchy|
@@ -2469,7 +2468,7 @@ pub const LinuxBackend = struct {
             var device_rules: []const Resources.DeviceRule = &.{};
             defer allocator.free(device_rules);
             if (handle.systemd and resources.devices.len != 0) {
-                device_rules = try v2DeviceRules(allocator, resources.devices, &.{});
+                device_rules = try v2DeviceRules(allocator, resources.devices, handle.device_nodes);
             }
             if (handle.systemd) if (requested.cpu) |cpu| {
                 if ((cpu.quota != null or cpu.period != null) and (cpu.quota == null or cpu.period == null)) {
@@ -2490,7 +2489,7 @@ pub const LinuxBackend = struct {
                 }
             };
             try setSystemdResources(allocator, handle, requested, .legacy, false, device_rules);
-            try applyV1Writes(allocator, hierarchies, writes, resources, &.{}, path);
+            try applyV1Writes(allocator, hierarchies, writes, resources, handle.device_nodes, path);
         } else {
             var requested = resources;
             var inferred_memory_limit = false;
@@ -2552,9 +2551,7 @@ pub const LinuxBackend = struct {
                 try writeCgroupFile(cgroup, write.name, write.value, path);
             }
             if (resources.devices.len != 0) {
-                // Like v1, update re-appends only built-in defaults, not the
-                // container's linux.devices entries.
-                const rules = try v2DeviceRules(allocator, resources.devices, &.{});
+                const rules = try v2DeviceRules(allocator, resources.devices, handle.device_nodes);
                 defer allocator.free(rules);
                 try applyV2DeviceFilter(allocator, cgroup, rules, path, true);
             }
@@ -2974,7 +2971,6 @@ fn readCgroupFile(allocator: std.mem.Allocator, dir: posix.fd_t, filename: [:0]c
 fn v2DeviceRules(allocator: std.mem.Allocator, rules: []const Resources.DeviceRule, devices: []const Backend.Device) Backend.Error![]Resources.DeviceRule {
     var result: std.ArrayList(Resources.DeviceRule) = .empty;
     defer result.deinit(allocator);
-    if (rules.len == 0) try result.append(allocator, .{ .allow = false });
     try result.appendSlice(allocator, rules);
     try result.appendSlice(allocator, &default_device_rules);
     for (devices) |device| {
@@ -3051,20 +3047,18 @@ fn deviceBpfError(path: []const u8, operation: []const u8, err: linux.E) Backend
 }
 
 fn skipDeviceBpfError(rules: []const Resources.DeviceRule, path: []const u8, operation: []const u8, err: linux.E) bool {
-    // Stricter than runc's canSkipEBPFError: fail closed on any deny rule,
-    // even inside a user namespace.
-    if (err != .PERM) return false;
-    for (rules) |rule| {
-        if (!rule.allow) return false;
-    }
-    var stat: linux.Statx = undefined;
-    if (linux.errno(linux.statx(linux.AT.FDCWD, "/proc/self/ns/user", 0, .{ .INO = true }, &stat)) != .SUCCESS)
-        return false;
-    // PROC_USER_INIT_INO identifies the initial user namespace, even when
-    // /proc/1 belongs to the same nested namespace as this process.
-    if (!stat.mask.INO or stat.ino == 0xeffffffd) return false;
-    reportDiagnostic("warning: cgroup '{s}' {s}(BPF_CGROUP_DEVICE): EPERM in a user namespace; proceeding without a device filter", .{ path, operation });
+    // Match runc's canSkipEBPFError for every load/attach errno: userns always
+    // permits skipping, otherwise every original rule must allow full rwm.
+    if (!devices_emulator.canSkipEBPFError(runningInUserNamespace(), rules)) return false;
+    reportDiagnostic("warning: cgroup '{s}' {s}(BPF_CGROUP_DEVICE): {s}; proceeding without a device filter", .{ path, operation, @tagName(err) });
     return true;
+}
+
+fn runningInUserNamespace() bool {
+    var stat: linux.Statx = undefined;
+    if (linux.errno(linux.statx(linux.AT.FDCWD, "/proc/self/ns/user", 0, .{ .INO = true }, &stat)) != .SUCCESS) return false;
+    // PROC_USER_INIT_INO remains stable even with /proc/1 in a nested namespace.
+    return stat.mask.INO and stat.ino != 0xeffffffd;
 }
 
 /// Query only this cgroup's programs, never effective filters inherited from
@@ -3092,9 +3086,16 @@ fn queryDevicePrograms(allocator: std.mem.Allocator, cgroup: posix.fd_t, path: [
 
 fn applyV2DeviceFilter(allocator: std.mem.Allocator, cgroup: posix.fd_t, rules: []const Resources.DeviceRule, path: []const u8, update: bool) Backend.Error!void {
     const insns = devicefilter.compile(allocator, rules) catch |err| {
-        if (err == error.InvalidConfig)
-            reportDiagnostic("cgroup '{s}' has invalid v2 device rules", .{path});
-        return err;
+        return switch (err) {
+            error.InvalidConfig, error.CannotPunchHole => invalid: {
+                reportDiagnostic("cgroup '{s}' has invalid v2 device rules", .{path});
+                // Reapply solely to retain runc's detailed wildcard-hole error.
+                var emu = try deviceEmulator(allocator, rules);
+                defer emu.deinit(allocator);
+                break :invalid error.InvalidConfig;
+            },
+            else => |other| other,
+        };
     };
     defer allocator.free(insns);
     var log: []u8 = &.{};
@@ -3508,6 +3509,14 @@ fn requiredV1Controller(controller: []const u8, resources: Resources, devices: [
 }
 
 fn applyV1Writes(allocator: std.mem.Allocator, hierarchies: []const V1Hierarchy, writes: []const V1Write, resources: Resources, devices: []const Backend.Device, path: []const u8) Backend.Error!void {
+    var has_devices = false;
+    for (writes) |write| {
+        if (std.mem.eql(u8, write.controller, "devices")) has_devices = true;
+    }
+    const configured = if (has_devices) try v2DeviceRules(allocator, resources.devices, devices) else &.{};
+    defer allocator.free(configured);
+    var target = try deviceEmulator(allocator, configured);
+    defer target.deinit(allocator);
     // Warn once per missing controller, including controllers with many writes.
     for (writes, 0..) |write, index| {
         var mounted = false;
@@ -3544,13 +3553,75 @@ fn applyV1Writes(allocator: std.mem.Allocator, hierarchies: []const V1Hierarchy,
         }
         for (writes, 0..) |write, index| {
             if (!hierarchy.has(write.controller)) continue;
+            if (std.mem.eql(u8, write.controller, "devices")) continue;
             if (swap_first) |swap| {
                 if (index == swap) continue;
                 if (index == limit_write.?) try writeV1Resource(hierarchy.leaf.?, writes[swap], path, &kmem_warned);
             }
             try writeV1Resource(hierarchy.leaf.?, write, path, &kmem_warned);
         }
+        if (has_devices and hierarchy.has("devices") and !runningInUserNamespace()) {
+            const list = try readCgroupFile(allocator, hierarchy.leaf.?, "devices.list");
+            defer allocator.free(list);
+            var current = try deviceEmulatorFromList(allocator, list);
+            defer current.deinit(allocator);
+            const transition = try current.transition(allocator, target);
+            defer allocator.free(transition);
+            var device_writes: std.ArrayList(V1Write) = .empty;
+            defer {
+                for (device_writes.items) |write| {
+                    allocator.free(write.name);
+                    allocator.free(write.value);
+                }
+                device_writes.deinit(allocator);
+            }
+            for (transition) |rule| try appendV1DeviceRule(allocator, &device_writes, rule);
+            for (device_writes.items) |write|
+                try writeV1Resource(hierarchy.leaf.?, write, path, &kmem_warned);
+        }
     }
+}
+
+test "linux v1 device updates write only the transition from devices.list" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (runningInUserNamespace()) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "devices.list",
+        .data =
+        \\c *:* m
+        \\b *:* m
+        \\c 1:3 rwm
+        \\c 1:5 rwm
+        \\c 1:7 rwm
+        \\c 1:8 rwm
+        \\c 1:9 rwm
+        \\c 5:0 rwm
+        \\c 5:2 rwm
+        \\c 136:* rwm
+        \\c 10:200 rwm
+        \\c 10:237 r
+        ,
+    });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "devices.allow", .data = "" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "devices.deny", .data = "untouched" });
+    const resources: Resources = .{ .devices = &.{
+        .{ .allow = true, .kind = .char, .major = 10, .minor = 237, .access = "rw" },
+    } };
+    const writes = try v1Writes(std.testing.allocator, resources, null);
+    defer freeV1Writes(std.testing.allocator, writes);
+    try applyV1Writes(std.testing.allocator, &.{.{
+        .mountpoint = "/test/devices",
+        .controllers = &.{"devices"},
+        .leaf = tmp.dir.handle,
+    }}, writes, resources, &.{}, "test");
+    const allowed = try tmp.dir.readFileAlloc(std.testing.io, "devices.allow", std.testing.allocator, .limited(64));
+    defer std.testing.allocator.free(allowed);
+    try std.testing.expectEqualStrings("c 10:237 w", allowed);
+    const denied = try tmp.dir.readFileAlloc(std.testing.io, "devices.deny", std.testing.allocator, .limited(64));
+    defer std.testing.allocator.free(denied);
+    try std.testing.expectEqualStrings("untouched", denied);
 }
 
 fn killV2Members(dir: posix.fd_t, signal: i32, path: []const u8) Backend.Error!void {
@@ -4289,7 +4360,7 @@ fn checkV2TestDefaultDevices(cgroup: posix.fd_t, namespace: posix.fd_t, root: po
     try std.testing.expectEqual(@as(u32, 0), try waitChild(pid));
 }
 
-test "linux v2 device filter fails closed when bpf is forbidden in the initial user namespace" {
+test "linux v2 device filter skips forbidden bpf only for full-access allows in the initial user namespace" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     var stat: linux.Statx = undefined;
     try checkResult(linux.statx(linux.AT.FDCWD, "/proc/self/ns/user", 0, .{ .INO = true }, &stat));
@@ -4312,73 +4383,77 @@ test "linux v2 device filter fails closed when bpf is forbidden in the initial u
         checkResult(linux.prctl(@intFromEnum(linux.PR.SET_NO_NEW_PRIVS), 1, 0, 0, 0)) catch linux.exit_group(1);
         if (seccomp.install(.{ .filters = &filters, .flags = 0 }) != .SUCCESS) linux.exit_group(2);
         const allocator = std.heap.page_allocator;
-        for ([_][]const Resources.DeviceRule{
-            &.{.{ .allow = true }},
-            &.{.{ .allow = false }},
-            &.{.{ .allow = true, .kind = .char }},
-            &.{ .{ .allow = true }, .{ .allow = true } },
-        }) |rules| {
-            applyV2DeviceFilter(allocator, -1, rules, "bpf-forbidden-test", false) catch |err| {
-                if (err != error.CgroupWriteFailed or
+        for ([_]struct { rules: []const Resources.DeviceRule, skip: bool }{
+            .{ .rules = &.{}, .skip = true },
+            .{ .rules = &.{.{ .allow = true }}, .skip = true },
+            .{ .rules = &.{.{ .allow = false }}, .skip = false },
+            .{ .rules = &.{.{ .allow = true, .kind = .char }}, .skip = true },
+            .{ .rules = &.{ .{ .allow = true }, .{ .allow = true } }, .skip = true },
+            .{ .rules = &.{.{ .allow = true, .kind = .char, .access = "r" }}, .skip = false },
+            .{ .rules = &.{
+                .{ .allow = true, .kind = .char, .access = "r" },
+                .{ .allow = true, .kind = .char, .access = "wm" },
+            }, .skip = false },
+        }) |case| {
+            if (applyV2DeviceFilter(allocator, -1, case.rules, "bpf-forbidden-test", false)) |_| {
+                if (!case.skip) linux.exit_group(5);
+            } else |err| {
+                if (case.skip or err != error.CgroupWriteFailed or
                     std.mem.indexOf(u8, last_diagnostic[0..last_diagnostic_len], "BPF_PROG_LOAD") == null or
                     std.mem.indexOf(u8, last_diagnostic[0..last_diagnostic_len], "PERM") == null)
                     linux.exit_group(4);
-                var actual: linux.rlimit = undefined;
-                checkResult(linux.getrlimit(.MEMLOCK, &actual)) catch linux.exit_group(8);
-                if (actual.cur != limited.cur or actual.max != limited.max) linux.exit_group(9);
-                continue;
-            };
-            linux.exit_group(5);
+            }
+            var actual: linux.rlimit = undefined;
+            checkResult(linux.getrlimit(.MEMLOCK, &actual)) catch linux.exit_group(8);
+            if (actual.cur != limited.cur or actual.max != limited.max) linux.exit_group(9);
         }
         linux.exit_group(0);
     }
     try std.testing.expectEqual(@as(u32, 0), try waitChild(pid));
 }
 
-test "linux v2 device filter ignores load EPERM in a user namespace only without deny rules" {
+test "linux v2 device filter skips load errors in a user namespace for every policy" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
-    const pid = try forkProcess();
-    if (pid == 0) {
-        const unshared = linux.errno(linux.unshare(linux.CLONE.NEWUSER));
-        if (unshared == .PERM) linux.exit_group(77);
-        if (unshared != .SUCCESS) linux.exit_group(1);
-        const filters = [_]seccomp.Filter{
-            .{ .code = 0x20, .k = 0 },
-            .{ .code = 0x15, .jf = 1, .k = @intFromEnum(linux.SYS.bpf) },
-            .{ .code = 0x06, .k = 0x00050001 }, // EPERM
-            .{ .code = 0x06, .k = 0x7fff0000 },
-        };
-        checkResult(linux.prctl(@intFromEnum(linux.PR.SET_NO_NEW_PRIVS), 1, 0, 0, 0)) catch linux.exit_group(2);
-        if (seccomp.install(.{ .filters = &filters, .flags = 0 }) != .SUCCESS) linux.exit_group(3);
-        const allocator = std.heap.page_allocator;
-        var original: linux.rlimit = undefined;
-        checkResult(linux.getrlimit(.MEMLOCK, &original)) catch linux.exit_group(4);
-        for ([_][]const Resources.DeviceRule{
-            &.{.{ .allow = true, .kind = .char, .major = 1, .minor = 3 }},
-            &.{ .{ .allow = true, .access = "r" }, .{ .allow = true, .access = "w" } },
-        }) |rules| {
-            applyV2DeviceFilter(allocator, -1, rules, "rootless-device-test", false) catch linux.exit_group(5);
-            if (std.mem.indexOf(u8, last_diagnostic[0..last_diagnostic_len], "warning:") == null)
-                linux.exit_group(6);
-        }
-        for ([_][]const Resources.DeviceRule{
-            &.{.{ .allow = false }},
-            &.{ .{ .allow = false }, .{ .allow = true } },
-        }) |rules| {
-            applyV2DeviceFilter(allocator, -1, rules, "rootless-device-test", false) catch |err| {
-                if (err == error.CgroupWriteFailed) continue;
-                linux.exit_group(7);
+    for ([_]linux.E{ .PERM, .ACCES, .INVAL }) |bpf_error| {
+        const pid = try forkProcess();
+        if (pid == 0) {
+            const unshared = linux.errno(linux.unshare(linux.CLONE.NEWUSER));
+            if (unshared == .PERM) linux.exit_group(77);
+            if (unshared != .SUCCESS) linux.exit_group(1);
+            const filters = [_]seccomp.Filter{
+                .{ .code = 0x20, .k = 0 },
+                .{ .code = 0x15, .jf = 1, .k = @intFromEnum(linux.SYS.bpf) },
+                .{ .code = 0x06, .k = 0x00050000 | @as(u32, @intFromEnum(bpf_error)) },
+                .{ .code = 0x06, .k = 0x7fff0000 },
             };
-            linux.exit_group(8);
+            checkResult(linux.prctl(@intFromEnum(linux.PR.SET_NO_NEW_PRIVS), 1, 0, 0, 0)) catch linux.exit_group(2);
+            if (seccomp.install(.{ .filters = &filters, .flags = 0 }) != .SUCCESS) linux.exit_group(3);
+            const allocator = std.heap.page_allocator;
+            var original: linux.rlimit = undefined;
+            checkResult(linux.getrlimit(.MEMLOCK, &original)) catch linux.exit_group(4);
+            for ([_][]const Resources.DeviceRule{
+                &.{},
+                &.{.{ .allow = true, .kind = .char, .major = 1, .minor = 3 }},
+                &.{ .{ .allow = true, .access = "r" }, .{ .allow = true, .access = "w" } },
+                &.{.{ .allow = false }},
+                &.{ .{ .allow = false }, .{ .allow = true } },
+            }) |rules| {
+                applyV2DeviceFilter(allocator, -1, rules, "rootless-device-test", false) catch linux.exit_group(5);
+                if (std.mem.indexOf(u8, last_diagnostic[0..last_diagnostic_len], "warning:") == null)
+                    linux.exit_group(6);
+            }
+            const implicit = v2DeviceRules(allocator, &.{}, &.{}) catch linux.exit_group(7);
+            applyV2DeviceFilter(allocator, -1, implicit, "rootless-implicit-devices", false) catch linux.exit_group(8);
+            allocator.free(implicit);
+            var actual: linux.rlimit = undefined;
+            checkResult(linux.getrlimit(.MEMLOCK, &actual)) catch linux.exit_group(9);
+            if (actual.cur != original.cur or actual.max != original.max) linux.exit_group(10);
+            linux.exit_group(0);
         }
-        var actual: linux.rlimit = undefined;
-        checkResult(linux.getrlimit(.MEMLOCK, &actual)) catch linux.exit_group(9);
-        if (actual.cur != original.cur or actual.max != original.max) linux.exit_group(10);
-        linux.exit_group(0);
+        const status = try waitChild(pid);
+        if (status == 77 << 8) return error.SkipZigTest;
+        try std.testing.expectEqual(@as(u32, 0), status);
     }
-    const status = try waitChild(pid);
-    if (status == 77 << 8) return error.SkipZigTest;
-    try std.testing.expectEqual(@as(u32, 0), status);
 }
 
 test "linux v1 missing optional controllers are ignored and required limits fail" {
@@ -9837,35 +9912,37 @@ test "systemd memory-only updates leave device properties untouched" {
     }
 }
 
-test "systemd legacy device properties preserve defaults and configured devices" {
+test "systemd legacy device properties preserve defaults and configured devices with wildcard majors" {
     const AllocationTest = struct {
         fn run(allocator: std.mem.Allocator) !void {
             const rules = try v2DeviceRules(allocator, &.{
                 .{ .allow = false },
+                .{ .allow = true, .kind = .char, .minor = 5 },
                 .{ .allow = true, .kind = .block, .major = 8, .minor = 0, .access = "rw" },
                 .{ .allow = false, .kind = .block, .major = 8, .minor = 0, .access = "w" },
             }, &.{.{ .path = "/dev/custom", .kind = .character, .major = 10, .minor = 237 }});
             defer allocator.free(rules);
             const properties = try systemdProperties(allocator, .{}, .legacy, rules);
             defer freeSystemdProperties(allocator, properties);
+            try std.testing.expectEqual(@as(usize, 3), properties.len);
             try std.testing.expectEqualStrings("DeviceAllow", properties[0].name);
             try std.testing.expectEqual(@as(usize, 0), properties[0].value.string_pairs.len);
             try std.testing.expectEqualStrings("DevicePolicy", properties[1].name);
             try std.testing.expectEqualStrings("strict", properties[1].value.string);
             const expected: []const [2][]const u8 = &.{
-                .{ "/dev/block/8:0", "r" },
-                .{ "char-*", "m" },
                 .{ "block-*", "m" },
+                .{ "char-*", "m" },
                 .{ "/dev/char/1:3", "rwm" },
-                .{ "/dev/char/1:8", "rwm" },
-                .{ "/dev/char/1:7", "rwm" },
-                .{ "/dev/char/5:0", "rwm" },
                 .{ "/dev/char/1:5", "rwm" },
+                .{ "/dev/char/1:7", "rwm" },
+                .{ "/dev/char/1:8", "rwm" },
                 .{ "/dev/char/1:9", "rwm" },
-                .{ "char-136", "rwm" },
+                .{ "/dev/char/5:0", "rwm" },
                 .{ "/dev/char/5:2", "rwm" },
+                .{ "/dev/block/8:0", "r" },
                 .{ "/dev/char/10:200", "rwm" },
                 .{ "/dev/char/10:237", "rwm" },
+                .{ "char-136", "rwm" },
             };
             try std.testing.expectEqualStrings("DeviceAllow", properties[2].name);
             try std.testing.expectEqualDeep(expected, properties[2].value.string_pairs);
@@ -9875,25 +9952,34 @@ test "systemd legacy device properties preserve defaults and configured devices"
     try std.testing.checkAllAllocationFailures(std.testing.allocator, AllocationTest.run, .{});
 }
 
-test "systemd device normalization merges permissions and fails closed for unsupported policies" {
+test "systemd device normalization merges permissions and delegates deny-lists" {
     const allocator = std.testing.allocator;
     defer last_diagnostic_len = 0;
     const allows = try systemdDeviceAllows(allocator, &.{
         .{ .allow = true, .kind = .char, .major = 10, .minor = 237, .access = "r" },
         .{ .allow = true, .kind = .char, .major = 10, .minor = 237, .access = "w" },
         .{ .allow = true, .kind = .block, .major = -1, .minor = -1, .access = "m" },
-        .{ .allow = true, .kind = .char, .minor = 5 },
     }, .legacy);
     defer freeSystemdValue(allocator, .{ .string_pairs = allows });
     try std.testing.expectEqualDeep(@as([]const [2][]const u8, &.{
-        .{ "/dev/char/10:237", "rw" }, .{ "block-*", "m" },
+        .{ "block-*", "m" }, .{ "/dev/char/10:237", "rw" },
     }), @as([]const [2][]const u8, allows));
-    const denylist = try systemdDeviceAllows(allocator, &.{
+    const denylist_rules: []const Resources.DeviceRule = &.{
         .{ .allow = true },
         .{ .allow = false, .kind = .char, .major = 10, .minor = 237 },
+    };
+    try std.testing.expectError(error.Unsupported, systemdDeviceAllows(allocator, denylist_rules, .legacy));
+    const properties = try systemdProperties(allocator, .{}, .legacy, denylist_rules);
+    defer freeSystemdProperties(allocator, properties);
+    try std.testing.expectEqual(@as(usize, 2), properties.len);
+    try std.testing.expectEqualStrings("DeviceAllow", properties[0].name);
+    try std.testing.expectEqual(@as(usize, 0), properties[0].value.string_pairs.len);
+    try std.testing.expectEqualStrings("strict", properties[1].value.string);
+    const wildcard = try systemdDeviceAllows(allocator, &.{
+        .{ .allow = true, .kind = .char, .minor = 5 },
     }, .legacy);
-    defer freeSystemdValue(allocator, .{ .string_pairs = denylist });
-    try std.testing.expectEqual(@as(usize, 0), denylist.len);
+    defer freeSystemdValue(allocator, .{ .string_pairs = wildcard });
+    try std.testing.expectEqual(@as(usize, 0), wildcard.len);
     const all = try systemdDeviceAllows(allocator, &.{.{ .allow = true }}, .legacy);
     defer freeSystemdValue(allocator, .{ .string_pairs = all });
     try std.testing.expectEqualDeep(@as([]const [2][]const u8, &.{
@@ -9905,21 +9991,21 @@ test "systemd device normalization merges permissions and fails closed for unsup
     };
     try std.testing.expectError(error.InvalidConfig, systemdDeviceAllows(allocator, rules, .legacy));
     try std.testing.expectError(error.InvalidConfig, systemdProperties(allocator, .{}, .legacy, rules));
-    const partial = try systemdDeviceAllows(allocator, rules, .unified);
-    defer freeSystemdValue(allocator, .{ .string_pairs = partial });
-    try std.testing.expectEqual(@as(usize, 0), partial.len);
+    try std.testing.expectError(error.InvalidConfig, systemdDeviceAllows(allocator, rules, .unified));
 }
 
-test "systemd wildcard subtraction retains only permissions expressible exactly" {
+test "systemd wildcard subtraction changes only exact exceptions" {
     const allocator = std.testing.allocator;
     const allows = try systemdDeviceAllows(allocator, &.{
         .{ .allow = true, .kind = .char, .access = "rm" },
-        .{ .allow = false, .kind = .char, .major = 1, .minor = 3, .access = "m" },
+        .{ .allow = false, .kind = .char, .access = "m" },
+        .{ .allow = true, .kind = .char, .major = 1, .minor = 3, .access = "rw" },
+        .{ .allow = false, .kind = .char, .major = 1, .access = "w" },
         .{ .allow = true, .kind = .block, .major = 8, .minor = 0, .access = "rw" },
     }, .unified);
     defer freeSystemdValue(allocator, .{ .string_pairs = allows });
     try std.testing.expectEqualDeep(@as([]const [2][]const u8, &.{
-        .{ "char-*", "r" }, .{ "/dev/block/8:0", "rw" },
+        .{ "char-*", "r" }, .{ "/dev/char/1:3", "rw" }, .{ "/dev/block/8:0", "rw" },
     }), @as([]const [2][]const u8, allows));
 }
 
@@ -10025,114 +10111,65 @@ fn systemdNumber(value: []const u8) Backend.Error!u64 {
     return std.fmt.parseInt(u64, trimmed, 10) catch error.InvalidConfig;
 }
 
-fn deviceAccessMask(access: []const u8) Backend.Error!u3 {
-    if (access.len == 0) return error.InvalidConfig;
-    var mask: u3 = 0;
-    for (access) |byte| mask |= switch (byte) {
-        'r' => @as(u3, 1),
-        'w' => @as(u3, 2),
-        'm' => @as(u3, 4),
-        else => return error.InvalidConfig,
+fn applyDeviceRule(allocator: std.mem.Allocator, emu: *devices_emulator.Emulator, rule: Resources.DeviceRule) Backend.Error!void {
+    emu.apply(allocator, rule) catch |err| {
+        if (emu.hole) |hole| {
+            const requested = hole.requested;
+            const wildcard = hole.wildcard;
+            const kind: u8 = if (requested.kind == .char) 'c' else 'b';
+            reportDiagnostic("unable to remove '{s}' exception: requested rule [{{{d} {d} {d}}} {s}] not supported by devices cgroupv1 (cannot punch hole in existing wildcard rule [{{{d} {d} {d}}} {s}])", .{
+                if (emu.default_allow) "deny" else "allow",
+                kind,
+                requested.major orelse -1,
+                requested.minor orelse -1,
+                devices_emulator.permissions(requested.access),
+                kind,
+                wildcard.major orelse -1,
+                wildcard.minor orelse -1,
+                devices_emulator.permissions(wildcard.access),
+            });
+            return error.InvalidConfig;
+        }
+        return switch (err) {
+            error.CannotPunchHole => error.InvalidConfig,
+            else => |other| other,
+        };
     };
-    return mask;
 }
 
-fn deviceRuleNumber(value: ?i64) Backend.Error!?i64 {
-    const number = value orelse return null;
-    if (number == -1) return null;
-    if (number < 0 or number > std.math.maxInt(u32)) return error.InvalidConfig;
-    return number;
+fn deviceEmulator(allocator: std.mem.Allocator, rules: []const Resources.DeviceRule) Backend.Error!devices_emulator.Emulator {
+    var emu: devices_emulator.Emulator = .{};
+    errdefer emu.deinit(allocator);
+    for (rules) |rule| try applyDeviceRule(allocator, &emu, rule);
+    return emu;
 }
 
-const DevicePolicy = struct {
-    const Entry = struct { rule: Resources.DeviceRule, access: u3 };
-    entries: []Entry,
-    default_allow: bool,
-    inexact: bool,
-};
-
-/// The v1 kernel cannot subtract a concrete device from a wildcard exception.
-fn normalizeDeviceRules(allocator: std.mem.Allocator, rules: []const Resources.DeviceRule, mode: CgroupMode) Backend.Error!DevicePolicy {
-    var entries: std.ArrayList(DevicePolicy.Entry) = .empty;
-    defer entries.deinit(allocator);
-    var default_allow = false;
-    var inexact = false;
-    for (rules) |configured| {
-        var rule = configured;
-        rule.major = try deviceRuleNumber(rule.major);
-        rule.minor = try deviceRuleNumber(rule.minor);
-        const access = try deviceAccessMask(rule.access);
-        if (rule.kind == .all) {
-            entries.clearRetainingCapacity();
-            default_allow = rule.allow;
-            inexact = false;
-            continue;
-        }
-        if (rule.allow != default_allow) {
-            for (entries.items) |*entry| {
-                if (entry.rule.kind == rule.kind and entry.rule.major == rule.major and entry.rule.minor == rule.minor) {
-                    entry.access |= access;
-                    break;
-                }
-            } else {
-                try entries.append(allocator, .{ .rule = rule, .access = access });
-            }
-        } else {
-            var index: usize = 0;
-            while (index < entries.items.len) {
-                const entry = &entries.items[index];
-                const overlaps = entry.rule.kind == rule.kind and
-                    (rule.major == null or entry.rule.major == null or rule.major == entry.rule.major) and
-                    (rule.minor == null or entry.rule.minor == null or rule.minor == entry.rule.minor);
-                if (overlaps and entry.access & access != 0) {
-                    if ((rule.major != null and entry.rule.major == null) or
-                        (rule.minor != null and entry.rule.minor == null))
-                    {
-                        if (mode == .legacy) {
-                            reportDiagnostic("cannot punch hole in existing wildcard rule on cgroup v1", .{});
-                            return error.InvalidConfig;
-                        }
-                        inexact = true;
-                    }
-                    entry.access &= ~access;
-                    if (entry.access == 0) {
-                        _ = entries.orderedRemove(index);
-                        continue;
-                    }
-                }
-                index += 1;
-            }
-        }
-    }
-    return .{ .entries = try entries.toOwnedSlice(allocator), .default_allow = default_allow, .inexact = inexact };
-}
-
-/// Translate only permissions systemd can express; v2's BPF filter handles holes.
-fn systemdDeviceAllows(allocator: std.mem.Allocator, rules: []const Resources.DeviceRule, mode: CgroupMode) Backend.Error![][2][]const u8 {
-    const policy = try normalizeDeviceRules(allocator, rules, mode);
-    defer allocator.free(policy.entries);
-    if (policy.inexact)
-        std.debug.print("igvano: warning: systemd cannot represent part of a wildcard device rule; DevicePolicy=strict retains only representable allows, and the BPF filter enforces the exact policy\n", .{});
-    const all: []const DevicePolicy.Entry = &.{
-        .{ .rule = .{ .allow = true, .kind = .char }, .access = 7 },
-        .{ .rule = .{ .allow = true, .kind = .block }, .access = 7 },
+fn deviceEmulatorFromList(allocator: std.mem.Allocator, list: []const u8) Backend.Error!devices_emulator.Emulator {
+    return devices_emulator.Emulator.fromList(allocator, list) catch |err| switch (err) {
+        error.CannotPunchHole => error.InvalidConfig,
+        else => |other| other,
     };
-    if (policy.default_allow) {
-        if (policy.entries.len != 0 or policy.inexact) {
-            if (mode == .unified)
-                std.debug.print("igvano: warning: systemd cannot represent a device denylist; using DevicePolicy=strict, and the BPF filter enforces the exact policy\n", .{})
-            else
-                std.debug.print("igvano: warning: systemd cannot represent a device denylist; using a strict deny-all policy before cgroupfs writes\n", .{});
-            return allocator.alloc([2][]const u8, 0);
-        }
-    }
+}
+
+/// systemd cannot express deny-lists or wildcard-major/concrete-minor rules.
+/// Deny-lists use a temporary strict policy; wildcard-major rules are skipped.
+/// The caller then applies exact cgroupfs rules.
+fn systemdDeviceAllows(allocator: std.mem.Allocator, rules: []const Resources.DeviceRule, _: CgroupMode) Backend.Error![][2][]const u8 {
+    var policy = try deviceEmulator(allocator, rules);
+    defer policy.deinit(allocator);
+    if (policy.default_allow and !policy.isAllowAll()) return error.Unsupported;
+    const normalized = try policy.rules(allocator);
+    defer allocator.free(normalized);
+    const all: []const Resources.DeviceRule = &.{
+        .{ .allow = true, .kind = .char },
+        .{ .allow = true, .kind = .block },
+    };
     var allows: std.ArrayList([2][]const u8) = .empty;
     errdefer {
         for (allows.items) |pair| allocator.free(pair[0]);
         allows.deinit(allocator);
     }
-    for (if (policy.default_allow) all else policy.entries) |entry| {
-        const rule = entry.rule;
+    for (if (policy.default_allow) all else normalized) |rule| {
         const kind: []const u8 = if (rule.kind == .char) "char" else "block";
         if (rule.major == null and rule.minor != null) {
             std.debug.print("igvano: warning: systemd cannot represent a wildcard-major device rule; leaving it to cgroupfs\n", .{});
@@ -10146,8 +10183,7 @@ fn systemdDeviceAllows(allocator: std.mem.Allocator, rules: []const Resources.De
         else
             try std.fmt.allocPrint(allocator, "{s}-*", .{kind});
         errdefer allocator.free(path);
-        const permissions = [_][]const u8{ "", "r", "w", "rw", "m", "rm", "wm", "rwm" };
-        try allows.append(allocator, .{ path, permissions[entry.access] });
+        try allows.append(allocator, .{ path, rule.access });
     }
     return allows.toOwnedSlice(allocator);
 }
@@ -10216,14 +10252,23 @@ fn systemdProperties(allocator: std.mem.Allocator, resources: Resources, mode: C
         };
     }
     if (mode == .legacy and device_rules.len != 0) {
-        // DeviceAllow appends in systemd, so clear old entries before replacing
-        // the allowlist. Strict prevents systemd from resetting devices to allow-all.
+        // As in runc, deny-lists temporarily use a strict deny-all policy.
+        // The v1 manager then applies the exact policy.
+        const allows = systemdDeviceAllows(allocator, device_rules, mode) catch |err| switch (err) {
+            error.Unsupported => {
+                try properties.appendSlice(allocator, &.{
+                    .{ .name = "DeviceAllow", .value = .{ .string_pairs = &.{} } },
+                    .{ .name = "DevicePolicy", .value = .{ .string = "strict" } },
+                });
+                return properties.toOwnedSlice(allocator);
+            },
+            else => return err,
+        };
+        errdefer freeSystemdValue(allocator, .{ .string_pairs = allows });
         try properties.appendSlice(allocator, &.{
             .{ .name = "DeviceAllow", .value = .{ .string_pairs = &.{} } },
             .{ .name = "DevicePolicy", .value = .{ .string = "strict" } },
         });
-        const allows = try systemdDeviceAllows(allocator, device_rules, mode);
-        errdefer freeSystemdValue(allocator, .{ .string_pairs = allows });
         try properties.append(allocator, .{ .name = "DeviceAllow", .value = .{ .string_pairs = allows } });
     }
     return properties.toOwnedSlice(allocator);

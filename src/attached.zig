@@ -5,7 +5,7 @@ const linux = std.os.linux;
 const fd_t = std.posix.fd_t;
 
 const watched = signals: {
-    var result: [linux.NSIG - 14]linux.SIG = undefined;
+    var result: [linux.NSIG]linux.SIG = undefined;
     var used = 0;
     for (1..linux.NSIG) |number| {
         const signal: linux.SIG = @enumFromInt(number);
@@ -20,7 +20,7 @@ const watched = signals: {
         result[used] = signal;
         used += 1;
     }
-    break :signals result;
+    break :signals result[0..used].*;
 };
 var signal_writer: std.atomic.Value(fd_t) = .init(-1);
 var pending_signals: [linux.sigemptyset().len]std.atomic.Value(c_ulong) = @splat(.init(0));

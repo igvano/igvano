@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const Rule = @import("../backend.zig").Backend.Resources.DeviceRule;
+const devices = @import("devices.zig");
 
 /// Linux struct bpf_insn. Register nibbles follow the target's byte order.
 pub const Insn = extern struct {
@@ -34,18 +35,6 @@ const op = struct {
     const exit = 0x95;
 };
 
-fn accessMask(access: []const u8) error{InvalidConfig}!u32 {
-    if (access.len == 0) return error.InvalidConfig;
-    var mask: u32 = 0;
-    for (access) |byte| mask |= switch (byte) {
-        'm' => @as(u32, 1),
-        'r' => @as(u32, 2),
-        'w' => @as(u32, 4),
-        else => return error.InvalidConfig,
-    };
-    return mask;
-}
-
 fn deviceNumber(number: ?i64) error{InvalidConfig}!?u32 {
     const value = number orelse return null;
     if (value == -1) return null;
@@ -59,21 +48,16 @@ pub fn isAllowAll(rules: []const Rule) bool {
     return rule.allow and rule.kind == .all and
         (deviceNumber(rule.major) catch return false) == null and
         (deviceNumber(rule.minor) catch return false) == null and
-        (accessMask(rule.access) catch return false) == 7;
+        (devices.accessMask(rule.access) catch return false) == 7;
 }
 
-/// The caller owns the instructions. Rules are checked in reverse order,
-/// returning at the first match; falling through denies the operation.
-pub fn compile(allocator: std.mem.Allocator, rules: []const Rule) (std.mem.Allocator.Error || error{InvalidConfig})![]Insn {
-    // ponytail: No runc-style devices-emulator normalization: partial-access allows
-    // for the same device are not merged (c 1:5 r + c 1:5 w denies rw; v1 merges).
-    // Normalize rules first, as runc's devices emulator does, to lift this ceiling.
-    // Validate even rules shadowed by a later catch-all.
-    for (rules) |rule| {
-        _ = try accessMask(rule.access);
-        _ = try deviceNumber(rule.major);
-        _ = try deviceNumber(rule.minor);
-    }
+/// The caller owns the instructions. As in runc, compile only normalized
+/// exceptions, with the emulator's mode determining the final decision.
+pub fn compile(allocator: std.mem.Allocator, configured: []const Rule) devices.Error![]Insn {
+    var emu = try devices.Emulator.init(allocator, configured);
+    defer emu.deinit(allocator);
+    const rules = try emu.rules(allocator);
+    defer allocator.free(rules);
     var insns: std.ArrayList(Insn) = .empty;
     defer insns.deinit(allocator);
     try insns.appendSlice(allocator, &.{
@@ -84,18 +68,16 @@ pub fn compile(allocator: std.mem.Allocator, rules: []const Rule) (std.mem.Alloc
         Insn.init(op.ldx_w, 4, 1, 4, 0),
         Insn.init(op.ldx_w, 5, 1, 8, 0),
     });
-    var remaining = rules.len;
-    while (remaining > 0) {
-        remaining -= 1;
-        const rule = rules[remaining];
+    for (rules) |rule| {
+        if (rule.kind == .all) continue;
         const start = insns.items.len;
-        const mask = try accessMask(rule.access);
+        const mask = try devices.accessMask(rule.access);
         const major = try deviceNumber(rule.major);
         const minor = try deviceNumber(rule.minor);
         if (rule.kind != .all)
             try insns.append(allocator, Insn.init(op.jne_imm, 2, 0, 0, if (rule.kind == .block) 1 else 2));
         if (mask != 7) {
-            // Allow requires every requested bit; deny matches any overlap.
+            // Allows require every requested bit; a deny exception blocks overlap.
             try insns.appendSlice(allocator, &.{
                 Insn.init(op.mov_reg, 6, 3, 0, 0),
                 Insn.init(op.and_imm, 6, 0, 0, @intCast(mask)),
@@ -112,12 +94,9 @@ pub fn compile(allocator: std.mem.Allocator, rules: []const Rule) (std.mem.Alloc
             if (insn.code == op.jeq_imm or insn.code == op.jne_imm or insn.code == op.jne_reg)
                 insn.off = @intCast(insns.items.len - index - 1);
         }
-        // Nothing can fall through a catch-all. Do not emit unreachable code.
-        if (rule.kind == .all and mask == 7 and major == null and minor == null)
-            return insns.toOwnedSlice(allocator);
     }
     try insns.appendSlice(allocator, &.{
-        Insn.init(op.mov_imm, 0, 0, 0, 0),
+        Insn.init(op.mov_imm, 0, 0, 0, @intFromBool(emu.default_allow)),
         Insn.init(op.exit, 0, 0, 0, 0),
     });
     return insns.toOwnedSlice(allocator);
@@ -208,22 +187,24 @@ test "device filter supports both wildcard spellings and all device types" {
         try expectDecision(&.{.{ .allow = true }}, kind, 123, 456, 7, true);
         try expectDecision(&.{.{ .allow = true, .major = -1, .minor = -1 }}, kind, 123, 456, 7, true);
         try expectDecision(&.{.{ .allow = true, .minor = 3 }}, kind, 123, 3, 7, true);
-        try expectDecision(&.{.{ .allow = true, .minor = 3 }}, kind, 123, 4, 7, false);
+        try expectDecision(&.{.{ .allow = true, .minor = 3 }}, kind, 123, 4, 7, true);
         try expectDecision(&.{.{ .allow = true, .major = 1 }}, kind, 1, 456, 7, true);
-        try expectDecision(&.{.{ .allow = true, .major = 1 }}, kind, 2, 456, 7, false);
+        try expectDecision(&.{.{ .allow = true, .major = 1 }}, kind, 2, 456, 7, true);
+        const device_kind: @FieldType(Rule, "kind") = if (kind == 1) .block else .char;
+        try expectDecision(&.{.{ .allow = true, .kind = device_kind, .minor = 3 }}, kind, 123, 3, 7, true);
+        try expectDecision(&.{.{ .allow = true, .kind = device_kind, .minor = 3 }}, kind, 123, 4, 7, false);
+        try expectDecision(&.{.{ .allow = true, .kind = device_kind, .major = 1 }}, kind, 1, 456, 7, true);
+        try expectDecision(&.{.{ .allow = true, .kind = device_kind, .major = 1 }}, kind, 2, 456, 7, false);
     }
 }
 
-test "v2 device filter enforces holes in wildcard allows exactly" {
+test "v2 device filter rejects holes in wildcard allows like v1" {
     for ([_]?i64{ null, -1 }) |wildcard| {
         const rules = [_]Rule{
             .{ .allow = true, .kind = .char, .major = 10, .minor = wildcard },
             .{ .allow = false, .kind = .char, .major = 10, .minor = 237 },
         };
-        try expectDecision(&rules, 2, 10, 237, 7, false);
-        try expectDecision(&rules, 2, 10, 236, 7, true);
-        try expectDecision(&rules, 2, 10, 238, 7, true);
-        try expectDecision(&rules, 1, 10, 238, 7, false);
+        try std.testing.expectError(error.CannotPunchHole, compile(std.testing.allocator, &rules));
     }
 }
 
@@ -239,11 +220,11 @@ test "device filter allow rules match access subsets rather than any overlapping
     };
     for (cases) |case| {
         for (case.allowed, 1..) |allowed, access|
-            try expectDecision(&.{.{ .allow = true, .access = case.access }}, 2, 1, 3, @intCast(access), allowed);
+            try expectDecision(&.{.{ .allow = true, .kind = .char, .access = case.access }}, 2, 1, 3, @intCast(access), allowed);
     }
 }
 
-test "device filter uses the last matching rule including broad rules and access subsets" {
+test "device filter enforces normalized deny and allow exceptions" {
     const denylist = [_]Rule{
         .{ .allow = true },
         .{ .allow = false, .kind = .char, .major = 1, .minor = 3, .access = "w" },
@@ -254,7 +235,7 @@ test "device filter uses the last matching rule including broad rules and access
     try expectDecision(&denylist, 1, 1, 3, 4, true);
     const allowlist = [_]Rule{
         .{ .allow = false },
-        .{ .allow = true, .kind = .char, .major = 1 },
+        .{ .allow = true, .kind = .char, .major = 1, .minor = 3 },
         .{ .allow = false, .kind = .char, .major = 1, .minor = 5 },
         .{ .allow = true, .kind = .char, .major = 1, .minor = 5, .access = "r" },
     };
@@ -277,10 +258,25 @@ test "device filter denies overlapping access after a default-deny allow rule" {
 }
 
 test "device filter compares the full unsigned device number" {
-    const rules = [_]Rule{.{ .allow = true, .major = 0xffffffff, .minor = 0x80000000 }};
+    const rules = [_]Rule{.{ .allow = true, .kind = .char, .major = 0xffffffff, .minor = 0x80000000 }};
     try expectDecision(&rules, 2, 0xffffffff, 0x80000000, 7, true);
     try expectDecision(&rules, 2, 0x7fffffff, 0x80000000, 7, false);
     try expectDecision(&rules, 2, 0xffffffff, 0, 7, false);
+}
+
+test "device filter merges split permissions and leaves concrete allows after wildcard denies" {
+    const merged = [_]Rule{
+        .{ .allow = true, .kind = .char, .major = 1, .minor = 5, .access = "r" },
+        .{ .allow = true, .kind = .char, .major = 1, .minor = 5, .access = "w" },
+    };
+    try expectDecision(&merged, 2, 1, 5, 6, true);
+    try expectDecision(&merged, 2, 1, 5, 7, false);
+    const broader_deny = [_]Rule{
+        .{ .allow = true, .kind = .char, .major = 1, .minor = 5 },
+        .{ .allow = false, .kind = .char, .major = 1, .access = "rw" },
+    };
+    try expectDecision(&broader_deny, 2, 1, 5, 7, true);
+    try expectDecision(&broader_deny, 2, 1, 6, 7, false);
 }
 
 test "device filter rejects invalid access and device numbers even in shadowed rules" {
