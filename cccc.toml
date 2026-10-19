@@ -1,0 +1,8 @@
+# Complexity limits for production code (moznion/cccc). Tests are exempt:
+# container-running tests live in tests/ directories; src/test/ holds test
+# helpers. Inline `test` blocks are still measured, so keep them small.
+languages = ["zig"]
+exclude = ["**/tests/**", "**/test/**", ".zig-cache/**", "zig-out/**"]
+max-cognitive = 25
+max-cyclomatic = 15
+cache = true

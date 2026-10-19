@@ -1,0 +1,26 @@
+# Run with prek (https://github.com/j178/prek), a drop-in pre-commit
+# replacement: `prek install` once, then hooks run on `git commit`.
+# Both tools come from the Nix devShell.
+repos:
+  - repo: local
+    hooks:
+      - id: zig-fmt
+        name: zig fmt --check
+        entry: nix develop -c zig fmt --check
+        language: system
+        files: \.zig$
+      - id: cccc
+        name: cccc complexity (staged files)
+        entry: nix develop -c cccc --table
+        language: system
+        files: \.zig$
+        exclude: (^|/)(tests?)/
+      # Whole-tree check. Manual until the existing offenders are refactored:
+      # `prek run cccc-all --hook-stage manual`.
+      - id: cccc-all
+        name: cccc complexity (src/)
+        entry: nix develop -c cccc --table src/
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [manual]
