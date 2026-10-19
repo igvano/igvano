@@ -6116,7 +6116,18 @@ fn sendMountSources(mounts: []const PreparedMount, socket: posix.fd_t) Backend.E
         var step: RootfsStep = .{ .operation = "open bind source", .source = mount.source, .path = mount.destination };
         errdefer |err| if (step.operation.len != 0) step.report(err);
         const source = mount.source orelse return error.InvalidConfig;
-        const source_fd = try openResolved(linux.AT.FDCWD, source, .{ .PATH = true, .CLOEXEC = true }, RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS);
+        const how: OpenHow = .{
+            .flags = @as(u32, @bitCast(linux.O{ .PATH = true, .CLOEXEC = true })),
+            .resolve = RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS,
+        };
+        const opened = linux.syscall4(.openat2, @bitCast(@as(isize, linux.AT.FDCWD)), @intFromPtr(source.ptr), @intFromPtr(&how), @sizeOf(OpenHow));
+        if (linux.errno(opened) == .LOOP) {
+            step.operation = "";
+            reportDiagnostic("bind source {s} contains a symlink; symlinks are not allowed when joining a mount namespace", .{source});
+            return error.CreateFailed;
+        }
+        try checkResult(opened);
+        const source_fd: posix.fd_t = @intCast(opened);
         defer closeFd(source_fd);
         var prepared = mount;
         prepared.source_fd = source_fd;
@@ -6221,7 +6232,11 @@ test "linux mount source helper rejects directory and final symlinks" {
             .propagation = 0,
             .data = "",
         }};
-        if (sendMountSources(&mounts, sockets[0])) return error.TestUnexpectedResult else |_| {}
+        last_diagnostic_len = 0;
+        try std.testing.expectError(error.CreateFailed, sendMountSources(&mounts, sockets[0]));
+        const diagnostic = try std.fmt.allocPrint(std.testing.allocator, "bind source {s} contains a symlink; symlinks are not allowed when joining a mount namespace", .{path});
+        defer std.testing.allocator.free(diagnostic);
+        try std.testing.expectEqualStrings(diagnostic, last_diagnostic[0..last_diagnostic_len]);
         // Ordinary sources opened by the runtime still follow symlinks.
         const ordinary = try openPath(linux.AT.FDCWD, path, .{ .PATH = true, .CLOEXEC = true });
         closeFd(ordinary);
@@ -6793,10 +6808,11 @@ const Procfs = struct {
         switch (linux.errno(opened)) {
             .SUCCESS => {},
             .NOENT => return null,
-            else => {
+            .LOOP, .XDEV => {
                 reportDiagnostic("cannot safely open procfs path '{s}': {s} (symlinks or overmounts are forbidden)", .{ path, @tagName(linux.errno(opened)) });
                 return error.MissingProcfs;
             },
+            else => try checkResult(opened),
         }
         const fd: posix.fd_t = @intCast(opened);
         errdefer closeFd(fd);
@@ -6813,21 +6829,22 @@ const Procfs = struct {
 };
 
 /// EPERM is possible in user namespaces even when container /proc is usable.
+/// EACCES may likewise result from LSM mount mediation.
 /// Old kernels may lack the new mount API or subset=pid; fail closed on other
 /// errors and let the caller verify the visible procfs if mounting is denied.
 fn privateProcfs(subset_pid: bool) Backend.Error!?posix.fd_t {
     const opened = linux.fsopen("proc", .{ .CLOEXEC = true });
-    if (linux.errno(opened) == .PERM or linux.errno(opened) == .NOSYS) return null;
+    if (linux.errno(opened) == .PERM or linux.errno(opened) == .ACCES or linux.errno(opened) == .NOSYS) return null;
     try checkResult(opened);
     const context: posix.fd_t = @intCast(opened);
     defer closeFd(context);
     if (subset_pid) {
         const result = linux.fsconfig(context, .SET_STRING, "subset", "pid", 0);
-        if (linux.errno(result) == .PERM or linux.errno(result) == .NOSYS) return null;
+        if (linux.errno(result) == .PERM or linux.errno(result) == .ACCES or linux.errno(result) == .NOSYS) return null;
         if (linux.errno(result) != .INVAL) try checkResult(result);
     }
     const created = linux.fsconfig(context, .CREATE, null, null, 0);
-    if (linux.errno(created) == .PERM or linux.errno(created) == .NOSYS) return null;
+    if (linux.errno(created) == .PERM or linux.errno(created) == .ACCES or linux.errno(created) == .NOSYS) return null;
     try checkResult(created);
     const mounted = linux.fsmount(context, .{ .CLOEXEC = true }, .{
         .RELATIME = 0,
@@ -6841,7 +6858,7 @@ fn privateProcfs(subset_pid: bool) Backend.Error!?posix.fd_t {
         .IDMAP = false,
         .NOSYMFOLLOW = false,
     });
-    if (linux.errno(mounted) == .PERM or linux.errno(mounted) == .NOSYS) return null;
+    if (linux.errno(mounted) == .PERM or linux.errno(mounted) == .ACCES or linux.errno(mounted) == .NOSYS) return null;
     try checkResult(mounted);
     return @intCast(mounted);
 }
@@ -6902,7 +6919,14 @@ fn writeSysctl(proc: Procfs, setting: Backend.Sysctl) Backend.Error!void {
     const path = try sysctlPath(&buffer, setting.key);
     const fd = (try proc.openWrite(path)) orelse return error.CreateFailed;
     defer closeFd(fd);
-    if (!writeAll(fd, setting.value)) return error.CreateFailed;
+    var offset: usize = 0;
+    while (offset < setting.value.len) {
+        const result = linux.write(fd, setting.value[offset..].ptr, setting.value.len - offset);
+        if (linux.errno(result) == .INTR) continue;
+        try checkResult(result);
+        if (result == 0) return error.CreateFailed;
+        offset += result;
+    }
 }
 
 fn applySysctls(settings: []const Backend.Sysctl) Backend.Error!void {
@@ -7272,6 +7296,7 @@ fn applyAppArmor(command: ?[]const u8) Backend.Error!void {
             return;
         }
     }
+    reportDiagnostic("no apparmor exec attr in procfs", .{});
     return error.MissingProcfs;
 }
 
