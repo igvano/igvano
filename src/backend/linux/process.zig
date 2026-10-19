@@ -34,25 +34,29 @@ pub fn closeFdRange(first: u32, last: u32, cloexec: bool, fd_dir: ?posix.fd_t) B
         if (linux.errno(count) == .INTR) continue;
         try checkResult(count);
         if (count == 0) return;
-        var offset: usize = 0;
-        while (offset < count) {
-            const entry: *align(1) const linux.dirent64 = @ptrCast(&buffer[offset]);
-            offset += entry.reclen;
-            const name_ptr: [*]const u8 = &entry.name;
-            const padded = name_ptr[0 .. entry.reclen - @offsetOf(linux.dirent64, "name")];
-            const name = padded[0..std.mem.indexOfScalar(u8, padded, 0).?];
-            const number = std.fmt.parseInt(u32, name, 10) catch continue;
-            if (number < first or number > last or number == dir) continue;
-            const fd: posix.fd_t = @intCast(number);
-            if (!cloexec) {
-                closeFd(fd);
-                continue;
-            }
-            const flags = linux.fcntl(fd, linux.F.GETFD, 0);
-            if (linux.errno(flags) == .BADF) continue;
-            try checkResult(flags);
-            try checkResult(linux.fcntl(fd, linux.F.SETFD, flags | linux.FD_CLOEXEC));
+        try closeDirectoryFdEntries(buffer[0..count], first, last, cloexec, dir);
+    }
+}
+
+fn closeDirectoryFdEntries(entries: []const u8, first: u32, last: u32, cloexec: bool, dir: posix.fd_t) Backend.Error!void {
+    var offset: usize = 0;
+    while (offset < entries.len) {
+        const entry: *align(1) const linux.dirent64 = @ptrCast(&entries[offset]);
+        offset += entry.reclen;
+        const name_ptr: [*]const u8 = &entry.name;
+        const padded = name_ptr[0 .. entry.reclen - @offsetOf(linux.dirent64, "name")];
+        const name = padded[0..std.mem.indexOfScalar(u8, padded, 0).?];
+        const number = std.fmt.parseInt(u32, name, 10) catch continue;
+        if (number < first or number > last or number == dir) continue;
+        const fd: posix.fd_t = @intCast(number);
+        if (!cloexec) {
+            closeFd(fd);
+            continue;
         }
+        const flags = linux.fcntl(fd, linux.F.GETFD, 0);
+        if (linux.errno(flags) == .BADF) continue;
+        try checkResult(flags);
+        try checkResult(linux.fcntl(fd, linux.F.SETFD, flags | linux.FD_CLOEXEC));
     }
 }
 
@@ -162,14 +166,7 @@ pub fn applyProcessSettings(process: ProcessSettings) Backend.Error!void {
         if (process.no_new_privileges)
             try checkResult(linux.prctl(@intFromEnum(linux.PR.SET_NO_NEW_PRIVS), 1, 0, 0, 0));
         if (process.capabilities) |caps| {
-            for (0..64) |cap| {
-                // EINVAL marks the running kernel's last supported capability.
-                const result = linux.prctl(@intFromEnum(linux.PR.CAPBSET_READ), cap, 0, 0, 0);
-                if (linux.errno(result) == .INVAL) break;
-                try checkResult(result);
-                if (result != 0 and caps.bounding & (@as(u64, 1) << @intCast(cap)) == 0)
-                    try checkResult(linux.prctl(@intFromEnum(linux.PR.CAPBSET_DROP), cap, 0, 0, 0));
-            }
+            try dropBoundingCapabilities(caps.bounding);
             try checkResult(linux.prctl(@intFromEnum(linux.PR.SET_KEEPCAPS), 1, 0, 0, 0));
         }
         // With a user namespace, additionalGids (like uid/gid) are namespace IDs.
@@ -177,24 +174,37 @@ pub fn applyProcessSettings(process: ProcessSettings) Backend.Error!void {
         try checkResult(linux.setgroups(groups.len, groups.ptr));
         try checkResult(linux.setgid(process.gid));
         try checkResult(linux.setuid(process.uid));
-        if (process.capabilities) |caps| {
-            // Linux's header uses a 32-bit pid, unlike Zig 0.16's usize field.
-            const header: CapabilityHeader = .{};
-            const data = [2]linux.cap_user_data_t{
-                .{ .effective = @truncate(caps.effective), .permitted = @truncate(caps.permitted), .inheritable = @truncate(caps.inheritable) },
-                .{ .effective = @truncate(caps.effective >> 32), .permitted = @truncate(caps.permitted >> 32), .inheritable = @truncate(caps.inheritable >> 32) },
-            };
-            try checkResult(linux.syscall2(.capset, @intFromPtr(&header), @intFromPtr(&data)));
-            try checkResult(linux.prctl(@intFromEnum(linux.PR.SET_KEEPCAPS), 0, 0, 0, 0));
-            // Discard inherited ambient caps even when the configured set is empty.
-            try checkResult(linux.prctl(@intFromEnum(linux.PR.CAP_AMBIENT), linux.PR.CAP_AMBIENT_CLEAR_ALL, 0, 0, 0));
-            for (0..64) |cap| {
-                if (caps.ambient & (@as(u64, 1) << @intCast(cap)) != 0)
-                    try checkResult(linux.prctl(@intFromEnum(linux.PR.CAP_AMBIENT), linux.PR.CAP_AMBIENT_RAISE, cap, 0, 0));
-            }
-        }
+        if (process.capabilities) |caps| try applyCapabilities(caps);
     } else {
         return error.NotImplemented;
+    }
+}
+
+fn dropBoundingCapabilities(bounding: u64) Backend.Error!void {
+    for (0..64) |cap| {
+        // EINVAL marks the running kernel's last supported capability.
+        const result = linux.prctl(@intFromEnum(linux.PR.CAPBSET_READ), cap, 0, 0, 0);
+        if (linux.errno(result) == .INVAL) break;
+        try checkResult(result);
+        if (result != 0 and bounding & (@as(u64, 1) << @intCast(cap)) == 0)
+            try checkResult(linux.prctl(@intFromEnum(linux.PR.CAPBSET_DROP), cap, 0, 0, 0));
+    }
+}
+
+fn applyCapabilities(caps: Backend.Capabilities) Backend.Error!void {
+    // Linux's header uses a 32-bit pid, unlike Zig 0.16's usize field.
+    const header: CapabilityHeader = .{};
+    const data = [2]linux.cap_user_data_t{
+        .{ .effective = @truncate(caps.effective), .permitted = @truncate(caps.permitted), .inheritable = @truncate(caps.inheritable) },
+        .{ .effective = @truncate(caps.effective >> 32), .permitted = @truncate(caps.permitted >> 32), .inheritable = @truncate(caps.inheritable >> 32) },
+    };
+    try checkResult(linux.syscall2(.capset, @intFromPtr(&header), @intFromPtr(&data)));
+    try checkResult(linux.prctl(@intFromEnum(linux.PR.SET_KEEPCAPS), 0, 0, 0, 0));
+    // Discard inherited ambient caps even when the configured set is empty.
+    try checkResult(linux.prctl(@intFromEnum(linux.PR.CAP_AMBIENT), linux.PR.CAP_AMBIENT_CLEAR_ALL, 0, 0, 0));
+    for (0..64) |cap| {
+        if (caps.ambient & (@as(u64, 1) << @intCast(cap)) != 0)
+            try checkResult(linux.prctl(@intFromEnum(linux.PR.CAP_AMBIENT), linux.PR.CAP_AMBIENT_RAISE, cap, 0, 0));
     }
 }
 

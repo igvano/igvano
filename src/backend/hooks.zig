@@ -144,6 +144,16 @@ fn runOne(hook: Prepared, state: []const u8, index: usize, reported: *bool, swee
         reportFailure(index, err, status, output, errors);
         reported.* = true;
     }
+    try writeHookState(input, state);
+    const started = try monotonicNow();
+    const forked = std.posix.system.fork();
+    if (std.posix.errno(forked) != .SUCCESS) return error.SystemResources;
+    const pid: i32 = @intCast(forked);
+    if (pid == 0) execHook(hook, input, output, errors, sweep);
+    try waitHook(pid, hook.timeout_seconds, started, &status);
+}
+
+fn writeHookState(input: std.posix.fd_t, state: []const u8) Error!void {
     var offset: usize = 0;
     while (offset < state.len) {
         const result = linux.write(input, state[offset..].ptr, state.len - offset);
@@ -157,28 +167,28 @@ fn runOne(hook: Prepared, state: []const u8, index: usize, reported: *bool, swee
         }
     }
     if (linux.errno(linux.lseek(input, 0, linux.SEEK.SET)) != .SUCCESS) return error.HookFailed;
-    const started = try monotonicNow();
-    const forked = std.posix.system.fork();
-    if (std.posix.errno(forked) != .SUCCESS) return error.SystemResources;
-    const pid: i32 = @intCast(forked);
-    if (pid == 0) {
-        for ([_]std.posix.fd_t{ input, output, errors }, 0..) |fd, target|
-            if (linux.errno(linux.dup2(fd, @intCast(target))) != .SUCCESS) linux.exit_group(1);
-        if (sweep) @import("linux.zig").closeExecFrom(3, null) catch linux.exit_group(1);
-        _ = linux.execve(hook.path, hook.argv.ptr, hook.envp.ptr);
-        linux.exit_group(1);
-    }
+}
+
+fn execHook(hook: Prepared, input: std.posix.fd_t, output: std.posix.fd_t, errors: std.posix.fd_t, sweep: bool) noreturn {
+    for ([_]std.posix.fd_t{ input, output, errors }, 0..) |fd, target|
+        if (linux.errno(linux.dup2(fd, @intCast(target))) != .SUCCESS) linux.exit_group(1);
+    if (sweep) @import("linux.zig").closeExecFrom(3, null) catch linux.exit_group(1);
+    _ = linux.execve(hook.path, hook.argv.ptr, hook.envp.ptr);
+    linux.exit_group(1);
+}
+
+fn waitHook(pid: i32, timeout_seconds: ?u64, started: u128, status: *u32) Error!void {
     var reaped = false;
     defer if (!reaped) {
         _ = linux.kill(pid, .KILL);
-        while (linux.errno(linux.waitpid(pid, &status, 0)) == .INTR) {}
+        while (linux.errno(linux.waitpid(pid, status, 0)) == .INTR) {}
     };
     while (true) {
-        const result = linux.waitpid(pid, &status, linux.W.NOHANG);
+        const result = linux.waitpid(pid, status, linux.W.NOHANG);
         switch (linux.errno(result)) {
             .SUCCESS => if (result != 0) {
                 reaped = true;
-                if (status != 0) return error.HookFailed;
+                if (status.* != 0) return error.HookFailed;
                 return;
             },
             .INTR => continue,
@@ -188,7 +198,7 @@ fn runOne(hook: Prepared, state: []const u8, index: usize, reported: *bool, swee
             },
             else => return error.HookFailed,
         }
-        if (timeoutExpired(hook.timeout_seconds, (try monotonicNow()) - started)) return error.HookTimeout;
+        if (timeoutExpired(timeout_seconds, (try monotonicNow()) - started)) return error.HookTimeout;
         const delay: linux.timespec = .{ .sec = 0, .nsec = 10 * std.time.ns_per_ms };
         switch (linux.errno(linux.nanosleep(&delay, null))) {
             .SUCCESS, .INTR => {},
@@ -305,25 +315,27 @@ test "linux hooks capture both output streams with closed runtime stdio" {
         const forked = std.posix.system.fork();
         if (std.posix.errno(forked) != .SUCCESS) return error.SystemResources;
         const pid: i32 = @intCast(forked);
-        if (pid == 0) {
-            _ = linux.close(1);
-            if (case.failure != null) _ = linux.close(2);
-            run(entries, "{}\n") catch |err| {
-                const expected = case.failure orelse linux.exit_group(1);
-                if (expected != err) linux.exit_group(1);
-                var implementation: @import("linux.zig").LinuxBackend = .{};
-                const detail = implementation.backend().diagnostic() orelse linux.exit_group(2);
-                if (detail.len > 512 or
-                    std.mem.indexOf(u8, detail, "error running hook #0:") == null or
-                    std.mem.indexOf(u8, detail, case.reason) == null or
-                    std.mem.indexOf(u8, detail, "stdout: hook-out") == null or
-                    std.mem.indexOf(u8, detail, "stderr: hook-err") == null) linux.exit_group(3);
-                linux.exit_group(0);
-            };
-            linux.exit_group(if (case.failure == null) 0 else 4);
-        }
+        if (pid == 0) checkCapturedHookOutput(entries, case.failure, case.reason);
         var status: u32 = undefined;
         while (linux.errno(linux.waitpid(pid, &status, 0)) == .INTR) {}
         try std.testing.expectEqual(@as(u32, 0), status);
     }
+}
+
+fn checkCapturedHookOutput(entries: []const Prepared, failure: ?Error, reason: []const u8) noreturn {
+    _ = linux.close(1);
+    if (failure != null) _ = linux.close(2);
+    run(entries, "{}\n") catch |err| {
+        const expected = failure orelse linux.exit_group(1);
+        if (expected != err) linux.exit_group(1);
+        var implementation: @import("linux.zig").LinuxBackend = .{};
+        const detail = implementation.backend().diagnostic() orelse linux.exit_group(2);
+        if (detail.len > 512 or
+            std.mem.indexOf(u8, detail, "error running hook #0:") == null or
+            std.mem.indexOf(u8, detail, reason) == null or
+            std.mem.indexOf(u8, detail, "stdout: hook-out") == null or
+            std.mem.indexOf(u8, detail, "stderr: hook-err") == null) linux.exit_group(3);
+        linux.exit_group(0);
+    };
+    linux.exit_group(if (failure == null) 0 else 4);
 }

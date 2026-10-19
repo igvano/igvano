@@ -101,15 +101,7 @@ pub const console = struct {
         if (message.controllen < rights_len or rights.header.level != linux.SOL.SOCKET or
             rights.header.type != linux.SCM.RIGHTS or rights.header.len < rights_len)
             return error.ConsoleFailed;
-        // The aligned control buffer can hold a second fd in its padding.
-        // Close all delivered rights, including on truncated/malformed input.
-        const bytes = std.mem.asBytes(&rights);
-        const control_end = @min(message.controllen, @min(rights.header.len, bytes.len));
-        var offset: usize = rights_len;
-        while (offset + @sizeOf(posix.fd_t) <= control_end) : (offset += @sizeOf(posix.fd_t)) {
-            const extra = std.mem.bytesToValue(posix.fd_t, bytes[offset..][0..@sizeOf(posix.fd_t)]);
-            closeFd(extra);
-        }
+        closeExtraRights(&rights, message.controllen);
         errdefer closeFd(rights.fd);
         if (rights.header.len != rights_len or message.flags & linux.MSG.CTRUNC != 0)
             return error.ConsoleFailed;
@@ -119,6 +111,18 @@ pub const console = struct {
         }
         if (!std.mem.eql(u8, &data, "ptmx")) return error.ConsoleFailed;
         return rights.fd;
+    }
+
+    fn closeExtraRights(rights: *const Rights, controllen: usize) void {
+        // The aligned control buffer can hold a second fd in its padding.
+        // Close all delivered rights, including on truncated/malformed input.
+        const bytes = std.mem.asBytes(rights);
+        const control_end = @min(controllen, @min(rights.header.len, bytes.len));
+        var offset: usize = rights_len;
+        while (offset + @sizeOf(posix.fd_t) <= control_end) : (offset += @sizeOf(posix.fd_t)) {
+            const extra = std.mem.bytesToValue(posix.fd_t, bytes[offset..][0..@sizeOf(posix.fd_t)]);
+            closeFd(extra);
+        }
     }
 };
 

@@ -91,68 +91,12 @@ pub fn prepareMounts(allocator: std.mem.Allocator, mounts: []const Backend.Mount
     defer prepared.deinit(allocator);
     for (mounts) |mount| {
         if (!std.mem.startsWith(u8, mount.destination, "/")) return error.InvalidPath;
-        if (mount.mappings) |mappings| {
-            if (mount.flags & linux.MS.BIND == 0) {
-                reportDiagnostic("idmapped mount '{s}' must be a bind mount", .{mount.destination});
-                return error.InvalidConfig;
-            }
-            if (if (mappings.userns_path) |path|
-                path.len == 0 or !std.fs.path.isAbsolute(path) or std.mem.indexOfScalar(u8, path, 0) != null or
-                    mappings.uid.len != 0 or mappings.gid.len != 0
-            else
-                mappings.uid.len == 0 or mappings.gid.len == 0)
-            {
-                reportDiagnostic("idmapped mount '{s}' requires both uid and gid mappings, or a user namespace path", .{mount.destination});
-                return error.InvalidConfig;
-            }
-        }
+        try validateMountMappings(mount);
         var mount_type = mount.type;
         if (mount_type != null and mount.flags & linux.MS.BIND == 0)
             mount_type = try cgroupMountType(mount_type.?, host_fs_type);
         if (mount_type != null and std.mem.eql(u8, mount_type.?, "cgroup") and mount.flags & linux.MS.BIND == 0) {
-            const destination = try pathString(allocator, mount.destination);
-            try prepared.append(allocator, .{
-                .destination = destination,
-                .source = "tmpfs",
-                .type = "tmpfs",
-                .flags = mount.flags & ~@as(u32, linux.MS.RDONLY),
-                .propagation = mount.propagation,
-                .data = "mode=755",
-            });
-            var symlinks: std.ArrayList(Backend.Symlink) = .empty;
-            defer symlinks.deinit(allocator);
-            // ponytail: bind the leaf even with a cgroup namespace; runc mounts
-            // cgroupfs with subsystem options there. Use that if needed.
-            for (hierarchies) |hierarchy| {
-                const basename = std.fs.path.basename(hierarchy.mountpoint);
-                try prepared.append(allocator, .{
-                    .destination = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ destination, basename }, 0),
-                    .source = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ hierarchy.mountpoint, cgroup_path }, 0),
-                    .type = null,
-                    .flags = mount.flags | linux.MS.BIND,
-                    .propagation = 0,
-                    .data = "",
-                    .recursive_readonly = mount.recursive_readonly,
-                });
-                if (std.mem.indexOfScalar(u8, basename, ',') != null) {
-                    var names = std.mem.tokenizeScalar(u8, basename, ',');
-                    while (names.next()) |name| try symlinks.append(allocator, .{
-                        .path = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ destination, name }, 0),
-                        .target = try allocator.dupeZ(u8, basename),
-                    });
-                }
-            }
-            // Finish links after all bind targets exist, preserving any names
-            // already present, then make only the covering tmpfs readonly.
-            prepared.items[prepared.items.len - 1].symlinks = try symlinks.toOwnedSlice(allocator);
-            if (mount.flags & linux.MS.RDONLY != 0) try prepared.append(allocator, .{
-                .destination = destination,
-                .source = null,
-                .type = null,
-                .flags = mount.flags | linux.MS.REMOUNT,
-                .propagation = 0,
-                .data = "",
-            });
+            try prepareV1CgroupMount(allocator, &prepared, mount, hierarchies, cgroup_path);
             continue;
         }
         try prepared.append(allocator, .{
@@ -167,6 +111,69 @@ pub fn prepareMounts(allocator: std.mem.Allocator, mounts: []const Backend.Mount
         });
     }
     return prepared.toOwnedSlice(allocator);
+}
+
+fn validateMountMappings(mount: Backend.Mount) Backend.Error!void {
+    const mappings = mount.mappings orelse return;
+    if (mount.flags & linux.MS.BIND == 0) {
+        reportDiagnostic("idmapped mount '{s}' must be a bind mount", .{mount.destination});
+        return error.InvalidConfig;
+    }
+    if (if (mappings.userns_path) |path|
+        path.len == 0 or !std.fs.path.isAbsolute(path) or std.mem.indexOfScalar(u8, path, 0) != null or
+            mappings.uid.len != 0 or mappings.gid.len != 0
+    else
+        mappings.uid.len == 0 or mappings.gid.len == 0)
+    {
+        reportDiagnostic("idmapped mount '{s}' requires both uid and gid mappings, or a user namespace path", .{mount.destination});
+        return error.InvalidConfig;
+    }
+}
+
+fn prepareV1CgroupMount(allocator: std.mem.Allocator, prepared: *std.ArrayList(PreparedMount), mount: Backend.Mount, hierarchies: []const V1Hierarchy, cgroup_path: []const u8) Backend.Error!void {
+    const destination = try pathString(allocator, mount.destination);
+    try prepared.append(allocator, .{
+        .destination = destination,
+        .source = "tmpfs",
+        .type = "tmpfs",
+        .flags = mount.flags & ~@as(u32, linux.MS.RDONLY),
+        .propagation = mount.propagation,
+        .data = "mode=755",
+    });
+    var symlinks: std.ArrayList(Backend.Symlink) = .empty;
+    defer symlinks.deinit(allocator);
+    // ponytail: bind the leaf even with a cgroup namespace; runc mounts
+    // cgroupfs with subsystem options there. Use that if needed.
+    for (hierarchies) |hierarchy| {
+        const basename = std.fs.path.basename(hierarchy.mountpoint);
+        try prepared.append(allocator, .{
+            .destination = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ destination, basename }, 0),
+            .source = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ hierarchy.mountpoint, cgroup_path }, 0),
+            .type = null,
+            .flags = mount.flags | linux.MS.BIND,
+            .propagation = 0,
+            .data = "",
+            .recursive_readonly = mount.recursive_readonly,
+        });
+        if (std.mem.indexOfScalar(u8, basename, ',') != null) {
+            var names = std.mem.tokenizeScalar(u8, basename, ',');
+            while (names.next()) |name| try symlinks.append(allocator, .{
+                .path = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ destination, name }, 0),
+                .target = try allocator.dupeZ(u8, basename),
+            });
+        }
+    }
+    // Finish links after all bind targets exist, preserving any names
+    // already present, then make only the covering tmpfs readonly.
+    prepared.items[prepared.items.len - 1].symlinks = try symlinks.toOwnedSlice(allocator);
+    if (mount.flags & linux.MS.RDONLY != 0) try prepared.append(allocator, .{
+        .destination = destination,
+        .source = null,
+        .type = null,
+        .flags = mount.flags | linux.MS.REMOUNT,
+        .propagation = 0,
+        .data = "",
+    });
 }
 
 test "cgroup mounts map to cgroup2 only on unified hosts" {
@@ -336,18 +343,7 @@ pub fn mountDestination(root_fd: posix.fd_t, destination: []const u8, is_file: b
         var buffer: [256]u8 = undefined;
         const name = std.fmt.bufPrintZ(&buffer, "{s}", .{component}) catch return error.InvalidPath;
         if (next == null and is_file) {
-            if (create) {
-                const created = linux.openat(current, name, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .NOFOLLOW = true, .CLOEXEC = true }, 0o644);
-                switch (linux.errno(created)) {
-                    .SUCCESS => closeFd(@intCast(created)),
-                    .EXIST => {},
-                    else => try checkResult(created),
-                }
-            }
-            const fd = try openPath(current, name, .{ .PATH = true, .NOFOLLOW = true, .CLOEXEC = true });
-            errdefer closeFd(fd);
-            const kind = try fileType(fd);
-            if (kind == linux.S.IFLNK or kind == linux.S.IFDIR) return error.InvalidPath;
+            const fd = try openMountFile(current, name, create);
             closeFd(current);
             return fd;
         }
@@ -363,6 +359,22 @@ pub fn mountDestination(root_fd: posix.fd_t, destination: []const u8, is_file: b
         current = fd;
         component = next orelse return current;
     }
+}
+
+fn openMountFile(dir: posix.fd_t, name: [:0]const u8, create: bool) Backend.Error!posix.fd_t {
+    if (create) {
+        const created = linux.openat(dir, name, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .NOFOLLOW = true, .CLOEXEC = true }, 0o644);
+        switch (linux.errno(created)) {
+            .SUCCESS => closeFd(@intCast(created)),
+            .EXIST => {},
+            else => try checkResult(created),
+        }
+    }
+    const fd = try openPath(dir, name, .{ .PATH = true, .NOFOLLOW = true, .CLOEXEC = true });
+    errdefer closeFd(fd);
+    const kind = try fileType(fd);
+    if (kind == linux.S.IFLNK or kind == linux.S.IFDIR) return error.InvalidPath;
+    return fd;
 }
 
 pub fn remountFlags(target_fd: posix.fd_t, requested: u32) Backend.Error!u32 {
@@ -416,7 +428,6 @@ pub fn applyMount(rootfs: [:0]const u8, root_fd: posix.fd_t, mount: PreparedMoun
     step.* = .{ .operation = "prepare mount destination", .path = mount.destination };
     var target_fd = try mountDestination(root_fd, mount.destination, is_file, true);
     defer closeFd(target_fd);
-    var target_buffer: [64]u8 = undefined;
     var source_buffer: [64]u8 = undefined;
     const source: ?[*:0]const u8 = if (source_fd) |fd|
         fdPath(&source_buffer, fd).ptr
@@ -424,6 +435,24 @@ pub fn applyMount(rootfs: [:0]const u8, root_fd: posix.fd_t, mount: PreparedMoun
         value.ptr
     else
         null;
+    try attachMount(mount, source, target_fd, step);
+    // The original fd pins the covered mount. Reopen to address the new mount
+    // for remount and propagation changes, still without following symlinks.
+    step.operation = "open mounted destination";
+    const mounted_fd = if (std.mem.eql(u8, mount.destination, "/"))
+        try openPath(linux.AT.FDCWD, rootfs, .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true })
+    else
+        try mountDestination(root_fd, mount.destination, is_file, false);
+    closeFd(target_fd);
+    target_fd = mounted_fd;
+    try isolateBindMount(mount, target_fd, private_mount_namespace, rootfs_propagation, step);
+    try applyMountAttributes(mount, target_fd, step);
+}
+
+fn attachMount(mount: PreparedMount, source: ?[*:0]const u8, target_fd: posix.fd_t, step: *RootfsStep) Backend.Error!void {
+    const ms = linux.MS;
+    const bind = mount.flags & ms.BIND != 0;
+    var target_buffer: [64]u8 = undefined;
     step.* = .{
         .operation = if (bind) "bind" else "mount",
         .path = mount.destination,
@@ -445,15 +474,12 @@ pub fn applyMount(rootfs: [:0]const u8, root_fd: posix.fd_t, mount: PreparedMoun
             if (bind or mount.data.len == 0) 0 else @intFromPtr(mount.data.ptr),
         ));
     }
-    // The original fd pins the covered mount. Reopen to address the new mount
-    // for remount and propagation changes, still without following symlinks.
-    step.operation = "open mounted destination";
-    const mounted_fd = if (std.mem.eql(u8, mount.destination, "/"))
-        try openPath(linux.AT.FDCWD, rootfs, .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true })
-    else
-        try mountDestination(root_fd, mount.destination, is_file, false);
-    closeFd(target_fd);
-    target_fd = mounted_fd;
+}
+
+fn isolateBindMount(mount: PreparedMount, target_fd: posix.fd_t, private_mount_namespace: bool, rootfs_propagation: u32, step: *RootfsStep) Backend.Error!void {
+    const ms = linux.MS;
+    const bind = mount.flags & ms.BIND != 0;
+    var target_buffer: [64]u8 = undefined;
     // Detached trees retain host peer groups even under a private parent.
     // Use one-way propagation before remounts to stop propagation to the host while
     // retaining the host propagation source when root or mount propagation needs it.
@@ -468,7 +494,12 @@ pub fn applyMount(rootfs: [:0]const u8, root_fd: posix.fd_t, mount: PreparedMoun
         step.operation = "mount private propagation";
         try checkResult(linux.mount(null, fdPath(&target_buffer, target_fd), null, ms.PRIVATE | ms.REC, 0));
     }
-    if (bind and mount.flags & ~@as(u32, ms.BIND | ms.REC) != 0) {
+}
+
+fn applyMountAttributes(mount: PreparedMount, target_fd: posix.fd_t, step: *RootfsStep) Backend.Error!void {
+    const ms = linux.MS;
+    var target_buffer: [64]u8 = undefined;
+    if (mount.flags & ms.BIND != 0 and mount.flags & ~@as(u32, ms.BIND | ms.REC) != 0) {
         step.operation = "bind remount";
         const requested = (mount.flags & ~@as(u32, ms.REC)) | ms.BIND | ms.REMOUNT;
         try bindRemount(target_fd, fdPath(&target_buffer, target_fd), requested);

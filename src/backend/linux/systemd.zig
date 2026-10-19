@@ -7,6 +7,7 @@ const v2DeviceRules = @import("devices.zig").v2DeviceRules;
 const deviceEmulator = @import("devices.zig").deviceEmulator;
 const reportDiagnostic = @import("diagnostic.zig").reportDiagnostic;
 const v2Writes = @import("cgroup_v2.zig").v2Writes;
+const Write = @import("cgroup_v2.zig").Write;
 const cpuWeight = @import("cgroup_v2.zig").cpuWeight;
 const freeWrites = @import("cgroup_v2.zig").freeWrites;
 const CgroupMode = @import("cgroup.zig").CgroupMode;
@@ -284,7 +285,7 @@ fn setSystemdUnifiedProperties(allocator: std.mem.Allocator, properties: *std.Ar
     for (writes) |write| try setSystemdUnifiedProperty(allocator, properties, write);
 }
 
-fn setSystemdUnifiedProperty(allocator: std.mem.Allocator, properties: *std.ArrayList(dbus.Property), write: @import("cgroup_v2.zig").Write) Backend.Error!void {
+fn setSystemdUnifiedProperty(allocator: std.mem.Allocator, properties: *std.ArrayList(dbus.Property), write: Write) Backend.Error!void {
     if (std.mem.eql(u8, write.name, "cpu.max")) {
         try setSystemdCpuMax(allocator, properties, write.value);
         return;

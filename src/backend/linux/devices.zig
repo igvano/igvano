@@ -131,9 +131,7 @@ pub fn applyV2DeviceFilter(allocator: std.mem.Allocator, cgroup: posix.fd_t, rul
         else => |other| other,
     };
     defer allocator.free(insns);
-    var log: []u8 = &.{};
-    defer allocator.free(log);
-    const program = (try loadV2DeviceProgram(allocator, insns, rules, path, &log)) orelse return;
+    const program = (try loadV2DeviceProgram(allocator, insns, rules, path)) orelse return;
     defer closeFd(program);
     const ids: []const u32 = if (update) try queryDevicePrograms(allocator, cgroup, path) else &.{};
     defer if (update) allocator.free(ids);
@@ -165,7 +163,9 @@ pub fn applyV2DeviceFilter(allocator: std.mem.Allocator, cgroup: posix.fd_t, rul
     }
 }
 
-fn loadV2DeviceProgram(allocator: std.mem.Allocator, insns: []const devicefilter.Insn, rules: []const Resources.DeviceRule, path: []const u8, log: *[]u8) Backend.Error!?posix.fd_t {
+fn loadV2DeviceProgram(allocator: std.mem.Allocator, insns: []const devicefilter.Insn, rules: []const Resources.DeviceRule, path: []const u8) Backend.Error!?posix.fd_t {
+    var log: []u8 = &.{};
+    defer allocator.free(log);
     var load: linux.BPF.Attr = .{ .prog_load = std.mem.zeroes(linux.BPF.ProgLoadAttr) };
     load.prog_load.prog_type = @intFromEnum(linux.BPF.ProgType.cgroup_device);
     load.prog_load.insn_cnt = @intCast(insns.len);
@@ -182,14 +182,14 @@ fn loadV2DeviceProgram(allocator: std.mem.Allocator, insns: []const devicefilter
     // only for a diagnostic retry after a load with all log fields zero fails.
     var loaded = linux.bpf(.prog_load, &load, @sizeOf(linux.BPF.ProgLoadAttr));
     if (linux.errno(loaded) != .SUCCESS) {
-        log.* = allocator.alloc(u8, 64 * 1024) catch |err| {
+        log = allocator.alloc(u8, 64 * 1024) catch |err| {
             if (raised) try checkResult(linux.setrlimit(.MEMLOCK, &original));
             return err;
         };
-        @memset(log.*, 0);
+        @memset(log, 0);
         load.prog_load.log_level = 1;
-        load.prog_load.log_size = @intCast(log.*.len);
-        load.prog_load.log_buf = @intFromPtr(log.*.ptr);
+        load.prog_load.log_size = @intCast(log.len);
+        load.prog_load.log_buf = @intFromPtr(log.ptr);
         loaded = linux.bpf(.prog_load, &load, @sizeOf(linux.BPF.ProgLoadAttr));
     }
     if (raised) {
@@ -202,7 +202,7 @@ fn loadV2DeviceProgram(allocator: std.mem.Allocator, insns: []const devicefilter
     }
     if (linux.errno(loaded) != .SUCCESS) {
         if (skipDeviceBpfError(rules, path, "BPF_PROG_LOAD", linux.errno(loaded))) return null;
-        const detail = std.mem.sliceTo(log.*, 0);
+        const detail = std.mem.sliceTo(log, 0);
         reportDiagnostic("cgroup '{s}' cannot enforce v2 devices: BPF_PROG_LOAD(BPF_CGROUP_DEVICE): {s}; verifier: {s}", .{ path, @tagName(linux.errno(loaded)), detail });
         return error.CgroupWriteFailed;
     }

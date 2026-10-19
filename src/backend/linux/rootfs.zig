@@ -48,28 +48,33 @@ fn isRootfsSelfBind(text: []const u8, mount_id: u64, path: []const u8) Backend.E
     while (lines.next()) |line| {
         const parent = try MountInfo.parse(line);
         if (parent.id != entry.parent) continue;
-        if (!std.mem.eql(u8, entry.device, parent.device)) return false;
-        const parent_point = try mountinfoPath(&point_buffer, parent.mountpoint);
-        const relative = if (std.mem.eql(u8, parent_point, "/"))
-            path[1..]
-        else if (std.mem.eql(u8, parent_point, path))
-            ""
-        else if (std.mem.startsWith(u8, path, parent_point) and path.len > parent_point.len and path[parent_point.len] == '/')
-            path[parent_point.len + 1 ..]
-        else
-            return false;
-        var parent_root_buffer: [std.fs.max_path_bytes]u8 = undefined;
-        const parent_root = try mountinfoPath(&parent_root_buffer, parent.root);
-        var expected_buffer: [std.fs.max_path_bytes]u8 = undefined;
-        const expected = std.fmt.bufPrint(&expected_buffer, "{s}{s}{s}", .{
-            parent_root,
-            if (relative.len == 0 or std.mem.eql(u8, parent_root, "/")) "" else "/",
-            relative,
-        }) catch return error.InvalidPath;
-        var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
-        return std.mem.eql(u8, try mountinfoPath(&root_buffer, entry.root), expected);
+        return selfBindRootMatches(entry, parent, path);
     }
     return false;
+}
+
+fn selfBindRootMatches(entry: MountInfo, parent: MountInfo, path: []const u8) Backend.Error!bool {
+    if (!std.mem.eql(u8, entry.device, parent.device)) return false;
+    var point_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const parent_point = try mountinfoPath(&point_buffer, parent.mountpoint);
+    const relative = if (std.mem.eql(u8, parent_point, "/"))
+        path[1..]
+    else if (std.mem.eql(u8, parent_point, path))
+        ""
+    else if (std.mem.startsWith(u8, path, parent_point) and path.len > parent_point.len and path[parent_point.len] == '/')
+        path[parent_point.len + 1 ..]
+    else
+        return false;
+    var parent_root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const parent_root = try mountinfoPath(&parent_root_buffer, parent.root);
+    var expected_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const expected = std.fmt.bufPrint(&expected_buffer, "{s}{s}{s}", .{
+        parent_root,
+        if (relative.len == 0 or std.mem.eql(u8, parent_root, "/")) "" else "/",
+        relative,
+    }) catch return error.InvalidPath;
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    return std.mem.eql(u8, try mountinfoPath(&root_buffer, entry.root), expected);
 }
 
 pub fn mountId(fd: posix.fd_t) Backend.Error!u64 {
@@ -328,59 +333,12 @@ pub fn setupRootfs(rootfs: [:0]const u8, mounts: []const PreparedMount, devices:
     const ms = linux.MS;
     var step: RootfsStep = .{ .operation = "mount propagation", .path = "/" };
     errdefer |err| if (step.operation.len != 0) step.report(err);
-    if (options.private_mount_namespace)
-        try checkResult(linux.mount(null, "/", null, options.propagation, 0));
-    // Shared parents prevent pivot_root and leak the rootfs self-bind.
-    // Making only the parent bindable also preserves runc's unbindable-submount pruning.
+    try prepareRootfsBind(rootfs, options, &step);
     const restore_propagation = options.private_mount_namespace and options.propagation & (ms.SHARED | ms.UNBINDABLE) != 0;
-    if (options.private_mount_namespace) {
-        step = .{ .operation = "mount parent propagation", .path = rootfs };
-        try makeRootfsParentUnshared(rootfs, options.propagation, &step);
-    }
-    step = .{ .operation = "bind", .source = rootfs, .path = rootfs };
-    try checkResult(linux.mount(rootfs, rootfs, null, ms.BIND | ms.REC, 0));
-    if (!options.private_mount_namespace) {
-        // Report ownership before a configured mount at "/" can cover this bind.
-        step = .{ .operation = "open rootfs", .path = rootfs };
-        const root_fd = try openPath(linux.AT.FDCWD, rootfs, .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true });
-        defer closeFd(root_fd);
-        step.operation = "stat rootfs mount";
-        var response: CreateResponse = .{ .rootfs_mount_id = try mountId(root_fd) };
-        step = .{ .operation = "report rootfs mount" };
-        if (options.runtime_sync) |sync|
-            if (!writeAll(sync.ready_fd, std.mem.asBytes(&response))) return error.CreateFailed;
-    }
-    // The new self-bind can inherit host peer groups. Isolate only this copy,
-    // so configured submounts do not also appear beneath the covered directory.
-    step = .{ .operation = "mount private propagation", .path = rootfs };
-    if (!options.private_mount_namespace)
-        try checkResult(linux.mount(null, rootfs, null, ms.PRIVATE | ms.REC, 0));
-    for (mounts) |mount| {
-        step = .{ .operation = "open rootfs", .path = rootfs };
-        const root_fd = try openPath(linux.AT.FDCWD, rootfs, .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true });
-        defer closeFd(root_fd);
-        try applyMount(rootfs, root_fd, mount, options.private_mount_namespace, options.propagation, &step);
-        try setupSymlinks(root_fd, mount.symlinks, &step);
-    }
+    try applyRootfsMounts(rootfs, mounts, options, &step);
     closeMountFds(mounts);
     owns_mount_fds = false;
-    if (options.runtime_sync) |sync| {
-        step = .{ .operation = "create synchronization" };
-        var response: CreateResponse = .{};
-        if (!writeAll(sync.ready_fd, std.mem.asBytes(&response))) return error.CreateFailed;
-        var byte: [1]u8 = undefined;
-        const released = readAll(sync.go_fd, &byte);
-        closeFd(sync.go_fd);
-        if (!released or byte[0] != 1) return error.CreateFailed;
-    }
-    // Runtime paths are still reachable; the hook already runs in the new
-    // mount namespace and sees all configured mounts before pivot_root.
-    step = .{ .operation = "create hooks" };
-    hooks.run(options.create_hooks, options.create_hook_state) catch |err| {
-        // The hook runner already recorded its captured output.
-        step.operation = "";
-        return @as(Backend.Error!void, err);
-    };
+    try runCreateHooks(options, &step);
     // runc's fd trick stacks the old root on the new root without a put_old
     // directory. Detach it and close both handles before any container exec.
     // Keep them above stdio, which console setup replaces before they close.
@@ -396,24 +354,7 @@ pub fn setupRootfs(rootfs: [:0]const u8, mounts: []const PreparedMount, devices:
     // Populate rootfs /dev even without tmpfs, but leave a bind-mounted /dev
     // untouched: device nodes and symlinks there would mutate the host source.
     if (needsSetupDev(mounts)) try setupDevices(new_root, devices, symlinks, options.private_mount_namespace, &step);
-    step = .{ .operation = "fchdir rootfs", .path = rootfs };
-    try checkResult(linux.fchdir(new_root));
-    if (options.private_mount_namespace) {
-        step = .{ .operation = "pivot_root" };
-        try checkResult(linux.pivot_root(".", "."));
-        step = .{ .operation = "fchdir old root" };
-        try checkResult(linux.fchdir(old_root.?));
-        // Detaching inherited shared submounts must not unmount their host peers.
-        step = .{ .operation = "mount old root slave propagation" };
-        try checkResult(linux.mount(null, ".", null, ms.SLAVE | ms.REC, 0));
-        step = .{ .operation = "umount old root" };
-        try checkResult(linux.umount2(".", linux.MNT.DETACH));
-    } else {
-        step = .{ .operation = "chroot", .path = rootfs };
-        try checkResult(linux.chroot("."));
-    }
-    step = .{ .operation = "chdir", .path = "/" };
-    try checkResult(linux.chdir("/"));
+    try enterRootfs(rootfs, old_root, new_root, &step);
     if (options.console_fd) |socket| {
         defer closeFd(socket);
         setupConsole(socket, true) catch |err| {
@@ -433,4 +374,86 @@ pub fn setupRootfs(rootfs: [:0]const u8, mounts: []const PreparedMount, devices:
     step = .{ .operation = "restore mount propagation", .path = "/" };
     if (restore_propagation)
         try checkResult(linux.mount(null, "/", null, options.propagation, 0));
+}
+
+fn prepareRootfsBind(rootfs: [:0]const u8, options: RootfsOptions, step: *RootfsStep) Backend.Error!void {
+    const ms = linux.MS;
+    if (options.private_mount_namespace)
+        try checkResult(linux.mount(null, "/", null, options.propagation, 0));
+    // Shared parents prevent pivot_root and leak the rootfs self-bind.
+    // Making only the parent bindable also preserves runc's unbindable-submount pruning.
+    if (options.private_mount_namespace) {
+        step.* = .{ .operation = "mount parent propagation", .path = rootfs };
+        try makeRootfsParentUnshared(rootfs, options.propagation, step);
+    }
+    step.* = .{ .operation = "bind", .source = rootfs, .path = rootfs };
+    try checkResult(linux.mount(rootfs, rootfs, null, ms.BIND | ms.REC, 0));
+    if (!options.private_mount_namespace) {
+        // Report ownership before a configured mount at "/" can cover this bind.
+        step.* = .{ .operation = "open rootfs", .path = rootfs };
+        const root_fd = try openPath(linux.AT.FDCWD, rootfs, .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true });
+        defer closeFd(root_fd);
+        step.operation = "stat rootfs mount";
+        var response: CreateResponse = .{ .rootfs_mount_id = try mountId(root_fd) };
+        step.* = .{ .operation = "report rootfs mount" };
+        if (options.runtime_sync) |sync|
+            if (!writeAll(sync.ready_fd, std.mem.asBytes(&response))) return error.CreateFailed;
+    }
+    // The new self-bind can inherit host peer groups. Isolate only this copy,
+    // so configured submounts do not also appear beneath the covered directory.
+    step.* = .{ .operation = "mount private propagation", .path = rootfs };
+    if (!options.private_mount_namespace)
+        try checkResult(linux.mount(null, rootfs, null, ms.PRIVATE | ms.REC, 0));
+}
+
+fn applyRootfsMounts(rootfs: [:0]const u8, mounts: []const PreparedMount, options: RootfsOptions, step: *RootfsStep) Backend.Error!void {
+    for (mounts) |mount| {
+        step.* = .{ .operation = "open rootfs", .path = rootfs };
+        const root_fd = try openPath(linux.AT.FDCWD, rootfs, .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true });
+        defer closeFd(root_fd);
+        try applyMount(rootfs, root_fd, mount, options.private_mount_namespace, options.propagation, step);
+        try setupSymlinks(root_fd, mount.symlinks, step);
+    }
+}
+
+fn runCreateHooks(options: RootfsOptions, step: *RootfsStep) Backend.Error!void {
+    if (options.runtime_sync) |sync| {
+        step.* = .{ .operation = "create synchronization" };
+        var response: CreateResponse = .{};
+        if (!writeAll(sync.ready_fd, std.mem.asBytes(&response))) return error.CreateFailed;
+        var byte: [1]u8 = undefined;
+        const released = readAll(sync.go_fd, &byte);
+        closeFd(sync.go_fd);
+        if (!released or byte[0] != 1) return error.CreateFailed;
+    }
+    // Runtime paths are still reachable; the hook already runs in the new
+    // mount namespace and sees all configured mounts before pivot_root.
+    step.* = .{ .operation = "create hooks" };
+    hooks.run(options.create_hooks, options.create_hook_state) catch |err| {
+        // The hook runner already recorded its captured output.
+        step.operation = "";
+        return @as(Backend.Error!void, err);
+    };
+}
+
+fn enterRootfs(rootfs: [:0]const u8, old_root: ?posix.fd_t, new_root: posix.fd_t, step: *RootfsStep) Backend.Error!void {
+    const ms = linux.MS;
+    step.* = .{ .operation = "fchdir rootfs", .path = rootfs };
+    try checkResult(linux.fchdir(new_root));
+    if (old_root) |fd| {
+        step.* = .{ .operation = "pivot_root" };
+        try checkResult(linux.pivot_root(".", "."));
+        step.* = .{ .operation = "fchdir old root" };
+        try checkResult(linux.fchdir(fd));
+        // Detaching inherited shared submounts must not unmount their host peers.
+        step.* = .{ .operation = "mount old root slave propagation" };
+        try checkResult(linux.mount(null, ".", null, ms.SLAVE | ms.REC, 0));
+        step.* = .{ .operation = "umount old root" };
+        try checkResult(linux.umount2(".", linux.MNT.DETACH));
+    } else {
+        step.* = .{ .operation = "chroot", .path = rootfs };
+        try checkResult(linux.chroot("."));
+    }
+    step.* = .{ .operation = "chdir", .path = "/" };
+    try checkResult(linux.chdir("/"));
 }

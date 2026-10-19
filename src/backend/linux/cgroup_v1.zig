@@ -714,8 +714,7 @@ fn checkV1DeviceController(hierarchies: []const V1Hierarchy, resources: Resource
 fn checkV1WriteControllers(hierarchies: []const V1Hierarchy, writes: []const V1Write, resources: Resources, nodes: []const Backend.Device) Backend.Error!void {
     // Warn once per missing controller, including controllers with many writes.
     for (writes, 0..) |write, index| {
-        const mounted = hasV1Controller(hierarchies, write.controller);
-        if (mounted) continue;
+        if (hasV1Controller(hierarchies, write.controller)) continue;
         if (requiredV1Controller(write.controller, resources, nodes)) {
             reportDiagnostic("cgroup v1 controller {s} is required but not mounted", .{write.controller});
             return error.CgroupWriteFailed;
@@ -738,10 +737,10 @@ const V1MemoryWriteOrder = struct {
 };
 
 fn v1MemoryWriteOrder(allocator: std.mem.Allocator, hierarchy: V1Hierarchy, writes: []const V1Write, resources: Resources) Backend.Error!V1MemoryWriteOrder {
+    if (!hierarchy.has("memory")) return .{};
     var swap_first: ?usize = null;
     var limit_write: ?usize = null;
     var swap_write: ?usize = null;
-    if (!hierarchy.has("memory")) return .{};
     for (writes, 0..) |write, index| {
         if (std.mem.eql(u8, write.name, "memory.limit_in_bytes")) limit_write = index;
         if (std.mem.eql(u8, write.name, "memory.memsw.limit_in_bytes")) swap_write = index;
@@ -941,6 +940,5 @@ fn v1CgroupIdentityMatches(owned: linux.Statx, leaf: posix.fd_t) Backend.Error!b
     var current: linux.Statx = undefined;
     try checkResult(linux.statx(leaf, "", linux.AT.EMPTY_PATH, .{ .INO = true }, &current));
     if (!owned.mask.INO or !current.mask.INO) return error.CgroupDeleteFailed;
-    if (owned.dev_major != current.dev_major or owned.dev_minor != current.dev_minor or owned.ino != current.ino) return false;
-    return true;
+    return owned.dev_major == current.dev_major and owned.dev_minor == current.dev_minor and owned.ino == current.ino;
 }

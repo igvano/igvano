@@ -232,15 +232,19 @@ pub fn applyAppArmor(command: ?[]const u8) Backend.Error!void {
             }) catch unreachable;
         const fd = (try proc.openWrite(path)) orelse continue;
         defer closeFd(fd);
-        while (true) {
-            const result = linux.write(fd, text.ptr, text.len);
-            if (linux.errno(result) == .INTR) continue;
-            unknown_profile = linux.errno(result) == .NOENT;
-            try checkResult(result);
-            if (result != text.len) return error.CreateFailed;
-            return;
-        }
+        return writeAppArmorCommand(fd, text, &unknown_profile);
     }
     reportDiagnostic("no apparmor exec attr in procfs", .{});
     return error.MissingProcfs;
+}
+
+fn writeAppArmorCommand(fd: posix.fd_t, text: []const u8, unknown_profile: *bool) Backend.Error!void {
+    while (true) {
+        const result = linux.write(fd, text.ptr, text.len);
+        if (linux.errno(result) == .INTR) continue;
+        unknown_profile.* = linux.errno(result) == .NOENT;
+        try checkResult(result);
+        if (result != text.len) return error.CreateFailed;
+        return;
+    }
 }
