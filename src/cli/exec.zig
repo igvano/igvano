@@ -1,0 +1,244 @@
+const std = @import("std");
+const builtin = @import("builtin");
+const oci = @import("igvano").oci;
+const backend_module = @import("igvano").backend;
+const Backend = backend_module.Backend;
+const attached = @import("../attached.zig");
+const backendResult = @import("diagnostic.zig").backendResult;
+const Config = @import("args.zig").Config;
+const parseArgs = @import("args.zig").parseArgs;
+const optionValue = @import("args.zig").optionValue;
+const prepareProcess = @import("process.zig").prepareProcess;
+const connectConsoleSocket = @import("process.zig").connectConsoleSocket;
+const writePidFile = @import("process.zig").writePidFile;
+const openContainerLock = @import("state.zig").openContainerLock;
+const lockContainer = @import("state.zig").lockContainer;
+const requireLinkedLock = @import("state.zig").requireLinkedLock;
+const readLiveState = @import("state.zig").readLiveState;
+
+fn execProcessConfig(allocator: std.mem.Allocator, inherited: oci.Spec.Process, config: Config) !oci.Spec.Process {
+    var process = inherited;
+    process.args = config.exec_args;
+    if (config.exec_cwd) |value| process.cwd = value;
+    process.terminal = config.tty orelse false;
+    if (config.exec_user) |value| {
+        process.user.uid = value.uid;
+        if (value.gid) |gid| process.user.gid = gid;
+    }
+    var env: std.ArrayList([]const u8) = .empty;
+    errdefer env.deinit(allocator);
+    try env.appendSlice(allocator, process.env orelse &.{});
+    var index: usize = 0;
+    while (index < config.exec_flags.len) : (index += 1) {
+        const flag = config.exec_flags[index];
+        if (std.mem.eql(u8, flag, "--env") or std.mem.startsWith(u8, flag, "--env=")) {
+            const value = try optionValue(config.exec_flags, &index, error.MissingEnv);
+            const key_len = std.mem.indexOfScalar(u8, value, '=').?;
+            // Later values override the saved environment and earlier --envs.
+            var entry: usize = 0;
+            while (entry < env.items.len) {
+                const existing = env.items[entry];
+                if (existing.len > key_len and existing[key_len] == '=' and
+                    std.mem.eql(u8, existing[0..key_len], value[0..key_len]))
+                    _ = env.orderedRemove(entry)
+                else
+                    entry += 1;
+            }
+            try env.append(allocator, value);
+        } else if (std.mem.indexOfScalar(u8, flag, '=') == null and
+            !std.mem.eql(u8, flag, "--detach") and !std.mem.eql(u8, flag, "-d") and
+            !std.mem.eql(u8, flag, "--tty") and !std.mem.eql(u8, flag, "-t"))
+        {
+            index += 1; // Skip the value of another parsed option.
+        }
+    }
+    process.env = try env.toOwnedSlice(allocator);
+    return process;
+}
+
+pub fn execContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, config: Config) !u8 {
+    if (comptime builtin.os.tag != .linux) return error.NotImplemented;
+    const linux = std.os.linux;
+    if (!config.detach) {
+        // Reserve stdio before locks, console sockets, or the signal
+        // pipe can reuse their numbers and become attached-loop I/O.
+        for ([_]std.posix.fd_t{ 0, 1, 2 }) |fd| {
+            switch (linux.errno(linux.fcntl(fd, linux.F.GETFD, 0))) {
+                .SUCCESS => continue,
+                .BADF => {},
+                else => return error.ConsoleFailed,
+            }
+            // open returns the lowest free fd; earlier stdio slots are reserved.
+            while (true) {
+                const opened = linux.open("/dev/null", .{ .ACCMODE = .RDWR }, 0);
+                switch (linux.errno(opened)) {
+                    .SUCCESS => break,
+                    .INTR => continue,
+                    else => return error.ConsoleFailed,
+                }
+            }
+        }
+    }
+    var lock = try openContainerLock(allocator, config, false);
+    defer if (lock) |file| file.close(io);
+    const locked = if (lock) |file| try lockContainer(file, false) else true;
+    if (locked) {
+        if (lock) |file| try requireLinkedLock(io, file);
+    }
+    const state = try readLiveState(allocator, io, backend, config, locked);
+    defer state.deinit();
+    if (state.parsed.value.status != .created and state.parsed.value.status != .running) return oci.validationError(error.InvalidStatus, "exec: requires created or running state", .{});
+
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer arena.deinit();
+    const process_allocator = arena.allocator();
+    const saved_bundle = try std.fs.path.join(process_allocator, &.{ config.root, config.id });
+    // Legacy containers did not snapshot config.json at create.
+    const saved_spec: ?std.json.Parsed(oci.Spec) = oci.loadSpec(process_allocator, io, saved_bundle) catch |err| switch (err) {
+        error.FileNotFound => oci.loadSpec(process_allocator, io, state.parsed.value.bundle) catch |bundle_err| switch (bundle_err) {
+            // Legacy containers created before seccomp support can exec --process without either config.
+            error.FileNotFound => if (config.process_file != null) null else return bundle_err,
+            else => return bundle_err,
+        },
+        else => return err,
+    };
+    var process: oci.Spec.Process = if (config.process_file) |path| process: {
+        const json = std.Io.Dir.cwd().readFileAlloc(io, path, process_allocator, .limited(1 << 20)) catch |err| {
+            if (err == error.StreamTooLong) oci.recordDiagnostic(err, "--process: JSON exceeds 1 MiB", .{});
+            return err;
+        };
+        const parsed = std.json.parseFromSlice(oci.Spec.Process, process_allocator, json, .{
+            .allocate = .alloc_always,
+            .ignore_unknown_fields = true,
+        }) catch |err| {
+            if (err != error.OutOfMemory) oci.recordDiagnostic(err, "--process: invalid JSON or schema ({s})", .{@errorName(err)});
+            return err;
+        };
+        break :process parsed.value;
+    } else process: {
+        const spec = saved_spec orelse return error.FileNotFound;
+        break :process try execProcessConfig(process_allocator, spec.value.process orelse return oci.validationError(error.MissingProcess, "exec: bundle has no process to inherit", .{}), config);
+    };
+    // Like runc, an omitted or empty exec profile inherits the container default.
+    if (process.apparmorProfile == null or process.apparmorProfile.?.len == 0) {
+        if (saved_spec) |spec| {
+            if (spec.value.process) |inherited| process.apparmorProfile = inherited.apparmorProfile;
+        }
+    }
+    try oci.validateProcess(process);
+    const local_console = (process.terminal orelse false) and !config.detach and config.console_socket == null;
+    var options = try prepareProcess(process_allocator, process, local_console or config.console_socket != null);
+    const seccomp = seccomp: {
+        const spec = saved_spec orelse break :seccomp null;
+        const settings = spec.value.linux orelse break :seccomp null;
+        break :seccomp settings.seccomp;
+    };
+    options.seccomp = try oci.prepareSeccomp(process_allocator, seccomp);
+    options.cgroup_path = state.handle.?.cgroup_path orelse return oci.validationError(error.InvalidState, "exec: saved cgroup path is missing", .{});
+    options.console_fds = if (process.terminal orelse false) try backend_module.console.socketpair() else null;
+    defer if (options.console_fds) |fds| for (fds) |fd| {
+        _ = linux.close(fd);
+    };
+    var was_subreaper: u32 = 0;
+    if (!config.detach) {
+        // The helper exits after exec; adoption lets this frontend waitpid the
+        // grandchild. Detached exec leaves adoption/reaping to the shim.
+        if (linux.errno(linux.prctl(@intFromEnum(linux.PR.GET_CHILD_SUBREAPER), @intFromPtr(&was_subreaper), 0, 0, 0)) != .SUCCESS or
+            linux.errno(linux.prctl(@intFromEnum(linux.PR.SET_CHILD_SUBREAPER), 1, 0, 0, 0)) != .SUCCESS)
+            return error.SubreaperFailed;
+    }
+    defer if (!config.detach) {
+        _ = linux.prctl(@intFromEnum(linux.PR.SET_CHILD_SUBREAPER), was_subreaper, 0, 0, 0);
+    };
+    var signals: ?attached.Signals = if (!config.detach) try attached.Signals.init() else null;
+    defer if (signals) |*handler| handler.deinit();
+    const pid = try backendResult(backend, backend.exec(state.handle.?, options));
+    var reaped = false;
+    errdefer if (!reaped) {
+        _ = linux.kill(pid, .KILL);
+        if (!config.detach) _ = waitExec(pid) catch {};
+    };
+    var controller: ?std.posix.fd_t = null;
+    defer if (controller) |fd| {
+        _ = linux.close(fd);
+    };
+    if (options.console_fds) |fds| {
+        controller = try backend_module.console.receiveFd(fds[0]);
+        if (config.console_socket) |path| {
+            const peer = try connectConsoleSocket(path);
+            defer _ = linux.close(peer);
+            try backend_module.console.sendFd(peer, controller.?);
+            _ = linux.close(controller.?);
+            controller = null;
+        }
+    }
+    if (config.pid_file) |path| try writePidFile(allocator, io, path, pid);
+    // Do not hold the container lock while waiting for a long-running command.
+    if (locked) {
+        if (lock) |file| {
+            file.close(io);
+            lock = null;
+        }
+    }
+    if (config.detach) return 0;
+    return try attached.wait(pid, &reaped, &signals.?, controller, 0, 1);
+}
+
+pub fn waitExec(pid: i32) !u8 {
+    if (comptime builtin.os.tag != .linux) return error.NotImplemented;
+    var status: if (builtin.link_libc) c_int else u32 = undefined;
+    while (true) {
+        switch (std.posix.errno(std.posix.system.waitpid(pid, &status, 0))) {
+            .SUCCESS => {
+                const value: u32 = @bitCast(status);
+                const signal = value & 0x7f;
+                return @intCast(if (signal == 0) (value >> 8) & 0xff else 128 + signal);
+            },
+            .INTR => continue,
+            else => return error.WaitFailed,
+        }
+    }
+}
+
+test "exec command overrides inherit process settings and replace environment keys" {
+    const config = try parseArgs(&.{
+        "igvano", "exec", "--cwd", "/work", "--env", "A=first", "--env=A=last", "--env", "NEW=x=y", "--user=1000:1001", "-t", "example", "sh", "-c", "exit 7",
+    });
+    const original: oci.Spec.Process = .{
+        .args = &.{"sleep"},
+        .env = &.{ "A=old", "KEEP=value" },
+        .cwd = "/",
+        .user = .{ .uid = 0, .gid = 1002, .additionalGids = &.{42} },
+        .noNewPrivileges = true,
+        .apparmorProfile = "igvano-default",
+        .oomScoreAdj = 100,
+        .capabilities = .{ .bounding = &.{"CAP_CHOWN"} },
+        .rlimits = &.{.{ .type = "RLIMIT_NOFILE", .hard = 1024, .soft = 512 }},
+    };
+    const process = try execProcessConfig(std.testing.allocator, original, config);
+    defer std.testing.allocator.free(process.env.?);
+    try std.testing.expectEqualSlices([]const u8, config.exec_args, process.args);
+    try std.testing.expectEqualStrings("/work", process.cwd);
+    try std.testing.expect(process.terminal.?);
+    try std.testing.expectEqual(@as(u32, 1000), process.user.uid);
+    try std.testing.expectEqual(@as(u32, 1001), process.user.gid);
+    try std.testing.expectEqual(@as(u32, 42), process.user.additionalGids.?[0]);
+    try std.testing.expect(process.noNewPrivileges);
+    try std.testing.expectEqualStrings("igvano-default", process.apparmorProfile.?);
+    try std.testing.expectEqual(original.oomScoreAdj, process.oomScoreAdj);
+    try std.testing.expectEqualStrings("CAP_CHOWN", process.capabilities.?.bounding.?[0]);
+    try std.testing.expectEqual(original.rlimits.?[0].hard, process.rlimits.?[0].hard);
+    try std.testing.expectEqual(@as(usize, 3), process.env.?.len);
+    try std.testing.expectEqualStrings("KEEP=value", process.env.?[0]);
+    try std.testing.expectEqualStrings("A=last", process.env.?[1]);
+    try std.testing.expectEqualStrings("NEW=x=y", process.env.?[2]);
+    const uid_only = try parseArgs(&.{ "igvano", "exec", "--user", "99", "example", "true" });
+    try std.testing.expectEqual(@as(?u32, null), uid_only.exec_user.?.gid);
+    var terminal_init = original;
+    terminal_init.terminal = true;
+    const no_tty = try execProcessConfig(std.testing.allocator, terminal_init, uid_only);
+    defer std.testing.allocator.free(no_tty.env.?);
+    try std.testing.expect(!no_tty.terminal.?);
+    try std.testing.expectEqual(@as(u32, 99), no_tty.user.uid);
+    try std.testing.expectEqual(@as(u32, 1002), no_tty.user.gid);
+}

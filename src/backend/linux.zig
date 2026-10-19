@@ -1,6 +1,4 @@
-const std = @import("std");
 const Backend = @import("../backend.zig").Backend;
-const Resources = Backend.Resources;
 
 pub const reportDiagnostic = @import("linux/diagnostic.zig").reportDiagnostic;
 pub const lockedMountFlags = @import("linux/mount.zig").lockedMountFlags;
@@ -17,67 +15,19 @@ pub const LinuxBackend = struct {
     }
 
     const vtable: Backend.VTable = .{
-        .create = create,
-        .exec = exec,
-        .alive = alive,
-        .kill = kill,
-        .killAll = killAll,
-        .update = update,
-        .pids = pids,
-        .freeze = freeze,
-        .thaw = thaw,
-        .frozen = frozen,
-        .delete = delete,
-        .diagnostic = diagnostic,
+        .create = @import("linux/create.zig").create,
+        .exec = @import("linux/exec.zig").exec,
+        .alive = @import("linux/proc.zig").alive,
+        .kill = @import("linux/proc.zig").kill,
+        .killAll = @import("linux/cgroup_ops.zig").killAll,
+        .update = @import("linux/cgroup_ops.zig").update,
+        .pids = @import("linux/cgroup_ops.zig").pids,
+        .freeze = @import("linux/cgroup_ops.zig").freeze,
+        .thaw = @import("linux/cgroup_ops.zig").thaw,
+        .frozen = @import("linux/cgroup_ops.zig").frozen,
+        .delete = @import("linux/cgroup_ops.zig").delete,
+        .diagnostic = @import("linux/diagnostic.zig").diagnostic,
     };
-
-    fn diagnostic(ptr: *anyopaque) ?[]const u8 {
-        return @import("linux/diagnostic.zig").diagnostic(ptr);
-    }
-
-    fn exec(ptr: *anyopaque, handle: Backend.Handle, options: Backend.ExecOptions) Backend.Error!i32 {
-        return @import("linux/exec.zig").exec(ptr, handle, options);
-    }
-
-    fn create(ptr: *anyopaque, options: Backend.CreateOptions) Backend.Error!Backend.Handle {
-        return @import("linux/create.zig").create(ptr, options);
-    }
-
-    fn alive(ptr: *anyopaque, handle: Backend.Handle) Backend.Error!bool {
-        return @import("linux/proc.zig").alive(ptr, handle);
-    }
-
-    fn kill(ptr: *anyopaque, handle: Backend.Handle, signal: i32) Backend.Error!void {
-        return @import("linux/proc.zig").kill(ptr, handle, signal);
-    }
-
-    fn killAll(ptr: *anyopaque, handle: Backend.Handle, signal: i32) Backend.Error!void {
-        return @import("linux/cgroup_ops.zig").killAll(ptr, handle, signal);
-    }
-
-    fn update(ptr: *anyopaque, handle: Backend.Handle, resources: Resources) Backend.Error!void {
-        return @import("linux/cgroup_ops.zig").update(ptr, handle, resources);
-    }
-
-    fn pids(ptr: *anyopaque, handle: Backend.Handle, allocator: std.mem.Allocator) Backend.Error![]i32 {
-        return @import("linux/cgroup_ops.zig").pids(ptr, handle, allocator);
-    }
-
-    fn freeze(ptr: *anyopaque, handle: Backend.Handle) Backend.Error!void {
-        return @import("linux/cgroup_ops.zig").freeze(ptr, handle);
-    }
-
-    fn thaw(ptr: *anyopaque, handle: Backend.Handle) Backend.Error!void {
-        return @import("linux/cgroup_ops.zig").thaw(ptr, handle);
-    }
-
-    fn frozen(ptr: *anyopaque, handle: Backend.Handle) Backend.Error!bool {
-        return @import("linux/cgroup_ops.zig").frozen(ptr, handle);
-    }
-
-    fn delete(ptr: *anyopaque, handle: Backend.Handle) Backend.Error!void {
-        return @import("linux/cgroup_ops.zig").delete(ptr, handle);
-    }
 };
 
 test {
@@ -109,6 +59,7 @@ test {
     _ = @import("linux/tests/cgroups_v2.zig");
     _ = @import("linux/tests/console.zig");
     _ = @import("linux/tests/devices.zig");
+    _ = @import("linux/tests/diagnostic.zig");
     _ = @import("linux/tests/freezer.zig");
     _ = @import("linux/tests/helpers.zig");
     _ = @import("linux/tests/idmapped_mounts.zig");

@@ -3,7 +3,6 @@ const linux = std.os.linux;
 const posix = std.posix;
 const Backend = @import("../../backend.zig").Backend;
 const writeAll = @import("syscall.zig").writeAll;
-const LinuxBackend = @import("../linux.zig").LinuxBackend;
 
 // Borrowed diagnostic detail for this thread; no allocation after fork.
 // ponytail: One backend per thread; use per-instance storage if a thread hosts several.
@@ -39,36 +38,6 @@ pub fn reportDiagnostic(comptime fmt: []const u8, args: anytype) void {
     }
 }
 
-test "backend diagnostic records formatted detail and truncates safely" {
-    var implementation: LinuxBackend = .{};
-    const backend = implementation.backend();
-    defer last_diagnostic_len = 0;
-    last_diagnostic_len = 0;
-    try std.testing.expect(backend.diagnostic() == null);
-    reportDiagnostic("failed at {s}: {d}", .{ "/proc", 42 });
-    try std.testing.expectEqualStrings("failed at /proc: 42", backend.diagnostic().?);
-    reportDiagnostic("{s}", .{"x" ** 600});
-    try std.testing.expectEqualStrings("x" ** 512, backend.diagnostic().?);
-    reportDiagnostic("{s}{s}", .{ "x" ** 511, "é" });
-    try std.testing.expectEqualStrings("x" ** 511, backend.diagnostic().?);
-    reportDiagnostic("short", .{});
-    try std.testing.expectEqualStrings("short", backend.diagnostic().?);
-    childError(": ", error.CreateFailed);
-    try std.testing.expectEqualStrings(": CreateFailed", backend.diagnostic().?);
-}
-
-test "backend diagnostics are isolated between threads" {
-    defer last_diagnostic_len = 0;
-    reportDiagnostic("main thread", .{});
-    const worker = try std.Thread.spawn(.{}, struct {
-        fn run() void {
-            reportDiagnostic("worker thread", .{});
-        }
-    }.run, .{});
-    worker.join();
-    var implementation: LinuxBackend = .{};
-    try std.testing.expectEqualStrings("main thread", implementation.backend().diagnostic().?);
-}
 pub fn diagnostic(_: *anyopaque) ?[]const u8 {
     return if (last_diagnostic_len == 0) null else last_diagnostic[0..last_diagnostic_len];
 }
