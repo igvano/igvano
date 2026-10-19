@@ -29,6 +29,8 @@ Rules:
 
 ## Build and test
 
+Pre-commit hooks run through [prek](https://github.com/j178/prek): `zig fmt --check`, and `cccc` enforcing the `cccc.toml` complexity limits (cognitive 25, cyclomatic 15 per function; `tests/` and `test/` exempt) on the staged files and on all of `src/`. Both tools come from the devShell. With a global `core.hooksPath` (e.g. a corporate hook that chains to local hooks), put `exec nix develop -c prek run --hook-stage pre-commit` in `.git/hooks/pre-commit` instead of `prek install`.
+
 Zig is NOT installed system-wide. The toolchain comes from the Nix flake devShell (ghostty's scheme: `minimum_zig_version` in `build.zig.zon` is the single declared pin; `flake.nix` supplies exactly that compiler via `mitchellh/zig-overlay`).
 
 ```sh

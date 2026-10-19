@@ -34,68 +34,14 @@ pub fn cgroupResources(allocator: std.mem.Allocator, configured: ?Spec.Resources
     const settings = configured orelse return .{};
     var resources: Backend.Resources = .{};
     errdefer freeCgroupResources(allocator, resources);
-    if (settings.memory) |memory| {
-        inline for (.{ "limit", "reservation", "swap", "kernel", "kernelTCP" }) |field|
-            try validateResourceLimit(@field(memory, field), "linux.resources.memory." ++ field);
-        resources.memory = .{
-            .limit = memory.limit,
-            .reservation = memory.reservation,
-            .swap = memory.swap,
-            .kernel = memory.kernel,
-            .kernel_tcp = memory.kernelTCP,
-            .swappiness = memory.swappiness,
-            .disable_oom_killer = memory.disableOOMKiller,
-        };
-    }
-    if (settings.cpu) |cpu| {
-        try validateResourceLimit(cpu.quota, "linux.resources.cpu.quota");
-        try validateResourceLimit(cpu.realtimeRuntime, "linux.resources.cpu.realtimeRuntime");
-        if (cpu.shares) |shares|
-            if (shares != 0 and (shares < 2 or shares > 262144)) return invalidConfig("linux.resources.cpu.shares: expected 0 or 2..262144", .{});
-        resources.cpu = .{
-            .shares = cpu.shares,
-            .quota = cpu.quota,
-            .period = cpu.period,
-            .realtime_runtime = cpu.realtimeRuntime,
-            .realtime_period = cpu.realtimePeriod,
-            .cpus = cpu.cpus,
-            .mems = cpu.mems,
-        };
-    }
+    if (settings.memory) |value| resources.memory = try resourceMemory(value);
+    if (settings.cpu) |value| resources.cpu = try resourceCpu(value);
     if (settings.pids) |pids| {
         try validateResourceLimit(pids.limit, "linux.resources.pids.limit");
         resources.pids = .{ .limit = pids.limit };
     }
-    if (settings.blockIO) |block| {
-        try validateResourceWeight(block.weight, "linux.resources.blockIO.weight");
-        try validateResourceWeight(block.leafWeight, "linux.resources.blockIO.leafWeight");
-        resources.block_io = .{ .weight = block.weight, .leaf_weight = block.leafWeight };
-        const weights = block.weightDevice orelse &.{};
-        const translated = try allocator.alloc(Backend.Resources.WeightDevice, weights.len);
-        resources.block_io.?.weight_device = translated;
-        for (weights, translated, 0..) |entry, *device, i| {
-            if (entry.major < 0 or entry.minor < 0) return invalidConfig("linux.resources.blockIO.weightDevice[{d}]: major/minor must be nonnegative", .{i});
-            try validateResourceWeight(entry.weight, "linux.resources.blockIO.weightDevice.weight");
-            try validateResourceWeight(entry.leafWeight, "linux.resources.blockIO.weightDevice.leafWeight");
-            device.* = .{
-                .major = entry.major,
-                .minor = entry.minor,
-                .weight = entry.weight,
-                .leaf_weight = entry.leafWeight,
-            };
-        }
-        resources.block_io.?.throttle_read_bps = try resourceThrottleDevices(allocator, block.throttleReadBpsDevice, "throttleReadBpsDevice");
-        resources.block_io.?.throttle_write_bps = try resourceThrottleDevices(allocator, block.throttleWriteBpsDevice, "throttleWriteBpsDevice");
-        resources.block_io.?.throttle_read_iops = try resourceThrottleDevices(allocator, block.throttleReadIOPSDevice, "throttleReadIOPSDevice");
-        resources.block_io.?.throttle_write_iops = try resourceThrottleDevices(allocator, block.throttleWriteIOPSDevice, "throttleWriteIOPSDevice");
-    }
-    const hugepages = settings.hugepageLimits orelse &.{};
-    const translated_pages = try allocator.alloc(Backend.Resources.HugepageLimit, hugepages.len);
-    resources.hugepage_limits = translated_pages;
-    for (hugepages, translated_pages, 0..) |entry, *page, i| {
-        if (entry.pageSize.len == 0) return invalidConfig("linux.resources.hugepageLimits[{d}].pageSize: must not be empty", .{i});
-        page.* = .{ .page_size = entry.pageSize, .limit = entry.limit };
-    }
+    if (settings.blockIO) |value| try prepareBlockResources(allocator, &resources, value);
+    try prepareHugepageResources(allocator, &resources, settings.hugepageLimits);
     if (settings.network) |network| {
         resources.network = .{ .class_id = network.classID };
         const priorities = network.priorities orelse &.{};
@@ -105,16 +51,82 @@ pub fn cgroupResources(allocator: std.mem.Allocator, configured: ?Spec.Resources
             priority.* = .{ .name = entry.name, .priority = entry.priority };
     }
     resources.devices = try resourceDeviceRules(allocator, settings.devices);
-    if (settings.unified) |unified| {
-        const translated = try allocator.alloc(Backend.Resources.Unified, unified.map.count());
-        resources.unified = translated;
-        for (unified.map.keys(), unified.map.values(), translated) |key, value, *entry| {
-            if (key.len == 0 or std.mem.indexOfAny(u8, key, "/\x00") != null or
-                std.mem.eql(u8, key, ".") or std.mem.eql(u8, key, "..")) return invalidConfig("linux.resources.unified: invalid key '{s}'", .{key});
-            entry.* = .{ .key = key, .value = value };
-        }
-    }
+    if (settings.unified) |value| try prepareUnifiedResources(allocator, &resources, value);
     return resources;
+}
+
+fn resourceMemory(memory: Spec.Resources.Memory) !Backend.Resources.Memory {
+    inline for (.{ "limit", "reservation", "swap", "kernel", "kernelTCP" }) |field|
+        try validateResourceLimit(@field(memory, field), "linux.resources.memory." ++ field);
+    return .{
+        .limit = memory.limit,
+        .reservation = memory.reservation,
+        .swap = memory.swap,
+        .kernel = memory.kernel,
+        .kernel_tcp = memory.kernelTCP,
+        .swappiness = memory.swappiness,
+        .disable_oom_killer = memory.disableOOMKiller,
+    };
+}
+
+fn resourceCpu(cpu: Spec.Resources.Cpu) !Backend.Resources.Cpu {
+    try validateResourceLimit(cpu.quota, "linux.resources.cpu.quota");
+    try validateResourceLimit(cpu.realtimeRuntime, "linux.resources.cpu.realtimeRuntime");
+    if (cpu.shares) |shares|
+        if (shares != 0 and (shares < 2 or shares > 262144)) return invalidConfig("linux.resources.cpu.shares: expected 0 or 2..262144", .{});
+    return .{
+        .shares = cpu.shares,
+        .quota = cpu.quota,
+        .period = cpu.period,
+        .realtime_runtime = cpu.realtimeRuntime,
+        .realtime_period = cpu.realtimePeriod,
+        .cpus = cpu.cpus,
+        .mems = cpu.mems,
+    };
+}
+
+fn prepareBlockResources(allocator: std.mem.Allocator, resources: *Backend.Resources, block: Spec.Resources.BlockIO) !void {
+    try validateResourceWeight(block.weight, "linux.resources.blockIO.weight");
+    try validateResourceWeight(block.leafWeight, "linux.resources.blockIO.leafWeight");
+    resources.block_io = .{ .weight = block.weight, .leaf_weight = block.leafWeight };
+    const weights = block.weightDevice orelse &.{};
+    const translated = try allocator.alloc(Backend.Resources.WeightDevice, weights.len);
+    resources.block_io.?.weight_device = translated;
+    for (weights, translated, 0..) |entry, *device, i| {
+        if (entry.major < 0 or entry.minor < 0) return invalidConfig("linux.resources.blockIO.weightDevice[{d}]: major/minor must be nonnegative", .{i});
+        try validateResourceWeight(entry.weight, "linux.resources.blockIO.weightDevice.weight");
+        try validateResourceWeight(entry.leafWeight, "linux.resources.blockIO.weightDevice.leafWeight");
+        device.* = .{
+            .major = entry.major,
+            .minor = entry.minor,
+            .weight = entry.weight,
+            .leaf_weight = entry.leafWeight,
+        };
+    }
+    resources.block_io.?.throttle_read_bps = try resourceThrottleDevices(allocator, block.throttleReadBpsDevice, "throttleReadBpsDevice");
+    resources.block_io.?.throttle_write_bps = try resourceThrottleDevices(allocator, block.throttleWriteBpsDevice, "throttleWriteBpsDevice");
+    resources.block_io.?.throttle_read_iops = try resourceThrottleDevices(allocator, block.throttleReadIOPSDevice, "throttleReadIOPSDevice");
+    resources.block_io.?.throttle_write_iops = try resourceThrottleDevices(allocator, block.throttleWriteIOPSDevice, "throttleWriteIOPSDevice");
+}
+
+fn prepareUnifiedResources(allocator: std.mem.Allocator, resources: *Backend.Resources, unified: std.json.ArrayHashMap([]const u8)) !void {
+    const translated = try allocator.alloc(Backend.Resources.Unified, unified.map.count());
+    resources.unified = translated;
+    for (unified.map.keys(), unified.map.values(), translated) |key, value, *entry| {
+        if (key.len == 0 or std.mem.indexOfAny(u8, key, "/\x00") != null or
+            std.mem.eql(u8, key, ".") or std.mem.eql(u8, key, "..")) return invalidConfig("linux.resources.unified: invalid key '{s}'", .{key});
+        entry.* = .{ .key = key, .value = value };
+    }
+}
+
+fn prepareHugepageResources(allocator: std.mem.Allocator, resources: *Backend.Resources, configured: ?[]const Spec.Resources.HugepageLimit) !void {
+    const hugepages = configured orelse &.{};
+    const translated_pages = try allocator.alloc(Backend.Resources.HugepageLimit, hugepages.len);
+    resources.hugepage_limits = translated_pages;
+    for (hugepages, translated_pages, 0..) |entry, *page, i| {
+        if (entry.pageSize.len == 0) return invalidConfig("linux.resources.hugepageLimits[{d}].pageSize: must not be empty", .{i});
+        page.* = .{ .page_size = entry.pageSize, .limit = entry.limit };
+    }
 }
 
 fn resourceDeviceRules(allocator: std.mem.Allocator, configured: ?[]const Spec.Resources.DeviceRule) ![]Backend.Resources.DeviceRule {

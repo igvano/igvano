@@ -11,6 +11,7 @@ const lockContainer = @import("state.zig").lockContainer;
 const requireLinkedLock = @import("state.zig").requireLinkedLock;
 const loadSavedHooks = @import("state.zig").loadSavedHooks;
 const loadHasProcess = @import("state.zig").loadHasProcess;
+const LiveState = @import("state.zig").LiveState;
 const readLiveState = @import("state.zig").readLiveState;
 const runHooks = @import("hooks.zig").runHooks;
 const warnHooks = @import("hooks.zig").warnHooks;
@@ -32,16 +33,7 @@ pub fn startContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend
     defer if (saved_hooks) |entries| entries.deinit();
     const path = try std.fs.path.join(allocator, &.{ config.root, config.id, oci.exec_fifo_name });
     defer allocator.free(path);
-    runHooks(allocator, if (saved_hooks) |entries| entries.value.prestart else null, state.parsed.value) catch |err| {
-        // Cleanup failures must not add backend detail to this frontend failure.
-        defer diagnostics.last_backend_detail = null;
-        if (lock) |file| requireLinkedLock(io, file) catch return err;
-        stopContainer(io, backend, state.handle) catch |cleanup_err|
-            std.debug.print("igvano: warning: cannot stop container after prestart failure: {s}\n", .{@errorName(cleanup_err)});
-        destroyContainer(allocator, io, backend, config, &state, &lock, if (saved_hooks) |entries| entries.value.poststop else null) catch |cleanup_err|
-            std.debug.print("igvano: warning: cannot destroy container after prestart failure: {s}\n", .{@errorName(cleanup_err)});
-        return err;
-    };
+    try runPrestartHooks(allocator, io, backend, config, &state, &lock, saved_hooks);
     if (lock) |file| try requireLinkedLock(io, file);
     try waitForStart(allocator, io, backend, state.handle.?, path);
     state.parsed.value.status = .running;
@@ -53,6 +45,19 @@ pub fn startContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend
         lock = null;
     }
     warnHooks(allocator, if (saved_hooks) |entries| entries.value.poststart else null, state.parsed.value, "poststart");
+}
+
+fn runPrestartHooks(allocator: std.mem.Allocator, io: std.Io, backend: Backend, config: Config, state: *LiveState, lock: *?std.Io.File, saved_hooks: ?std.json.Parsed(oci.Spec.Hooks)) !void {
+    runHooks(allocator, if (saved_hooks) |entries| entries.value.prestart else null, state.parsed.value) catch |err| {
+        // Cleanup failures must not add backend detail to this frontend failure.
+        defer diagnostics.last_backend_detail = null;
+        if (lock.*) |file| requireLinkedLock(io, file) catch return err;
+        stopContainer(io, backend, state.handle) catch |cleanup_err|
+            std.debug.print("igvano: warning: cannot stop container after prestart failure: {s}\n", .{@errorName(cleanup_err)});
+        destroyContainer(allocator, io, backend, config, state, lock, if (saved_hooks) |entries| entries.value.poststop else null) catch |cleanup_err|
+            std.debug.print("igvano: warning: cannot destroy container after prestart failure: {s}\n", .{@errorName(cleanup_err)});
+        return err;
+    };
 }
 
 /// After acknowledgement, CLOEXEC closes the writer at exec; earlier EOF can
@@ -78,47 +83,62 @@ pub fn waitForStart(allocator: std.mem.Allocator, io: std.Io, backend: Backend, 
         const path_z = try allocator.dupeZ(u8, path);
         defer allocator.free(path_z);
         const started = std.Io.Clock.awake.now(io);
-        const fd: std.posix.fd_t = open: while (true) {
-            try requireStartWait(try backendResult(backend, backend.alive(handle)), started.untilNow(io, .awake));
-            const result = linux.open(path_z, .{ .ACCMODE = .RDONLY, .NONBLOCK = true, .CLOEXEC = true }, 0);
-            switch (linux.errno(result)) {
-                .SUCCESS => break :open @intCast(result),
-                .INTR => continue,
-                .NOENT => return error.StartFailed,
-                .ACCES, .PERM => return error.PermissionDenied,
-                else => return error.StartFailed,
-            }
-        };
+        const fd = try openStartFifo(io, backend, handle, path_z, started);
         defer _ = linux.close(fd);
-        var byte: [1]u8 = undefined;
         var writer_seen = false;
         var acked = false;
         while (true) {
             const is_alive = try backendResult(backend, backend.alive(handle));
-            const result = linux.read(fd, &byte, byte.len);
-            switch (linux.errno(result)) {
-                .SUCCESS => {
-                    if (try startReadComplete(writer_seen, acked, result, if (result == 1) byte[0] else 0)) return;
-                    if (result == 1) acked = true;
-                },
-                .AGAIN => writer_seen = true,
-                .INTR => continue,
-                else => return error.StartFailed,
-            }
-            // After acknowledgement, drain to EOF or 0 even if init exited.
-            if (!acked) {
-                if (writer_seen) {
-                    // Init opened the FIFO and may be running start hooks. Their
-                    // configured deadlines govern this phase, including no deadline.
-                    if (!is_alive) return error.ProcessNotFound;
-                } else {
-                    try requireStartWait(is_alive, started.untilNow(io, .awake));
-                }
-            }
+            if (try readStartFifo(fd, &writer_seen, &acked) orelse continue) return;
+            try requireStartProgress(io, started, is_alive, writer_seen, acked);
             try std.Io.sleep(io, .fromMilliseconds(10), .awake);
         }
     } else {
         return error.NotImplemented;
+    }
+}
+
+fn openStartFifo(io: std.Io, backend: Backend, handle: Backend.Handle, path_z: [:0]const u8, started: std.Io.Timestamp) !std.posix.fd_t {
+    const linux = std.os.linux;
+    return open: while (true) {
+        try requireStartWait(try backendResult(backend, backend.alive(handle)), started.untilNow(io, .awake));
+        const result = linux.open(path_z, .{ .ACCMODE = .RDONLY, .NONBLOCK = true, .CLOEXEC = true }, 0);
+        switch (linux.errno(result)) {
+            .SUCCESS => break :open @as(std.posix.fd_t, @intCast(result)),
+            .INTR => continue,
+            .NOENT => return error.StartFailed,
+            .ACCES, .PERM => return error.PermissionDenied,
+            else => return error.StartFailed,
+        }
+    };
+}
+
+fn readStartFifo(fd: std.posix.fd_t, writer_seen: *bool, acked: *bool) !?bool {
+    const linux = std.os.linux;
+    var byte: [1]u8 = undefined;
+    const result = linux.read(fd, &byte, byte.len);
+    switch (linux.errno(result)) {
+        .SUCCESS => {
+            if (try startReadComplete(writer_seen.*, acked.*, result, if (result == 1) byte[0] else 0)) return true;
+            if (result == 1) acked.* = true;
+        },
+        .AGAIN => writer_seen.* = true,
+        .INTR => return null,
+        else => return error.StartFailed,
+    }
+    return false;
+}
+
+fn requireStartProgress(io: std.Io, started: std.Io.Timestamp, is_alive: bool, writer_seen: bool, acked: bool) !void {
+    // After acknowledgement, drain to EOF or 0 even if init exited.
+    if (!acked) {
+        if (writer_seen) {
+            // Init opened the FIFO and may be running start hooks. Their
+            // configured deadlines govern this phase, including no deadline.
+            if (!is_alive) return error.ProcessNotFound;
+        } else {
+            try requireStartWait(is_alive, started.untilNow(io, .awake));
+        }
     }
 }
 

@@ -241,25 +241,29 @@ pub fn loadCleanupSystemdDriver(allocator: std.mem.Allocator, io: std.Io, root: 
         if (!force or err == error.OutOfMemory) return err;
         std.debug.print("igvano: warning: cannot load cgroup driver for '{s}': {s}; checking scope ownership before systemd cleanup\n", .{ id, @errorName(err) });
         oci.clearDiagnostic();
-        const path = cgroup_path orelse return false;
-        const unit = std.fs.path.basename(path);
-        const state_dir = try std.fs.path.join(allocator, &.{ root, id });
-        defer allocator.free(state_dir);
-        const saved_spec: ?std.json.Parsed(oci.Spec) = oci.loadSpec(allocator, io, state_dir) catch |spec_err| switch (spec_err) {
-            error.OutOfMemory => return spec_err,
-            error.FileNotFound => null,
-            else => {
-                oci.clearDiagnostic();
-                return false;
-            },
-        };
-        defer if (saved_spec) |spec| spec.deinit();
-        const configured = if (saved_spec) |spec| if (spec.value.linux) |settings| settings.cgroupsPath else null else null;
-        if (!try systemdUnitMatchesContainer(allocator, unit, id, configured)) return false;
-        return backend_module.systemdCgroupMatches(allocator, unit, path) catch |query_err| {
-            if (query_err == error.OutOfMemory) return query_err;
+        return inferCleanupSystemdDriver(allocator, io, root, id, cgroup_path);
+    };
+}
+
+fn inferCleanupSystemdDriver(allocator: std.mem.Allocator, io: std.Io, root: []const u8, id: []const u8, cgroup_path: ?[]const u8) !bool {
+    const path = cgroup_path orelse return false;
+    const unit = std.fs.path.basename(path);
+    const state_dir = try std.fs.path.join(allocator, &.{ root, id });
+    defer allocator.free(state_dir);
+    const saved_spec: ?std.json.Parsed(oci.Spec) = oci.loadSpec(allocator, io, state_dir) catch |spec_err| switch (spec_err) {
+        error.OutOfMemory => return spec_err,
+        error.FileNotFound => null,
+        else => {
+            oci.clearDiagnostic();
             return false;
-        };
+        },
+    };
+    defer if (saved_spec) |spec| spec.deinit();
+    const configured = if (saved_spec) |spec| if (spec.value.linux) |settings| settings.cgroupsPath else null else null;
+    if (!try systemdUnitMatchesContainer(allocator, unit, id, configured)) return false;
+    return backend_module.systemdCgroupMatches(allocator, unit, path) catch |query_err| {
+        if (query_err == error.OutOfMemory) return query_err;
+        return false;
     };
 }
 
@@ -352,45 +356,53 @@ pub fn requireUnusedRootfs(allocator: std.mem.Allocator, io: std.Io, backend: Ba
     var entries = directory.iterate();
     while (try entries.next(io)) |entry| {
         if (entry.kind != .directory or std.mem.eql(u8, entry.name, id)) continue;
-        const mount = (loadRootfsMount(allocator, io, root, entry.name) catch |err| {
-            if (err == error.OutOfMemory) return err;
-            warnRootfsSibling(entry.name, err);
-            continue;
-        }) orelse continue;
-        defer allocator.free(mount.path);
-        const mounted_path = rootfsComparisonPath(allocator, io, mount.path) catch |err| {
-            if (err == error.OutOfMemory) return err;
-            warnRootfsSibling(entry.name, err);
-            continue;
-        };
-        defer allocator.free(mounted_path);
-        if (!std.mem.eql(u8, mounted_path, resolved)) continue;
-        const saved = oci.loadState(allocator, io, root, entry.name) catch |err| switch (err) {
-            error.FileNotFound => continue, // Concurrent deletion.
-            error.OutOfMemory => return err,
-            else => {
-                warnRootfsSibling(entry.name, err);
-                continue;
-            },
-        };
-        defer saved.deinit();
-        if (!std.mem.eql(u8, saved.value.id, entry.name)) {
-            warnRootfsSibling(entry.name, error.InvalidState);
-            continue;
-        }
-        if (saved.value.pid == null) continue;
-        const handle = stateHandle(allocator, io, root, saved.value, false) catch |err| switch (err) {
-            error.FileNotFound => continue,
-            error.OutOfMemory => return err,
-            else => {
-                warnRootfsSibling(entry.name, err);
-                continue;
-            },
-        };
-        defer freeStateHandle(allocator, handle);
-        if (try backendResult(backend, backend.alive(handle)))
+        if (!try rootfsSiblingMatches(allocator, io, root, entry.name, resolved)) continue;
+        if (try rootfsSiblingAlive(allocator, io, backend, root, entry.name))
             return oci.validationError(error.InvalidConfig, "rootfs '{s}' is already used by live container '{s}' in the inherited mount namespace", .{ rootfs, entry.name });
     }
+}
+
+fn rootfsSiblingMatches(allocator: std.mem.Allocator, io: std.Io, root: []const u8, id: []const u8, resolved: []const u8) !bool {
+    const mount = (loadRootfsMount(allocator, io, root, id) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        warnRootfsSibling(id, err);
+        return false;
+    }) orelse return false;
+    defer allocator.free(mount.path);
+    const mounted_path = rootfsComparisonPath(allocator, io, mount.path) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        warnRootfsSibling(id, err);
+        return false;
+    };
+    defer allocator.free(mounted_path);
+    return std.mem.eql(u8, mounted_path, resolved);
+}
+
+fn rootfsSiblingAlive(allocator: std.mem.Allocator, io: std.Io, backend: Backend, root: []const u8, id: []const u8) !bool {
+    const saved = oci.loadState(allocator, io, root, id) catch |err| switch (err) {
+        error.FileNotFound => return false, // Concurrent deletion.
+        error.OutOfMemory => return err,
+        else => {
+            warnRootfsSibling(id, err);
+            return false;
+        },
+    };
+    defer saved.deinit();
+    if (!std.mem.eql(u8, saved.value.id, id)) {
+        warnRootfsSibling(id, error.InvalidState);
+        return false;
+    }
+    if (saved.value.pid == null) return false;
+    const handle = stateHandle(allocator, io, root, saved.value, false) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        error.OutOfMemory => return err,
+        else => {
+            warnRootfsSibling(id, err);
+            return false;
+        },
+    };
+    defer freeStateHandle(allocator, handle);
+    return backendResult(backend, backend.alive(handle));
 }
 
 fn warnRootfsSibling(id: []const u8, err: anyerror) void {
@@ -507,29 +519,37 @@ pub fn recoverLiveState(allocator: std.mem.Allocator, io: std.Io, backend: Backe
     var handle: ?Backend.Handle = null;
     errdefer if (handle) |value| freeStateHandle(allocator, value);
     if (parsed.value.status == .creating or parsed.value.status == .created or parsed.value.status == .running or parsed.value.status == .paused) {
-        handle = stateHandle(allocator, io, config.root, parsed.value, config.subcommand == .delete and config.force) catch |err| switch (err) {
-            error.InvalidState => if (parsed.value.status == .creating) recovered: {
-                oci.clearDiagnostic();
-                break :recovered null;
-            } else return err,
-            else => return err,
-        };
+        handle = try loadLiveHandle(allocator, io, config, parsed.value);
         if (handle == null or !try backendResult(backend, backend.alive(handle.?))) {
             parsed.value.status = .stopped;
             if (persist_recovery) try oci.saveState(allocator, io, config.root, parsed.value);
         } else if (parsed.value.status != .creating) {
-            const frozen = if (config.subcommand == .kill or (config.subcommand == .delete and config.force))
-                backend.frozen(handle.?) catch false
-            else
-                try backendResult(backend, backend.frozen(handle.?));
-            if (frozen) {
-                parsed.value.status = .paused;
-            } else if (parsed.value.status == .paused) {
-                parsed.value.status = .running;
-            }
+            try recoverFrozenState(backend, config, &parsed.value, handle.?);
         }
     }
     return .{ .parsed = parsed, .handle = handle, .allocator = allocator };
+}
+
+fn loadLiveHandle(allocator: std.mem.Allocator, io: std.Io, config: Config, state: oci.State) !?Backend.Handle {
+    return stateHandle(allocator, io, config.root, state, config.subcommand == .delete and config.force) catch |err| switch (err) {
+        error.InvalidState => if (state.status == .creating) recovered: {
+            oci.clearDiagnostic();
+            break :recovered null;
+        } else return err,
+        else => return err,
+    };
+}
+
+fn recoverFrozenState(backend: Backend, config: Config, state: *oci.State, handle: Backend.Handle) !void {
+    const frozen = if (config.subcommand == .kill or (config.subcommand == .delete and config.force))
+        backend.frozen(handle) catch false
+    else
+        try backendResult(backend, backend.frozen(handle));
+    if (frozen) {
+        state.status = .paused;
+    } else if (state.status == .paused) {
+        state.status = .running;
+    }
 }
 
 test "state handle requires a nonempty starttime file" {

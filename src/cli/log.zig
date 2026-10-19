@@ -56,38 +56,45 @@ test "json error logs append escaped messages and RFC3339 UTC timestamps" {
         defer parsed.deinit();
         try std.testing.expectEqualStrings("error", parsed.value.level);
         try std.testing.expectEqualStrings(message, parsed.value.msg);
-        // Parse the UTC RFC3339 form and validate its calendar and clock fields.
-        const time = parsed.value.time;
-        try std.testing.expectEqual(@as(usize, 20), time.len);
-        try std.testing.expectEqualStrings("-", time[4..5]);
-        try std.testing.expectEqualStrings("-", time[7..8]);
-        try std.testing.expectEqualStrings("T", time[10..11]);
-        try std.testing.expectEqualStrings(":", time[13..14]);
-        try std.testing.expectEqualStrings(":", time[16..17]);
-        try std.testing.expectEqualStrings("Z", time[19..20]);
-        for (time, 0..) |byte, index| {
-            if (index == 4 or index == 7 or index == 10 or index == 13 or index == 16 or index == 19) continue;
-            try std.testing.expect(std.ascii.isDigit(byte));
-        }
-        const year = try std.fmt.parseInt(std.time.epoch.Year, time[0..4], 10);
-        const month = try std.fmt.parseInt(u8, time[5..7], 10);
-        const day = try std.fmt.parseInt(u8, time[8..10], 10);
-        const hour = try std.fmt.parseInt(u8, time[11..13], 10);
-        const minute = try std.fmt.parseInt(u8, time[14..16], 10);
-        const second = try std.fmt.parseInt(u8, time[17..19], 10);
-        try std.testing.expect(year >= 1970 and month >= 1 and month <= 12);
-        try std.testing.expect(day >= 1 and day <= std.time.epoch.getDaysInMonth(year, @enumFromInt(month)));
-        try std.testing.expect(hour < 24 and minute < 60 and second < 60);
-        var days: u64 = day - 1;
-        for (1970..year) |y| days += std.time.epoch.getDaysInYear(@intCast(y));
-        for (1..month) |m| days += std.time.epoch.getDaysInMonth(year, @enumFromInt(m));
-        const timestamp = days * 86400 + @as(u64, hour) * 3600 + @as(u64, minute) * 60 + second;
-        try std.testing.expect(timestamp >= before and timestamp <= after);
+        try expectLogTimestamp(parsed.value.time, before, after);
     }
     try std.testing.expectEqualStrings("", lines.next().?);
     try std.testing.expect(lines.next() == null);
     const stat = try tmp.dir.statFile(std.testing.io, "runtime.log", .{});
     try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), stat.permissions.toMode() & 0o777);
+}
+
+fn expectLogTimeFormat(time: []const u8) !void {
+    // Parse the UTC RFC3339 form and validate its calendar and clock fields.
+    try std.testing.expectEqual(@as(usize, 20), time.len);
+    try std.testing.expectEqualStrings("-", time[4..5]);
+    try std.testing.expectEqualStrings("-", time[7..8]);
+    try std.testing.expectEqualStrings("T", time[10..11]);
+    try std.testing.expectEqualStrings(":", time[13..14]);
+    try std.testing.expectEqualStrings(":", time[16..17]);
+    try std.testing.expectEqualStrings("Z", time[19..20]);
+    for (time, 0..) |byte, index| {
+        if (index == 4 or index == 7 or index == 10 or index == 13 or index == 16 or index == 19) continue;
+        try std.testing.expect(std.ascii.isDigit(byte));
+    }
+}
+
+fn expectLogTimestamp(time: []const u8, before: i128, after: i128) !void {
+    try expectLogTimeFormat(time);
+    const year = try std.fmt.parseInt(std.time.epoch.Year, time[0..4], 10);
+    const month = try std.fmt.parseInt(u8, time[5..7], 10);
+    const day = try std.fmt.parseInt(u8, time[8..10], 10);
+    const hour = try std.fmt.parseInt(u8, time[11..13], 10);
+    const minute = try std.fmt.parseInt(u8, time[14..16], 10);
+    const second = try std.fmt.parseInt(u8, time[17..19], 10);
+    try std.testing.expect(year >= 1970 and month >= 1 and month <= 12);
+    try std.testing.expect(day >= 1 and day <= std.time.epoch.getDaysInMonth(year, @enumFromInt(month)));
+    try std.testing.expect(hour < 24 and minute < 60 and second < 60);
+    var days: u64 = day - 1;
+    for (1970..year) |y| days += std.time.epoch.getDaysInYear(@intCast(y));
+    for (1..month) |m| days += std.time.epoch.getDaysInMonth(year, @enumFromInt(m));
+    const timestamp = days * 86400 + @as(u64, hour) * 3600 + @as(u64, minute) * 60 + second;
+    try std.testing.expect(timestamp >= before and timestamp <= after);
 }
 
 test "text error logs append the stderr line without changing existing permissions" {

@@ -60,192 +60,171 @@ pub fn parseArgs(args: []const []const u8) !Config {
 
 // Keep the settings already parsed available when a later argument fails.
 pub fn parseArgsWithLog(args: []const []const u8, log: *?[]const u8, log_format: *LogFormat) !Config {
-    var root: []const u8 = default_root;
-    var systemd = false;
+    // The subcommand is assigned before any successful return; every error drops config.
+    var config: Config = .{ .root = default_root, .subcommand = undefined, .id = "" };
     var index: usize = 1;
-    while (index < args.len and std.mem.startsWith(u8, args[index], "-")) {
-        if (std.mem.eql(u8, args[index], "--root")) {
-            index += 1;
-            if (index >= args.len or args[index].len == 0) return oci.validationError(error.MissingRoot, "--root: missing value", .{});
-            root = args[index];
-        } else if (std.mem.startsWith(u8, args[index], "--root=")) {
-            root = args[index]["--root=".len..];
-            if (root.len == 0) return oci.validationError(error.MissingRoot, "--root: missing value", .{});
-        } else if (std.mem.eql(u8, args[index], "--log")) {
-            index += 1;
-            if (index >= args.len or args[index].len == 0 or std.mem.startsWith(u8, args[index], "--"))
-                return oci.validationError(error.MissingLog, "--log: missing value", .{});
-            log.* = args[index];
-        } else if (std.mem.startsWith(u8, args[index], "--log=")) {
-            const value = args[index]["--log=".len..];
-            if (value.len == 0) return oci.validationError(error.MissingLog, "--log: missing value", .{});
-            log.* = value;
-        } else if (std.mem.eql(u8, args[index], "--log-format") or std.mem.startsWith(u8, args[index], "--log-format=")) {
-            const value = if (std.mem.eql(u8, args[index], "--log-format")) value: {
-                index += 1;
-                if (index >= args.len or std.mem.startsWith(u8, args[index], "--")) return oci.validationError(error.MissingLogFormat, "--log-format: missing value", .{});
-                break :value args[index];
-            } else args[index]["--log-format=".len..];
-            if (value.len == 0) return oci.validationError(error.MissingLogFormat, "--log-format: missing value", .{});
-            log_format.* = std.meta.stringToEnum(LogFormat, value) orelse return oci.validationError(error.InvalidLogFormat, "--log-format: expected text or json", .{});
-        } else if (std.mem.eql(u8, args[index], "--debug")) {
-            // Accepted for compatibility with runc callers.
-        } else if (std.mem.eql(u8, args[index], "--systemd-cgroup")) {
-            systemd = true;
-        } else {
-            return oci.validationError(error.UnknownOption, "unknown option '{s}'", .{args[index]});
-        }
-        index += 1;
-    }
+    try parseGlobalOptions(args, &index, &config, log, log_format);
     if (index >= args.len) return oci.validationError(error.MissingSubcommand, "missing subcommand", .{});
-    const subcommand = std.meta.stringToEnum(Subcommand, args[index]) orelse
+    config.subcommand = std.meta.stringToEnum(Subcommand, args[index]) orelse
         return oci.validationError(error.UnknownSubcommand, "unknown subcommand '{s}'", .{args[index]});
+    config.log = log.*;
+    config.log_format = log_format.*;
     index += 1;
-    if (subcommand == .features) {
+    if (config.subcommand == .features) {
         if (index != args.len) return oci.validationError(error.UnexpectedArgument, "unexpected argument; global flags must precede the subcommand", .{});
-        return .{
-            .root = root,
-            .subcommand = subcommand,
-            .id = "",
-            .systemd = systemd,
-            .log = log.*,
-            .log_format = log_format.*,
-        };
+        return config;
     }
-
-    var bundle: ?[]const u8 = null;
-    var pid_file: ?[]const u8 = null;
-    var console_socket: ?[]const u8 = null;
-    var force = false;
-    var all = false;
-    var ps_format: PsFormat = .table;
-    var process_file: ?[]const u8 = null;
-    var resources_file: ?[]const u8 = null;
-    var resource_flags: oci.Spec.Resources = .{};
-    var detach = false;
-    var tty: ?bool = null;
-    var exec_cwd: ?[]const u8 = null;
-    var exec_user: ?ExecUser = null;
     const flags_start = index;
-    if (subcommand == .exec) {
-        while (index < args.len and std.mem.startsWith(u8, args[index], "-")) : (index += 1) {
-            const flag = args[index];
-            if (std.mem.eql(u8, flag, "--detach") or std.mem.eql(u8, flag, "-d") or std.mem.startsWith(u8, flag, "--detach=")) {
-                detach = try boolOption(flag);
-            } else if (std.mem.eql(u8, flag, "--tty") or std.mem.eql(u8, flag, "-t") or std.mem.startsWith(u8, flag, "--tty=")) {
-                tty = try boolOption(flag);
-            } else if (std.mem.eql(u8, flag, "--process") or std.mem.startsWith(u8, flag, "--process=")) {
-                process_file = try optionValue(args, &index, error.MissingProcessFile);
-            } else if (std.mem.eql(u8, flag, "--pid-file") or std.mem.startsWith(u8, flag, "--pid-file=")) {
-                pid_file = try optionValue(args, &index, error.MissingPidFile);
-            } else if (std.mem.eql(u8, flag, "--console-socket") or std.mem.startsWith(u8, flag, "--console-socket=")) {
-                console_socket = try optionValue(args, &index, error.MissingConsoleSocket);
-            } else if (std.mem.eql(u8, flag, "--cwd") or std.mem.startsWith(u8, flag, "--cwd=")) {
-                exec_cwd = try optionValue(args, &index, error.MissingCwd);
-            } else if (std.mem.eql(u8, flag, "--user") or std.mem.startsWith(u8, flag, "--user=")) {
-                exec_user = try parseUser(try optionValue(args, &index, error.MissingUser));
-            } else if (std.mem.eql(u8, flag, "--env") or std.mem.startsWith(u8, flag, "--env=")) {
-                try oci.validateEnv(try optionValue(args, &index, error.MissingEnv));
-            } else return oci.validationError(error.UnknownOption, "unknown option '{s}'", .{args[index]});
+    try parseCommandOptions(args, &index, &config);
+    try parseCommandArguments(args, index, &config);
+    if (config.subcommand == .exec) config.exec_flags = args[flags_start..index];
+    return config;
+}
+
+fn optionName(flag: []const u8) []const u8 {
+    return flag[0 .. std.mem.indexOfScalar(u8, flag, '=') orelse flag.len];
+}
+
+fn longOptionValue(args: []const []const u8, index: *usize, comptime missing: error{ MissingRoot, MissingLog, MissingLogFormat, MissingBundle, MissingPidFile, MissingConsoleSocket }, allow_dash_value: bool) ![]const u8 {
+    const flag = optionName(args[index.*]);
+    const value = if (std.mem.indexOfScalar(u8, args[index.*], '=')) |equals|
+        args[index.*][equals + 1 ..]
+    else value: {
+        index.* += 1;
+        if (index.* >= args.len) return oci.validationError(missing, "{s}: missing value", .{flag});
+        if (!allow_dash_value and std.mem.startsWith(u8, args[index.*], "--"))
+            return oci.validationError(missing, "{s}: missing value", .{flag});
+        break :value args[index.*];
+    };
+    if (value.len == 0) return oci.validationError(missing, "{s}: missing value", .{flag});
+    return value;
+}
+
+fn parseGlobalOptions(args: []const []const u8, index: *usize, config: *Config, log: *?[]const u8, log_format: *LogFormat) !void {
+    const options = std.StaticStringMap(enum { root, log, log_format, debug, systemd }).initComptime(.{
+        .{ "--root", .root },   .{ "--log", .log },                .{ "--log-format", .log_format },
+        .{ "--debug", .debug }, .{ "--systemd-cgroup", .systemd },
+    });
+    while (index.* < args.len and std.mem.startsWith(u8, args[index.*], "-")) : (index.* += 1) {
+        const flag = args[index.*];
+        const option = options.get(optionName(flag)) orelse return oci.validationError(error.UnknownOption, "unknown option '{s}'", .{flag});
+        switch (option) {
+            .root => config.root = try longOptionValue(args, index, error.MissingRoot, true),
+            .log => log.* = try longOptionValue(args, index, error.MissingLog, false),
+            .log_format => {
+                const value = try longOptionValue(args, index, error.MissingLogFormat, false);
+                log_format.* = std.meta.stringToEnum(LogFormat, value) orelse return oci.validationError(error.InvalidLogFormat, "--log-format: expected text or json", .{});
+            },
+            .debug, .systemd => {
+                if (std.mem.indexOfScalar(u8, flag, '=') != null) return oci.validationError(error.UnknownOption, "unknown option '{s}'", .{flag});
+                if (option == .systemd) config.systemd = true;
+            },
         }
     }
-    if (subcommand == .create) {
-        while (index < args.len and std.mem.startsWith(u8, args[index], "-")) : (index += 1) {
-            if (std.mem.eql(u8, args[index], "--bundle")) {
-                index += 1;
-                if (index >= args.len or args[index].len == 0 or std.mem.startsWith(u8, args[index], "--"))
-                    return oci.validationError(error.MissingBundle, "--bundle: missing value", .{});
-                bundle = args[index];
-            } else if (std.mem.startsWith(u8, args[index], "--bundle=")) {
-                bundle = args[index]["--bundle=".len..];
-                if (bundle.?.len == 0) return oci.validationError(error.MissingBundle, "--bundle: missing value", .{});
-            } else if (std.mem.eql(u8, args[index], "--pid-file")) {
-                index += 1;
-                if (index >= args.len or args[index].len == 0 or std.mem.startsWith(u8, args[index], "--"))
-                    return oci.validationError(error.MissingPidFile, "--pid-file: missing value", .{});
-                pid_file = args[index];
-            } else if (std.mem.startsWith(u8, args[index], "--pid-file=")) {
-                pid_file = args[index]["--pid-file=".len..];
-                if (pid_file.?.len == 0) return oci.validationError(error.MissingPidFile, "--pid-file: missing value", .{});
-            } else if (std.mem.eql(u8, args[index], "--console-socket")) {
-                index += 1;
-                if (index >= args.len or args[index].len == 0 or std.mem.startsWith(u8, args[index], "--"))
-                    return oci.validationError(error.MissingConsoleSocket, "--console-socket: missing value", .{});
-                console_socket = args[index];
-            } else if (std.mem.startsWith(u8, args[index], "--console-socket=")) {
-                console_socket = args[index]["--console-socket=".len..];
-                if (console_socket.?.len == 0) return oci.validationError(error.MissingConsoleSocket, "--console-socket: missing value", .{});
-            } else {
-                return oci.validationError(error.UnknownOption, "unknown option '{s}'", .{args[index]});
+}
+
+fn parseCommandOptions(args: []const []const u8, index: *usize, config: *Config) !void {
+    switch (config.subcommand) {
+        .exec => try parseExecOptions(args, index, config),
+        .create => try parseCreateOptions(args, index, config),
+        .update => {
+            const update = try parseUpdateArgs(args, index.*);
+            index.* = update.index;
+            config.resources_file = update.resources_file;
+            config.resource_flags = update.resource_flags;
+        },
+        .delete => try parseDeleteOptions(args, index, config),
+        .ps => try parsePsOptions(args, index, config),
+        .kill => {
+            while (index.* < args.len and (std.mem.eql(u8, args[index.*], "--all") or
+                std.mem.eql(u8, args[index.*], "-a"))) : (index.* += 1)
+            {
+                config.all = true;
             }
-        }
-        if (bundle == null) bundle = ".";
-    } else if (subcommand == .update) {
-        const parsed_update = try parseUpdateArgs(args, index);
-        index = parsed_update.index;
-        resources_file = parsed_update.resources_file;
-        resource_flags = parsed_update.resource_flags;
-    } else if (subcommand == .delete) {
-        while (index < args.len and std.mem.startsWith(u8, args[index], "-")) : (index += 1) {
-            if (!std.mem.eql(u8, args[index], "--force")) return oci.validationError(error.UnknownOption, "unknown option '{s}'", .{args[index]});
-            force = true;
-        }
-    } else if (subcommand == .ps) {
-        while (index < args.len and std.mem.startsWith(u8, args[index], "-")) : (index += 1) {
-            const flag = args[index];
-            if (!std.mem.eql(u8, flag, "--format") and !std.mem.startsWith(u8, flag, "--format="))
-                return oci.validationError(error.UnknownOption, "unknown option '{s}'", .{args[index]});
-            ps_format = std.meta.stringToEnum(PsFormat, try optionValue(args, &index, error.MissingFormat)) orelse
-                return oci.validationError(error.InvalidFormat, "--format: expected table or json", .{});
-        }
-    } else if (subcommand == .kill) {
-        while (index < args.len and (std.mem.eql(u8, args[index], "--all") or
-            std.mem.eql(u8, args[index], "-a"))) : (index += 1)
-        {
-            all = true;
+        },
+        else => {},
+    }
+}
+
+fn parseExecOptions(args: []const []const u8, index: *usize, config: *Config) !void {
+    const options = std.StaticStringMap(enum { detach, tty, process, pid_file, console_socket, cwd, user, env }).initComptime(.{
+        .{ "--detach", .detach },   .{ "-d", .detach },           .{ "--tty", .tty },                       .{ "-t", .tty },
+        .{ "--process", .process }, .{ "--pid-file", .pid_file }, .{ "--console-socket", .console_socket }, .{ "--cwd", .cwd },
+        .{ "--user", .user },       .{ "--env", .env },
+    });
+    while (index.* < args.len and std.mem.startsWith(u8, args[index.*], "-")) : (index.* += 1) {
+        const flag = args[index.*];
+        // Short boolean flags accept only their bare form.
+        if (std.mem.startsWith(u8, flag, "-d=") or std.mem.startsWith(u8, flag, "-t="))
+            return oci.validationError(error.UnknownOption, "unknown option '{s}'", .{flag});
+        switch (options.get(optionName(flag)) orelse return oci.validationError(error.UnknownOption, "unknown option '{s}'", .{flag})) {
+            .detach => config.detach = try boolOption(flag),
+            .tty => config.tty = try boolOption(flag),
+            .process => config.process_file = try optionValue(args, index, error.MissingProcessFile),
+            .pid_file => config.pid_file = try optionValue(args, index, error.MissingPidFile),
+            .console_socket => config.console_socket = try optionValue(args, index, error.MissingConsoleSocket),
+            .cwd => config.exec_cwd = try optionValue(args, index, error.MissingCwd),
+            .user => config.exec_user = try parseUser(try optionValue(args, index, error.MissingUser)),
+            .env => try oci.validateEnv(try optionValue(args, index, error.MissingEnv)),
         }
     }
+}
+
+fn parseCreateOptions(args: []const []const u8, index: *usize, config: *Config) !void {
+    const options = std.StaticStringMap(enum { bundle, pid_file, console_socket }).initComptime(.{
+        .{ "--bundle", .bundle }, .{ "--pid-file", .pid_file }, .{ "--console-socket", .console_socket },
+    });
+    while (index.* < args.len and std.mem.startsWith(u8, args[index.*], "-")) : (index.* += 1) {
+        switch (options.get(optionName(args[index.*])) orelse return oci.validationError(error.UnknownOption, "unknown option '{s}'", .{args[index.*]})) {
+            .bundle => config.bundle = try longOptionValue(args, index, error.MissingBundle, false),
+            .pid_file => config.pid_file = try longOptionValue(args, index, error.MissingPidFile, false),
+            .console_socket => config.console_socket = try longOptionValue(args, index, error.MissingConsoleSocket, false),
+        }
+    }
+    if (config.bundle == null) config.bundle = ".";
+}
+
+fn parseDeleteOptions(args: []const []const u8, index: *usize, config: *Config) !void {
+    while (index.* < args.len and std.mem.startsWith(u8, args[index.*], "-")) : (index.* += 1) {
+        if (!std.mem.eql(u8, args[index.*], "--force")) return oci.validationError(error.UnknownOption, "unknown option '{s}'", .{args[index.*]});
+        config.force = true;
+    }
+}
+
+fn parsePsOptions(args: []const []const u8, index: *usize, config: *Config) !void {
+    while (index.* < args.len and std.mem.startsWith(u8, args[index.*], "-")) : (index.* += 1) {
+        const flag = args[index.*];
+        if (!std.mem.eql(u8, flag, "--format") and !std.mem.startsWith(u8, flag, "--format="))
+            return oci.validationError(error.UnknownOption, "unknown option '{s}'", .{args[index.*]});
+        config.ps_format = std.meta.stringToEnum(PsFormat, try optionValue(args, index, error.MissingFormat)) orelse
+            return oci.validationError(error.InvalidFormat, "--format: expected table or json", .{});
+    }
+}
+
+fn parseCommandArguments(args: []const []const u8, index: usize, config: *Config) !void {
     if (index >= args.len) return oci.validationError(error.MissingId, "container id: required", .{});
     const remaining = args.len - index;
-    if (subcommand == .exec) {
-        if (process_file != null and remaining != 1) return oci.validationError(error.UnexpectedArgument, "exec: --process cannot be combined with command arguments", .{});
-        if (process_file == null and remaining == 1) return oci.validationError(error.MissingCommand, "exec: requires a command or --process", .{});
-    } else if (subcommand != .ps and remaining != 1 and !(subcommand == .kill and remaining == 2)) return oci.validationError(error.UnexpectedArgument, "unexpected argument; global flags must precede the subcommand", .{});
+    try requireArgumentCount(config.*, remaining);
     const id = args[index];
     if (id.len == 0 or std.mem.indexOfScalar(u8, id, 0) != null or std.mem.eql(u8, id, ".") or std.mem.eql(u8, id, "..") or
         std.mem.indexOfScalar(u8, id, '/') != null or std.mem.startsWith(u8, id, "-"))
     {
         return oci.validationError(error.InvalidId, "container id: must not be empty, contain / or NUL, or equal . or ..", .{});
     }
-    const signal = if (subcommand == .kill and remaining == 2) args[index + 1] else null;
-    if (signal) |value| {
+    config.id = id;
+    config.signal = if (config.subcommand == .kill and remaining == 2) args[index + 1] else null;
+    if (config.signal) |value| {
         if (value.len == 0 or std.mem.startsWith(u8, value, "-")) return oci.validationError(error.UnexpectedArgument, "kill: signal must not be empty or start with '-'", .{});
     }
-    return .{
-        .root = root,
-        .subcommand = subcommand,
-        .id = id,
-        .systemd = systemd,
-        .log = log.*,
-        .log_format = log_format.*,
-        .bundle = bundle,
-        .pid_file = pid_file,
-        .console_socket = console_socket,
-        .signal = signal,
-        .force = force,
-        .all = all,
-        .ps_format = ps_format,
-        .ps_args = if (subcommand == .ps) args[index + 1 ..] else &.{},
-        .process_file = process_file,
-        .resources_file = resources_file,
-        .resource_flags = resource_flags,
-        .detach = detach,
-        .tty = tty,
-        .exec_cwd = exec_cwd,
-        .exec_user = exec_user,
-        .exec_flags = if (subcommand == .exec) args[flags_start..index] else &.{},
-        .exec_args = if (subcommand == .exec) args[index + 1 ..] else &.{},
-    };
+    if (config.subcommand == .ps) config.ps_args = args[index + 1 ..];
+    if (config.subcommand == .exec) config.exec_args = args[index + 1 ..];
+}
+
+fn requireArgumentCount(config: Config, remaining: usize) !void {
+    if (config.subcommand == .exec) {
+        if (config.process_file != null and remaining != 1) return oci.validationError(error.UnexpectedArgument, "exec: --process cannot be combined with command arguments", .{});
+        if (config.process_file == null and remaining == 1) return oci.validationError(error.MissingCommand, "exec: requires a command or --process", .{});
+    } else if (config.subcommand != .ps and remaining != 1 and !(config.subcommand == .kill and remaining == 2)) return oci.validationError(error.UnexpectedArgument, "unexpected argument; global flags must precede the subcommand", .{});
 }
 
 pub fn parseUpdateArgs(args: []const []const u8, start_index: usize) !struct {
@@ -264,58 +243,75 @@ pub fn parseUpdateArgs(args: []const []const u8, start_index: usize) !struct {
             resources_file = try optionValue(args, &index, error.MissingResources);
             continue;
         }
-        const matched = flag: {
-            inline for (.{
-                .{ "--memory", "limit" },
-                .{ "--memory-reservation", "reservation" },
-                .{ "--memory-swap", "swap" },
-                .{ "--kernel-memory", "kernel" },
-            }) |entry| {
-                if (std.mem.eql(u8, name, entry[0])) {
-                    const value = try optionValue(args, &index, error.MissingResourceValue);
-                    if (resource_flags.memory == null) resource_flags.memory = .{};
-                    @field(resource_flags.memory.?, entry[1]) = parseMemoryBytes(value) catch
-                        return oci.validationError(error.InvalidResourceValue, "{s}: invalid memory size '{s}'", .{ name, value });
-                    break :flag true;
-                }
-            }
-            inline for (.{
-                .{ "--cpu-shares", "shares", u64 },
-                .{ "--cpu-share", "shares", u64 },
-                .{ "--cpu-period", "period", u64 },
-                .{ "--cpu-quota", "quota", i64 },
-                .{ "--cpu-rt-period", "realtimePeriod", u64 },
-                .{ "--cpu-rt-runtime", "realtimeRuntime", i64 },
-            }) |entry| {
-                if (std.mem.eql(u8, name, entry[0])) {
-                    const value = try optionValue(args, &index, error.MissingResourceValue);
-                    if (resource_flags.cpu == null) resource_flags.cpu = .{};
-                    @field(resource_flags.cpu.?, entry[1]) = try resourceNumber(entry[2], name, value);
-                    break :flag true;
-                }
-            }
-            inline for (.{ .{ "--cpuset-cpus", "cpus" }, .{ "--cpuset-mems", "mems" } }) |entry| {
-                if (std.mem.eql(u8, name, entry[0])) {
-                    if (resource_flags.cpu == null) resource_flags.cpu = .{};
-                    @field(resource_flags.cpu.?, entry[1]) = try optionValue(args, &index, error.MissingResourceValue);
-                    break :flag true;
-                }
-            }
-            if (std.mem.eql(u8, name, "--pids-limit")) {
-                resource_flags.pids = .{ .limit = try resourceNumber(i64, name, try optionValue(args, &index, error.MissingResourceValue)) };
-                break :flag true;
-            }
-            if (std.mem.eql(u8, name, "--blkio-weight")) {
-                resource_flags.blockIO = .{ .weight = try resourceNumber(u16, name, try optionValue(args, &index, error.MissingResourceValue)) };
-                break :flag true;
-            }
-            break :flag false;
-        };
+        const matched = try parseMemoryOption(args, &index, name, &resource_flags) or
+            try parseCpuOption(args, &index, name, &resource_flags) or
+            try parseCpusetOption(args, &index, name, &resource_flags) or
+            try parseOtherResourceOption(args, &index, name, &resource_flags);
         if (!matched) return oci.validationError(error.UnknownOption, "unknown option '{s}'", .{flag});
         has_resource_flags = true;
     }
     if (resources_file == null and !has_resource_flags) return oci.validationError(error.MissingResources, "update: requires --resources <file|-> or resource flags", .{});
     return .{ .index = index, .resources_file = resources_file, .resource_flags = resource_flags };
+}
+
+fn parseMemoryOption(args: []const []const u8, index: *usize, name: []const u8, resources: *oci.Spec.Resources) !bool {
+    inline for (.{
+        .{ "--memory", "limit" },
+        .{ "--memory-reservation", "reservation" },
+        .{ "--memory-swap", "swap" },
+        .{ "--kernel-memory", "kernel" },
+    }) |entry| {
+        if (std.mem.eql(u8, name, entry[0])) {
+            const value = try optionValue(args, index, error.MissingResourceValue);
+            if (resources.memory == null) resources.memory = .{};
+            @field(resources.memory.?, entry[1]) = parseMemoryBytes(value) catch
+                return oci.validationError(error.InvalidResourceValue, "{s}: invalid memory size '{s}'", .{ name, value });
+            return true;
+        }
+    }
+    return false;
+}
+
+fn parseCpuOption(args: []const []const u8, index: *usize, name: []const u8, resources: *oci.Spec.Resources) !bool {
+    inline for (.{
+        .{ "--cpu-shares", "shares", u64 },
+        .{ "--cpu-share", "shares", u64 },
+        .{ "--cpu-period", "period", u64 },
+        .{ "--cpu-quota", "quota", i64 },
+        .{ "--cpu-rt-period", "realtimePeriod", u64 },
+        .{ "--cpu-rt-runtime", "realtimeRuntime", i64 },
+    }) |entry| {
+        if (std.mem.eql(u8, name, entry[0])) {
+            const value = try optionValue(args, index, error.MissingResourceValue);
+            if (resources.cpu == null) resources.cpu = .{};
+            @field(resources.cpu.?, entry[1]) = try resourceNumber(entry[2], name, value);
+            return true;
+        }
+    }
+    return false;
+}
+
+fn parseCpusetOption(args: []const []const u8, index: *usize, name: []const u8, resources: *oci.Spec.Resources) !bool {
+    inline for (.{ .{ "--cpuset-cpus", "cpus" }, .{ "--cpuset-mems", "mems" } }) |entry| {
+        if (std.mem.eql(u8, name, entry[0])) {
+            if (resources.cpu == null) resources.cpu = .{};
+            @field(resources.cpu.?, entry[1]) = try optionValue(args, index, error.MissingResourceValue);
+            return true;
+        }
+    }
+    return false;
+}
+
+fn parseOtherResourceOption(args: []const []const u8, index: *usize, name: []const u8, resources: *oci.Spec.Resources) !bool {
+    if (std.mem.eql(u8, name, "--pids-limit")) {
+        resources.pids = .{ .limit = try resourceNumber(i64, name, try optionValue(args, index, error.MissingResourceValue)) };
+        return true;
+    }
+    if (std.mem.eql(u8, name, "--blkio-weight")) {
+        resources.blockIO = .{ .weight = try resourceNumber(u16, name, try optionValue(args, index, error.MissingResourceValue)) };
+        return true;
+    }
+    return false;
 }
 
 fn resourceNumber(comptime T: type, flag: []const u8, value: []const u8) !T {
@@ -328,6 +324,20 @@ fn resourceNumber(comptime T: type, flag: []const u8, value: []const u8) !T {
 fn parseMemoryBytes(value: []const u8) !i64 {
     // runc also accepts -1 for an unlimited limit.
     if (std.mem.eql(u8, value, "-1")) return -1;
+    const number_end = try memoryNumberEnd(value);
+    var suffix_start = number_end;
+    if (suffix_start < value.len and value[suffix_start] == ' ') {
+        suffix_start += 1;
+        if (suffix_start == value.len) return error.InvalidResourceValue;
+    }
+    const suffix = value[suffix_start..];
+    var amount = std.fmt.parseFloat(f64, value[0..number_end]) catch return error.InvalidResourceValue;
+    amount *= try memoryMultiplier(suffix);
+    if (!std.math.isFinite(amount) or amount < 0 or amount >= 0x1p63) return error.InvalidResourceValue;
+    return @intFromFloat(amount);
+}
+
+fn memoryNumberEnd(value: []const u8) !usize {
     var number_end: usize = 0;
     while (number_end < value.len and std.ascii.isDigit(value[number_end])) : (number_end += 1) {}
     if (number_end == 0) return error.InvalidResourceValue;
@@ -337,13 +347,10 @@ fn parseMemoryBytes(value: []const u8) !i64 {
         while (number_end < value.len and std.ascii.isDigit(value[number_end])) : (number_end += 1) {}
         if (number_end == fraction_start) return error.InvalidResourceValue;
     }
-    var suffix_start = number_end;
-    if (suffix_start < value.len and value[suffix_start] == ' ') {
-        suffix_start += 1;
-        if (suffix_start == value.len) return error.InvalidResourceValue;
-    }
-    const suffix = value[suffix_start..];
-    var amount = std.fmt.parseFloat(f64, value[0..number_end]) catch return error.InvalidResourceValue;
+    return number_end;
+}
+
+fn memoryMultiplier(suffix: []const u8) !f64 {
     if (suffix.len > 0) {
         if (suffix.len > 3) return error.InvalidResourceValue;
         if (std.ascii.toLower(suffix[0]) == 'b') {
@@ -359,11 +366,10 @@ fn parseMemoryBytes(value: []const u8) !i64 {
             };
             if ((suffix.len == 2 and std.ascii.toLower(suffix[1]) != 'b') or
                 (suffix.len == 3 and !std.ascii.eqlIgnoreCase(suffix[1..], "ib"))) return error.InvalidResourceValue;
-            amount *= @floatFromInt(@as(u64, 1) << power);
+            return @floatFromInt(@as(u64, 1) << power);
         }
     }
-    if (!std.math.isFinite(amount) or amount < 0 or amount >= 0x1p63) return error.InvalidResourceValue;
-    return @intFromFloat(amount);
+    return 1;
 }
 
 pub fn optionValue(args: []const []const u8, index: *usize, comptime missing: error{

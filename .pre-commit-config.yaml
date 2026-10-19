@@ -15,12 +15,10 @@ repos:
         language: system
         files: \.zig$
         exclude: (^|/)(tests?)/
-      # Whole-tree check. Manual until the existing offenders are refactored:
-      # `prek run cccc-all --hook-stage manual`.
+      # Whole-tree check.
       - id: cccc-all
         name: cccc complexity (src/)
         entry: nix develop -c cccc --table src/
         language: system
         pass_filenames: false
         always_run: true
-        stages: [manual]

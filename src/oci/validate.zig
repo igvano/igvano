@@ -21,8 +21,19 @@ pub fn requireCreate(spec: Spec) !void {
     try validateHooks(spec.hooks);
     const settings: Spec.Linux = spec.linux orelse .{};
     try validateSysctls(settings);
-    const uid_mappings: []const Spec.IDMapping = settings.uidMappings orelse &.{};
-    const gid_mappings: []const Spec.IDMapping = settings.gidMappings orelse &.{};
+    try validateNamespaces(settings);
+    if (spec.root.path.len == 0) return invalidConfig("root.path: must not be empty", .{});
+    if (spec.process) |process| try validateProcess(process);
+    for (spec.mounts orelse &.{}, 0..) |mount, i| {
+        errdefer diagnosticContext("mounts[{d}]", .{i});
+        try validateMountDestination(mount.destination);
+        _ = try mountMappingConfig(mount, settings);
+    }
+    try validateRestrictionPaths(settings.maskedPaths, "linux.maskedPaths");
+    try validateRestrictionPaths(settings.readonlyPaths, "linux.readonlyPaths");
+}
+
+fn validateNamespaces(settings: Spec.Linux) !void {
     const namespaces = settings.namespaces orelse &.{};
     var has_mount = false;
     var has_user = false;
@@ -34,6 +45,15 @@ pub fn requireCreate(spec: Spec) !void {
             joined_user = namespace.path != null;
         }
     }
+    try validateUserMappings(settings, has_user, joined_user);
+    if (!has_mount and settings.rootfsPropagation != null) {
+        return invalidConfig("linux.rootfsPropagation: requires a mount namespace", .{});
+    }
+}
+
+fn validateUserMappings(settings: Spec.Linux, has_user: bool, joined_user: bool) !void {
+    const uid_mappings: []const Spec.IDMapping = settings.uidMappings orelse &.{};
+    const gid_mappings: []const Spec.IDMapping = settings.gidMappings orelse &.{};
     if (has_user) {
         for ([_][]const Spec.IDMapping{ uid_mappings, gid_mappings }, [_][]const u8{ "linux.uidMappings", "linux.gidMappings" }) |mappings, field| {
             if (joined_user and mappings.len == 0) continue;
@@ -49,22 +69,11 @@ pub fn requireCreate(spec: Spec) !void {
     } else if (uid_mappings.len > 0 or gid_mappings.len > 0) {
         return invalidConfig("linux.uidMappings/gidMappings: require a user namespace", .{});
     }
-    if (!has_mount and settings.rootfsPropagation != null) {
-        return invalidConfig("linux.rootfsPropagation: requires a mount namespace", .{});
-    }
-    if (spec.root.path.len == 0) return invalidConfig("root.path: must not be empty", .{});
-    if (spec.process) |process| try validateProcess(process);
-    for (spec.mounts orelse &.{}, 0..) |mount, i| {
-        errdefer diagnosticContext("mounts[{d}]", .{i});
-        try validateMountDestination(mount.destination);
-        _ = try mountMappingConfig(mount, settings);
-    }
-    for (settings.maskedPaths orelse &.{}, 0..) |path, i| {
-        errdefer diagnosticContext("linux.maskedPaths[{d}]", .{i});
-        try validateMountDestination(path);
-    }
-    for (settings.readonlyPaths orelse &.{}, 0..) |path, i| {
-        errdefer diagnosticContext("linux.readonlyPaths[{d}]", .{i});
+}
+
+fn validateRestrictionPaths(configured: ?[]const []const u8, comptime field: []const u8) !void {
+    for (configured orelse &.{}, 0..) |path, i| {
+        errdefer diagnosticContext(field ++ "[{d}]", .{i});
         try validateMountDestination(path);
     }
 }

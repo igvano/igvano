@@ -14,6 +14,7 @@ const writePidFile = @import("process.zig").writePidFile;
 const openContainerLock = @import("state.zig").openContainerLock;
 const lockContainer = @import("state.zig").lockContainer;
 const requireLinkedLock = @import("state.zig").requireLinkedLock;
+const LiveState = @import("state.zig").LiveState;
 const readLiveState = @import("state.zig").readLiveState;
 
 fn execProcessConfig(allocator: std.mem.Allocator, inherited: oci.Spec.Process, config: Config) !oci.Spec.Process {
@@ -33,18 +34,7 @@ fn execProcessConfig(allocator: std.mem.Allocator, inherited: oci.Spec.Process, 
         const flag = config.exec_flags[index];
         if (std.mem.eql(u8, flag, "--env") or std.mem.startsWith(u8, flag, "--env=")) {
             const value = try optionValue(config.exec_flags, &index, error.MissingEnv);
-            const key_len = std.mem.indexOfScalar(u8, value, '=').?;
-            // Later values override the saved environment and earlier --envs.
-            var entry: usize = 0;
-            while (entry < env.items.len) {
-                const existing = env.items[entry];
-                if (existing.len > key_len and existing[key_len] == '=' and
-                    std.mem.eql(u8, existing[0..key_len], value[0..key_len]))
-                    _ = env.orderedRemove(entry)
-                else
-                    entry += 1;
-            }
-            try env.append(allocator, value);
+            try replaceExecEnv(allocator, &env, value);
         } else if (std.mem.indexOfScalar(u8, flag, '=') == null and
             !std.mem.eql(u8, flag, "--detach") and !std.mem.eql(u8, flag, "-d") and
             !std.mem.eql(u8, flag, "--tty") and !std.mem.eql(u8, flag, "-t"))
@@ -56,29 +46,25 @@ fn execProcessConfig(allocator: std.mem.Allocator, inherited: oci.Spec.Process, 
     return process;
 }
 
+fn replaceExecEnv(allocator: std.mem.Allocator, env: *std.ArrayList([]const u8), value: []const u8) !void {
+    const key_len = std.mem.indexOfScalar(u8, value, '=').?;
+    // Later values override the saved environment and earlier --envs.
+    var entry: usize = 0;
+    while (entry < env.items.len) {
+        const existing = env.items[entry];
+        if (existing.len > key_len and existing[key_len] == '=' and
+            std.mem.eql(u8, existing[0..key_len], value[0..key_len]))
+            _ = env.orderedRemove(entry)
+        else
+            entry += 1;
+    }
+    try env.append(allocator, value);
+}
+
 pub fn execContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, config: Config) !u8 {
     if (comptime builtin.os.tag != .linux) return error.NotImplemented;
     const linux = std.os.linux;
-    if (!config.detach) {
-        // Reserve stdio before locks, console sockets, or the signal
-        // pipe can reuse their numbers and become attached-loop I/O.
-        for ([_]std.posix.fd_t{ 0, 1, 2 }) |fd| {
-            switch (linux.errno(linux.fcntl(fd, linux.F.GETFD, 0))) {
-                .SUCCESS => continue,
-                .BADF => {},
-                else => return error.ConsoleFailed,
-            }
-            // open returns the lowest free fd; earlier stdio slots are reserved.
-            while (true) {
-                const opened = linux.open("/dev/null", .{ .ACCMODE = .RDWR }, 0);
-                switch (linux.errno(opened)) {
-                    .SUCCESS => break,
-                    .INTR => continue,
-                    else => return error.ConsoleFailed,
-                }
-            }
-        }
-    }
+    if (!config.detach) try reserveStdio();
     var lock = try openContainerLock(allocator, config, false);
     defer if (lock) |file| file.close(io);
     const locked = if (lock) |file| try lockContainer(file, false) else true;
@@ -92,17 +78,68 @@ pub fn execContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend,
     var arena: std.heap.ArenaAllocator = .init(allocator);
     defer arena.deinit();
     const process_allocator = arena.allocator();
+    const options = try prepareExecOptions(process_allocator, io, state, config);
+    defer if (options.console_fds) |fds| for (fds) |fd| {
+        _ = linux.close(fd);
+    };
+    return runExec(allocator, io, backend, config, state.handle.?, options, &lock, locked);
+}
+
+fn reserveStdio() !void {
+    const linux = std.os.linux;
+    // Reserve stdio before locks, console sockets, or the signal
+    // pipe can reuse their numbers and become attached-loop I/O.
+    for ([_]std.posix.fd_t{ 0, 1, 2 }) |fd| {
+        switch (linux.errno(linux.fcntl(fd, linux.F.GETFD, 0))) {
+            .SUCCESS => continue,
+            .BADF => {},
+            else => return error.ConsoleFailed,
+        }
+        // open returns the lowest free fd; earlier stdio slots are reserved.
+        while (true) {
+            const opened = linux.open("/dev/null", .{ .ACCMODE = .RDWR }, 0);
+            switch (linux.errno(opened)) {
+                .SUCCESS => break,
+                .INTR => continue,
+                else => return error.ConsoleFailed,
+            }
+        }
+    }
+}
+
+fn prepareExecOptions(process_allocator: std.mem.Allocator, io: std.Io, state: LiveState, config: Config) !Backend.ExecOptions {
     const saved_bundle = try std.fs.path.join(process_allocator, &.{ config.root, config.id });
     // Legacy containers did not snapshot config.json at create.
-    const saved_spec: ?std.json.Parsed(oci.Spec) = oci.loadSpec(process_allocator, io, saved_bundle) catch |err| switch (err) {
-        error.FileNotFound => oci.loadSpec(process_allocator, io, state.parsed.value.bundle) catch |bundle_err| switch (bundle_err) {
+    const saved_spec = try loadExecSpec(process_allocator, io, saved_bundle, state.parsed.value.bundle, config.process_file != null);
+    var process = try loadExecProcess(process_allocator, io, saved_spec, config);
+    inheritExecProfile(&process, saved_spec);
+    try oci.validateProcess(process);
+    const local_console = (process.terminal orelse false) and !config.detach and config.console_socket == null;
+    var options = try prepareProcess(process_allocator, process, local_console or config.console_socket != null);
+    const seccomp = seccomp: {
+        const spec = saved_spec orelse break :seccomp null;
+        const settings = spec.value.linux orelse break :seccomp null;
+        break :seccomp settings.seccomp;
+    };
+    options.seccomp = try oci.prepareSeccomp(process_allocator, seccomp);
+    options.cgroup_path = state.handle.?.cgroup_path orelse return oci.validationError(error.InvalidState, "exec: saved cgroup path is missing", .{});
+    options.console_fds = if (process.terminal orelse false) try backend_module.console.socketpair() else null;
+    return options;
+}
+
+fn loadExecSpec(process_allocator: std.mem.Allocator, io: std.Io, saved_bundle: []const u8, bundle: []const u8, has_process_file: bool) !?std.json.Parsed(oci.Spec) {
+    return oci.loadSpec(process_allocator, io, saved_bundle) catch |err| switch (err) {
+        error.FileNotFound => oci.loadSpec(process_allocator, io, bundle) catch |bundle_err| switch (bundle_err) {
             // Legacy containers created before seccomp support can exec --process without either config.
-            error.FileNotFound => if (config.process_file != null) null else return bundle_err,
+            error.FileNotFound => if (has_process_file) null else return bundle_err,
             else => return bundle_err,
         },
         else => return err,
     };
-    var process: oci.Spec.Process = if (config.process_file) |path| process: {
+}
+
+fn loadExecProcess(process_allocator: std.mem.Allocator, io: std.Io, saved_spec: ?std.json.Parsed(oci.Spec), config: Config) !oci.Spec.Process {
+    return if (config.process_file) |path| process: {
         const json = std.Io.Dir.cwd().readFileAlloc(io, path, process_allocator, .limited(1 << 20)) catch |err| {
             if (err == error.StreamTooLong) oci.recordDiagnostic(err, "--process: JSON exceeds 1 MiB", .{});
             return err;
@@ -119,52 +156,70 @@ pub fn execContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend,
         const spec = saved_spec orelse return error.FileNotFound;
         break :process try execProcessConfig(process_allocator, spec.value.process orelse return oci.validationError(error.MissingProcess, "exec: bundle has no process to inherit", .{}), config);
     };
+}
+
+fn inheritExecProfile(process: *oci.Spec.Process, saved_spec: ?std.json.Parsed(oci.Spec)) void {
     // Like runc, an omitted or empty exec profile inherits the container default.
     if (process.apparmorProfile == null or process.apparmorProfile.?.len == 0) {
         if (saved_spec) |spec| {
             if (spec.value.process) |inherited| process.apparmorProfile = inherited.apparmorProfile;
         }
     }
-    try oci.validateProcess(process);
-    const local_console = (process.terminal orelse false) and !config.detach and config.console_socket == null;
-    var options = try prepareProcess(process_allocator, process, local_console or config.console_socket != null);
-    const seccomp = seccomp: {
-        const spec = saved_spec orelse break :seccomp null;
-        const settings = spec.value.linux orelse break :seccomp null;
-        break :seccomp settings.seccomp;
-    };
-    options.seccomp = try oci.prepareSeccomp(process_allocator, seccomp);
-    options.cgroup_path = state.handle.?.cgroup_path orelse return oci.validationError(error.InvalidState, "exec: saved cgroup path is missing", .{});
-    options.console_fds = if (process.terminal orelse false) try backend_module.console.socketpair() else null;
-    defer if (options.console_fds) |fds| for (fds) |fd| {
-        _ = linux.close(fd);
-    };
+}
+
+fn enableExecSubreaper() !u32 {
+    const linux = std.os.linux;
     var was_subreaper: u32 = 0;
-    if (!config.detach) {
-        // The helper exits after exec; adoption lets this frontend waitpid the
-        // grandchild. Detached exec leaves adoption/reaping to the shim.
-        if (linux.errno(linux.prctl(@intFromEnum(linux.PR.GET_CHILD_SUBREAPER), @intFromPtr(&was_subreaper), 0, 0, 0)) != .SUCCESS or
-            linux.errno(linux.prctl(@intFromEnum(linux.PR.SET_CHILD_SUBREAPER), 1, 0, 0, 0)) != .SUCCESS)
-            return error.SubreaperFailed;
-    }
-    defer if (!config.detach) {
-        _ = linux.prctl(@intFromEnum(linux.PR.SET_CHILD_SUBREAPER), was_subreaper, 0, 0, 0);
-    };
+    // The helper exits after exec; adoption lets this frontend waitpid the
+    // grandchild. Detached exec leaves adoption/reaping to the shim.
+    if (linux.errno(linux.prctl(@intFromEnum(linux.PR.GET_CHILD_SUBREAPER), @intFromPtr(&was_subreaper), 0, 0, 0)) != .SUCCESS or
+        linux.errno(linux.prctl(@intFromEnum(linux.PR.SET_CHILD_SUBREAPER), 1, 0, 0, 0)) != .SUCCESS)
+        return error.SubreaperFailed;
+    return was_subreaper;
+}
+
+fn restoreExecSubreaper(was_subreaper: u32) void {
+    const linux = std.os.linux;
+    _ = linux.prctl(@intFromEnum(linux.PR.SET_CHILD_SUBREAPER), was_subreaper, 0, 0, 0);
+}
+
+fn runExec(allocator: std.mem.Allocator, io: std.Io, backend: Backend, config: Config, handle: Backend.Handle, options: Backend.ExecOptions, lock: *?std.Io.File, locked: bool) !u8 {
+    const linux = std.os.linux;
+    const was_subreaper = if (!config.detach) try enableExecSubreaper() else 0;
+    defer if (!config.detach) restoreExecSubreaper(was_subreaper);
     var signals: ?attached.Signals = if (!config.detach) try attached.Signals.init() else null;
     defer if (signals) |*handler| handler.deinit();
-    const pid = try backendResult(backend, backend.exec(state.handle.?, options));
+    const pid = try backendResult(backend, backend.exec(handle, options));
     var reaped = false;
     errdefer if (!reaped) {
         _ = linux.kill(pid, .KILL);
         if (!config.detach) _ = waitExec(pid) catch {};
     };
-    var controller: ?std.posix.fd_t = null;
+    const controller = try receiveExecConsole(options.console_fds, config.console_socket);
     defer if (controller) |fd| {
         _ = linux.close(fd);
     };
-    if (options.console_fds) |fds| {
+    if (config.pid_file) |path| try writePidFile(allocator, io, path, pid);
+    // Do not hold the container lock while waiting for a long-running command.
+    if (locked) {
+        if (lock.*) |file| {
+            file.close(io);
+            lock.* = null;
+        }
+    }
+    if (config.detach) return 0;
+    return try attached.wait(pid, &reaped, &signals.?, controller, 0, 1);
+}
+
+fn receiveExecConsole(console_fds: ?[2]std.posix.fd_t, console_socket: ?[]const u8) !?std.posix.fd_t {
+    const linux = std.os.linux;
+    var controller: ?std.posix.fd_t = null;
+    errdefer if (controller) |fd| {
+        _ = linux.close(fd);
+    };
+    if (console_fds) |fds| {
         controller = try backend_module.console.receiveFd(fds[0]);
-        if (config.console_socket) |path| {
+        if (console_socket) |path| {
             const peer = try connectConsoleSocket(path);
             defer _ = linux.close(peer);
             try backend_module.console.sendFd(peer, controller.?);
@@ -172,16 +227,7 @@ pub fn execContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend,
             controller = null;
         }
     }
-    if (config.pid_file) |path| try writePidFile(allocator, io, path, pid);
-    // Do not hold the container lock while waiting for a long-running command.
-    if (locked) {
-        if (lock) |file| {
-            file.close(io);
-            lock = null;
-        }
-    }
-    if (config.detach) return 0;
-    return try attached.wait(pid, &reaped, &signals.?, controller, 0, 1);
+    return controller;
 }
 
 pub fn waitExec(pid: i32) !u8 {

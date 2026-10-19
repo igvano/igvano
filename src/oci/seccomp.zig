@@ -12,57 +12,17 @@ pub fn prepareSeccomp(allocator: std.mem.Allocator, configured: ?Spec.Seccomp) !
     if (config.defaultErrnoRet != null and default_action != .errno and default_action != .trace)
         return seccompInvalid("seccomp defaultErrnoRet is not supported by {s}", .{config.defaultAction});
     const default_errno = try seccompErrno(config.defaultErrnoRet);
-    var flags: u32 = 0;
-    for (config.flags orelse &.{}) |flag|
-        flags |= seccomp_flags.get(flag) orelse
-            return seccompInvalid("unsupported seccomp flag: {s}", .{flag});
+    const flags = try seccompFlags(config.flags);
     var arches: std.ArrayList(seccomp.Arch) = .empty;
     defer arches.deinit(allocator);
-    // Like seccomp_init, retain the native ABI when additional ABIs are named.
-    try arches.append(allocator, seccomp.Arch.native() orelse
-        return seccompInvalid("seccomp is unsupported on this architecture", .{}));
-    for (config.architectures orelse &.{}) |name| {
-        // Known but unimplemented ABIs are ignored.
-        const arch = (seccomp_arches.get(name) orelse
-            return seccompInvalid("unknown seccomp architecture: {s}", .{name})) orelse continue;
-        if (std.mem.indexOfScalar(seccomp.Arch, arches.items, arch) == null)
-            try arches.append(allocator, arch);
-    }
+    try appendSeccompArches(allocator, &arches, config.architectures);
     var rules: std.ArrayList(seccomp.Rule) = .empty;
     defer rules.deinit(allocator);
     errdefer for (rules.items) |rule| allocator.free(rule.args);
     var args: std.ArrayList(seccomp.Arg) = .empty;
     defer args.deinit(allocator);
     for (config.syscalls orelse &.{}) |syscall| {
-        const action = try seccompAction(syscall.action);
-        if (syscall.errnoRet != null and action != .errno and action != .trace)
-            return seccompInvalid("seccomp errnoRet is not supported by {s}", .{syscall.action});
-        const errno_ret = try seccompErrno(syscall.errnoRet);
-        args.clearRetainingCapacity();
-        var indices: [6]bool = @splat(false);
-        var repeated_index = false;
-        for (syscall.args orelse &.{}) |arg| {
-            if (arg.index >= 6) return seccompInvalid("seccomp argument index must be less than 6", .{});
-            repeated_index = repeated_index or indices[arg.index];
-            indices[arg.index] = true;
-            try args.append(allocator, .{
-                .index = arg.index,
-                .value = arg.value,
-                .value_two = arg.valueTwo,
-                .op = seccomp_ops.get(arg.op) orelse
-                    return seccompInvalid("unknown seccomp operator: {s}", .{arg.op}),
-            });
-        }
-        for (arches.items) |arch| for (syscall.names) |name| {
-            const number = seccompSyscall(arch, name) orelse continue;
-            // runc/libseccomp split every condition into an OR rule if any index repeats.
-            for (0..if (repeated_index) args.items.len else 1) |i| {
-                const conditions = if (repeated_index) args.items[i..][0..1] else args.items;
-                const owned_args = try allocator.dupe(seccomp.Arg, conditions);
-                errdefer allocator.free(owned_args);
-                try rules.append(allocator, .{ .arch = arch, .number = number, .action = action, .errno_ret = errno_ret, .args = owned_args });
-            }
-        };
+        try appendSeccompSyscall(allocator, &rules, &args, arches.items, syscall);
     }
     const owned_arches = try arches.toOwnedSlice(allocator);
     errdefer allocator.free(owned_arches);
@@ -72,6 +32,70 @@ pub fn prepareSeccomp(allocator: std.mem.Allocator, configured: ?Spec.Seccomp) !
         .architectures = owned_arches,
         .flags = flags,
         .rules = try rules.toOwnedSlice(allocator),
+    };
+}
+
+fn seccompFlags(configured: ?[]const []const u8) !u32 {
+    var flags: u32 = 0;
+    for (configured orelse &.{}) |flag|
+        flags |= seccomp_flags.get(flag) orelse
+            return seccompInvalid("unsupported seccomp flag: {s}", .{flag});
+    return flags;
+}
+
+fn appendSeccompArches(allocator: std.mem.Allocator, arches: *std.ArrayList(Backend.seccomp.Arch), configured: ?[]const []const u8) !void {
+    const seccomp = Backend.seccomp;
+    // Like seccomp_init, retain the native ABI when additional ABIs are named.
+    try arches.append(allocator, seccomp.Arch.native() orelse
+        return seccompInvalid("seccomp is unsupported on this architecture", .{}));
+    for (configured orelse &.{}) |name| {
+        // Known but unimplemented ABIs are ignored.
+        const arch = (seccomp_arches.get(name) orelse
+            return seccompInvalid("unknown seccomp architecture: {s}", .{name})) orelse continue;
+        if (std.mem.indexOfScalar(seccomp.Arch, arches.items, arch) == null)
+            try arches.append(allocator, arch);
+    }
+}
+
+fn appendSeccompSyscall(allocator: std.mem.Allocator, rules: *std.ArrayList(Backend.seccomp.Rule), args: *std.ArrayList(Backend.seccomp.Arg), arches: []const Backend.seccomp.Arch, syscall: Spec.Seccomp.Syscall) !void {
+    const action = try seccompAction(syscall.action);
+    if (syscall.errnoRet != null and action != .errno and action != .trace)
+        return seccompInvalid("seccomp errnoRet is not supported by {s}", .{syscall.action});
+    const errno_ret = try seccompErrno(syscall.errnoRet);
+    const repeated_index = try prepareSeccompArgs(allocator, args, syscall.args);
+    try appendSeccompRules(allocator, rules, arches, syscall.names, action, errno_ret, args.items, repeated_index);
+}
+
+fn prepareSeccompArgs(allocator: std.mem.Allocator, args: *std.ArrayList(Backend.seccomp.Arg), configured: ?[]const Spec.Seccomp.Arg) !bool {
+    args.clearRetainingCapacity();
+    var indices: [6]bool = @splat(false);
+    var repeated_index = false;
+    for (configured orelse &.{}) |arg| {
+        if (arg.index >= 6) return seccompInvalid("seccomp argument index must be less than 6", .{});
+        repeated_index = repeated_index or indices[arg.index];
+        indices[arg.index] = true;
+        try args.append(allocator, .{
+            .index = arg.index,
+            .value = arg.value,
+            .value_two = arg.valueTwo,
+            .op = seccomp_ops.get(arg.op) orelse
+                return seccompInvalid("unknown seccomp operator: {s}", .{arg.op}),
+        });
+    }
+    return repeated_index;
+}
+
+fn appendSeccompRules(allocator: std.mem.Allocator, rules: *std.ArrayList(Backend.seccomp.Rule), arches: []const Backend.seccomp.Arch, names: []const []const u8, action: Backend.seccomp.Action, errno_ret: ?u16, args: []const Backend.seccomp.Arg, repeated_index: bool) !void {
+    const seccomp = Backend.seccomp;
+    for (arches) |arch| for (names) |name| {
+        const number = seccompSyscall(arch, name) orelse continue;
+        // runc/libseccomp split every condition into an OR rule if any index repeats.
+        for (0..if (repeated_index) args.len else 1) |i| {
+            const conditions = if (repeated_index) args[i..][0..1] else args;
+            const owned_args = try allocator.dupe(seccomp.Arg, conditions);
+            errdefer allocator.free(owned_args);
+            try rules.append(allocator, .{ .arch = arch, .number = number, .action = action, .errno_ret = errno_ret, .args = owned_args });
+        }
     };
 }
 

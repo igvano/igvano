@@ -27,24 +27,77 @@ pub fn createContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backen
     const parsed = try oci.loadSpec(allocator, io, bundle);
     defer parsed.deinit();
     try oci.requireCreate(parsed.value);
-    const process_options = if (parsed.value.process) |process|
-        try prepareProcess(allocator, process, config.console_socket != null)
-    else options: {
-        try validateConsoleSocket(null, config.console_socket != null);
-        break :options @as(?Backend.ExecOptions, null);
-    };
+    const process_options = try prepareCreateProcess(allocator, parsed.value.process, config.console_socket != null);
     defer if (process_options) |options| allocator.free(options.rlimits);
     const console_fds = if (config.console_socket != null) try backend_module.console.socketpair() else null;
-    defer if (console_fds) |fds| for (fds) |fd| {
-        _ = std.os.linux.close(fd);
-    };
+    defer closeConsoleFds(console_fds);
     const rootfs = try oci.resolveRootfs(allocator, bundle, parsed.value.root.path);
     defer allocator.free(rootfs);
     var mount_arena: std.heap.ArenaAllocator = .init(allocator);
     defer mount_arena.deinit();
     const mount_allocator = mount_arena.allocator();
     const settings: oci.Spec.Linux = parsed.value.linux orelse .{};
-    const spec_mounts = parsed.value.mounts orelse &.{};
+    const mounts = try prepareCreateMounts(mount_allocator, bundle, parsed.value.mounts, settings);
+    const seccomp_config = try oci.prepareSeccomp(allocator, settings.seccomp);
+    defer oci.freeSeccomp(allocator, seccomp_config);
+    const sysctls = try oci.prepareSysctls(mount_allocator, settings);
+    const configured_hooks: oci.Spec.Hooks = parsed.value.hooks orelse .{};
+    const create_hooks = try oci.prepareHooks(mount_allocator, configured_hooks.createContainer);
+    const start_hooks = try oci.prepareHooks(mount_allocator, configured_hooks.startContainer);
+    const masked_paths = try prepareRestrictionPaths(mount_allocator, settings.maskedPaths);
+    const readonly_paths = try prepareRestrictionPaths(mount_allocator, settings.readonlyPaths);
+    const devices = try oci.prepareDevices(allocator, settings.devices);
+    defer oci.freeDevices(allocator, devices);
+    const systemd_config = if (config.systemd) try oci.parseSystemdCgroupPath(allocator, settings.cgroupsPath, config.id) else null;
+    defer if (systemd_config) |value| value.deinit(allocator);
+    const cgroup_path = if (systemd_config) |value| try allocator.dupe(u8, value.path) else try oci.resolveCgroupPath(allocator, settings.cgroupsPath, config.id);
+    defer allocator.free(cgroup_path);
+    const resources = try oci.cgroupResources(allocator, settings.resources);
+    defer oci.freeCgroupResources(allocator, resources);
+    var options: Backend.CreateOptions = .{
+        .allocator = allocator,
+        .id = config.id,
+        .rootfs = rootfs,
+        .exec_fifo = "",
+        .spec = &parsed.value,
+        .console_fds = console_fds,
+        .mounts = mounts,
+        .cgroup_path = cgroup_path,
+        .systemd = config.systemd,
+        .systemd_slice = if (systemd_config) |value| value.slice else "system.slice",
+        .systemd_unit = if (systemd_config) |value| value.unit else "",
+        .resources = resources,
+        .devices = devices,
+        .device_symlinks = oci.deviceSymlinks(mounts),
+        .create_hooks = create_hooks,
+        .start_hooks = start_hooks,
+        .masked_paths = masked_paths,
+        .readonly_paths = readonly_paths,
+        .sysctls = sysctls,
+        .rootfs_propagation = if (settings.rootfsPropagation) |mode| oci.rootfsPropagation(mode) else null,
+        .seccomp = seccomp_config,
+    };
+    applyCreateProcess(&options, process_options);
+    try createPreparedContainer(allocator, mount_allocator, io, backend, config, bundle, options);
+}
+
+fn prepareCreateProcess(allocator: std.mem.Allocator, process: ?oci.Spec.Process, console_socket: bool) !?Backend.ExecOptions {
+    return if (process) |value|
+        try prepareProcess(allocator, value, console_socket)
+    else options: {
+        try validateConsoleSocket(null, console_socket);
+        break :options @as(?Backend.ExecOptions, null);
+    };
+}
+
+fn closeConsoleFds(console_fds: ?[2]std.posix.fd_t) void {
+    if (console_fds) |fds| for (fds) |fd| {
+        _ = std.os.linux.close(fd);
+    };
+}
+
+fn prepareCreateMounts(mount_allocator: std.mem.Allocator, bundle: []const u8, configured: ?[]const oci.Spec.Mount, settings: oci.Spec.Linux) ![]Backend.Mount {
+    const spec_mounts = configured orelse &.{};
     const mounts = try mount_allocator.alloc(Backend.Mount, spec_mounts.len);
     for (spec_mounts, mounts, 0..) |mount, *prepared, i| {
         errdefer |err| if (err == error.InvalidConfig) oci.diagnosticContext("mounts[{d}]", .{i});
@@ -67,39 +120,33 @@ pub fn createContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backen
             .mappings = try oci.mountMappings(mount_allocator, mount, settings),
         };
     }
-    const seccomp_config = try oci.prepareSeccomp(allocator, settings.seccomp);
-    defer oci.freeSeccomp(allocator, seccomp_config);
-    const sysctls = try oci.prepareSysctls(mount_allocator, settings);
-    const configured_hooks: oci.Spec.Hooks = parsed.value.hooks orelse .{};
-    const create_hooks = try oci.prepareHooks(mount_allocator, configured_hooks.createContainer);
-    const start_hooks = try oci.prepareHooks(mount_allocator, configured_hooks.startContainer);
-    const masked_paths = try prepareRestrictionPaths(mount_allocator, settings.maskedPaths);
-    const readonly_paths = try prepareRestrictionPaths(mount_allocator, settings.readonlyPaths);
-    const devices = try oci.prepareDevices(allocator, settings.devices);
-    defer oci.freeDevices(allocator, devices);
-    const systemd_config = if (config.systemd) try oci.parseSystemdCgroupPath(allocator, settings.cgroupsPath, config.id) else null;
-    defer if (systemd_config) |value| value.deinit(allocator);
-    const cgroup_path = if (systemd_config) |value| try allocator.dupe(u8, value.path) else try oci.resolveCgroupPath(allocator, settings.cgroupsPath, config.id);
-    defer allocator.free(cgroup_path);
-    const resources = try oci.cgroupResources(allocator, settings.resources);
-    defer oci.freeCgroupResources(allocator, resources);
+    return mounts;
+}
+
+fn applyCreateProcess(options: *Backend.CreateOptions, process: ?Backend.ExecOptions) void {
+    if (process) |value| {
+        options.capabilities = value.capabilities;
+        options.rlimits = value.rlimits;
+        options.oom_score_adj = value.oom_score_adj;
+        options.apparmor_profile = value.apparmor_profile;
+    }
+}
+
+fn createPreparedContainer(allocator: std.mem.Allocator, mount_allocator: std.mem.Allocator, io: std.Io, backend: Backend, config: Config, bundle: []const u8, prepared: Backend.CreateOptions) !void {
+    const cwd = std.Io.Dir.cwd();
+    const configured_hooks: oci.Spec.Hooks = prepared.spec.hooks orelse .{};
+    var options = prepared;
     _ = try cwd.createDirPathStatus(io, config.root, .fromMode(0o700));
     const root = try cwd.realPathFileAlloc(io, config.root, allocator);
     defer allocator.free(root);
-    const inherits_mounts = inherits: {
-        for (settings.namespaces orelse &.{}) |namespace| {
-            if (namespace.type == .mount) break :inherits false;
-        }
-        break :inherits true;
-    };
-    if (inherits_mounts) try requireUnusedRootfs(allocator, io, backend, root, config.id, rootfs);
+    if (inheritsMountNamespace(options.spec.linux orelse .{})) try requireUnusedRootfs(allocator, io, backend, root, config.id, options.rootfs);
     const state_dir = try std.fs.path.join(allocator, &.{ root, config.id });
     defer allocator.free(state_dir);
     var state: oci.State = .{
         .id = config.id,
         .status = .creating,
         .bundle = bundle,
-        .annotations = parsed.value.annotations,
+        .annotations = options.spec.annotations,
     };
     cwd.createDir(io, state_dir, .fromMode(0o700)) catch |err| switch (err) {
         error.PathAlreadyExists => return error.ContainerExists,
@@ -108,56 +155,14 @@ pub fn createContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backen
     var lock: ?std.Io.File = null;
     defer if (lock) |file| file.close(io);
     var setup_attempted = false;
-    errdefer cleanup: {
-        // Forced deletion unlinks our lock; a reused id belongs to another owner.
-        if (lock) |file| requireLinkedLock(io, file) catch break :cleanup;
-        deleteStateDirectory(io, state_dir) catch {};
-        if (lock) |file| {
-            file.close(io);
-            lock = null;
-        }
-        // Backend failures clean up init; later failures kill it before this defer.
-        if (setup_attempted) {
-            state.status = .stopped;
-            warnHooks(allocator, configured_hooks.poststop, state, "poststop");
-        }
-    }
+    // The errdefer reads setup_attempted when it runs, not when it is registered.
+    errdefer cleanupCreateState(allocator, io, state_dir, &lock, &state, configured_hooks.poststop, setup_attempted);
     lock = try openContainerLock(allocator, .{ .root = root, .id = config.id, .subcommand = .create }, true);
     if (lock) |file| _ = try lockContainer(file, true);
     // Setup hooks hold the lock; start and ordinary delete wait, while state, kill and forced delete never block.
 
-    const cgroup_state_path = try std.fs.path.join(allocator, &.{ state_dir, oci.cgroup_file_name });
-    defer allocator.free(cgroup_state_path);
-    try oci.atomicWrite(io, cgroup_state_path, cgroup_path);
-    const driver_path = try std.fs.path.join(allocator, &.{ state_dir, oci.cgroup_driver_file_name });
-    defer allocator.free(driver_path);
-    try oci.atomicWrite(io, driver_path, if (config.systemd) "systemd\n" else "cgroupfs\n");
-    const process_path = try std.fs.path.join(allocator, &.{ state_dir, oci.process_file_name });
-    defer allocator.free(process_path);
-    try oci.atomicWrite(io, process_path, if (parsed.value.process != null) "true\n" else "false\n");
-    // Capture exec defaults independently of later changes to the bundle.
-    const saved_config = try std.fs.path.join(allocator, &.{ state_dir, "config.json" });
-    defer allocator.free(saved_config);
-    const config_json = try std.json.Stringify.valueAlloc(allocator, parsed.value, .{ .emit_null_optional_fields = false });
-    defer allocator.free(config_json);
-    try oci.atomicWrite(io, saved_config, config_json);
-    const devices_path = try std.fs.path.join(allocator, &.{ state_dir, "devices.json" });
-    defer allocator.free(devices_path);
-    const devices_json = try std.json.Stringify.valueAlloc(allocator, devices, .{});
-    defer allocator.free(devices_json);
-    try oci.atomicWrite(io, devices_path, devices_json);
-    const fifo = try std.fs.path.join(allocator, &.{ state_dir, oci.exec_fifo_name });
+    const fifo = try persistCreatingState(allocator, io, root, state_dir, state, options);
     defer allocator.free(fifo);
-    try makeExecFifo(allocator, fifo);
-    try oci.saveState(allocator, io, root, state);
-    // Delete must still run poststop if the original bundle was removed.
-    if (parsed.value.hooks) |entries| {
-        const hooks_path = try std.fs.path.join(allocator, &.{ state_dir, oci.hooks_file_name });
-        defer allocator.free(hooks_path);
-        const json = try std.json.Stringify.valueAlloc(allocator, entries, .{ .emit_null_optional_fields = false });
-        defer allocator.free(json);
-        try oci.atomicWrite(io, hooks_path, json);
-    }
     const create_hook_state = try hookStateTemplate(mount_allocator, state);
     var start_state = state;
     start_state.status = .created;
@@ -172,43 +177,12 @@ pub fn createContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backen
         .lock = lock,
     };
     setup_attempted = true;
-    const created = backend.create(.{
-        .allocator = allocator,
-        .id = config.id,
-        .rootfs = rootfs,
-        .exec_fifo = fifo,
-        .spec = &parsed.value,
-        .console_fds = console_fds,
-        .mounts = mounts,
-        .cgroup_path = cgroup_path,
-        .systemd = config.systemd,
-        .systemd_slice = if (systemd_config) |value| value.slice else "system.slice",
-        .systemd_unit = if (systemd_config) |value| value.unit else "",
-        .resources = resources,
-        .capabilities = if (process_options) |options| options.capabilities else null,
-        .rlimits = if (process_options) |options| options.rlimits else &.{},
-        .oom_score_adj = if (process_options) |options| options.oom_score_adj else null,
-        .apparmor_profile = if (process_options) |options| options.apparmor_profile else null,
-        .devices = devices,
-        .device_symlinks = oci.deviceSymlinks(mounts),
-        .create_hooks = create_hooks,
-        .start_hooks = start_hooks,
-        .create_hook_state = create_hook_state,
-        .start_hook_state = start_hook_state,
-        .masked_paths = masked_paths,
-        .readonly_paths = readonly_paths,
-        .sysctls = sysctls,
-        .rootfs_propagation = if (settings.rootfsPropagation) |mode| oci.rootfsPropagation(mode) else null,
-        .seccomp = seccomp_config,
-        .on_create = .{ .ptr = &create_context, .run = CreateContext.run },
-    });
-    const handle = backendResult(backend, created) catch |err| {
-        if (create_context.failure) |failure| {
-            diagnostics.last_backend_detail = null;
-            return failure;
-        }
-        return err;
-    };
+    options.exec_fifo = fifo;
+    options.create_hook_state = create_hook_state;
+    options.start_hook_state = start_hook_state;
+    options.on_create = .{ .ptr = &create_context, .run = CreateContext.run };
+    const created = backend.create(options);
+    const handle = try createdHandle(backend, created, create_context.failure);
     defer allocator.free(handle.starttime);
     errdefer cleanup: {
         if (lock) |file| requireLinkedLock(io, file) catch break :cleanup;
@@ -218,20 +192,92 @@ pub fn createContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backen
     state.pid = handle.pid;
     try saveRootfsMount(allocator, io, state_dir, handle);
 
-    if (console_fds) |fds| {
-        const controller = try backend_module.console.receiveFd(fds[0]);
-        defer _ = std.os.linux.close(controller);
-        // Connect after fork so the blocked init cannot keep this connection
-        // alive after create closes its copy.
-        const peer = try connectConsoleSocket(config.console_socket.?);
-        defer _ = std.os.linux.close(peer);
-        try backend_module.console.sendFd(peer, controller);
-    }
+    try reportCreateConsole(options.console_fds, config.console_socket);
     state.status = .created;
     if (lock) |file| try requireLinkedLock(io, file);
     try oci.saveState(allocator, io, root, state);
     if (config.pid_file) |path| {
         try writePidFile(allocator, io, path, handle.pid);
+    }
+}
+
+fn createdHandle(backend: Backend, created: Backend.Error!Backend.Handle, failure: ?anyerror) !Backend.Handle {
+    return backendResult(backend, created) catch |err| {
+        if (failure) |reason| {
+            diagnostics.last_backend_detail = null;
+            return reason;
+        }
+        return err;
+    };
+}
+
+fn inheritsMountNamespace(settings: oci.Spec.Linux) bool {
+    for (settings.namespaces orelse &.{}) |namespace| {
+        if (namespace.type == .mount) return false;
+    }
+    return true;
+}
+
+fn cleanupCreateState(allocator: std.mem.Allocator, io: std.Io, state_dir: []const u8, lock: *?std.Io.File, state: *oci.State, poststop: ?[]const oci.Spec.Hook, setup_attempted: bool) void {
+    // Forced deletion unlinks our lock; a reused id belongs to another owner.
+    if (lock.*) |file| requireLinkedLock(io, file) catch return;
+    deleteStateDirectory(io, state_dir) catch {};
+    if (lock.*) |file| {
+        file.close(io);
+        lock.* = null;
+    }
+    // Backend failures clean up init; later failures kill it before this defer.
+    if (setup_attempted) {
+        state.status = .stopped;
+        warnHooks(allocator, poststop, state.*, "poststop");
+    }
+}
+
+fn persistCreatingState(allocator: std.mem.Allocator, io: std.Io, root: []const u8, state_dir: []const u8, state: oci.State, options: Backend.CreateOptions) ![]u8 {
+    const cgroup_state_path = try std.fs.path.join(allocator, &.{ state_dir, oci.cgroup_file_name });
+    defer allocator.free(cgroup_state_path);
+    try oci.atomicWrite(io, cgroup_state_path, options.cgroup_path);
+    const driver_path = try std.fs.path.join(allocator, &.{ state_dir, oci.cgroup_driver_file_name });
+    defer allocator.free(driver_path);
+    try oci.atomicWrite(io, driver_path, if (options.systemd) "systemd\n" else "cgroupfs\n");
+    const process_path = try std.fs.path.join(allocator, &.{ state_dir, oci.process_file_name });
+    defer allocator.free(process_path);
+    try oci.atomicWrite(io, process_path, if (options.spec.process != null) "true\n" else "false\n");
+    // Capture exec defaults independently of later changes to the bundle.
+    const saved_config = try std.fs.path.join(allocator, &.{ state_dir, "config.json" });
+    defer allocator.free(saved_config);
+    const config_json = try std.json.Stringify.valueAlloc(allocator, options.spec.*, .{ .emit_null_optional_fields = false });
+    defer allocator.free(config_json);
+    try oci.atomicWrite(io, saved_config, config_json);
+    const devices_path = try std.fs.path.join(allocator, &.{ state_dir, "devices.json" });
+    defer allocator.free(devices_path);
+    const devices_json = try std.json.Stringify.valueAlloc(allocator, options.devices, .{});
+    defer allocator.free(devices_json);
+    try oci.atomicWrite(io, devices_path, devices_json);
+    const fifo = try std.fs.path.join(allocator, &.{ state_dir, oci.exec_fifo_name });
+    errdefer allocator.free(fifo);
+    try makeExecFifo(allocator, fifo);
+    try oci.saveState(allocator, io, root, state);
+    // Delete must still run poststop if the original bundle was removed.
+    if (options.spec.hooks) |entries| {
+        const hooks_path = try std.fs.path.join(allocator, &.{ state_dir, oci.hooks_file_name });
+        defer allocator.free(hooks_path);
+        const json = try std.json.Stringify.valueAlloc(allocator, entries, .{ .emit_null_optional_fields = false });
+        defer allocator.free(json);
+        try oci.atomicWrite(io, hooks_path, json);
+    }
+    return fifo;
+}
+
+fn reportCreateConsole(console_fds: ?[2]std.posix.fd_t, console_socket: ?[]const u8) !void {
+    if (console_fds) |fds| {
+        const controller = try backend_module.console.receiveFd(fds[0]);
+        defer _ = std.os.linux.close(controller);
+        // Connect after fork so the blocked init cannot keep this connection
+        // alive after create closes its copy.
+        const peer = try connectConsoleSocket(console_socket.?);
+        defer _ = std.os.linux.close(peer);
+        try backend_module.console.sendFd(peer, controller);
     }
 }
 

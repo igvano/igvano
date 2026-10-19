@@ -161,34 +161,19 @@ const MountMappingConfig = struct {
 };
 
 pub fn mountMappingConfig(mount: Spec.Mount, settings: Spec.Linux) !?MountMappingConfig {
-    var bind = mount.type != null and std.mem.eql(u8, mount.type.?, "bind");
-    var recursive: ?bool = null;
-    for (mount.options orelse &.{}) |option| {
-        if (std.mem.eql(u8, option, "bind") or std.mem.eql(u8, option, "rbind")) bind = true;
-        for (mount_option_table) |entry| {
-            if (std.mem.eql(u8, option, entry.name) and entry.idmap != null) recursive = entry.idmap;
-        }
-    }
+    const options = mountMappingOptions(mount);
     const explicit = mount.uidMappings != null or mount.gidMappings != null;
-    if (!explicit and recursive == null) return null;
-    if (!bind) {
+    if (!explicit and options.recursive == null) return null;
+    if (!options.bind) {
         return invalidConfig("mount '{s}': idmapping requires a bind mount", .{mount.destination});
     }
-    var config: MountMappingConfig = .{ .recursive = recursive orelse false };
+    var config: MountMappingConfig = .{ .recursive = options.recursive orelse false };
     if (explicit) {
         config.uid = mount.uidMappings orelse &.{};
         config.gid = mount.gidMappings orelse &.{};
     } else {
-        for (settings.namespaces orelse &.{}) |namespace| {
-            if (namespace.type != .user) continue;
-            if (namespace.path) |path| {
-                config.userns_path = path;
-                return config;
-            }
-            config.uid = settings.uidMappings orelse &.{};
-            config.gid = settings.gidMappings orelse &.{};
-            break;
-        }
+        inheritMountMappings(&config, settings);
+        if (config.userns_path != null) return config;
     }
     if (config.uid.len == 0 or config.gid.len == 0) {
         return invalidConfig("mount '{s}': idmapping requires both uid and gid mappings", .{mount.destination});
@@ -200,6 +185,31 @@ pub fn mountMappingConfig(mount: Spec.Mount, settings: Spec.Linux) !?MountMappin
         };
     }
     return config;
+}
+
+fn mountMappingOptions(mount: Spec.Mount) struct { bind: bool, recursive: ?bool } {
+    var bind = mount.type != null and std.mem.eql(u8, mount.type.?, "bind");
+    var recursive: ?bool = null;
+    for (mount.options orelse &.{}) |option| {
+        if (std.mem.eql(u8, option, "bind") or std.mem.eql(u8, option, "rbind")) bind = true;
+        for (mount_option_table) |entry| {
+            if (std.mem.eql(u8, option, entry.name) and entry.idmap != null) recursive = entry.idmap;
+        }
+    }
+    return .{ .bind = bind, .recursive = recursive };
+}
+
+fn inheritMountMappings(config: *MountMappingConfig, settings: Spec.Linux) void {
+    for (settings.namespaces orelse &.{}) |namespace| {
+        if (namespace.type != .user) continue;
+        if (namespace.path) |path| {
+            config.userns_path = path;
+            return;
+        }
+        config.uid = settings.uidMappings orelse &.{};
+        config.gid = settings.gidMappings orelse &.{};
+        break;
+    }
 }
 
 /// Translate to backend-owned types; the caller owns both mapping slices.

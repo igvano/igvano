@@ -93,35 +93,15 @@ pub fn destroyContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backe
         if (cgroup_path) |path| allocator.free(path);
     };
     const rootfs_mount = if (state.handle) |handle|
-        if (handle.rootfs_mount) |path| RootfsMount{
-            .path = path,
-            .mount_id_unique = handle.rootfs_mount_id,
-            .boot_id = handle.rootfs_mount_boot_id,
-        } else null
+        handleRootfsMount(handle)
     else
         try loadRootfsMount(allocator, io, config.root, config.id);
     defer if (state.handle == null) {
         if (rootfs_mount) |mount| allocator.free(mount.path);
     };
     const systemd = if (state.handle) |handle| handle.systemd else try loadCleanupSystemdDriver(allocator, io, config.root, config.id, cgroup_path, config.force);
-    var cleanup_handle = state.handle orelse Backend.Handle{
-        .id = state.parsed.value.id,
-        .pid = state.parsed.value.pid orelse 0,
-        .starttime = "",
-        .cgroup_path = cgroup_path,
-        .systemd = systemd,
-        .rootfs_mount = if (rootfs_mount) |mount| mount.path else null,
-        .rootfs_mount_id = if (rootfs_mount) |mount| mount.mount_id_unique else null,
-        .rootfs_mount_boot_id = if (rootfs_mount) |mount| mount.boot_id else null,
-    };
-    backendResult(backend, backend.delete(cleanup_handle)) catch |err| {
-        if (!config.force or !cleanup_handle.systemd) return err;
-        std.debug.print("igvano: warning: systemd cleanup failed for '{s}': {s}; trying cgroupfs cleanup\n", .{ config.id, @errorName(err) });
-        diagnostics.last_backend_detail = null;
-        cleanup_handle.systemd = false;
-        cleanup_handle.systemd_cleanup = true;
-        try backendResult(backend, backend.delete(cleanup_handle));
-    };
+    const cleanup_handle = state.handle orelse savedCleanupHandle(state.parsed.value, cgroup_path, systemd, rootfs_mount);
+    try deleteBackendContainer(backend, cleanup_handle, config);
     state.parsed.value.status = .stopped;
     const path = try std.fs.path.join(allocator, &.{ config.root, config.id });
     defer allocator.free(path);
@@ -131,6 +111,39 @@ pub fn destroyContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backe
         lock.* = null;
     }
     warnHooks(allocator, poststop, state.parsed.value, "poststop");
+}
+
+fn handleRootfsMount(handle: Backend.Handle) ?RootfsMount {
+    return if (handle.rootfs_mount) |path| RootfsMount{
+        .path = path,
+        .mount_id_unique = handle.rootfs_mount_id,
+        .boot_id = handle.rootfs_mount_boot_id,
+    } else null;
+}
+
+fn savedCleanupHandle(state: oci.State, cgroup_path: ?[]const u8, systemd: bool, rootfs_mount: ?RootfsMount) Backend.Handle {
+    return .{
+        .id = state.id,
+        .pid = state.pid orelse 0,
+        .starttime = "",
+        .cgroup_path = cgroup_path,
+        .systemd = systemd,
+        .rootfs_mount = if (rootfs_mount) |mount| mount.path else null,
+        .rootfs_mount_id = if (rootfs_mount) |mount| mount.mount_id_unique else null,
+        .rootfs_mount_boot_id = if (rootfs_mount) |mount| mount.boot_id else null,
+    };
+}
+
+fn deleteBackendContainer(backend: Backend, handle: Backend.Handle, config: Config) !void {
+    var cleanup_handle = handle;
+    backendResult(backend, backend.delete(cleanup_handle)) catch |err| {
+        if (!config.force or !cleanup_handle.systemd) return err;
+        std.debug.print("igvano: warning: systemd cleanup failed for '{s}': {s}; trying cgroupfs cleanup\n", .{ config.id, @errorName(err) });
+        diagnostics.last_backend_detail = null;
+        cleanup_handle.systemd = false;
+        cleanup_handle.systemd_cleanup = true;
+        try backendResult(backend, backend.delete(cleanup_handle));
+    };
 }
 
 test "forced delete accepts every lifecycle status while ordinary delete requires stopped" {

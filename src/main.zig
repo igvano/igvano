@@ -8,6 +8,7 @@ const backendResult = @import("cli/diagnostic.zig").backendResult;
 const Subcommand = @import("cli/args.zig").Subcommand;
 const Config = @import("cli/args.zig").Config;
 const parseArgsWithLog = @import("cli/args.zig").parseArgsWithLog;
+const ParseArgsError = @typeInfo(@typeInfo(@TypeOf(parseArgsWithLog)).@"fn".return_type.?).error_union.error_set;
 const LogFormat = @import("cli/log.zig").LogFormat;
 const appendErrorLog = @import("cli/log.zig").appendErrorLog;
 const updateContainer = @import("cli/update.zig").updateContainer;
@@ -30,34 +31,7 @@ pub fn main(init: std.process.Init) !u8 {
     var log: ?[]const u8 = null;
     var log_format: LogFormat = .text;
     const config = parseArgsWithLog(args, &log, &log_format) catch |err| {
-        const message = switch (err) {
-            error.MissingRoot => "missing value for --root",
-            error.MissingLog => "missing value for --log",
-            error.MissingLogFormat => "missing value for --log-format",
-            error.InvalidLogFormat => "invalid --log-format; expected text or json",
-            error.MissingSubcommand => "missing subcommand",
-            error.UnknownOption => "unknown option",
-            error.UnknownSubcommand => "unknown subcommand",
-            error.MissingId => "missing container id",
-            error.MissingBundle => "missing value for --bundle",
-            error.MissingPidFile => "missing value for --pid-file",
-            error.MissingConsoleSocket => "missing value for --console-socket",
-            error.MissingProcessFile => "missing value for --process",
-            error.MissingResources => "update requires --resources <file|-> or resource flags",
-            error.MissingResourceValue => "missing value for resource flag",
-            error.InvalidResourceValue => "invalid resource flag value",
-            error.MissingCommand => "exec requires a command or --process",
-            error.MissingCwd => "missing value for --cwd",
-            error.MissingEnv => "missing value for --env",
-            error.MissingUser => "missing value for --user",
-            error.InvalidUser => "invalid --user; expected UID[:GID]",
-            error.InvalidBoolean => "invalid boolean; expected true or false",
-            error.MissingFormat => "missing value for --format",
-            error.InvalidFormat => "invalid --format; expected table or json",
-            error.InvalidProcess => "invalid process environment; expected K=V",
-            error.UnexpectedArgument => "unexpected argument; global flags must precede the subcommand",
-            error.InvalidId => "invalid container id",
-        };
+        const message = argumentErrorMessage(err);
         var buffer: [1024]u8 = undefined;
         const line = std.fmt.bufPrint(&buffer, "igvano: {s}", .{oci.diagnosticFor(err) orelse message}) catch unreachable;
         emitError(allocator, init.io, log, log_format, line, null, null);
@@ -67,33 +41,78 @@ pub fn main(init: std.process.Init) !u8 {
     var implementation: backend_module.LinuxBackend = .{};
     const backend = implementation.backend();
     diagnostics.last_backend_detail = null;
-    if (config.subcommand == .exec) {
-        return execContainer(allocator, init.io, backend, config) catch |err| {
-            reportError(allocator, init.io, diagnostics.last_backend_detail, config, err);
-            return 1;
-        };
-    }
-    const result = switch (config.subcommand) {
-        .features => features(allocator, init.io),
-        .state => stateContainer(allocator, init.io, backend, config),
-        .create => createContainer(allocator, init.io, backend, config),
-        .start => startContainer(allocator, init.io, backend, config),
-        .kill => killContainer(allocator, init.io, backend, config),
-        .update => updateContainer(allocator, init.io, backend, config),
-        .ps => psContainer(allocator, init.io, backend, config, std.Io.File.stdout()),
-        .pause, .@"resume" => pauseContainer(allocator, init.io, backend, config),
-        .delete => deleteContainer(allocator, init.io, backend, config),
-        .exec => unreachable,
-    };
-    result catch |err| {
+    return dispatchCommand(allocator, init.io, backend, config) catch |err| {
         reportError(allocator, init.io, diagnostics.last_backend_detail, config, err);
         return 1;
     };
+}
+
+fn argumentErrorMessage(err: ParseArgsError) []const u8 {
+    const messages = std.StaticStringMap([]const u8).initComptime(.{
+        .{ "MissingRoot", "missing value for --root" },
+        .{ "MissingLog", "missing value for --log" },
+        .{ "MissingLogFormat", "missing value for --log-format" },
+        .{ "InvalidLogFormat", "invalid --log-format; expected text or json" },
+        .{ "MissingSubcommand", "missing subcommand" },
+        .{ "UnknownOption", "unknown option" },
+        .{ "UnknownSubcommand", "unknown subcommand" },
+        .{ "MissingId", "missing container id" },
+        .{ "MissingBundle", "missing value for --bundle" },
+        .{ "MissingPidFile", "missing value for --pid-file" },
+        .{ "MissingConsoleSocket", "missing value for --console-socket" },
+        .{ "MissingProcessFile", "missing value for --process" },
+        .{ "MissingResources", "update requires --resources <file|-> or resource flags" },
+        .{ "MissingResourceValue", "missing value for resource flag" },
+        .{ "InvalidResourceValue", "invalid resource flag value" },
+        .{ "MissingCommand", "exec requires a command or --process" },
+        .{ "MissingCwd", "missing value for --cwd" },
+        .{ "MissingEnv", "missing value for --env" },
+        .{ "MissingUser", "missing value for --user" },
+        .{ "InvalidUser", "invalid --user; expected UID[:GID]" },
+        .{ "InvalidBoolean", "invalid boolean; expected true or false" },
+        .{ "MissingFormat", "missing value for --format" },
+        .{ "InvalidFormat", "invalid --format; expected table or json" },
+        .{ "InvalidProcess", "invalid process environment; expected K=V" },
+        .{ "UnexpectedArgument", "unexpected argument; global flags must precede the subcommand" },
+        .{ "InvalidId", "invalid container id" },
+    });
+    comptime {
+        for (@typeInfo(ParseArgsError).error_set.?) |parse_error| {
+            if (messages.get(parse_error.name) == null)
+                @compileError("missing argument error message for " ++ parse_error.name);
+        }
+    }
+    return messages.get(@errorName(err)).?;
+}
+
+fn dispatchCommand(allocator: std.mem.Allocator, io: std.Io, backend: Backend, config: Config) !u8 {
+    switch (config.subcommand) {
+        .features => try features(allocator, io),
+        .state => try stateContainer(allocator, io, backend, config),
+        .create => try createContainer(allocator, io, backend, config),
+        .start => try startContainer(allocator, io, backend, config),
+        .exec => return execContainer(allocator, io, backend, config),
+        .kill => try killContainer(allocator, io, backend, config),
+        .update => try updateContainer(allocator, io, backend, config),
+        .ps => try psContainer(allocator, io, backend, config, std.Io.File.stdout()),
+        .pause, .@"resume" => try pauseContainer(allocator, io, backend, config),
+        .delete => try deleteContainer(allocator, io, backend, config),
+    }
     return 0;
 }
 
 fn reportError(allocator: std.mem.Allocator, io: std.Io, diagnostic: ?[]const u8, config: Config, err: anyerror) void {
-    const message = (if (err == error.FileNotFound)
+    const message = errorMessage(allocator, config, err) catch {
+        std.debug.print("igvano: {s} for '{s}' failed: {s}\n", .{ @tagName(config.subcommand), config.id, @errorName(err) });
+        return;
+    };
+    defer allocator.free(message);
+    const frontend_detail = if (diagnostic == null) oci.diagnosticFor(err) else null;
+    emitError(allocator, io, config.log, config.log_format, message, frontend_detail, diagnostic orelse frontend_detail);
+}
+
+fn errorMessage(allocator: std.mem.Allocator, config: Config, err: anyerror) ![]u8 {
+    return if (err == error.FileNotFound)
         std.fmt.allocPrint(allocator, "igvano: container '{s}' or a required file does not exist", .{config.id})
     else if (err == error.ContainerExists)
         std.fmt.allocPrint(allocator, "igvano: container '{s}' already exists", .{config.id})
@@ -103,7 +122,12 @@ fn reportError(allocator: std.mem.Allocator, io: std.Io, diagnostic: ?[]const u8
         allocator.dupe(u8, "igvano: terminal=true requires --console-socket")
     else if (err == error.UnexpectedConsoleSocket)
         allocator.dupe(u8, "igvano: --console-socket requires terminal=true")
-    else if (config.subcommand == .start and err == error.ProcessNotFound)
+    else
+        commandErrorMessage(allocator, config, err);
+}
+
+fn commandErrorMessage(allocator: std.mem.Allocator, config: Config, err: anyerror) ![]u8 {
+    return if (config.subcommand == .start and err == error.ProcessNotFound)
         std.fmt.allocPrint(allocator, "igvano: init for '{s}' is no longer alive; start failed", .{config.id})
     else if (config.subcommand == .kill and (err == error.ContainerNotRunning or err == error.ProcessNotFound))
         std.fmt.allocPrint(allocator, "igvano: kill for '{s}' failed: {s}", .{
@@ -111,13 +135,7 @@ fn reportError(allocator: std.mem.Allocator, io: std.Io, diagnostic: ?[]const u8
             @as([]const u8, if (err == error.ContainerNotRunning) "container not running" else "no such process"),
         })
     else
-        std.fmt.allocPrint(allocator, "igvano: {s} for '{s}' failed: {s}", .{ @tagName(config.subcommand), config.id, @errorName(err) })) catch {
-        std.debug.print("igvano: {s} for '{s}' failed: {s}\n", .{ @tagName(config.subcommand), config.id, @errorName(err) });
-        return;
-    };
-    defer allocator.free(message);
-    const frontend_detail = if (diagnostic == null) oci.diagnosticFor(err) else null;
-    emitError(allocator, io, config.log, config.log_format, message, frontend_detail, diagnostic orelse frontend_detail);
+        std.fmt.allocPrint(allocator, "igvano: {s} for '{s}' failed: {s}", .{ @tagName(config.subcommand), config.id, @errorName(err) });
 }
 
 fn emitError(allocator: std.mem.Allocator, io: std.Io, log: ?[]const u8, log_format: LogFormat, message: []const u8, stderr_detail: ?[]const u8, log_detail: ?[]const u8) void {

@@ -54,25 +54,7 @@ test "features JSON reports parser tables and supported isolation" {
     const root = parsed.value.object;
     try std.testing.expectEqualStrings(oci_version_min, root.get("ociVersionMin").?.string);
     try std.testing.expectEqualStrings(oci_version_max, root.get("ociVersionMax").?.string);
-    const reported_mounts = root.get("mountOptions").?.array.items;
-    try std.testing.expectEqual(mount_option_table.len, reported_mounts.len);
-    var has_rro = false;
-    var has_idmap = false;
-    var has_ridmap = false;
-    for (mount_option_table, reported_mounts) |entry, reported| {
-        try std.testing.expectEqualStrings(entry.name, reported.string);
-        const options = try parseMountOptions(allocator, &.{reported.string}, null);
-        defer allocator.free(options.data);
-        try std.testing.expectEqualStrings("", options.data);
-        if (std.mem.eql(u8, reported.string, "rro")) {
-            has_rro = true;
-            try std.testing.expectEqual(@as(?bool, true), options.recursive_readonly);
-        }
-        if (std.mem.eql(u8, reported.string, "idmap")) has_idmap = true;
-        if (std.mem.eql(u8, reported.string, "ridmap")) has_ridmap = true;
-    }
-    try std.testing.expect(has_rro);
-    try std.testing.expect(has_idmap and has_ridmap);
+    try expectFeatureMounts(allocator, root.get("mountOptions").?.array.items);
     const hooks = root.get("hooks").?.array.items;
     const hook_names = std.meta.fieldNames(Spec.Hooks);
     try std.testing.expectEqual(hook_names.len, hooks.len);
@@ -99,7 +81,35 @@ test "features JSON reports parser tables and supported isolation" {
     try std.testing.expect(cgroup.get("systemd").?.bool);
     for ([_][]const u8{ "systemdUser", "rdma" }) |name|
         try std.testing.expect(!cgroup.get(name).?.bool);
-    const seccomp = linux.get("seccomp").?.object;
+    try expectFeatureSeccomp(allocator, linux.get("seccomp").?.object);
+    try std.testing.expect(linux.get("apparmor").?.object.get("enabled").?.bool);
+    for ([_][]const u8{ "selinux", "intelRdt" }) |name|
+        try std.testing.expect(!linux.get(name).?.object.get("enabled").?.bool);
+    try std.testing.expect(linux.get("mountExtensions").?.object.get("idmap").?.object.get("enabled").?.bool);
+}
+
+fn expectFeatureMounts(allocator: std.mem.Allocator, reported_mounts: []const std.json.Value) !void {
+    try std.testing.expectEqual(mount_option_table.len, reported_mounts.len);
+    var has_rro = false;
+    var has_idmap = false;
+    var has_ridmap = false;
+    for (mount_option_table, reported_mounts) |entry, reported| {
+        try std.testing.expectEqualStrings(entry.name, reported.string);
+        const options = try parseMountOptions(allocator, &.{reported.string}, null);
+        defer allocator.free(options.data);
+        try std.testing.expectEqualStrings("", options.data);
+        if (std.mem.eql(u8, reported.string, "rro")) {
+            has_rro = true;
+            try std.testing.expectEqual(@as(?bool, true), options.recursive_readonly);
+        }
+        if (std.mem.eql(u8, reported.string, "idmap")) has_idmap = true;
+        if (std.mem.eql(u8, reported.string, "ridmap")) has_ridmap = true;
+    }
+    try std.testing.expect(has_rro);
+    try std.testing.expect(has_idmap and has_ridmap);
+}
+
+fn expectFeatureSeccomp(allocator: std.mem.Allocator, seccomp: std.json.ObjectMap) !void {
     try std.testing.expect(seccomp.get("enabled").?.bool);
     const lists = [_]struct { name: []const u8, count: usize }{
         .{ .name = "actions", .count = 8 },
@@ -131,8 +141,4 @@ test "features JSON reports parser tables and supported isolation" {
             defer freeSeccomp(allocator, prepared);
         }
     }
-    try std.testing.expect(linux.get("apparmor").?.object.get("enabled").?.bool);
-    for ([_][]const u8{ "selinux", "intelRdt" }) |name|
-        try std.testing.expect(!linux.get(name).?.object.get("enabled").?.bool);
-    try std.testing.expect(linux.get("mountExtensions").?.object.get("idmap").?.object.get("enabled").?.bool);
 }

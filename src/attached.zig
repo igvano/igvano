@@ -201,57 +201,97 @@ pub fn wait(pid: i32, reaped: *bool, signals: *Signals, controller: ?fd_t, input
     if (comptime builtin.os.tag != .linux) return error.NotImplemented;
     // Raw mode and the first resize deliberately follow backend.exec, matching runc.
     const original = if (controller != null) try makeRaw(input) else null;
-    defer if (original) |term| {
-        var saved = term;
-        while (linux.errno(linux.ioctl(input, linux.T.CSETS, @intFromPtr(&saved))) == .INTR) {}
-    };
+    defer restoreTerminal(input, original);
     const controller_flags = if (controller) |fd| try nonblocking(fd) else null;
-    defer if (controller) |fd| {
-        if (controller_flags) |flags| _ = linux.fcntl(fd, linux.F.SETFL, flags);
-    };
+    defer restoreControllerFlags(controller, controller_flags);
     // stdin/stdout share their open file descriptions with the caller's shell.
     // Leave their flags alone; poll gates the blocking reads and writes.
     if (controller) |fd| resize(input, fd);
-    var to_console: Buffer = .{};
-    var from_console: Buffer = .{};
-    var input_open = controller != null;
-    var console_open = controller != null;
+    var terminal: AttachedIo = .{ .controller = controller, .input = input, .output = output, .input_open = controller != null, .console_open = controller != null };
     var exit_status: ?u8 = null;
     while (true) {
-        try reap(pid, &exit_status, reaped);
-        try signals.forward(if (reaped.*) null else pid, controller, input);
+        try supervise(pid, reaped, signals, controller, input, &exit_status);
         if (controller == null) {
             if (exit_status) |status| return status;
         }
-        var fds = [_]linux.pollfd{
-            .{ .fd = signals.pipe[0], .events = linux.POLL.IN, .revents = 0 },
-            .{ .fd = if (input_open and exit_status == null and to_console.used == 0) input else -1, .events = linux.POLL.IN, .revents = 0 },
-            // HUP is reported even with events=0; stop watching while output is buffered.
-            .{ .fd = if (console_open and from_console.used == 0) controller.? else -1, .events = linux.POLL.IN | @as(i16, if (to_console.used > 0 and exit_status == null) linux.POLL.OUT else 0), .revents = 0 },
-            .{ .fd = if (from_console.used > 0) output else -1, .events = linux.POLL.OUT, .revents = 0 },
-        };
+        var fds = terminal.pollFds(signals.pipe[0], exit_status);
         // After exit, drain available PTY output without waiting for descendants
         // that may have inherited the replica. Pending stdout still gets flushed.
-        const timeout: i32 = if (exit_status != null and from_console.used == 0) 0 else -1;
+        const timeout: i32 = if (exit_status != null and terminal.from_console.used == 0) 0 else -1;
         _ = try std.posix.poll(&fds, timeout);
-        if (fds[0].revents != 0) {
-            try reap(pid, &exit_status, reaped);
-            try signals.forward(if (reaped.*) null else pid, controller, input);
-        }
-        if (fds[3].revents != 0) try from_console.write(output);
-        if (fds[1].revents & linux.POLL.NVAL != 0)
-            input_open = false
-        else if (fds[1].revents != 0)
-            input_open = !try to_console.read(input);
-        if (fds[2].revents & linux.POLL.OUT != 0 and to_console.used > 0)
-            try to_console.write(controller.?);
-        if (fds[2].revents & (linux.POLL.IN | linux.POLL.HUP | linux.POLL.ERR) != 0 and from_console.used == 0)
-            console_open = !try from_console.read(controller.?);
+        if (fds[0].revents != 0) try supervise(pid, reaped, signals, controller, input, &exit_status);
+        try terminal.copyOutput(&fds);
+        try terminal.copyInput(&fds);
+        try terminal.readOutput(&fds);
         if (exit_status) |status| {
-            if (from_console.used == 0 and (!console_open or (fds[2].fd >= 0 and fds[2].revents == 0))) return status;
+            if (terminal.drained(fds[2])) return status;
         }
     }
 }
+
+fn restoreTerminal(input: fd_t, original: ?linux.termios) void {
+    if (original) |term| {
+        var saved = term;
+        while (linux.errno(linux.ioctl(input, linux.T.CSETS, @intFromPtr(&saved))) == .INTR) {}
+    }
+}
+
+fn restoreControllerFlags(controller: ?fd_t, controller_flags: ?usize) void {
+    if (controller) |fd| {
+        if (controller_flags) |flags| _ = linux.fcntl(fd, linux.F.SETFL, flags);
+    }
+}
+
+fn supervise(pid: i32, reaped: *bool, signals: *Signals, controller: ?fd_t, input: fd_t, exit_status: *?u8) !void {
+    try reap(pid, exit_status, reaped);
+    try signals.forward(if (reaped.*) null else pid, controller, input);
+}
+
+const AttachedIo = struct {
+    controller: ?fd_t,
+    input: fd_t,
+    output: fd_t,
+    to_console: Buffer = .{},
+    from_console: Buffer = .{},
+    input_open: bool,
+    console_open: bool,
+
+    fn pollFds(self: *const AttachedIo, signal_fd: fd_t, exit_status: ?u8) [4]linux.pollfd {
+        return [_]linux.pollfd{
+            .{ .fd = signal_fd, .events = linux.POLL.IN, .revents = 0 },
+            .{ .fd = self.inputFd(exit_status), .events = linux.POLL.IN, .revents = 0 },
+            // HUP is reported even with events=0; stop watching while output is buffered.
+            .{ .fd = if (self.console_open and self.from_console.used == 0) self.controller.? else -1, .events = linux.POLL.IN | @as(i16, if (self.to_console.used > 0 and exit_status == null) linux.POLL.OUT else 0), .revents = 0 },
+            .{ .fd = if (self.from_console.used > 0) self.output else -1, .events = linux.POLL.OUT, .revents = 0 },
+        };
+    }
+
+    fn inputFd(self: *const AttachedIo, exit_status: ?u8) fd_t {
+        return if (self.input_open and exit_status == null and self.to_console.used == 0) self.input else -1;
+    }
+
+    fn copyOutput(self: *AttachedIo, fds: *const [4]linux.pollfd) !void {
+        if (fds[3].revents != 0) try self.from_console.write(self.output);
+    }
+
+    fn copyInput(self: *AttachedIo, fds: *const [4]linux.pollfd) !void {
+        if (fds[1].revents & linux.POLL.NVAL != 0)
+            self.input_open = false
+        else if (fds[1].revents != 0)
+            self.input_open = !try self.to_console.read(self.input);
+        if (fds[2].revents & linux.POLL.OUT != 0 and self.to_console.used > 0)
+            try self.to_console.write(self.controller.?);
+    }
+
+    fn readOutput(self: *AttachedIo, fds: *const [4]linux.pollfd) !void {
+        if (fds[2].revents & (linux.POLL.IN | linux.POLL.HUP | linux.POLL.ERR) != 0 and self.from_console.used == 0)
+            self.console_open = !try self.from_console.read(self.controller.?);
+    }
+
+    fn drained(self: *const AttachedIo, controller_fd: linux.pollfd) bool {
+        return self.from_console.used == 0 and (!self.console_open or (controller_fd.fd >= 0 and controller_fd.revents == 0));
+    }
+};
 
 test "raw mode ignores closed or non-terminal stdin" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;

@@ -94,6 +94,8 @@ Note: Nix flakes only see files tracked by git — `git add` new files before
 
 ## Test
 
+Pre-commit hooks run through [prek](https://github.com/j178/prek): `zig fmt --check`, and `cccc` enforcing the `cccc.toml` complexity limits (cognitive 25, cyclomatic 15 per function; `tests/` and `test/` exempt) on the staged files and on all of `src/`. Both tools come from the devShell. With a global `core.hooksPath` (e.g. a corporate hook that chains to local hooks), put `exec nix develop -c prek run --hook-stage pre-commit` in `.git/hooks/pre-commit` instead of `prek install`.
+
 ```sh
 # unit tests (library + CLI), run on any OS; Linux-only tests skip on macOS
 nix develop -c zig build test

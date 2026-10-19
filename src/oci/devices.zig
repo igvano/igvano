@@ -22,43 +22,9 @@ pub fn prepareDevices(allocator: std.mem.Allocator, configured: ?[]const Spec.De
         devices.deinit(allocator);
     }
     for (configured orelse &.{}, 0..) |device, i| {
-        const kind: Backend.Device.Kind = if (std.mem.eql(u8, device.type, "c") or std.mem.eql(u8, device.type, "u"))
-            .character
-        else if (std.mem.eql(u8, device.type, "b"))
-            .block
-        else if (std.mem.eql(u8, device.type, "p"))
-            .fifo
-        else
-            return invalidConfig("linux.devices[{d}].type: expected c, u, b or p", .{i});
-        const major = device.major orelse if (kind == .fifo) 0 else return invalidConfig("linux.devices[{d}].major: required", .{i});
-        const minor = device.minor orelse if (kind == .fifo) 0 else return invalidConfig("linux.devices[{d}].minor: required", .{i});
-        // Linux mknod encodes 12 major bits and 20 minor bits.
-        if (major < 0 or major > 0xfff or minor < 0 or minor > 0xfffff)
-            return invalidConfig("linux.devices[{d}]: major or minor exceeds Linux device range", .{i});
-        const mode = device.fileMode orelse 0o666;
-        const uid = device.uid orelse 0;
-        const gid = device.gid orelse 0;
-        if (mode & ~@as(u32, 0o7777) != 0 or
-            uid == std.math.maxInt(u32) or gid == std.math.maxInt(u32))
-            return invalidConfig("linux.devices[{d}]: invalid fileMode, uid or gid", .{i});
-        const path = resolveMountDestination(allocator, device.path) catch |err| {
-            diagnosticContext("linux.devices[{d}].path", .{i});
-            return err;
-        };
-        errdefer allocator.free(path);
-        if (path.len == 1) return invalidConfig("linux.devices[{d}].path: must not be /", .{i});
-        for (devices.items) |previous| {
-            if (std.mem.eql(u8, previous.path, path)) return invalidConfig("linux.devices[{d}].path: duplicate {s}", .{ i, path });
-        }
-        try devices.append(allocator, .{
-            .path = path,
-            .kind = kind,
-            .major = @intCast(major),
-            .minor = @intCast(minor),
-            .mode = mode,
-            .uid = uid,
-            .gid = gid,
-        });
+        const prepared = try prepareDevice(allocator, device, i, devices.items);
+        errdefer allocator.free(prepared.path);
+        try devices.append(allocator, prepared);
     }
     for (default_devices) |device| {
         for (devices.items) |existing| {
@@ -72,6 +38,55 @@ pub fn prepareDevices(allocator: std.mem.Allocator, configured: ?[]const Spec.De
         }
     }
     return devices.toOwnedSlice(allocator);
+}
+
+fn deviceKind(device: Spec.Device, i: usize) !Backend.Device.Kind {
+    return if (std.mem.eql(u8, device.type, "c") or std.mem.eql(u8, device.type, "u"))
+        .character
+    else if (std.mem.eql(u8, device.type, "b"))
+        .block
+    else if (std.mem.eql(u8, device.type, "p"))
+        .fifo
+    else
+        return invalidConfig("linux.devices[{d}].type: expected c, u, b or p", .{i});
+}
+
+fn deviceNumbers(device: Spec.Device, kind: Backend.Device.Kind, i: usize) !struct { major: u32, minor: u32 } {
+    const major = device.major orelse if (kind == .fifo) 0 else return invalidConfig("linux.devices[{d}].major: required", .{i});
+    const minor = device.minor orelse if (kind == .fifo) 0 else return invalidConfig("linux.devices[{d}].minor: required", .{i});
+    // Linux mknod encodes 12 major bits and 20 minor bits.
+    if (major < 0 or major > 0xfff or minor < 0 or minor > 0xfffff)
+        return invalidConfig("linux.devices[{d}]: major or minor exceeds Linux device range", .{i});
+    return .{ .major = @intCast(major), .minor = @intCast(minor) };
+}
+
+fn prepareDevice(allocator: std.mem.Allocator, device: Spec.Device, i: usize, previous_devices: []const Backend.Device) !Backend.Device {
+    const kind = try deviceKind(device, i);
+    const numbers = try deviceNumbers(device, kind, i);
+    const mode = device.fileMode orelse 0o666;
+    const uid = device.uid orelse 0;
+    const gid = device.gid orelse 0;
+    if (mode & ~@as(u32, 0o7777) != 0 or
+        uid == std.math.maxInt(u32) or gid == std.math.maxInt(u32))
+        return invalidConfig("linux.devices[{d}]: invalid fileMode, uid or gid", .{i});
+    const path = resolveMountDestination(allocator, device.path) catch |err| {
+        diagnosticContext("linux.devices[{d}].path", .{i});
+        return err;
+    };
+    errdefer allocator.free(path);
+    if (path.len == 1) return invalidConfig("linux.devices[{d}].path: must not be /", .{i});
+    for (previous_devices) |previous| {
+        if (std.mem.eql(u8, previous.path, path)) return invalidConfig("linux.devices[{d}].path: duplicate {s}", .{ i, path });
+    }
+    return .{
+        .path = path,
+        .kind = kind,
+        .major = numbers.major,
+        .minor = numbers.minor,
+        .mode = mode,
+        .uid = uid,
+        .gid = gid,
+    };
 }
 
 pub fn freeDevices(allocator: std.mem.Allocator, devices: []const Backend.Device) void {
