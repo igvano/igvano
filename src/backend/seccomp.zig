@@ -90,100 +90,15 @@ pub fn compile(allocator: std.mem.Allocator, config: Config, host: Arch) Error!P
         if (!arch.runnable(host)) continue;
         if (std.mem.indexOfScalar(Arch, arches[0..count], arch) != null) continue;
         arches[count] = arch;
-        // A nearby conditional skips a 32-bit JA trampoline.
-        try builder.emit(0x15, arch.audit());
-        builder.code.items[builder.code.items.len - 1].jf = if (arch == .x86_64 or arch == .x32) 3 else 1;
-        if (arch == .x86_64 or arch == .x32) {
-            // These ABIs share AUDIT_ARCH_X86_64; bit 30 selects x32.
-            try builder.emit(0x20, 0);
-            try builder.emit(0x45, 0x40000000);
-            builder.code.items[builder.code.items.len - 1].jt = if (arch == .x86_64) 1 else 0;
-            builder.code.items[builder.code.items.len - 1].jf = if (arch == .x32) 1 else 0;
-        }
-        targets[count] = try builder.jump();
-        if (arch == .x86_64 or arch == .x32) try builder.emit(0x20, 4);
+        targets[count] = try builder.archDispatch(arch);
         count += 1;
     }
     if (count == 0) return error.UnsupportedArchitecture;
     try builder.emit(0x06, Action.kill_process.encode(null));
-    const default = config.default_action.encode(config.default_errno_ret);
     for (arches[0..count], targets[0..count]) |arch, target| {
         builder.patch(target);
         returns.clearRetainingCapacity();
-        var nr_loaded = false;
-        // runc's patchbpf/enosys_linux.go: permissive defaults (including
-        // TRACE, whose tracer handles future syscalls) do not get a stub.
-        // Count every named rule, regardless of its action or conditions.
-        switch (config.default_action) {
-            .allow, .log, .trace => {},
-            else => if (default != Action.errno.encode(38)) {
-                var maximum: u32 = 0;
-                for (config.rules) |rule| {
-                    if (rule.arch == arch) maximum = @max(maximum, rule.number);
-                }
-                // Like runc, an ABI with no positive syscall number has no stub.
-                if (maximum != 0) {
-                    try builder.emit(0x20, 0);
-                    try builder.emit(0x25, maximum);
-                    builder.code.items[builder.code.items.len - 1].jf = 1;
-                    try builder.emit(0x06, Action.errno.encode(38)); // Linux ENOSYS.
-                    nr_loaded = true;
-                }
-            },
-        }
-        var rule_index: usize = 0;
-        while (rule_index < config.rules.len) {
-            const rule = config.rules[rule_index];
-            rule_index += 1;
-            if (rule.arch != arch) continue;
-            failures.clearRetainingCapacity();
-            if (!nr_loaded) {
-                try builder.emit(0x20, 0); // Reload nr after argument loads.
-                nr_loaded = true;
-            }
-            const action = rule.action.encode(rule.errno_ret);
-            if (rule.args.len == 0) {
-                // Preserve order: only merge consecutive unconditional rules
-                // with identical return data within this ABI.
-                const start = builder.code.items.len;
-                try builder.emit(0x15, rule.number);
-                var comparisons: usize = 1;
-                while (rule_index < config.rules.len and comparisons < 256) {
-                    const next = config.rules[rule_index];
-                    if (next.arch != arch) {
-                        rule_index += 1;
-                        continue;
-                    }
-                    if (next.args.len != 0 or next.action.encode(next.errno_ret) != action) break;
-                    try builder.emit(0x15, next.number);
-                    comparisons += 1;
-                    rule_index += 1;
-                }
-                // A chain reaches a nearby JA to the shared action RET.
-                // Split at 256 comparisons to keep every conditional jump u8.
-                for (builder.code.items[start..], 0..) |*instruction, i|
-                    instruction.jt = @intCast(comparisons - i - 1);
-                builder.code.items[builder.code.items.len - 1].jf = 1;
-                try builder.returnAction(action, &returns);
-                continue;
-            }
-            try builder.require(0x15, rule.number, true, &failures);
-            for (rule.args) |arg| try builder.argument(arg, arch, &failures);
-            nr_loaded = false;
-            try builder.returnAction(action, &returns);
-            for (failures.items) |failure| builder.patch(failure);
-        }
-        try builder.returnAction(default, &returns);
-        // Sorting only the return fixups leaves the rules' first-match order
-        // intact and emits one RET for each distinct encoded action.
-        std.mem.sort(ReturnJump, returns.items, {}, ReturnJump.lessThan);
-        var index: usize = 0;
-        while (index < returns.items.len) {
-            const action = returns.items[index].action;
-            while (index < returns.items.len and returns.items[index].action == action) : (index += 1)
-                builder.patch(returns.items[index].index);
-            try builder.emit(0x06, action);
-        }
+        try builder.archRules(config, arch, &failures, &returns);
     }
     return .{ .filters = try builder.code.toOwnedSlice(allocator), .flags = config.flags };
 }
@@ -234,58 +149,172 @@ const Builder = struct {
         return .{ try self.jump(), try self.jump() };
     }
 
+    fn archDispatch(self: *Builder, arch: Arch) Error!usize {
+        // A nearby conditional skips a 32-bit JA trampoline.
+        try self.emit(0x15, arch.audit());
+        self.code.items[self.code.items.len - 1].jf = if (arch == .x86_64 or arch == .x32) 3 else 1;
+        if (arch == .x86_64 or arch == .x32) {
+            // These ABIs share AUDIT_ARCH_X86_64; bit 30 selects x32.
+            try self.emit(0x20, 0);
+            try self.emit(0x45, 0x40000000);
+            self.code.items[self.code.items.len - 1].jt = if (arch == .x86_64) 1 else 0;
+            self.code.items[self.code.items.len - 1].jf = if (arch == .x32) 1 else 0;
+        }
+        const target = try self.jump();
+        if (arch == .x86_64 or arch == .x32) try self.emit(0x20, 4);
+        return target;
+    }
+
+    fn enosysStub(self: *Builder, config: Config, arch: Arch) Error!bool {
+        // runc's patchbpf/enosys_linux.go: permissive defaults (including
+        // TRACE, whose tracer handles future syscalls) do not get a stub.
+        // Count every named rule, regardless of its action or conditions.
+        switch (config.default_action) {
+            .allow, .log, .trace => return false,
+            else => {},
+        }
+        if (config.default_action.encode(config.default_errno_ret) == Action.errno.encode(38)) return false;
+        var maximum: u32 = 0;
+        for (config.rules) |rule| {
+            if (rule.arch == arch) maximum = @max(maximum, rule.number);
+        }
+        // Like runc, an ABI with no positive syscall number has no stub.
+        if (maximum == 0) return false;
+        try self.emit(0x20, 0);
+        try self.emit(0x25, maximum);
+        self.code.items[self.code.items.len - 1].jf = 1;
+        try self.emit(0x06, Action.errno.encode(38)); // Linux ENOSYS.
+        return true;
+    }
+
+    fn archRules(self: *Builder, config: Config, arch: Arch, failures: *std.ArrayList(usize), returns: *std.ArrayList(ReturnJump)) Error!void {
+        var nr_loaded = try self.enosysStub(config, arch);
+        var rule_index: usize = 0;
+        while (rule_index < config.rules.len) {
+            const rule = config.rules[rule_index];
+            rule_index += 1;
+            if (rule.arch != arch) continue;
+            failures.clearRetainingCapacity();
+            if (!nr_loaded) {
+                try self.emit(0x20, 0); // Reload nr after argument loads.
+                nr_loaded = true;
+            }
+            const action = rule.action.encode(rule.errno_ret);
+            if (rule.args.len == 0) {
+                try self.ruleChain(rule, config.rules, &rule_index);
+                try self.returnAction(action, returns);
+                continue;
+            }
+            try self.require(0x15, rule.number, true, failures);
+            for (rule.args) |arg| try self.argument(arg, arch, failures);
+            nr_loaded = false;
+            try self.returnAction(action, returns);
+            for (failures.items) |failure| self.patch(failure);
+        }
+        try self.returnAction(config.default_action.encode(config.default_errno_ret), returns);
+        try self.emitReturns(returns.items);
+    }
+
+    fn ruleChain(self: *Builder, rule: Rule, rules: []const Rule, rule_index: *usize) Error!void {
+        // Preserve order: only merge consecutive unconditional rules
+        // with identical return data within this ABI.
+        const action = rule.action.encode(rule.errno_ret);
+        const start = self.code.items.len;
+        try self.emit(0x15, rule.number);
+        var comparisons: usize = 1;
+        while (rule_index.* < rules.len and comparisons < 256) {
+            const next = rules[rule_index.*];
+            if (next.arch != rule.arch) {
+                rule_index.* += 1;
+                continue;
+            }
+            if (next.args.len != 0 or next.action.encode(next.errno_ret) != action) break;
+            try self.emit(0x15, next.number);
+            comparisons += 1;
+            rule_index.* += 1;
+        }
+        // A chain reaches a nearby JA to the shared action RET.
+        // Split at 256 comparisons to keep every conditional jump u8.
+        for (self.code.items[start..], 0..) |*instruction, i|
+            instruction.jt = @intCast(comparisons - i - 1);
+        self.code.items[self.code.items.len - 1].jf = 1;
+    }
+
+    fn emitReturns(self: *Builder, returns: []ReturnJump) Error!void {
+        // Sorting only the return fixups leaves the rules' first-match order
+        // intact and emits one RET for each distinct encoded action.
+        std.mem.sort(ReturnJump, returns, {}, ReturnJump.lessThan);
+        var index: usize = 0;
+        while (index < returns.len) {
+            const action = returns[index].action;
+            while (index < returns.len and returns[index].action == action) : (index += 1)
+                self.patch(returns[index].index);
+            try self.emit(0x06, action);
+        }
+    }
+
     fn argument(self: *Builder, arg: Arg, arch: Arch, failures: *std.ArrayList(usize)) Error!void {
         // All supported native/compat ABIs use little-endian seccomp_data.
         const low = 16 + arg.index * 8;
-        const high = low + 4;
-        const hi: u32 = @truncate(arg.value >> 32);
-        const lo: u32 = @truncate(arg.value);
         if (arch == .x86 or arch == .x32 or arch == .arm) {
-            // libseccomp truncates both operands for 32-bit ABIs.
-            try self.emit(0x20, low);
-            if (arg.op == .masked_eq) try self.emit(0x54, lo);
-            try self.require(switch (arg.op) {
-                .eq, .ne, .masked_eq => 0x15,
-                .lt, .ge => 0x35,
-                .le, .gt => 0x25,
-            }, if (arg.op == .masked_eq) @truncate(arg.value_two) else lo, arg.op != .ne and arg.op != .lt and arg.op != .le, failures);
+            try self.argument32(arg, low, failures);
             return;
         }
-        try self.emit(0x20, high);
+        try self.emit(0x20, low + 4);
         switch (arg.op) {
-            .eq, .masked_eq => {
-                if (arg.op == .masked_eq) try self.emit(0x54, hi);
-                try self.require(0x15, if (arg.op == .eq) hi else @truncate(arg.value_two >> 32), true, failures);
-                try self.emit(0x20, low);
-                if (arg.op == .masked_eq) try self.emit(0x54, lo);
-                try self.require(0x15, if (arg.op == .eq) lo else @truncate(arg.value_two), true, failures);
-            },
-            .ne => {
-                const edge = try self.branch(0x15, hi);
-                self.patch(edge[0]);
-                try self.emit(0x20, low);
-                try self.require(0x15, lo, false, failures);
-                self.patch(edge[1]);
-            },
-            .lt, .le, .gt, .ge => {
-                const greater = try self.branch(0x25, hi);
-                const ascending = arg.op == .gt or arg.op == .ge;
-                if (!ascending) try failures.append(self.allocator, greater[0]);
-                // A smaller high word either succeeds (LT/LE) or fails (GT/GE).
-                // Equality continues to the low-word comparison.
-                self.patch(greater[1]);
-                const equal = try self.branch(0x15, hi);
-                if (ascending) try failures.append(self.allocator, equal[1]);
-                self.patch(equal[0]);
-                try self.emit(0x20, low);
-                try self.require(switch (arg.op) {
-                    .gt, .le => 0x25,
-                    .ge, .lt => 0x35,
-                    else => unreachable,
-                }, lo, ascending, failures);
-                if (ascending) self.patch(greater[0]) else self.patch(equal[1]);
-            },
+            .eq, .masked_eq => try self.argumentEqual(arg, low, failures),
+            .ne => try self.argumentNotEqual(arg, low, failures),
+            .lt, .le, .gt, .ge => try self.argumentOrdered(arg, low, failures),
         }
+    }
+
+    fn argument32(self: *Builder, arg: Arg, low: u32, failures: *std.ArrayList(usize)) Error!void {
+        // libseccomp truncates both operands for 32-bit ABIs.
+        const lo: u32 = @truncate(arg.value);
+        try self.emit(0x20, low);
+        if (arg.op == .masked_eq) try self.emit(0x54, lo);
+        try self.require(switch (arg.op) {
+            .eq, .ne, .masked_eq => 0x15,
+            .lt, .ge => 0x35,
+            .le, .gt => 0x25,
+        }, if (arg.op == .masked_eq) @truncate(arg.value_two) else lo, arg.op != .ne and arg.op != .lt and arg.op != .le, failures);
+    }
+
+    fn argumentEqual(self: *Builder, arg: Arg, low: u32, failures: *std.ArrayList(usize)) Error!void {
+        const hi: u32 = @truncate(arg.value >> 32);
+        const lo: u32 = @truncate(arg.value);
+        if (arg.op == .masked_eq) try self.emit(0x54, hi);
+        try self.require(0x15, if (arg.op == .eq) hi else @truncate(arg.value_two >> 32), true, failures);
+        try self.emit(0x20, low);
+        if (arg.op == .masked_eq) try self.emit(0x54, lo);
+        try self.require(0x15, if (arg.op == .eq) lo else @truncate(arg.value_two), true, failures);
+    }
+
+    fn argumentNotEqual(self: *Builder, arg: Arg, low: u32, failures: *std.ArrayList(usize)) Error!void {
+        const edge = try self.branch(0x15, @truncate(arg.value >> 32));
+        self.patch(edge[0]);
+        try self.emit(0x20, low);
+        try self.require(0x15, @truncate(arg.value), false, failures);
+        self.patch(edge[1]);
+    }
+
+    fn argumentOrdered(self: *Builder, arg: Arg, low: u32, failures: *std.ArrayList(usize)) Error!void {
+        const greater = try self.branch(0x25, @truncate(arg.value >> 32));
+        const ascending = arg.op == .gt or arg.op == .ge;
+        if (!ascending) try failures.append(self.allocator, greater[0]);
+        // A smaller high word either succeeds (LT/LE) or fails (GT/GE).
+        // Equality continues to the low-word comparison.
+        self.patch(greater[1]);
+        const equal = try self.branch(0x15, @truncate(arg.value >> 32));
+        if (ascending) try failures.append(self.allocator, equal[1]);
+        self.patch(equal[0]);
+        try self.emit(0x20, low);
+        try self.require(switch (arg.op) {
+            .gt, .le => 0x25,
+            .ge, .lt => 0x35,
+            else => unreachable,
+        }, @truncate(arg.value), ascending, failures);
+        if (ascending) self.patch(greater[0]) else self.patch(equal[1]);
     }
 };
 
@@ -376,7 +405,6 @@ test "seccomp default ENOSYS needs no extra ENOSYS stub" {
 }
 
 test "seccomp optimized chains match ordered rules across every ABI and argument boundaries" {
-    const testing = @import("../test/seccomp.zig");
     const arches = [_]Arch{ .x86_64, .x86, .x32, .aarch64, .arm };
     var rules: std.ArrayList(Rule) = .empty;
     defer rules.deinit(std.testing.allocator);
@@ -423,23 +451,28 @@ test "seccomp optimized chains match ordered rules across every ABI and argument
             .{ .arch = arch, .number = base + 400, .action = .allow },
         });
     }
-    const values = [_]u64{ 0, 1, 2, 0xffffffff, 0x100000000, 0x100000001, 0x100000002, 0xffffffffffffffff };
     for ([_]Arch{ .x86_64, .aarch64 }) |host| {
         const config: Config = .{ .default_action = .errno, .architectures = &arches, .rules = rules.items };
         const program = try compile(std.testing.allocator, config, host);
         defer std.testing.allocator.free(program.filters);
         for (arches) |arch| {
             if (!arch.runnable(host)) continue;
-            const base: u32 = if (arch == .x32) 0x40000000 else 0;
-            for (values) |value| for ([_]u64{ 0, 1 }) |second| {
-                var data: TestData = .{ .arch = arch.audit(), .args = .{ value, second, 0, 0, 0, 0 } };
-                for (0..412) |number| {
-                    data.nr = base + @as(u32, @intCast(number));
-                    try std.testing.expectEqual(testing.evaluate(config, arch, data), try interpret(program.filters, data));
-                }
-            };
+            try expectOptimizedMatches(config, program, arch);
         }
     }
+}
+
+fn expectOptimizedMatches(config: Config, program: Program, arch: Arch) !void {
+    const testing = @import("../test/seccomp.zig");
+    const values = [_]u64{ 0, 1, 2, 0xffffffff, 0x100000000, 0x100000001, 0x100000002, 0xffffffffffffffff };
+    const base: u32 = if (arch == .x32) 0x40000000 else 0;
+    for (values) |value| for ([_]u64{ 0, 1 }) |second| {
+        var data: TestData = .{ .arch = arch.audit(), .args = .{ value, second, 0, 0, 0, 0 } };
+        for (0..412) |number| {
+            data.nr = base + @as(u32, @intCast(number));
+            try std.testing.expectEqual(testing.evaluate(config, arch, data), try interpret(program.filters, data));
+        }
+    };
 }
 
 test "seccomp x32 and amd64 have independent ENOSYS boundaries" {

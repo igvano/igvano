@@ -363,50 +363,62 @@ const Encoder = struct {
             .uint32 => |u| try self.integer(u32, u),
             .uint64 => |t| try self.integer(u64, t),
             .int32 => |i| try self.integer(i32, i),
-            .strings => |strings| {
-                const array = try self.beginArray(4);
-                for (strings) |s| try self.text(s);
-                try self.finishArray(array);
-            },
-            .string_pairs => |pairs| {
-                const array = try self.beginArray(8);
-                for (pairs) |pair| {
-                    try self.alignTo(8);
-                    try self.text(pair[0]);
-                    try self.text(pair[1]);
-                }
-                try self.finishArray(array);
-            },
-            .uint32s => |numbers| {
-                const array = try self.beginArray(4);
-                for (numbers) |u| try self.integer(u32, u);
-                try self.finishArray(array);
-            },
-            .bytes => |bytes| {
-                const array = try self.beginArray(1);
-                try self.data.appendSlice(self.allocator, bytes);
-                try self.finishArray(array);
-            },
-            .properties => |properties| {
-                const array = try self.beginArray(8);
-                for (properties) |property| {
-                    try self.alignTo(8);
-                    try self.text(property.name);
-                    try self.variant(property.value);
-                }
-                try self.finishArray(array);
-            },
-            .auxiliary => |units| {
-                const array = try self.beginArray(8);
-                for (units) |unit| {
-                    try self.alignTo(8);
-                    try self.text(unit.name);
-                    try self.encode(.{ .properties = unit.properties });
-                }
-                try self.finishArray(array);
-            },
+            .strings => |strings| try self.stringArray(strings),
+            .string_pairs => |pairs| try self.stringPairs(pairs),
+            .uint32s => |numbers| try self.uint32Array(numbers),
+            .bytes => |bytes| try self.byteArray(bytes),
+            .properties => |properties| try self.propertyArray(properties),
+            .auxiliary => |units| try self.auxiliaryArray(units),
             .variant => |inner| try self.variant(inner.*),
         }
+    }
+
+    fn stringArray(self: *Encoder, strings: []const []const u8) Error!void {
+        const array = try self.beginArray(4);
+        for (strings) |s| try self.text(s);
+        try self.finishArray(array);
+    }
+
+    fn stringPairs(self: *Encoder, pairs: []const [2][]const u8) Error!void {
+        const array = try self.beginArray(8);
+        for (pairs) |pair| {
+            try self.alignTo(8);
+            try self.text(pair[0]);
+            try self.text(pair[1]);
+        }
+        try self.finishArray(array);
+    }
+
+    fn uint32Array(self: *Encoder, numbers: []const u32) Error!void {
+        const array = try self.beginArray(4);
+        for (numbers) |u| try self.integer(u32, u);
+        try self.finishArray(array);
+    }
+
+    fn byteArray(self: *Encoder, bytes: []const u8) Error!void {
+        const array = try self.beginArray(1);
+        try self.data.appendSlice(self.allocator, bytes);
+        try self.finishArray(array);
+    }
+
+    fn propertyArray(self: *Encoder, properties: []const Property) Error!void {
+        const array = try self.beginArray(8);
+        for (properties) |property| {
+            try self.alignTo(8);
+            try self.text(property.name);
+            try self.variant(property.value);
+        }
+        try self.finishArray(array);
+    }
+
+    fn auxiliaryArray(self: *Encoder, units: []const Auxiliary) Error!void {
+        const array = try self.beginArray(8);
+        for (units) |unit| {
+            try self.alignTo(8);
+            try self.text(unit.name);
+            try self.encode(.{ .properties = unit.properties });
+        }
+        try self.finishArray(array);
     }
 
     fn field(self: *Encoder, code: u8, v: Value) !void {
@@ -538,24 +550,28 @@ fn nextType(signature_value: *[]const u8, depth: usize, dictionary: bool) Error!
     switch (start[0]) {
         'y', 'b', 'n', 'q', 'i', 'u', 'x', 't', 'd', 's', 'o', 'g', 'h', 'v' => {},
         'a' => _ = try nextType(signature_value, depth + 1, true),
-        '(' => {
-            if (signature_value.len == 0 or signature_value.*[0] == ')') return error.InvalidMessage;
-            while (signature_value.len != 0 and signature_value.*[0] != ')')
-                _ = try nextType(signature_value, depth + 1, false);
-            if (signature_value.len == 0) return error.InvalidMessage;
-            signature_value.* = signature_value.*[1..];
-        },
-        '{' => {
-            if (!dictionary or signature_value.len == 0 or
-                std.mem.indexOfScalar(u8, "ybnqiuxtdsogh", signature_value.*[0]) == null) return error.InvalidMessage;
-            _ = try nextType(signature_value, depth + 1, false);
-            _ = try nextType(signature_value, depth + 1, false);
-            if (signature_value.len == 0 or signature_value.*[0] != '}') return error.InvalidMessage;
-            signature_value.* = signature_value.*[1..];
-        },
+        '(' => try nextStruct(signature_value, depth),
+        '{' => try nextDictionary(signature_value, depth, dictionary),
         else => return error.InvalidMessage,
     }
     return start[0 .. start.len - signature_value.len];
+}
+
+fn nextStruct(signature_value: *[]const u8, depth: usize) Error!void {
+    if (signature_value.len == 0 or signature_value.*[0] == ')') return error.InvalidMessage;
+    while (signature_value.len != 0 and signature_value.*[0] != ')')
+        _ = try nextType(signature_value, depth + 1, false);
+    if (signature_value.len == 0) return error.InvalidMessage;
+    signature_value.* = signature_value.*[1..];
+}
+
+fn nextDictionary(signature_value: *[]const u8, depth: usize, dictionary: bool) Error!void {
+    if (!dictionary or signature_value.len == 0 or
+        std.mem.indexOfScalar(u8, "ybnqiuxtdsogh", signature_value.*[0]) == null) return error.InvalidMessage;
+    _ = try nextType(signature_value, depth + 1, false);
+    _ = try nextType(signature_value, depth + 1, false);
+    if (signature_value.len == 0 or signature_value.*[0] != '}') return error.InvalidMessage;
+    signature_value.* = signature_value.*[1..];
 }
 
 pub const Message = struct {
@@ -570,14 +586,8 @@ pub const Message = struct {
     body: []const u8,
 
     pub fn parse(bytes: []const u8) Error!Message {
-        // The encoder and readers support little-endian D-Bus messages only.
-        if (bytes.len < 16) return error.InvalidMessage;
-        if (bytes[0] == 'B') return error.UnsupportedByteOrder;
-        if (bytes[0] != 'l' or bytes[1] < 1 or bytes[1] > 4 or bytes[3] != 1 or std.mem.readInt(u32, bytes[8..12], .little) == 0) return error.InvalidMessage;
+        const body_start = try bodyStart(bytes);
         const fields_len: usize = std.mem.readInt(u32, bytes[12..16], .little);
-        const body_start = std.mem.alignForward(usize, 16 + fields_len, 8);
-        const body_len: usize = std.mem.readInt(u32, bytes[4..8], .little);
-        if (body_start > bytes.len or body_len != bytes.len - body_start) return error.InvalidMessage;
         var reader: Reader = .{ .bytes = bytes[0 .. 16 + fields_len], .offset = 16 };
         var message: Message = .{ .kind = bytes[1], .body = bytes[body_start..] };
         var seen: u16 = 0;
@@ -592,36 +602,54 @@ pub const Message = struct {
             const bit = @as(u16, 1) << @intCast(code);
             if (seen & bit != 0) return error.InvalidMessage;
             seen |= bit;
-            const sig = try reader.signature();
-            switch (code) {
-                1, 2, 3, 4, 6, 7 => {
-                    if (!std.mem.eql(u8, sig, if (code == 1) "o" else "s")) return error.InvalidMessage;
-                    const text_value = try reader.text();
-                    switch (code) {
-                        1 => message.path = text_value,
-                        2 => message.interface = text_value,
-                        3 => message.member = text_value,
-                        4 => message.error_name = text_value,
-                        7 => message.sender = text_value,
-                        else => {},
-                    }
-                },
-                5, 9 => {
-                    if (!std.mem.eql(u8, sig, "u")) return error.InvalidMessage;
-                    const u = try reader.integer(u32);
-                    if (code == 5) message.reply_serial = u;
-                    if (code == 9 and u != 0) return error.InvalidMessage; // no FD passing
-                },
-                8 => {
-                    if (!std.mem.eql(u8, sig, "g")) return error.InvalidMessage;
-                    message.signature = try reader.signature();
-                },
-                else => unreachable,
-            }
+            try message.readField(&reader, code);
         }
         if ((message.kind == 2 or message.kind == 3) and message.reply_serial == 0) return error.InvalidMessage;
         if (message.kind == 3 and message.error_name.len == 0) return error.InvalidMessage;
         return message;
+    }
+
+    fn bodyStart(bytes: []const u8) Error!usize {
+        // The encoder and readers support little-endian D-Bus messages only.
+        if (bytes.len < 16) return error.InvalidMessage;
+        if (bytes[0] == 'B') return error.UnsupportedByteOrder;
+        if (bytes[0] != 'l' or bytes[1] < 1 or bytes[1] > 4 or bytes[3] != 1 or std.mem.readInt(u32, bytes[8..12], .little) == 0) return error.InvalidMessage;
+        const fields_len: usize = std.mem.readInt(u32, bytes[12..16], .little);
+        const body_start = std.mem.alignForward(usize, 16 + fields_len, 8);
+        const body_len: usize = std.mem.readInt(u32, bytes[4..8], .little);
+        if (body_start > bytes.len or body_len != bytes.len - body_start) return error.InvalidMessage;
+        return body_start;
+    }
+
+    fn readField(self: *Message, reader: *Reader, code: u8) Error!void {
+        const sig = try reader.signature();
+        switch (code) {
+            1, 2, 3, 4, 6, 7 => try self.readTextField(reader, code, sig),
+            5, 9 => {
+                if (!std.mem.eql(u8, sig, "u")) return error.InvalidMessage;
+                const u = try reader.integer(u32);
+                if (code == 5) self.reply_serial = u;
+                if (code == 9 and u != 0) return error.InvalidMessage; // no FD passing
+            },
+            8 => {
+                if (!std.mem.eql(u8, sig, "g")) return error.InvalidMessage;
+                self.signature = try reader.signature();
+            },
+            else => unreachable,
+        }
+    }
+
+    fn readTextField(self: *Message, reader: *Reader, code: u8, sig: []const u8) Error!void {
+        if (!std.mem.eql(u8, sig, if (code == 1) "o" else "s")) return error.InvalidMessage;
+        const text_value = try reader.text();
+        switch (code) {
+            1 => self.path = text_value,
+            2 => self.interface = text_value,
+            3 => self.member = text_value,
+            4 => self.error_name = text_value,
+            7 => self.sender = text_value,
+            else => {},
+        }
     }
 
     pub fn errorText(self: Message) Error![]const u8 {
@@ -801,20 +829,24 @@ pub const Client = struct {
             if (message.kind == 4) try self.remember(message);
             if ((message.kind == 2 or message.kind == 3) and message.reply_serial == serial) {
                 if (message.kind == 2) return bytes;
-                self.error_name_len = @min(message.error_name.len, self.error_name.len);
-                @memcpy(self.error_name[0..self.error_name_len], message.error_name[0..self.error_name_len]);
-                const remote_text = try message.errorText();
-                if ((std.mem.eql(u8, destination, manager_destination) and
-                    (self.isRemote("org.freedesktop.DBus.Error.ServiceUnknown") or self.isRemote("org.freedesktop.DBus.Error.NameHasNoOwner"))) or
-                    (std.mem.eql(u8, destination, bus_interface) and std.mem.eql(u8, member, "GetNameOwner") and
-                        self.isRemote("org.freedesktop.DBus.Error.NameHasNoOwner")))
-                    self.note("systemd cgroup driver requested but systemd is not available: {s}: {s}", .{ message.error_name, remote_text })
-                else
-                    self.note("{s}: {s}: {s}", .{ member, message.error_name, remote_text });
+                try self.noteRemoteError(message, destination, member);
                 return error.RemoteError;
             }
             self.allocator.free(bytes);
         }
+    }
+
+    fn noteRemoteError(self: *Client, message: Message, destination: []const u8, member: []const u8) Error!void {
+        self.error_name_len = @min(message.error_name.len, self.error_name.len);
+        @memcpy(self.error_name[0..self.error_name_len], message.error_name[0..self.error_name_len]);
+        const remote_text = try message.errorText();
+        if ((std.mem.eql(u8, destination, manager_destination) and
+            (self.isRemote("org.freedesktop.DBus.Error.ServiceUnknown") or self.isRemote("org.freedesktop.DBus.Error.NameHasNoOwner"))) or
+            (std.mem.eql(u8, destination, bus_interface) and std.mem.eql(u8, member, "GetNameOwner") and
+                self.isRemote("org.freedesktop.DBus.Error.NameHasNoOwner")))
+            self.note("systemd cgroup driver requested but systemd is not available: {s}: {s}", .{ message.error_name, remote_text })
+        else
+            self.note("{s}: {s}: {s}", .{ member, message.error_name, remote_text });
     }
 
     fn remember(self: *Client, message: Message) Error!void {

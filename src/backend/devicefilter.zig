@@ -74,35 +74,43 @@ pub fn compileEmulator(allocator: std.mem.Allocator, emu: devices.Emulator) devi
     });
     for (rules) |rule| {
         if (rule.kind == .all) continue;
-        const start = insns.items.len;
-        const mask = try devices.accessMask(rule.access);
-        const major = try deviceNumber(rule.major);
-        const minor = try deviceNumber(rule.minor);
-        try insns.append(allocator, Insn.init(op.jne_imm, 2, 0, 0, if (rule.kind == .block) 1 else 2));
-        if (mask != 7) {
-            // Allows require every requested bit; a deny exception blocks overlap.
-            try insns.appendSlice(allocator, &.{
-                Insn.init(op.mov_reg, 6, 3, 0, 0),
-                Insn.init(op.and_imm, 6, 0, 0, @intCast(mask)),
-                Insn.init(if (rule.allow) op.jne_reg else op.jeq_imm, 6, if (rule.allow) 3 else 0, 0, 0),
-            });
-        }
-        if (major) |number| try appendNumber(allocator, &insns, 4, number);
-        if (minor) |number| try appendNumber(allocator, &insns, 5, number);
-        try insns.appendSlice(allocator, &.{
-            Insn.init(op.mov_imm, 0, 0, 0, @intFromBool(rule.allow)),
-            Insn.init(op.exit, 0, 0, 0, 0),
-        });
-        for (insns.items[start..], start..) |*insn, index| {
-            if (insn.code == op.jeq_imm or insn.code == op.jne_imm or insn.code == op.jne_reg)
-                insn.off = @intCast(insns.items.len - index - 1);
-        }
+        try appendRule(allocator, &insns, rule);
     }
     try insns.appendSlice(allocator, &.{
         Insn.init(op.mov_imm, 0, 0, 0, @intFromBool(emu.default_allow)),
         Insn.init(op.exit, 0, 0, 0, 0),
     });
     return insns.toOwnedSlice(allocator);
+}
+
+fn appendRule(allocator: std.mem.Allocator, insns: *std.ArrayList(Insn), rule: Rule) devices.Error!void {
+    const start = insns.items.len;
+    const mask = try devices.accessMask(rule.access);
+    const major = try deviceNumber(rule.major);
+    const minor = try deviceNumber(rule.minor);
+    try insns.append(allocator, Insn.init(op.jne_imm, 2, 0, 0, if (rule.kind == .block) 1 else 2));
+    if (mask != 7) {
+        // Allows require every requested bit; a deny exception blocks overlap.
+        try insns.appendSlice(allocator, &.{
+            Insn.init(op.mov_reg, 6, 3, 0, 0),
+            Insn.init(op.and_imm, 6, 0, 0, @intCast(mask)),
+            Insn.init(if (rule.allow) op.jne_reg else op.jeq_imm, 6, if (rule.allow) 3 else 0, 0, 0),
+        });
+    }
+    if (major) |number| try appendNumber(allocator, insns, 4, number);
+    if (minor) |number| try appendNumber(allocator, insns, 5, number);
+    try insns.appendSlice(allocator, &.{
+        Insn.init(op.mov_imm, 0, 0, 0, @intFromBool(rule.allow)),
+        Insn.init(op.exit, 0, 0, 0, 0),
+    });
+    patchRuleJumps(insns.items, start);
+}
+
+fn patchRuleJumps(insns: []Insn, start: usize) void {
+    for (insns[start..], start..) |*insn, index| {
+        if (insn.code == op.jeq_imm or insn.code == op.jne_imm or insn.code == op.jne_reg)
+            insn.off = @intCast(insns.len - index - 1);
+    }
 }
 
 fn appendNumber(allocator: std.mem.Allocator, insns: *std.ArrayList(Insn), reg: u4, number: u32) std.mem.Allocator.Error!void {
@@ -130,11 +138,7 @@ fn evaluate(insns: []const Insn, context: [3]u32) !bool {
         const jump_imm: u64 = @bitCast(@as(i64, insn.imm));
         var jump = false;
         switch (insn.code) {
-            0x61 => {
-                try std.testing.expectEqual(@as(u8, 1), src);
-                try std.testing.expect(insn.off >= 0 and @mod(insn.off, 4) == 0 and insn.off <= 8);
-                regs[dst] = context[@intCast(@divTrunc(insn.off, 4))];
-            },
+            0x61 => regs[dst] = try loadContext(context, src, insn.off),
             0x54 => regs[dst] = @as(u32, @truncate(regs[dst])) & imm,
             0x74 => regs[dst] = @as(u32, @truncate(regs[dst])) >> @as(u5, @intCast(imm)),
             0xb4 => regs[dst] = imm,
@@ -149,6 +153,12 @@ fn evaluate(insns: []const Insn, context: [3]u32) !bool {
         pc += 1 + if (jump) @as(usize, @intCast(insn.off)) else 0;
     }
     return error.MissingExit;
+}
+
+fn loadContext(context: [3]u32, src: u8, offset: i16) !u32 {
+    try std.testing.expectEqual(@as(u8, 1), src);
+    try std.testing.expect(offset >= 0 and @mod(offset, 4) == 0 and offset <= 8);
+    return context[@intCast(@divTrunc(offset, 4))];
 }
 
 fn expectDecision(rules: []const Rule, kind: u32, major: u32, minor: u32, access: u32, allowed: bool) !void {
