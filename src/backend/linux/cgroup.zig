@@ -23,6 +23,7 @@ const walkV1Cgroup = @import("cgroup_v1.zig").walkV1Cgroup;
 const applyV1Writes = @import("cgroup_v1.zig").applyV1Writes;
 
 pub const CgroupMode = enum { unified, legacy };
+pub const CgroupRoot = struct { fd: posix.fd_t, fs_type: usize, mode: CgroupMode };
 
 test "cgroup mode detects unified and legacy roots" {
     try std.testing.expectEqual(CgroupMode.unified, try cgroupMode(0x63677270));
@@ -60,6 +61,22 @@ pub fn validateCgroupPath(path: []const u8) Backend.Error!void {
     }
 }
 
+/// Intermediate directories may exist; creation must own a new leaf.
+pub fn createCgroupDirectory(parent: posix.fd_t, name: [:0]const u8, path: []const u8, leaf: bool) Backend.Error!bool {
+    const result = linux.mkdirat(parent, name, 0o755);
+    switch (linux.errno(result)) {
+        .SUCCESS => return true,
+        .EXIST => {
+            if (leaf) {
+                reportDiagnostic("cgroup '{s}' already exists", .{path});
+                return error.CreateFailed;
+            }
+        },
+        else => try checkResult(result),
+    }
+    return false;
+}
+
 fn cgroupMode(fs_type: usize) Backend.Error!CgroupMode {
     return switch (fs_type) {
         0x63677270 => .unified, // CGROUP2_SUPER_MAGIC
@@ -68,7 +85,7 @@ fn cgroupMode(fs_type: usize) Backend.Error!CgroupMode {
     };
 }
 
-pub fn openCgroupRoot() Backend.Error!struct { fd: posix.fd_t, fs_type: usize, mode: CgroupMode } {
+pub fn openCgroupRoot() Backend.Error!CgroupRoot {
     const opened = linux.openat(linux.AT.FDCWD, "/sys/fs/cgroup", .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .NOFOLLOW = true, .CLOEXEC = true }, 0);
     switch (linux.errno(opened)) {
         .SUCCESS => {},
@@ -339,31 +356,30 @@ pub fn procCgroupMatches(text: []const u8, mount_root: []const u8, path: []const
     while (lines.next()) |line| {
         const first = std.mem.indexOfScalar(u8, line, ':') orelse continue;
         const second = std.mem.indexOfScalarPos(u8, line, first + 1, ':') orelse continue;
-        if (controller) |name| {
-            const controllers = line[first + 1 .. second];
-            if (name.len == 0) {
-                if (!std.mem.eql(u8, line[0..first], "0") or controllers.len != 0) continue;
-            } else {
-                var names = std.mem.tokenizeScalar(u8, controllers, ',');
-                var found = false;
-                while (names.next()) |candidate| {
-                    if (std.mem.eql(u8, candidate, name)) found = true;
-                }
-                if (!found) continue;
-            }
-        }
-        const member = line[second + 1 ..];
-        if (member.len == 0 or member[0] != '/') continue;
-        const relative = if (std.mem.eql(u8, mount_root, "/"))
-            member[1..]
-        else if (std.mem.startsWith(u8, member, mount_root) and member.len > mount_root.len and member[mount_root.len] == '/')
-            member[mount_root.len + 1 ..]
-        else
-            continue;
+        if (controller) |name|
+            if (!procCgroupControllerMatches(line[0..first], line[first + 1 .. second], name)) continue;
+        const relative = procCgroupRelativePath(line[second + 1 ..], mount_root) orelse continue;
         if (std.mem.startsWith(u8, relative, path) and
             (relative.len == path.len or relative[path.len] == '/')) return true;
     }
     return false;
+}
+
+fn procCgroupControllerMatches(id: []const u8, controllers: []const u8, name: []const u8) bool {
+    if (name.len == 0) return std.mem.eql(u8, id, "0") and controllers.len == 0;
+    var names = std.mem.tokenizeScalar(u8, controllers, ',');
+    while (names.next()) |candidate| {
+        if (std.mem.eql(u8, candidate, name)) return true;
+    }
+    return false;
+}
+
+fn procCgroupRelativePath(member: []const u8, mount_root: []const u8) ?[]const u8 {
+    if (member.len == 0 or member[0] != '/') return null;
+    if (std.mem.eql(u8, mount_root, "/")) return member[1..];
+    if (std.mem.startsWith(u8, member, mount_root) and member.len > mount_root.len and member[mount_root.len] == '/')
+        return member[mount_root.len + 1 ..];
+    return null;
 }
 
 test "cgroup membership verifies hierarchy and subtree boundaries" {

@@ -82,7 +82,7 @@ const freeSystemdProperties = @import("systemd.zig").freeSystemdProperties;
 const systemdProperties = @import("systemd.zig").systemdProperties;
 const stopSystemdScope = @import("systemd.zig").stopSystemdScope;
 
-const CgroupRoot = @typeInfo(@TypeOf(openCgroupRoot())).error_union.payload;
+const CgroupRoot = @import("cgroup.zig").CgroupRoot;
 
 const CreateNamespaces = struct {
     flags: usize = undefined,
@@ -129,7 +129,6 @@ const CreateCgroups = struct {
     hierarchies: []V1Hierarchy = undefined,
     cgroup_writes: []const Write = undefined,
     v1_writes: []const V1Write = undefined,
-    ignored_fields: []const u8 = undefined,
     cgroup: ?posix.fd_t = null,
 };
 
@@ -163,6 +162,9 @@ const CreateContext = struct {
     mount_source_socket: ?posix.fd_t = null,
 };
 
+// Step chain: validate → prepare → joined user namespace → cgroups → mounts
+// → resources → host descriptors → mount sources → fork → await parent.
+// Each step owns a defer scope that stays active through the following steps.
 pub fn create(ptr: *anyopaque, options: Backend.CreateOptions) Backend.Error!Backend.Handle {
     diagnostics.last_diagnostic_len = 0;
     if (comptime builtin.os.tag == .linux) {
@@ -223,7 +225,6 @@ fn prepareCreate(ctx: *CreateContext) Backend.Error!Backend.Handle {
         }
     else
         null;
-    ctx.namespaces.joins = .empty;
     for (if (ctx.options.spec.linux) |settings| settings.namespaces orelse &.{} else &.{}) |namespace| {
         if (namespace.path) |path| try ctx.namespaces.joins.append(ctx.allocator, .{
             .flag = namespaceFlag(namespace.type),
@@ -283,8 +284,6 @@ fn prepareCreateMappings(ctx: *CreateContext) Backend.Error!void {
 
 fn prepareJoinedUserNamespace(ctx: *CreateContext) Backend.Error!Backend.Handle {
     // Pin the validated namespace and use that same descriptor in init.
-    ctx.namespaces.joined_user_fd = null;
-    ctx.namespaces.joined_user_path = null;
     defer if (ctx.namespaces.joined_user_fd) |fd| closeFd(fd);
     if (ctx.namespaces.joined_user_namespace) {
         for (ctx.namespaces.joins.items) |join| {
@@ -316,8 +315,6 @@ fn prepareCreatePaths(ctx: *CreateContext) Backend.Error!void {
 }
 
 fn probeInheritedRootfs(ctx: *CreateContext) Backend.Error!void {
-    ctx.rootfs_mount_before = null;
-    ctx.rootfs_mount_boot_id = null;
     if (!ctx.namespaces.private_mount_namespace) {
         const root_fd = try openPath(linux.AT.FDCWD, ctx.init.rootfs, .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true });
         defer closeFd(root_fd);
@@ -431,10 +428,10 @@ fn prepareCreateResources(ctx: *CreateContext) Backend.Error!Backend.Handle {
     }
     ctx.cgroups.v1_writes = if (ctx.cgroups.cgroup_root.mode == .legacy) try v1Writes(ctx.allocator, ctx.options.resources) else &.{};
     defer if (ctx.cgroups.cgroup_root.mode == .legacy) freeV1Writes(ctx.allocator, ctx.cgroups.v1_writes);
-    ctx.cgroups.ignored_fields = if (ctx.cgroups.cgroup_root.mode == .unified) try v2IgnoredFields(ctx.allocator, ctx.options.resources) else try ctx.allocator.dupe(u8, "");
-    defer ctx.allocator.free(ctx.cgroups.ignored_fields);
-    if (ctx.cgroups.ignored_fields.len != 0)
-        std.debug.print("igvano: warning: cgroup v2 has no equivalent for: {s}; ignoring\n", .{ctx.cgroups.ignored_fields});
+    const ignored_fields = if (ctx.cgroups.cgroup_root.mode == .unified) try v2IgnoredFields(ctx.allocator, ctx.options.resources) else try ctx.allocator.dupe(u8, "");
+    defer ctx.allocator.free(ignored_fields);
+    if (ignored_fields.len != 0)
+        std.debug.print("igvano: warning: cgroup v2 has no equivalent for: {s}; ignoring\n", .{ignored_fields});
     return createWithHostDescriptors(ctx);
 }
 
@@ -447,9 +444,7 @@ fn createWithHostDescriptors(ctx: *CreateContext) Backend.Error!Backend.Handle {
     // traversing the private state directory as a mapped user.
     ctx.fifo_fd = try openPath(linux.AT.FDCWD, ctx.init.fifo, .{ .PATH = true, .NOFOLLOW = true, .CLOEXEC = true });
     defer closeFd(ctx.fifo_fd);
-    ctx.cgroups.cgroup = null;
     defer if (ctx.cgroups.cgroup) |fd| closeFd(fd);
-    ctx.rootfs_mount_id = null;
     errdefer cleanupFailedCreate(ctx);
     // fs cgroups are ready before fork; systemd adopts init at the
     // early mapping exchange, while init is blocked before rootfs work.
@@ -504,12 +499,10 @@ fn forkCreate(ctx: *CreateContext) Backend.Error!Backend.Handle {
     // getpid() in child2 may be 1. Child1 supplies its host PID for
     // opaque hook input; buffers and JSON fragments were prepared above.
     ctx.sync.pid_pipe = try makePipe();
-    ctx.sync.owns_pid_pipe = true;
     defer if (ctx.sync.owns_pid_pipe) {
         for (ctx.sync.pid_pipe) |fd| closeFd(fd);
     };
     try prepareCreatePipes(ctx);
-    ctx.sync.owns_create_go = true;
     defer if (ctx.sync.owns_create_go) {
         for (ctx.sync.create_go) |fd| closeFd(fd);
     };
@@ -765,7 +758,6 @@ fn awaitCreateParent(ctx: *CreateContext) Backend.Error!Backend.Handle {
     ctx.sync.map_writer = if (ctx.sync.map_pipe) |fds| fds[1] else null;
     // On failure, close before waiting to unblock init; null prevents double close.
     defer if (ctx.sync.map_writer) |fd| closeFd(fd);
-    ctx.sync.child1_reaped = false;
     errdefer if (!ctx.sync.child1_reaped) reapFailedCreateChild(ctx);
     try releaseInitMappings(ctx);
     try receiveRootfsMount(ctx);

@@ -266,81 +266,108 @@ pub fn systemdProperties(allocator: std.mem.Allocator, resources: Resources, mod
         properties.deinit(allocator);
     }
     if (mode == .unified) {
-        const writes = try v2Writes(allocator, resources);
-        defer freeWrites(allocator, writes);
-        for (writes) |write| {
-            if (std.mem.eql(u8, write.name, "cpu.max")) {
-                var fields = std.mem.tokenizeAny(u8, write.value, " \t\r\n");
-                const quota_text = fields.next() orelse return error.InvalidConfig;
-                const quota: i64 = if (std.mem.eql(u8, quota_text, "max")) -1 else std.fmt.parseInt(i64, quota_text, 10) catch return error.InvalidConfig;
-                const period = if (fields.next()) |text| std.fmt.parseInt(u64, text, 10) catch return error.InvalidConfig else 100000;
-                if (fields.next() != null) return error.InvalidConfig;
-                try systemdQuota(allocator, &properties, quota, period);
-                continue;
-            }
-            if (std.mem.eql(u8, write.name, "cpuset.cpus") or std.mem.eql(u8, write.name, "cpuset.mems")) {
-                try setSystemdProperty(allocator, &properties, .{
-                    .name = if (std.mem.eql(u8, write.name, "cpuset.cpus")) "AllowedCPUs" else "AllowedMemoryNodes",
-                    .value = .{ .bytes = try systemdCpuSet(allocator, std.mem.trim(u8, write.value, " \t\r\n")) },
-                });
-                continue;
-            }
-            const mappings = [_][2][]const u8{
-                .{ "memory.max", "MemoryMax" },          .{ "memory.low", "MemoryLow" },
-                .{ "memory.high", "MemoryHigh" },        .{ "memory.min", "MemoryMin" },
-                .{ "memory.swap.max", "MemorySwapMax" }, .{ "cpu.weight", "CPUWeight" },
-                .{ "pids.max", "TasksMax" },
-            };
-            for (mappings) |mapping| {
-                if (std.mem.eql(u8, write.name, mapping[0])) {
-                    try setSystemdProperty(allocator, &properties, .{ .name = mapping[1], .value = .{ .uint64 = try systemdNumber(write.value) } });
-                    break;
-                }
-            }
-        }
+        try setSystemdUnifiedProperties(allocator, &properties, resources);
     } else {
-        if (resources.memory) |memory| if (memory.limit) |limit| {
-            if (limit != 0) try setSystemdProperty(allocator, &properties, .{ .name = "MemoryLimit", .value = .{ .uint64 = @bitCast(limit) } });
-        };
-        if (resources.cpu) |cpu| {
-            if (cpu.shares) |shares| if (shares != 0) {
-                _ = try cpuWeight(shares);
-                try setSystemdProperty(allocator, &properties, .{ .name = "CPUShares", .value = .{ .uint64 = shares } });
-            };
-            if (cpu.quota != null or cpu.period != null) try systemdQuota(allocator, &properties, cpu.quota orelse -1, cpu.period orelse 0);
-            inline for (.{ .{ "cpus", "AllowedCPUs" }, .{ "mems", "AllowedMemoryNodes" } }) |field| {
-                if (@field(cpu, field[0])) |value|
-                    try setSystemdProperty(allocator, &properties, .{ .name = field[1], .value = .{ .bytes = try systemdCpuSet(allocator, value) } });
-            }
-        }
-        if (resources.pids) |pids| if (pids.limit) |limit| {
-            if (limit != 0) try setSystemdProperty(allocator, &properties, .{ .name = "TasksMax", .value = .{ .uint64 = @bitCast(limit) } });
-        };
-        if (resources.block_io) |block| if (block.weight) |weight| {
-            if (weight != 0) try setSystemdProperty(allocator, &properties, .{ .name = "BlockIOWeight", .value = .{ .uint64 = weight } });
-        };
+        if (resources.memory) |memory| try setSystemdMemoryProperties(allocator, &properties, memory);
+        if (resources.cpu) |cpu| try setSystemdCpuProperties(allocator, &properties, cpu);
+        if (resources.pids) |pids| try setSystemdPidsProperties(allocator, &properties, pids);
+        if (resources.block_io) |block| try setSystemdBlockIOProperties(allocator, &properties, block);
     }
-    if (mode == .legacy and device_rules.len != 0) {
-        // As in runc, deny-lists temporarily use a strict deny-all policy.
-        // The v1 manager then applies the exact policy.
-        const allows = systemdDeviceAllows(allocator, device_rules) catch |err| switch (err) {
-            error.Unsupported => {
-                try properties.appendSlice(allocator, &.{
-                    .{ .name = "DeviceAllow", .value = .{ .string_pairs = &.{} } },
-                    .{ .name = "DevicePolicy", .value = .{ .string = "strict" } },
-                });
-                return properties.toOwnedSlice(allocator);
-            },
-            else => return err,
-        };
-        errdefer freeSystemdValue(allocator, .{ .string_pairs = allows });
-        try properties.appendSlice(allocator, &.{
-            .{ .name = "DeviceAllow", .value = .{ .string_pairs = &.{} } },
-            .{ .name = "DevicePolicy", .value = .{ .string = "strict" } },
-        });
-        try properties.append(allocator, .{ .name = "DeviceAllow", .value = .{ .string_pairs = allows } });
-    }
+    if (mode == .legacy and device_rules.len != 0)
+        try appendSystemdDeviceProperties(allocator, &properties, device_rules);
     return properties.toOwnedSlice(allocator);
+}
+
+fn setSystemdUnifiedProperties(allocator: std.mem.Allocator, properties: *std.ArrayList(dbus.Property), resources: Resources) Backend.Error!void {
+    const writes = try v2Writes(allocator, resources);
+    defer freeWrites(allocator, writes);
+    for (writes) |write| try setSystemdUnifiedProperty(allocator, properties, write);
+}
+
+fn setSystemdUnifiedProperty(allocator: std.mem.Allocator, properties: *std.ArrayList(dbus.Property), write: @import("cgroup_v2.zig").Write) Backend.Error!void {
+    if (std.mem.eql(u8, write.name, "cpu.max")) {
+        try setSystemdCpuMax(allocator, properties, write.value);
+        return;
+    }
+    if (std.mem.eql(u8, write.name, "cpuset.cpus") or std.mem.eql(u8, write.name, "cpuset.mems")) {
+        try setSystemdProperty(allocator, properties, .{
+            .name = if (std.mem.eql(u8, write.name, "cpuset.cpus")) "AllowedCPUs" else "AllowedMemoryNodes",
+            .value = .{ .bytes = try systemdCpuSet(allocator, std.mem.trim(u8, write.value, " \t\r\n")) },
+        });
+        return;
+    }
+    const mappings = [_][2][]const u8{
+        .{ "memory.max", "MemoryMax" },          .{ "memory.low", "MemoryLow" },
+        .{ "memory.high", "MemoryHigh" },        .{ "memory.min", "MemoryMin" },
+        .{ "memory.swap.max", "MemorySwapMax" }, .{ "cpu.weight", "CPUWeight" },
+        .{ "pids.max", "TasksMax" },
+    };
+    for (mappings) |mapping| {
+        if (std.mem.eql(u8, write.name, mapping[0])) {
+            try setSystemdProperty(allocator, properties, .{ .name = mapping[1], .value = .{ .uint64 = try systemdNumber(write.value) } });
+            break;
+        }
+    }
+}
+
+fn setSystemdCpuMax(allocator: std.mem.Allocator, properties: *std.ArrayList(dbus.Property), value: []const u8) Backend.Error!void {
+    var fields = std.mem.tokenizeAny(u8, value, " \t\r\n");
+    const quota_text = fields.next() orelse return error.InvalidConfig;
+    const quota: i64 = if (std.mem.eql(u8, quota_text, "max")) -1 else std.fmt.parseInt(i64, quota_text, 10) catch return error.InvalidConfig;
+    const period = if (fields.next()) |text| std.fmt.parseInt(u64, text, 10) catch return error.InvalidConfig else 100000;
+    if (fields.next() != null) return error.InvalidConfig;
+    try systemdQuota(allocator, properties, quota, period);
+}
+
+fn setSystemdMemoryProperties(allocator: std.mem.Allocator, properties: *std.ArrayList(dbus.Property), memory: Resources.Memory) Backend.Error!void {
+    if (memory.limit) |limit| {
+        if (limit != 0) try setSystemdProperty(allocator, properties, .{ .name = "MemoryLimit", .value = .{ .uint64 = @bitCast(limit) } });
+    }
+}
+
+fn setSystemdCpuProperties(allocator: std.mem.Allocator, properties: *std.ArrayList(dbus.Property), cpu: Resources.Cpu) Backend.Error!void {
+    if (cpu.shares) |shares| if (shares != 0) {
+        _ = try cpuWeight(shares);
+        try setSystemdProperty(allocator, properties, .{ .name = "CPUShares", .value = .{ .uint64 = shares } });
+    };
+    if (cpu.quota != null or cpu.period != null) try systemdQuota(allocator, properties, cpu.quota orelse -1, cpu.period orelse 0);
+    inline for (.{ .{ "cpus", "AllowedCPUs" }, .{ "mems", "AllowedMemoryNodes" } }) |field| {
+        if (@field(cpu, field[0])) |value|
+            try setSystemdProperty(allocator, properties, .{ .name = field[1], .value = .{ .bytes = try systemdCpuSet(allocator, value) } });
+    }
+}
+
+fn setSystemdPidsProperties(allocator: std.mem.Allocator, properties: *std.ArrayList(dbus.Property), pids: Resources.Pids) Backend.Error!void {
+    if (pids.limit) |limit| {
+        if (limit != 0) try setSystemdProperty(allocator, properties, .{ .name = "TasksMax", .value = .{ .uint64 = @bitCast(limit) } });
+    }
+}
+
+fn setSystemdBlockIOProperties(allocator: std.mem.Allocator, properties: *std.ArrayList(dbus.Property), block: Resources.BlockIO) Backend.Error!void {
+    if (block.weight) |weight| {
+        if (weight != 0) try setSystemdProperty(allocator, properties, .{ .name = "BlockIOWeight", .value = .{ .uint64 = weight } });
+    }
+}
+
+fn appendSystemdDeviceProperties(allocator: std.mem.Allocator, properties: *std.ArrayList(dbus.Property), device_rules: []const Resources.DeviceRule) Backend.Error!void {
+    // As in runc, deny-lists temporarily use a strict deny-all policy.
+    // The v1 manager then applies the exact policy.
+    const allows = systemdDeviceAllows(allocator, device_rules) catch |err| switch (err) {
+        error.Unsupported => {
+            try properties.appendSlice(allocator, &.{
+                .{ .name = "DeviceAllow", .value = .{ .string_pairs = &.{} } },
+                .{ .name = "DevicePolicy", .value = .{ .string = "strict" } },
+            });
+            return;
+        },
+        else => return err,
+    };
+    errdefer freeSystemdValue(allocator, .{ .string_pairs = allows });
+    try properties.appendSlice(allocator, &.{
+        .{ .name = "DeviceAllow", .value = .{ .string_pairs = &.{} } },
+        .{ .name = "DevicePolicy", .value = .{ .string = "strict" } },
+    });
+    try properties.append(allocator, .{ .name = "DeviceAllow", .value = .{ .string_pairs = allows } });
 }
 
 pub fn setSystemdResources(allocator: std.mem.Allocator, handle: Backend.Handle, resources: Resources, mode: CgroupMode, omit_inferred_memory_limit: bool, device_rules: []const Resources.DeviceRule) Backend.Error!void {

@@ -8,6 +8,7 @@ const checkResult = @import("syscall.zig").checkResult;
 const closeFd = @import("syscall.zig").closeFd;
 const openPath = @import("syscall.zig").openPath;
 const reportDiagnostic = @import("diagnostic.zig").reportDiagnostic;
+const createCgroupDirectory = @import("cgroup.zig").createCgroupDirectory;
 const validateCgroupPath = @import("cgroup.zig").validateCgroupPath;
 const readCgroupFile = @import("cgroup.zig").readCgroupFile;
 const writeCgroupFile = @import("cgroup.zig").writeCgroupFile;
@@ -27,89 +28,105 @@ pub fn v2Writes(allocator: std.mem.Allocator, resources: Resources) Backend.Erro
         allocator.free(write.name);
         allocator.free(write.value);
     };
-    if (resources.memory) |memory| {
-        if (memory.limit) |limit| {
-            if (limit != 0)
-                try appendWrite(allocator, &writes, "memory.max", try cgroupLimit(allocator, limit));
-        }
-        if (memory.reservation) |reservation|
-            try appendWrite(allocator, &writes, "memory.low", try cgroupLimit(allocator, reservation));
-        if (memory.swap) |swap| {
-            const limit = memory.limit orelse 0;
-            if (swap < -1) return error.InvalidConfig;
-            if (swap == -1) {
-                try appendWrite(allocator, &writes, "memory.swap.max", try allocator.dupe(u8, "max"));
-            } else if (swap > 0) {
-                if (limit <= 0) {
-                    reportDiagnostic("swap limit requires a memory limit", .{});
-                    return error.InvalidConfig;
-                }
-                if (swap < limit) return error.InvalidConfig;
-                try appendWrite(allocator, &writes, "memory.swap.max", try cgroupLimit(allocator, swap - limit));
+    if (resources.memory) |memory| try appendV2MemoryWrites(allocator, &writes, memory);
+    if (resources.cpu) |cpu| try appendV2CpuWrites(allocator, &writes, cpu);
+    if (resources.pids) |pids| try appendV2PidsWrites(allocator, &writes, pids);
+    if (resources.block_io) |block| try appendV2BlockIOWrites(allocator, &writes, block);
+    try appendV2HugepageWrites(allocator, &writes, resources.hugepage_limits);
+    try appendV2UnifiedWrites(allocator, &writes, resources.unified);
+    return writes.toOwnedSlice(allocator);
+}
+
+fn appendV2MemoryWrites(allocator: std.mem.Allocator, writes: *std.ArrayList(Write), memory: Resources.Memory) Backend.Error!void {
+    if (memory.limit) |limit| {
+        if (limit != 0)
+            try appendWrite(allocator, writes, "memory.max", try cgroupLimit(allocator, limit));
+    }
+    if (memory.reservation) |reservation|
+        try appendWrite(allocator, writes, "memory.low", try cgroupLimit(allocator, reservation));
+    if (memory.swap) |swap| {
+        const limit = memory.limit orelse 0;
+        if (swap < -1) return error.InvalidConfig;
+        if (swap == -1) {
+            try appendWrite(allocator, writes, "memory.swap.max", try allocator.dupe(u8, "max"));
+        } else if (swap > 0) {
+            if (limit <= 0) {
+                reportDiagnostic("swap limit requires a memory limit", .{});
+                return error.InvalidConfig;
             }
+            if (swap < limit) return error.InvalidConfig;
+            try appendWrite(allocator, writes, "memory.swap.max", try cgroupLimit(allocator, swap - limit));
         }
     }
-    if (resources.cpu) |cpu| {
-        const quota = cpu.quota orelse -1;
-        if (quota < -1) return error.InvalidConfig;
-        const period = if ((cpu.period orelse 0) == 0) 100000 else cpu.period.?;
-        if (cpu.quota != null or cpu.period != null) {
-            const value = if (quota <= 0)
-                try std.fmt.allocPrint(allocator, "max {d}", .{period})
-            else
-                try std.fmt.allocPrint(allocator, "{d} {d}", .{ quota, period });
-            try appendWrite(allocator, &writes, "cpu.max", value);
-        }
-        if (cpu.shares) |shares| {
-            const weight = try cpuWeight(shares);
-            if (weight != 0)
-                try appendWrite(allocator, &writes, "cpu.weight", try std.fmt.allocPrint(allocator, "{d}", .{weight}));
-        }
-        if (cpu.cpus) |cpus|
-            try appendWrite(allocator, &writes, "cpuset.cpus", try allocator.dupe(u8, cpus));
-        if (cpu.mems) |mems|
-            try appendWrite(allocator, &writes, "cpuset.mems", try allocator.dupe(u8, mems));
+}
+
+fn appendV2CpuWrites(allocator: std.mem.Allocator, writes: *std.ArrayList(Write), cpu: Resources.Cpu) Backend.Error!void {
+    const quota = cpu.quota orelse -1;
+    if (quota < -1) return error.InvalidConfig;
+    const period = if ((cpu.period orelse 0) == 0) 100000 else cpu.period.?;
+    if (cpu.quota != null or cpu.period != null) {
+        const value = if (quota <= 0)
+            try std.fmt.allocPrint(allocator, "max {d}", .{period})
+        else
+            try std.fmt.allocPrint(allocator, "{d} {d}", .{ quota, period });
+        try appendWrite(allocator, writes, "cpu.max", value);
     }
-    if (resources.pids) |pids| {
-        if (pids.limit) |limit| {
-            if (limit != 0)
-                try appendWrite(allocator, &writes, "pids.max", try cgroupLimit(allocator, limit));
-        }
+    if (cpu.shares) |shares| {
+        const weight = try cpuWeight(shares);
+        if (weight != 0)
+            try appendWrite(allocator, writes, "cpu.weight", try std.fmt.allocPrint(allocator, "{d}", .{weight}));
     }
-    if (resources.block_io) |block| {
-        if (block.weight) |weight| {
+    if (cpu.cpus) |cpus|
+        try appendWrite(allocator, writes, "cpuset.cpus", try allocator.dupe(u8, cpus));
+    if (cpu.mems) |mems|
+        try appendWrite(allocator, writes, "cpuset.mems", try allocator.dupe(u8, mems));
+}
+
+fn appendV2PidsWrites(allocator: std.mem.Allocator, writes: *std.ArrayList(Write), pids: Resources.Pids) Backend.Error!void {
+    if (pids.limit) |limit| {
+        if (limit != 0)
+            try appendWrite(allocator, writes, "pids.max", try cgroupLimit(allocator, limit));
+    }
+}
+
+fn appendV2BlockIOWrites(allocator: std.mem.Allocator, writes: *std.ArrayList(Write), block: Resources.BlockIO) Backend.Error!void {
+    if (block.weight) |weight| {
+        const converted = try ioWeight(weight);
+        if (converted != 0)
+            try appendWrite(allocator, writes, "io.weight", try std.fmt.allocPrint(allocator, "{d}", .{converted}));
+    }
+    for (block.weight_device) |device| {
+        if (device.weight) |weight| {
             const converted = try ioWeight(weight);
             if (converted != 0)
-                try appendWrite(allocator, &writes, "io.weight", try std.fmt.allocPrint(allocator, "{d}", .{converted}));
-        }
-        for (block.weight_device) |device| {
-            if (device.weight) |weight| {
-                const converted = try ioWeight(weight);
-                if (converted != 0)
-                    try appendWrite(allocator, &writes, "io.weight", try std.fmt.allocPrint(allocator, "{d}:{d} {d}", .{ device.major, device.minor, converted }));
-            }
-        }
-        inline for (.{
-            .{ "throttle_read_bps", "rbps" },
-            .{ "throttle_write_bps", "wbps" },
-            .{ "throttle_read_iops", "riops" },
-            .{ "throttle_write_iops", "wiops" },
-        }) |throttle| {
-            for (@field(block, throttle[0])) |device|
-                try appendWrite(allocator, &writes, "io.max", try std.fmt.allocPrint(allocator, "{d}:{d} {s}={d}", .{ device.major, device.minor, throttle[1], device.rate }));
+                try appendWrite(allocator, writes, "io.weight", try std.fmt.allocPrint(allocator, "{d}:{d} {d}", .{ device.major, device.minor, converted }));
         }
     }
-    for (resources.hugepage_limits) |page| {
+    inline for (.{
+        .{ "throttle_read_bps", "rbps" },
+        .{ "throttle_write_bps", "wbps" },
+        .{ "throttle_read_iops", "riops" },
+        .{ "throttle_write_iops", "wiops" },
+    }) |throttle| {
+        for (@field(block, throttle[0])) |device|
+            try appendWrite(allocator, writes, "io.max", try std.fmt.allocPrint(allocator, "{d}:{d} {s}={d}", .{ device.major, device.minor, throttle[1], device.rate }));
+    }
+}
+
+fn appendV2HugepageWrites(allocator: std.mem.Allocator, writes: *std.ArrayList(Write), pages: []const Resources.HugepageLimit) Backend.Error!void {
+    for (pages) |page| {
         if (page.page_size.len == 0 or std.mem.indexOfAny(u8, page.page_size, "/\x00") != null)
             return error.InvalidConfig;
         const name = try std.fmt.allocPrint(allocator, "hugetlb.{s}.max", .{page.page_size});
         defer allocator.free(name);
-        try appendWrite(allocator, &writes, name, try std.fmt.allocPrint(allocator, "{d}", .{page.limit}));
+        try appendWrite(allocator, writes, name, try std.fmt.allocPrint(allocator, "{d}", .{page.limit}));
     }
+}
+
+fn appendV2UnifiedWrites(allocator: std.mem.Allocator, writes: *std.ArrayList(Write), entries: []const Resources.Unified) Backend.Error!void {
     // Raw settings are last so they override any typed resource mapping.
-    for (resources.unified) |entry|
-        try appendWrite(allocator, &writes, entry.key, try allocator.dupe(u8, entry.value));
-    return writes.toOwnedSlice(allocator);
+    for (entries) |entry|
+        try appendWrite(allocator, writes, entry.key, try allocator.dupe(u8, entry.value));
 }
 
 pub fn cgroupLimit(allocator: std.mem.Allocator, limit: i64) Backend.Error![]u8 {
@@ -581,42 +598,13 @@ pub fn walkCgroup(root: posix.fd_t, path: []const u8, create: bool, writes: []co
     try validateCgroupPath(path);
     var current = try openPath(root, ".", .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true });
     errdefer closeFd(current);
-    const needs_controller = for (writes) |write| {
-        const dot = std.mem.indexOfScalar(u8, write.name, '.') orelse continue;
-        if (!std.mem.eql(u8, write.name[0..dot], "cgroup")) break true;
-    } else false;
+    const needs_controller = needsCgroupController(writes);
     var components = std.mem.tokenizeScalar(u8, path, '/');
     while (components.next()) |component| {
         var buffer: [256]u8 = undefined;
         const name = std.fmt.bufPrintZ(&buffer, "{s}", .{component}) catch return error.InvalidPath;
-        if (needs_controller) {
-            // 8 KiB bounds controller discovery and the enabled-name list.
-            // This runs after fork too: exhaustion is a policy-size failure,
-            // not heap OOM, and must retain a useful cgroup diagnostic.
-            var scratch: [8192]u8 = undefined;
-            var fixed: std.heap.FixedBufferAllocator = .init(&scratch);
-            const allocator = fixed.allocator();
-            const available = readCgroupFile(allocator, current, "cgroup.controllers") catch |err|
-                return controllerBufferError(err, path);
-            defer allocator.free(available);
-            const controllers = enabledControllers(allocator, available, writes) catch |err|
-                return controllerBufferError(err, path);
-            defer allocator.free(controllers);
-            if (controllers.len != 0) try enableCgroupControllers(current, controllers, path);
-        }
-        if (create) {
-            const result = linux.mkdirat(current, name, 0o755);
-            switch (linux.errno(result)) {
-                .SUCCESS => {},
-                .EXIST => {
-                    if (components.peek() == null) {
-                        reportDiagnostic("cgroup '{s}' already exists", .{path});
-                        return error.CreateFailed;
-                    }
-                },
-                else => try checkResult(result),
-            }
-        }
+        if (needs_controller) try enableRequestedControllers(current, writes, path);
+        if (create) _ = try createCgroupDirectory(current, name, path, components.peek() == null);
         const result = linux.openat(current, name, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .NOFOLLOW = true, .CLOEXEC = true }, 0);
         switch (linux.errno(result)) {
             .SUCCESS => {
@@ -632,6 +620,29 @@ pub fn walkCgroup(root: posix.fd_t, path: []const u8, create: bool, writes: []co
         }
     }
     return current;
+}
+
+fn needsCgroupController(writes: []const Write) bool {
+    return for (writes) |write| {
+        const dot = std.mem.indexOfScalar(u8, write.name, '.') orelse continue;
+        if (!std.mem.eql(u8, write.name[0..dot], "cgroup")) break true;
+    } else false;
+}
+
+fn enableRequestedControllers(dir: posix.fd_t, writes: []const Write, path: []const u8) Backend.Error!void {
+    // 8 KiB bounds controller discovery and the enabled-name list.
+    // This runs after fork too: exhaustion is a policy-size failure,
+    // not heap OOM, and must retain a useful cgroup diagnostic.
+    var scratch: [8192]u8 = undefined;
+    var fixed: std.heap.FixedBufferAllocator = .init(&scratch);
+    const allocator = fixed.allocator();
+    const available = readCgroupFile(allocator, dir, "cgroup.controllers") catch |err|
+        return controllerBufferError(err, path);
+    defer allocator.free(available);
+    const controllers = enabledControllers(allocator, available, writes) catch |err|
+        return controllerBufferError(err, path);
+    defer allocator.free(controllers);
+    if (controllers.len != 0) try enableCgroupControllers(dir, controllers, path);
 }
 
 fn controllerBufferError(err: Backend.Error, path: []const u8) Backend.Error {

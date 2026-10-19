@@ -43,20 +43,21 @@ pub fn kill(_: *anyopaque, handle: Backend.Handle, signal: i32) Backend.Error!vo
         const stat = try readProcStat(handle.pid, &buffer);
         if (!stat.matches(handle.starttime)) return error.ProcessNotFound;
         try signalPid(handle.pid, pidfd, signal);
-        // A v1 freezer holds SIGKILL until the paused cgroup is thawed.
-        if (signal == @intFromEnum(linux.SIG.KILL)) {
-            const root = openCgroupRoot() catch return;
-            defer closeFd(root.fd);
-            if (root.mode == .unified) return;
-            if (openFreezerCgroup(handle) catch null) |cgroup| {
-                defer closeFd(cgroup.fd);
-                if (cgroupFrozen(cgroup.fd, .legacy) catch false)
-                    writeCgroupFile(cgroup.fd, "freezer.state", "THAWED", handle.cgroup_path.?) catch {};
-            }
-        }
+        if (signal == @intFromEnum(linux.SIG.KILL)) thawKilledV1Cgroup(handle);
     } else {
         return error.NotImplemented;
     }
+}
+
+fn thawKilledV1Cgroup(handle: Backend.Handle) void {
+    // A v1 freezer holds SIGKILL until the paused cgroup is thawed.
+    const root = openCgroupRoot() catch return;
+    defer closeFd(root.fd);
+    if (root.mode == .unified) return;
+    const cgroup = (openFreezerCgroup(handle) catch null) orelse return;
+    defer closeFd(cgroup.fd);
+    if (cgroupFrozen(cgroup.fd, .legacy) catch false)
+        writeCgroupFile(cgroup.fd, "freezer.state", "THAWED", handle.cgroup_path.?) catch {};
 }
 
 const ProcStat = struct {

@@ -155,12 +155,11 @@ fn execWithCgroups(ptr: *anyopaque, handle: Backend.Handle, options: Backend.Exe
 }
 
 fn prepareExecNamespaces(allocator: std.mem.Allocator, handle: Backend.Handle, joins: *[8]NamespaceJoin, ns_fds: *[8]posix.fd_t) Backend.Error!void {
-    const names = namespace_names;
     const flags = [_]usize{
         linux.CLONE.NEWUSER, linux.CLONE.NEWCGROUP, linux.CLONE.NEWIPC, linux.CLONE.NEWUTS,
         linux.CLONE.NEWNET,  linux.CLONE.NEWPID,    linux.CLONE.NEWNS,  linux.CLONE.NEWTIME,
     };
-    for (names, flags, 0..) |name, flag, i| {
+    for (namespace_names, flags, 0..) |name, flag, i| {
         const path = try std.fmt.allocPrintSentinel(allocator, "/proc/{d}/ns/{s}", .{ handle.pid, name }, 0);
         joins[i] = .{ .flag = flag, .path = path };
         const opened = linux.openat(linux.AT.FDCWD, path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
@@ -254,8 +253,7 @@ fn skipCurrentNamespaces(context: *ExecContext) void {
     const proc_dir = context.proc_dir;
     const report = context.report;
     const ns_fds = &context.ns_fds;
-    const names = namespace_names;
-    for (names, 0..) |name, i| {
+    for (namespace_names, 0..) |name, i| {
         if (ns_fds[i] < 0) continue;
         var buffer: [64]u8 = undefined;
         const own_path = std.fmt.bufPrintZ(&buffer, "self/ns/{s}", .{name}) catch unreachable;

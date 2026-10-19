@@ -133,47 +133,7 @@ pub fn applyV2DeviceFilter(allocator: std.mem.Allocator, cgroup: posix.fd_t, rul
     defer allocator.free(insns);
     var log: []u8 = &.{};
     defer allocator.free(log);
-    var load: linux.BPF.Attr = .{ .prog_load = std.mem.zeroes(linux.BPF.ProgLoadAttr) };
-    load.prog_load.prog_type = @intFromEnum(linux.BPF.ProgType.cgroup_device);
-    load.prog_load.insn_cnt = @intCast(insns.len);
-    load.prog_load.insns = @intFromPtr(insns.ptr);
-    // Same MODULE_LICENSE string as runc's devicefilter.go.
-    load.prog_load.license = @intFromPtr("Apache");
-    // Older kernels charge BPF allocations to memlock. Restore both limits
-    // immediately after loading so init cannot inherit the temporary increase.
-    var original: linux.rlimit = undefined;
-    try checkResult(linux.getrlimit(.MEMLOCK, &original));
-    const memlock: linux.rlimit = .{ .cur = linux.RLIM.INFINITY, .max = linux.RLIM.INFINITY };
-    const raised = linux.errno(linux.setrlimit(.MEMLOCK, &memlock)) == .SUCCESS;
-    // A valid large program can overflow a fixed verifier log. Enable logging
-    // only for a diagnostic retry after a load with all log fields zero fails.
-    var loaded = linux.bpf(.prog_load, &load, @sizeOf(linux.BPF.ProgLoadAttr));
-    if (linux.errno(loaded) != .SUCCESS) {
-        log = allocator.alloc(u8, 64 * 1024) catch |err| {
-            if (raised) try checkResult(linux.setrlimit(.MEMLOCK, &original));
-            return err;
-        };
-        @memset(log, 0);
-        load.prog_load.log_level = 1;
-        load.prog_load.log_size = @intCast(log.len);
-        load.prog_load.log_buf = @intFromPtr(log.ptr);
-        loaded = linux.bpf(.prog_load, &load, @sizeOf(linux.BPF.ProgLoadAttr));
-    }
-    if (raised) {
-        const restored = linux.errno(linux.setrlimit(.MEMLOCK, &original));
-        if (restored != .SUCCESS) {
-            if (linux.errno(loaded) == .SUCCESS) closeFd(@intCast(loaded));
-            reportDiagnostic("cgroup '{s}' cannot restore RLIMIT_MEMLOCK after BPF_PROG_LOAD: {s}", .{ path, @tagName(restored) });
-            return error.CgroupWriteFailed;
-        }
-    }
-    if (linux.errno(loaded) != .SUCCESS) {
-        if (skipDeviceBpfError(rules, path, "BPF_PROG_LOAD", linux.errno(loaded))) return;
-        const detail = std.mem.sliceTo(log, 0);
-        reportDiagnostic("cgroup '{s}' cannot enforce v2 devices: BPF_PROG_LOAD(BPF_CGROUP_DEVICE): {s}; verifier: {s}", .{ path, @tagName(linux.errno(loaded)), detail });
-        return error.CgroupWriteFailed;
-    }
-    const program: posix.fd_t = @intCast(loaded);
+    const program = (try loadV2DeviceProgram(allocator, insns, rules, path, &log)) orelse return;
     defer closeFd(program);
     const ids: []const u32 = if (update) try queryDevicePrograms(allocator, cgroup, path) else &.{};
     defer if (update) allocator.free(ids);
@@ -182,22 +142,7 @@ pub fn applyV2DeviceFilter(allocator: std.mem.Allocator, cgroup: posix.fd_t, rul
         for (old.items) |fd| closeFd(fd);
         old.deinit(allocator);
     }
-    for (ids) |id| {
-        var attr: linux.BPF.Attr = .{ .get_id = std.mem.zeroes(linux.BPF.GetIdAttr) };
-        attr.get_id.id.prog_id = id;
-        const fd = linux.bpf(.prog_get_fd_by_id, &attr, @sizeOf(linux.BPF.GetIdAttr));
-        switch (linux.errno(fd)) {
-            .SUCCESS => {
-                const owned: posix.fd_t = @intCast(fd);
-                errdefer closeFd(owned);
-                try old.append(allocator, owned);
-            },
-            // Like runc, leave LSM-protected programs alone. Other attached
-            // programs can only restrict our new policy further.
-            .ACCES, .PERM => continue,
-            else => |err| return deviceBpfError(path, "BPF_PROG_GET_FD_BY_ID", err),
-        }
-    }
+    try openDevicePrograms(allocator, ids, path, &old);
     var attach: linux.BPF.Attr = .{ .prog_attach = std.mem.zeroes(linux.BPF.ProgAttachAttr) };
     attach.prog_attach.target_fd = cgroup;
     attach.prog_attach.attach_bpf_fd = program;
@@ -217,6 +162,69 @@ pub fn applyV2DeviceFilter(allocator: std.mem.Allocator, cgroup: posix.fd_t, rul
         detach.prog_attach.attach_type = @intFromEnum(linux.BPF.AttachType.cgroup_device);
         const detached = linux.errno(linux.bpf(.prog_detach, &detach, @sizeOf(linux.BPF.ProgAttachAttr)));
         if (detached != .SUCCESS) return deviceBpfError(path, "BPF_PROG_DETACH", detached);
+    }
+}
+
+fn loadV2DeviceProgram(allocator: std.mem.Allocator, insns: []const devicefilter.Insn, rules: []const Resources.DeviceRule, path: []const u8, log: *[]u8) Backend.Error!?posix.fd_t {
+    var load: linux.BPF.Attr = .{ .prog_load = std.mem.zeroes(linux.BPF.ProgLoadAttr) };
+    load.prog_load.prog_type = @intFromEnum(linux.BPF.ProgType.cgroup_device);
+    load.prog_load.insn_cnt = @intCast(insns.len);
+    load.prog_load.insns = @intFromPtr(insns.ptr);
+    // Same MODULE_LICENSE string as runc's devicefilter.go.
+    load.prog_load.license = @intFromPtr("Apache");
+    // Older kernels charge BPF allocations to memlock. Restore both limits
+    // immediately after loading so init cannot inherit the temporary increase.
+    var original: linux.rlimit = undefined;
+    try checkResult(linux.getrlimit(.MEMLOCK, &original));
+    const memlock: linux.rlimit = .{ .cur = linux.RLIM.INFINITY, .max = linux.RLIM.INFINITY };
+    const raised = linux.errno(linux.setrlimit(.MEMLOCK, &memlock)) == .SUCCESS;
+    // A valid large program can overflow a fixed verifier log. Enable logging
+    // only for a diagnostic retry after a load with all log fields zero fails.
+    var loaded = linux.bpf(.prog_load, &load, @sizeOf(linux.BPF.ProgLoadAttr));
+    if (linux.errno(loaded) != .SUCCESS) {
+        log.* = allocator.alloc(u8, 64 * 1024) catch |err| {
+            if (raised) try checkResult(linux.setrlimit(.MEMLOCK, &original));
+            return err;
+        };
+        @memset(log.*, 0);
+        load.prog_load.log_level = 1;
+        load.prog_load.log_size = @intCast(log.*.len);
+        load.prog_load.log_buf = @intFromPtr(log.*.ptr);
+        loaded = linux.bpf(.prog_load, &load, @sizeOf(linux.BPF.ProgLoadAttr));
+    }
+    if (raised) {
+        const restored = linux.errno(linux.setrlimit(.MEMLOCK, &original));
+        if (restored != .SUCCESS) {
+            if (linux.errno(loaded) == .SUCCESS) closeFd(@intCast(loaded));
+            reportDiagnostic("cgroup '{s}' cannot restore RLIMIT_MEMLOCK after BPF_PROG_LOAD: {s}", .{ path, @tagName(restored) });
+            return error.CgroupWriteFailed;
+        }
+    }
+    if (linux.errno(loaded) != .SUCCESS) {
+        if (skipDeviceBpfError(rules, path, "BPF_PROG_LOAD", linux.errno(loaded))) return null;
+        const detail = std.mem.sliceTo(log.*, 0);
+        reportDiagnostic("cgroup '{s}' cannot enforce v2 devices: BPF_PROG_LOAD(BPF_CGROUP_DEVICE): {s}; verifier: {s}", .{ path, @tagName(linux.errno(loaded)), detail });
+        return error.CgroupWriteFailed;
+    }
+    return @intCast(loaded);
+}
+
+fn openDevicePrograms(allocator: std.mem.Allocator, ids: []const u32, path: []const u8, old: *std.ArrayList(posix.fd_t)) Backend.Error!void {
+    for (ids) |id| {
+        var attr: linux.BPF.Attr = .{ .get_id = std.mem.zeroes(linux.BPF.GetIdAttr) };
+        attr.get_id.id.prog_id = id;
+        const fd = linux.bpf(.prog_get_fd_by_id, &attr, @sizeOf(linux.BPF.GetIdAttr));
+        switch (linux.errno(fd)) {
+            .SUCCESS => {
+                const owned: posix.fd_t = @intCast(fd);
+                errdefer closeFd(owned);
+                try old.append(allocator, owned);
+            },
+            // Like runc, leave LSM-protected programs alone. Other attached
+            // programs can only restrict our new policy further.
+            .ACCES, .PERM => continue,
+            else => |err| return deviceBpfError(path, "BPF_PROG_GET_FD_BY_ID", err),
+        }
     }
 }
 
