@@ -5,7 +5,6 @@ const backend_module = @import("igvano").backend;
 const Backend = backend_module.Backend;
 const backendResult = @import("diagnostic.zig").backendResult;
 const Config = @import("args.zig").Config;
-const LockTestBackend = @import("tests/helpers.zig").LockTestBackend;
 
 pub fn openContainerLock(allocator: std.mem.Allocator, config: Config, create: bool) !?std.Io.File {
     if (comptime builtin.os.tag != .linux) return null;
@@ -400,6 +399,7 @@ fn warnRootfsSibling(id: []const u8, err: anyerror) void {
 }
 
 test "inherited rootfs ownership rejects live aliases and permits dead or private containers" {
+    const LockTestBackend = @import("tests/helpers.zig").LockTestBackend;
     defer oci.clearDiagnostic();
     const TestBackend = struct {
         fn alive(_: *anyopaque, handle: Backend.Handle) Backend.Error!bool {

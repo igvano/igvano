@@ -20,7 +20,6 @@ const psContainer = @import("cli/ps.zig").psContainer;
 const pauseContainer = @import("cli/pause.zig").pauseContainer;
 const stateContainer = @import("cli/state_cmd.zig").stateContainer;
 const features = @import("cli/features.zig").features;
-const LockTestBackend = @import("cli/tests/helpers.zig").LockTestBackend;
 pub const default_root = @import("cli/args.zig").default_root;
 
 pub fn main(init: std.process.Init) !u8 {
@@ -138,33 +137,38 @@ fn emitError(allocator: std.mem.Allocator, io: std.Io, log: ?[]const u8, log_for
     }
 }
 
+comptime {
+    if (builtin.is_test) {
+        _ = @import("cli/args.zig");
+        _ = @import("cli/create.zig");
+        _ = @import("cli/delete.zig");
+        _ = @import("cli/diagnostic.zig");
+        _ = @import("cli/exec.zig");
+        _ = @import("cli/features.zig");
+        _ = @import("cli/hooks.zig");
+        _ = @import("cli/kill.zig");
+        _ = @import("cli/log.zig");
+        _ = @import("cli/pause.zig");
+        _ = @import("cli/process.zig");
+        _ = @import("cli/ps.zig");
+        _ = @import("cli/start.zig");
+        _ = @import("cli/state.zig");
+        _ = @import("cli/state_cmd.zig");
+        _ = @import("cli/tests/create.zig");
+        _ = @import("cli/tests/delete.zig");
+        _ = @import("cli/tests/exec.zig");
+        _ = @import("cli/tests/helpers.zig");
+        _ = @import("cli/tests/hooks.zig");
+        _ = @import("cli/tests/lifecycle.zig");
+        _ = @import("cli/tests/locks.zig");
+        _ = @import("cli/tests/security.zig");
+        _ = @import("cli/tests/start.zig");
+        _ = @import("cli/tests/systemd.zig");
+        _ = @import("cli/update.zig");
+    }
+}
+
 test "dispatch recognizes lifecycle subcommands and rejects unknown commands" {
-    _ = @import("cli/args.zig");
-    _ = @import("cli/create.zig");
-    _ = @import("cli/delete.zig");
-    _ = @import("cli/diagnostic.zig");
-    _ = @import("cli/exec.zig");
-    _ = @import("cli/features.zig");
-    _ = @import("cli/hooks.zig");
-    _ = @import("cli/kill.zig");
-    _ = @import("cli/log.zig");
-    _ = @import("cli/pause.zig");
-    _ = @import("cli/process.zig");
-    _ = @import("cli/ps.zig");
-    _ = @import("cli/start.zig");
-    _ = @import("cli/state.zig");
-    _ = @import("cli/state_cmd.zig");
-    _ = @import("cli/tests/create.zig");
-    _ = @import("cli/tests/delete.zig");
-    _ = @import("cli/tests/exec.zig");
-    _ = @import("cli/tests/helpers.zig");
-    _ = @import("cli/tests/hooks.zig");
-    _ = @import("cli/tests/lifecycle.zig");
-    _ = @import("cli/tests/locks.zig");
-    _ = @import("cli/tests/security.zig");
-    _ = @import("cli/tests/start.zig");
-    _ = @import("cli/tests/systemd.zig");
-    _ = @import("cli/update.zig");
     try std.testing.expectEqual(@as(?Subcommand, .state), std.meta.stringToEnum(Subcommand, "state"));
     try std.testing.expectEqual(@as(?Subcommand, .create), std.meta.stringToEnum(Subcommand, "create"));
     try std.testing.expectEqual(@as(?Subcommand, .start), std.meta.stringToEnum(Subcommand, "start"));
@@ -250,6 +254,7 @@ test "kill errors use shim-compatible messages in the log" {
 }
 
 test "backend error detail survives cleanup overwriting the borrowed buffer" {
+    const LockTestBackend = @import("cli/tests/helpers.zig").LockTestBackend;
     diagnostics.last_backend_detail = null;
     defer diagnostics.last_backend_detail = null;
     var detail = "original create failure".*;
@@ -273,6 +278,7 @@ test "backend error detail survives cleanup overwriting the borrowed buffer" {
 }
 
 test "frontend failure after successful liveness does not log stale backend detail" {
+    const LockTestBackend = @import("cli/tests/helpers.zig").LockTestBackend;
     diagnostics.last_backend_detail = null;
     defer diagnostics.last_backend_detail = null;
     var tmp = std.testing.tmpDir(.{});
