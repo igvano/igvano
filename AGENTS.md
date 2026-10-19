@@ -10,8 +10,10 @@ igvano is a toy OCI container runtime written in Zig. It conforms to the OCI run
 
 Two layers, split so new isolation backends (wasm, VM-based, ...) can be added without touching the runtime frontend:
 
-- **Runtime frontend** (`src/main.zig`, `src/oci.zig`): runc-compatible CLI, OCI spec types (config.json / state.json schemas), state persistence under `--root`, lifecycle state machine and exit codes. Knows nothing about HOW isolation happens.
+- **Runtime frontend** (`src/main.zig`, `src/cli/`, `src/attached.zig`, `src/oci.zig` + `src/oci/`): runc-compatible CLI, OCI spec types (config.json / state.json schemas), state persistence under `--root`, lifecycle state machine and exit codes. Knows nothing about HOW isolation happens.
 - **Backend library** (`src/backend.zig`, `src/backend/`): libcontainer-like, exposed as its own Zig module importable without the CLI. `Backend` is a runtime-polymorphic interface (`std.mem.Allocator`-style ptr + vtable) with the ops `create`, `exec`, `alive`, `kill`, `killAll`, `update`, `pids`, `freeze`, `thaw`, `frozen`, `delete`, `diagnostic`. Supporting modules: `backend/seccomp.zig` (BPF compiler), `backend/devices.zig` + `devicefilter.zig` (device emulator, v2 BPF filter), `backend/dbus.zig` (systemd driver), `backend/hooks.zig`.
+
+`backend/linux.zig` is a thin facade (`LinuxBackend` + vtable); the Linux implementation lives in `backend/linux/` by area.
 
 Scope: the ONLY backend in scope is `backend/linux.zig` (general container: namespaces + cgroups). wasm / VM-based isolation are future directions that justify the interface — do NOT scaffold stubs, enum variants, or config options for them.
 
@@ -22,6 +24,7 @@ Rules:
 - No allocation or std.Io calls in forked children before exec; prepare everything in the parent.
 - Errors must carry a reason: frontend validation records a diagnostic, backend failures use `reportDiagnostic` (it crosses the fork boundary in the failure response) and reach stderr and `--log`.
 - Security-sensitive paths fail closed (seccomp, device filter, AppArmor/procfs writes, mount locks for user-namespace containers).
+- File layout: keep files roughly under 1,000–1,500 lines; small unit tests next to the code, container-running end-to-end tests in the area's `tests/` directory. Every new file must be reachable from test discovery (`test { _ = @import("x.zig"); }`); a refactor must not change test names or counts.
 - Inclusive naming: no master/slave/whitelist/blacklist identifiers (kernel API names such as `MS_SLAVE` excepted).
 
 ## Build and test

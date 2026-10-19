@@ -150,16 +150,31 @@ containerd's CRI plugin. On both cgroup v1 and v2 the results match runc's.
 
 ## Layout
 
-- `src/main.zig` — CLI frontend: arg parsing, lifecycle state machine, state dir, `--log`
+- `src/main.zig` — CLI entry point: dispatch and error reporting (stderr, `--log`)
+- `src/cli/` — the runc-compatible commands: argument parsing (`args.zig`),
+  `--log` writing, the state directory and locks (`state.zig`), one file per
+  command (`create`, `start`, `exec`, `kill`, `delete`, `ps`, `pause`,
+  `update`, `features`, ...); end-to-end CLI tests in `src/cli/tests/`
 - `src/attached.zig` — attached `exec`: signal forwarding, pty proxy
-- `src/oci.zig` — OCI spec types (config.json / state.json), validation, translation to backend types, `features`
+- `src/oci.zig` + `src/oci/` — OCI spec types (config.json / state.json),
+  validation, and translation to backend types (resources, devices, mounts,
+  process, seccomp, sysctls, systemd paths), `features`; fixture tests in
+  `src/oci/tests/`
 - `src/backend.zig` — backend interface (vtable); isolation is pluggable by design
-- `src/backend/linux.zig` — the namespace/cgroup backend (the only one implemented)
+- `src/backend/linux.zig` + `src/backend/linux/` — the namespace/cgroup backend
+  (the only one implemented): `linux.zig` holds `LinuxBackend` and its vtable;
+  the implementation is split by area (cgroup v1/v2, freezer, systemd, devices,
+  mounts, rootfs, namespaces, process, procfs, console, create, exec);
+  end-to-end tests in `src/backend/linux/tests/`
 - `src/backend/seccomp.zig` — seccomp BPF compiler
 - `src/backend/devices.zig`, `devicefilter.zig` — device-cgroup emulator and v2 BPF device filter
 - `src/backend/dbus.zig` — minimal D-Bus client for the systemd driver
 - `src/backend/hooks.zig` — hook execution
 - `hack/conformance.sh` — runtime-tools conformance harness
+
+Small unit tests sit next to the code they test; tests that run real
+containers live in the `tests/` directories and are pulled into the test
+binaries with `test { _ = @import(...); }` blocks.
 
 See `AGENTS.md` for architecture rules and development conventions.
 
