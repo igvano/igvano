@@ -320,6 +320,15 @@ test "linux kill all signals every cgroup member and plain SIGKILL thaws paused 
         } else {
             try std.testing.expectEqual(stays_frozen, try backend.frozen(handle));
         }
+        // Finish SIGKILL exits before thawing so the kernel has updated
+        // the subtree's freezer counters.
+        if (case.paused and case.all and signal == 9) {
+            for (&children) |*child| {
+                const status = try waitChild(child.*);
+                child.* = 0;
+                try std.testing.expectEqual(@as(u32, 9), status);
+            }
+        }
         if (stays_frozen) try backend.thaw(handle);
         if (!case.all) try backend.killAll(handle, signal);
         if (cgroup) |fd| {
