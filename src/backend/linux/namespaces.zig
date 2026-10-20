@@ -2,7 +2,6 @@ const std = @import("std");
 const linux = std.os.linux;
 const posix = std.posix;
 const Backend = @import("../../backend.zig").Backend;
-const oci = @import("../../oci.zig");
 const diagnostics = @import("diagnostic.zig");
 const checkResult = @import("syscall.zig").checkResult;
 const forkProcess = @import("syscall.zig").forkProcess;
@@ -16,7 +15,7 @@ const reportDiagnostic = @import("diagnostic.zig").reportDiagnostic;
 const CreateResponse = @import("diagnostic.zig").CreateResponse;
 const failCreate = @import("diagnostic.zig").failCreate;
 
-pub fn namespaceFlag(kind: @FieldType(oci.Spec.Namespace, "type")) usize {
+pub fn namespaceFlag(kind: Backend.Namespace.Kind) usize {
     return switch (kind) {
         .pid => linux.CLONE.NEWPID,
         .network => linux.CLONE.NEWNET,
@@ -30,13 +29,11 @@ pub fn namespaceFlag(kind: @FieldType(oci.Spec.Namespace, "type")) usize {
 }
 
 /// Only namespaces without paths are unshared. Constants work on macOS too.
-pub fn namespaceFlags(config: ?oci.Spec.Linux) Backend.Error!usize {
-    const settings = config orelse return 0;
-    const namespaces = settings.namespaces orelse return 0;
+pub fn namespaceFlags(namespaces: []const Backend.Namespace) Backend.Error!usize {
     var flags: usize = 0;
     var seen: usize = 0;
     for (namespaces) |namespace| {
-        const flag = namespaceFlag(namespace.type);
+        const flag = namespaceFlag(namespace.kind);
         if (seen & flag != 0) return error.InvalidConfig;
         seen |= flag;
         if (namespace.path) |path| {
@@ -211,20 +208,12 @@ pub fn joinedUserNamespaceMappings(allocator: std.mem.Allocator, fd: posix.fd_t)
     return .{ .uid = uid, .gid = gid };
 }
 
-pub fn formatIDMappings(allocator: std.mem.Allocator, mappings: []const oci.Spec.IDMapping) std.mem.Allocator.Error![]u8 {
+pub fn formatIDMappings(allocator: std.mem.Allocator, mappings: []const Backend.IDMapping) std.mem.Allocator.Error![]u8 {
     var text: std.ArrayList(u8) = .empty;
     defer text.deinit(allocator);
     for (mappings) |mapping| {
-        try text.print(allocator, "{d} {d} {d}\n", .{ mapping.containerID, mapping.hostID, mapping.size });
-    }
-    return text.toOwnedSlice(allocator);
-}
-
-fn formatMountIDMappings(allocator: std.mem.Allocator, mappings: []const Backend.IDMapping) std.mem.Allocator.Error![]u8 {
-    var text: std.ArrayList(u8) = .empty;
-    defer text.deinit(allocator);
-    for (mappings) |mapping|
         try text.print(allocator, "{d} {d} {d}\n", .{ mapping.container_id, mapping.host_id, mapping.size });
+    }
     return text.toOwnedSlice(allocator);
 }
 
@@ -232,9 +221,9 @@ fn formatMountIDMappings(allocator: std.mem.Allocator, mappings: []const Backend
 /// As in runc's userns helpers, keep the child alive until maps are installed
 /// and the namespace is pinned, then reap it. Only the parent allocates.
 pub fn createMountUserNamespace(allocator: std.mem.Allocator, mappings: Backend.MountMappings) Backend.Error!posix.fd_t {
-    const uid_map = try formatMountIDMappings(allocator, mappings.uid);
+    const uid_map = try formatIDMappings(allocator, mappings.uid);
     defer allocator.free(uid_map);
-    const gid_map = try formatMountIDMappings(allocator, mappings.gid);
+    const gid_map = try formatIDMappings(allocator, mappings.gid);
     defer allocator.free(gid_map);
     const ready = try makePipe();
     defer closeFd(ready[0]);
@@ -311,53 +300,39 @@ test "namespace flags map each namespace and combine flags without system calls"
         .{ .time, linux.CLONE.NEWTIME },
     };
     inline for (cases) |case| {
-        try std.testing.expectEqual(@as(usize, case[1]), try namespaceFlags(.{ .namespaces = &.{.{ .type = case[0] }} }));
+        try std.testing.expectEqual(@as(usize, case[1]), try namespaceFlags(&.{.{ .kind = case[0] }}));
     }
-    try std.testing.expectEqual(@as(usize, 0), try namespaceFlags(null));
-    try std.testing.expectEqual(@as(usize, 0), try namespaceFlags(.{}));
+    try std.testing.expectEqual(@as(usize, 0), try namespaceFlags(&.{}));
     try std.testing.expectEqual(
         @as(usize, linux.CLONE.NEWPID | linux.CLONE.NEWUTS | linux.CLONE.NEWNS),
-        try namespaceFlags(.{ .namespaces = &.{ .{ .type = .pid }, .{ .type = .uts }, .{ .type = .mount } } }),
+        try namespaceFlags(&.{ .{ .kind = .pid }, .{ .kind = .uts }, .{ .kind = .mount } }),
     );
 }
 
 test "namespace flags reject duplicate types" {
     try std.testing.expectError(
         error.InvalidConfig,
-        namespaceFlags(.{ .namespaces = &.{ .{ .type = .pid }, .{ .type = .uts }, .{ .type = .mount }, .{ .type = .pid } } }),
+        namespaceFlags(&.{ .{ .kind = .pid }, .{ .kind = .uts }, .{ .kind = .mount }, .{ .kind = .pid } }),
     );
 }
 
 test "namespace flags exclude joins including existing user namespaces" {
-    try std.testing.expectEqual(@as(usize, 0), try namespaceFlags(.{
-        .namespaces = &.{.{ .type = .network, .path = "/proc/1234/ns/net" }},
-    }));
-    try std.testing.expectEqual(@as(usize, linux.CLONE.NEWNS), try namespaceFlags(.{
-        .namespaces = &.{ .{ .type = .mount }, .{ .type = .user, .path = "/proc/1234/ns/user" } },
-    }));
-    const mappings: []const oci.Spec.IDMapping = &.{.{ .containerID = 0, .hostID = 1000, .size = 1 }};
-    try std.testing.expectEqual(@as(usize, linux.CLONE.NEWUSER | linux.CLONE.NEWNS), try namespaceFlags(.{
-        .namespaces = &.{ .{ .type = .user }, .{ .type = .mount } },
-        .uidMappings = mappings,
-        .gidMappings = mappings,
-    }));
+    try std.testing.expectEqual(@as(usize, 0), try namespaceFlags(&.{.{ .kind = .network, .path = "/proc/1234/ns/net" }}));
+    try std.testing.expectEqual(@as(usize, linux.CLONE.NEWNS), try namespaceFlags(&.{ .{ .kind = .mount }, .{ .kind = .user, .path = "/proc/1234/ns/user" } }));
+    try std.testing.expectEqual(@as(usize, linux.CLONE.NEWUSER | linux.CLONE.NEWNS), try namespaceFlags(&.{ .{ .kind = .user }, .{ .kind = .mount } }));
 }
 
 test "namespace paths reject empty relative and NUL paths and duplicate joins" {
     for ([_][]const u8{ "", "relative", "/proc/1/ns/net\x00" }) |path| {
-        try std.testing.expectError(error.InvalidPath, namespaceFlags(.{
-            .namespaces = &.{.{ .type = .network, .path = path }},
-        }));
+        try std.testing.expectError(error.InvalidPath, namespaceFlags(&.{.{ .kind = .network, .path = path }}));
     }
-    try std.testing.expectError(error.InvalidConfig, namespaceFlags(.{
-        .namespaces = &.{ .{ .type = .network, .path = "/proc/1/ns/net" }, .{ .type = .network } },
-    }));
+    try std.testing.expectError(error.InvalidConfig, namespaceFlags(&.{ .{ .kind = .network, .path = "/proc/1/ns/net" }, .{ .kind = .network } }));
 }
 
 test "ID mapping lines preserve order and decimal IDs" {
     const text = try formatIDMappings(std.testing.allocator, &.{
-        .{ .containerID = 0, .hostID = 100000, .size = 65536 },
-        .{ .containerID = 100000, .hostID = 200000, .size = 1 },
+        .{ .container_id = 0, .host_id = 100000, .size = 65536 },
+        .{ .container_id = 100000, .host_id = 200000, .size = 1 },
     });
     defer std.testing.allocator.free(text);
     try std.testing.expectEqualStrings("0 100000 65536\n100000 200000 1\n", text);

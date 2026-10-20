@@ -3,7 +3,6 @@ const builtin = @import("builtin");
 const linux = std.os.linux;
 const posix = std.posix;
 const Backend = @import("../../../backend.zig").Backend;
-const oci = @import("../../../oci.zig");
 const hooks = @import("../../hooks.zig");
 const PreparedMount = @import("../mount.zig").PreparedMount;
 const checkResult = @import("../syscall.zig").checkResult;
@@ -264,7 +263,13 @@ test "linux rootfs setup applies ordered mounts detaches the host root and enfor
         .{ .path = "/dev/null", .mode = linux.S.IFCHR | 0o666, .dev = 0x103 },
         .{ .path = "/run/pipe", .mode = linux.S.IFIFO | 0o640, .dev = 0 },
     };
-    const symlinks = oci.deviceSymlinks(&.{.{ .destination = "/dev/pts", .source = "devpts", .type = "devpts", .flags = 0, .propagation = 0, .data = "" }});
+    const symlinks: []const Backend.Symlink = &.{
+        .{ .path = "/dev/fd", .target = "/proc/self/fd" },
+        .{ .path = "/dev/stdin", .target = "/proc/self/fd/0" },
+        .{ .path = "/dev/stdout", .target = "/proc/self/fd/1" },
+        .{ .path = "/dev/stderr", .target = "/proc/self/fd/2" },
+        .{ .path = "/dev/ptmx", .target = "pts/ptmx" },
+    };
     const pid = try forkProcess();
     if (pid == 0) {
         checkResult(linux.unshare(linux.CLONE.NEWNS)) catch linux.exit_group(1);

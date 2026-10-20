@@ -3,7 +3,6 @@ const builtin = @import("builtin");
 const linux = std.os.linux;
 const posix = std.posix;
 const Backend = @import("../../backend.zig").Backend;
-const oci = @import("../../oci.zig");
 const seccomp = @import("../seccomp.zig");
 const checkResult = @import("syscall.zig").checkResult;
 const closeFd = @import("syscall.zig").closeFd;
@@ -87,11 +86,11 @@ pub const CapabilityHeader = extern struct {
     pid: i32 = 0,
 };
 
-pub fn runProcess(spec: *const oci.Spec, executable: ?[*:0]const u8, argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*:0]const u8, seccomp_program: ?seccomp.Program) !noreturn {
+pub fn runProcess(configured: ?Backend.Process, executable: ?[*:0]const u8, argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*:0]const u8, seccomp_program: ?seccomp.Program) !noreturn {
     // A process-less config can be created; it cannot be started.
-    if (spec.process == null) return error.InvalidProcess;
+    const process = configured orelse return error.InvalidProcess;
     // With NNP=true, install after startContainer hooks (unfiltered); NNP=false hooks run filtered, intentionally.
-    if (spec.process.?.noNewPrivileges) {
+    if (process.no_new_privileges) {
         if (seccomp_program) |program| try installSeccomp(program);
     }
     return execResolved(executable orelse return error.InvalidProcess, argv, envp);
@@ -149,12 +148,12 @@ pub const ProcessSettings = struct {
 /// Runs before readiness, without allocating. Keep privileges until limits and
 /// bounding drops finish, then retain permitted caps across the UID transition.
 // For UID 0, exec recomputes permitted/effective as inheritable | bounding (as in runc).
-pub fn applyProcess(process: oci.Spec.Process, capabilities: ?Backend.Capabilities, rlimits: []const Backend.Rlimit) Backend.Error!void {
+pub fn applyProcess(process: Backend.Process, capabilities: ?Backend.Capabilities, rlimits: []const Backend.Rlimit) Backend.Error!void {
     return applyProcessSettings(.{
-        .uid = process.user.uid,
-        .gid = process.user.gid,
-        .additional_gids = process.user.additionalGids orelse &.{},
-        .no_new_privileges = process.noNewPrivileges,
+        .uid = process.uid,
+        .gid = process.gid,
+        .additional_gids = process.additional_gids,
+        .no_new_privileges = process.no_new_privileges,
         .capabilities = capabilities,
         .rlimits = rlimits,
     });
@@ -169,7 +168,7 @@ pub fn applyProcessSettings(process: ProcessSettings) Backend.Error!void {
             try dropBoundingCapabilities(caps.bounding);
             try checkResult(linux.prctl(@intFromEnum(linux.PR.SET_KEEPCAPS), 1, 0, 0, 0));
         }
-        // With a user namespace, additionalGids (like uid/gid) are namespace IDs.
+        // With a user namespace, additional_gids (like uid/gid) are namespace IDs.
         const groups = process.additional_gids;
         try checkResult(linux.setgroups(groups.len, groups.ptr));
         try checkResult(linux.setgid(process.gid));

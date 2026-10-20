@@ -3,7 +3,6 @@ const builtin = @import("builtin");
 const linux = std.os.linux;
 const Backend = @import("../../../backend.zig").Backend;
 const Resources = Backend.Resources;
-const oci = @import("../../../oci.zig");
 const seccomp = @import("../../seccomp.zig");
 const diagnostics = @import("../diagnostic.zig");
 const v2DeviceRules = @import("../devices.zig").v2DeviceRules;
@@ -151,12 +150,13 @@ test "linux v1 container allowlist opens dev null while a denied device fails" {
     try checkResult(linux.mknod(denied, linux.S.IFCHR | 0o600, (10 << 8) | 237));
     const path = try std.fmt.allocPrint(allocator, "igvano-v1-devices-{d}", .{linux.getpid()});
     defer allocator.free(path);
-    const devices = try oci.prepareDevices(allocator, null);
-    defer oci.freeDevices(allocator, devices);
-    const spec: oci.Spec = .{
-        .ociVersion = "1.0.2",
-        .root = .{ .path = "rootfs" },
-        .linux = .{ .namespaces = &.{.{ .type = .mount }} },
+    const devices: []const Backend.Device = &.{
+        .{ .path = "/dev/null", .kind = .character, .major = 1, .minor = 3, .required = false },
+        .{ .path = "/dev/zero", .kind = .character, .major = 1, .minor = 5, .required = false },
+        .{ .path = "/dev/full", .kind = .character, .major = 1, .minor = 7, .required = false },
+        .{ .path = "/dev/random", .kind = .character, .major = 1, .minor = 8, .required = false },
+        .{ .path = "/dev/urandom", .kind = .character, .major = 1, .minor = 9, .required = false },
+        .{ .path = "/dev/tty", .kind = .character, .major = 5, .minor = 0, .required = false },
     };
     var implementation: LinuxBackend = .{};
     const backend = implementation.backend();
@@ -165,7 +165,7 @@ test "linux v1 container allowlist opens dev null while a denied device fails" {
         .id = "v1-devices",
         .rootfs = rootfs,
         .exec_fifo = fifo,
-        .spec = &spec,
+        .namespaces = &.{.{ .kind = .mount }},
         .cgroup_path = path,
         .devices = devices,
         .mounts = &.{
@@ -227,11 +227,6 @@ test "linux v2 container device filter preserves defaults and replaces unlisted 
         .{ .allow = true, .kind = .char, .major = 1, .minor = 3 },
         .{ .allow = true, .kind = .char, .major = 10, .minor = 237 },
     };
-    const spec: oci.Spec = .{
-        .ociVersion = "1.0.2",
-        .root = .{ .path = "rootfs" },
-        .linux = .{ .namespaces = &.{.{ .type = .mount }} },
-    };
     var implementation: LinuxBackend = .{};
     const backend = implementation.backend();
     var original_memlock: linux.rlimit = undefined;
@@ -244,7 +239,7 @@ test "linux v2 container device filter preserves defaults and replaces unlisted 
         .id = "v2-devices",
         .rootfs = rootfs,
         .exec_fifo = fifo,
-        .spec = &spec,
+        .namespaces = &.{.{ .kind = .mount }},
         .cgroup_path = path,
         .devices = &.{.{ .path = "/dev/null", .kind = .character, .major = 1, .minor = 3 }},
         .mounts = &.{

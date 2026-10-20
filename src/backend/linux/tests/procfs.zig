@@ -2,7 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 const posix = std.posix;
-const oci = @import("../../../oci.zig");
+const Backend = @import("../../../backend.zig").Backend;
 const diagnostics = @import("../diagnostic.zig");
 const PreparedMount = @import("../mount.zig").PreparedMount;
 const checkResult = @import("../syscall.zig").checkResult;
@@ -19,6 +19,8 @@ const requireTestMountNamespace = @import("helpers.zig").requireTestMountNamespa
 const Procfs = @import("../procfs.zig").Procfs;
 const writeSysctl = @import("../procfs.zig").writeSysctl;
 const applySysctls = @import("../procfs.zig").applySysctls;
+const namespaceFlag = @import("../namespaces.zig").namespaceFlag;
+const validateNamespaceFd = @import("../namespaces.zig").validateNamespaceFd;
 
 test "linux private subset procfs resolves the child in its PID namespace" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
@@ -109,16 +111,15 @@ test "linux sysctls precede readonly restrictions and preserve the runtime netwo
         return error.TestUnexpectedResult;
     }
     // Joined namespaces also validate when their inode differs from ours.
-    for ([_]struct { kind: @FieldType(oci.Spec.Namespace, "type"), name: []const u8, key: []const u8 }{
-        .{ .kind = .network, .name = "net", .key = "net.ipv4.ip_forward" },
-        .{ .kind = .ipc, .name = "ipc", .key = "kernel.msgmax" },
+    for ([_]struct { kind: Backend.Namespace.Kind, name: []const u8 }{
+        .{ .kind = .network, .name = "net" },
+        .{ .kind = .ipc, .name = "ipc" },
     }) |case| {
-        const path = try std.fmt.allocPrint(allocator, "/proc/{d}/ns/{s}", .{ pid, case.name });
+        const path = try std.fmt.allocPrintSentinel(allocator, "/proc/{d}/ns/{s}", .{ pid, case.name }, 0);
         defer allocator.free(path);
-        var sysctl: std.json.ArrayHashMap([]const u8) = .{};
-        defer sysctl.deinit(allocator);
-        try sysctl.map.put(allocator, case.key, "1");
-        try oci.validateSysctls(.{ .sysctl = sysctl, .namespaces = &.{.{ .type = case.kind, .path = path }} });
+        const fd = try openPath(linux.AT.FDCWD, path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true });
+        defer closeFd(fd);
+        try validateNamespaceFd(fd, namespaceFlag(case.kind));
     }
     try std.testing.expect(writeAll(go[1], &.{1}));
     try std.testing.expectEqual(@as(u32, 0), try waitChild(pid));

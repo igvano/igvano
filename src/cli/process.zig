@@ -6,17 +6,18 @@ const Backend = backend_module.Backend;
 
 pub fn prepareProcess(allocator: std.mem.Allocator, process: oci.Spec.Process, has_console: bool) !Backend.ExecOptions {
     try validateConsoleSocket(process.terminal, has_console);
+    const config = oci.processConfig(process);
     return .{
         .allocator = allocator,
-        .argv = process.args,
-        .envp = process.env orelse &.{},
-        .cwd = process.cwd,
-        .uid = process.user.uid,
-        .gid = process.user.gid,
-        .additional_gids = process.user.additionalGids orelse &.{},
+        .argv = config.args,
+        .envp = config.env,
+        .cwd = config.cwd,
+        .uid = config.uid,
+        .gid = config.gid,
+        .additional_gids = config.additional_gids,
         .capabilities = if (process.capabilities) |caps| try oci.processCapabilities(caps) else null,
         .rlimits = try oci.processRlimits(allocator, process.rlimits),
-        .no_new_privileges = process.noNewPrivileges,
+        .no_new_privileges = config.no_new_privileges,
         .apparmor_profile = process.apparmorProfile,
         .oom_score_adj = process.oomScoreAdj,
     };
@@ -155,6 +156,19 @@ test "process validation and typed translation serve create and exec" {
     };
     const options = try prepareProcess(std.testing.allocator, process, false);
     defer std.testing.allocator.free(options.rlimits);
+    const config = oci.processConfig(process);
+    try std.testing.expectEqualDeep(process.args, config.args);
+    try std.testing.expectEqualDeep(process.env.?, config.env);
+    try std.testing.expectEqualStrings(process.cwd, config.cwd);
+    try std.testing.expectEqual(@as(u32, 1000), config.uid);
+    try std.testing.expectEqual(@as(u32, 1001), config.gid);
+    try std.testing.expectEqualSlices(u32, &.{42}, config.additional_gids);
+    try std.testing.expect(config.no_new_privileges);
+    try std.testing.expect(!config.terminal);
+    const defaults = oci.processConfig(.{ .args = &.{"/bin/sh"}, .cwd = "/", .user = .{ .uid = 0, .gid = 0 } });
+    try std.testing.expectEqual(@as(usize, 0), defaults.env.len);
+    try std.testing.expectEqual(@as(usize, 0), defaults.additional_gids.len);
+    try std.testing.expect(!defaults.terminal and !defaults.no_new_privileges);
     try std.testing.expectEqual(@as(u64, 1), options.capabilities.?.bounding);
     try std.testing.expectEqual(@as(u64, 512), options.rlimits[0].soft);
     try std.testing.expectEqual(@as(u32, 42), options.additional_gids[0]);
@@ -172,5 +186,6 @@ test "process validation and typed translation serve create and exec" {
     try std.testing.expectError(error.InvalidProcess, oci.validateProcess(invalid));
     invalid = process;
     invalid.terminal = true;
+    try std.testing.expect(oci.processConfig(invalid).terminal);
     try std.testing.expectError(error.MissingConsoleSocket, prepareProcess(std.testing.allocator, invalid, false));
 }

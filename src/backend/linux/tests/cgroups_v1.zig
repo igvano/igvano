@@ -4,7 +4,6 @@ const linux = std.os.linux;
 const posix = std.posix;
 const Backend = @import("../../../backend.zig").Backend;
 const Resources = Backend.Resources;
-const oci = @import("../../../oci.zig");
 const checkResult = @import("../syscall.zig").checkResult;
 const forkProcess = @import("../syscall.zig").forkProcess;
 const makePipe = @import("../syscall.zig").makePipe;
@@ -71,11 +70,6 @@ test "linux v1 create exposes readonly controller leaves containing init" {
     try checkResult(linux.mknod(fifo, linux.S.IFIFO | 0o600, 0));
     const controller_path = try std.fmt.allocPrintSentinel(allocator, "/sys/fs/cgroup/{s}", .{std.fs.path.basename(selected.mountpoint)}, 0);
     defer allocator.free(controller_path);
-    const spec: oci.Spec = .{
-        .ociVersion = "1.0.2",
-        .root = .{ .path = "rootfs" },
-        .linux = .{ .namespaces = &.{ .{ .type = .mount }, .{ .type = .cgroup } } },
-    };
     var implementation: LinuxBackend = .{};
     const backend = implementation.backend();
     const handle = try backend.create(.{
@@ -83,7 +77,7 @@ test "linux v1 create exposes readonly controller leaves containing init" {
         .id = "v1-mount",
         .rootfs = rootfs,
         .exec_fifo = fifo,
-        .spec = &spec,
+        .namespaces = &.{ .{ .kind = .mount }, .{ .kind = .cgroup } },
         .cgroup_path = path,
         .mounts = &.{.{
             .destination = "/sys/fs/cgroup",

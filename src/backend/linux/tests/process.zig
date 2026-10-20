@@ -3,7 +3,6 @@ const builtin = @import("builtin");
 const linux = std.os.linux;
 const posix = std.posix;
 const Backend = @import("../../../backend.zig").Backend;
-const oci = @import("../../../oci.zig");
 const seccomp = @import("../../seccomp.zig");
 const diagnostics = @import("../diagnostic.zig");
 const checkResult = @import("../syscall.zig").checkResult;
@@ -114,11 +113,7 @@ test "linux init rejects missing directory and non-executable args before create
     const rootfs_z = try std.testing.allocator.dupeZ(u8, rootfs);
     defer std.testing.allocator.free(rootfs_z);
     for ([_][*:0]const u8{ "igvano-no-such-binary", "/igvano-no-such-binary", "/directory", "/no-execute" }) |arg0| {
-        const spec: oci.Spec = .{
-            .ociVersion = "1.0.2",
-            .root = .{ .path = "rootfs" },
-            .process = .{ .args = &.{std.mem.span(arg0)}, .cwd = "/", .user = .{ .uid = 0, .gid = 0 } },
-        };
+        const process: Backend.Process = .{ .args = &.{std.mem.span(arg0)}, .cwd = "/", .uid = 0, .gid = 0 };
         const argv = [_:null]?[*:0]const u8{arg0};
         const envp = [_:null]?[*:0]const u8{"PATH=/bin:/usr/bin"};
         const ready = try makePipe();
@@ -130,7 +125,7 @@ test "linux init rejects missing directory and non-executable args before create
         if (pid == 0) {
             closeFd(ready[0]);
             checkResult(linux.unshare(linux.CLONE.NEWNS)) catch linux.exit_group(2);
-            runInit(&spec, null, &.{}, linux.CLONE.NEWNS, rootfs_z, &.{}, &.{}, &.{}, "/", -1, -1, &argv, &envp, ready[1], .{}, &.{}, "", null, null);
+            runInit(process, null, false, null, &.{}, linux.CLONE.NEWNS, rootfs_z, &.{}, &.{}, &.{}, "/", -1, -1, &argv, &envp, ready[1], .{}, &.{}, "", null, null);
         }
         closeFd(ready[1]);
         var response: CreateResponse = .{};
@@ -148,21 +143,12 @@ test "linux init rejects missing directory and non-executable args before create
 test "linux init applies uid gid and optional supplementary groups before exec" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     if (linux.geteuid() != 0) return error.SkipZigTest;
-    const cases = [_]struct { user_json: []const u8, expected: []const u8 }{
-        .{ .user_json = "{\"uid\":1000,\"gid\":1000}", .expected = "1000\n1000\n1000\n" },
-        .{ .user_json = "{\"uid\":1000,\"gid\":1000,\"additionalGids\":[]}", .expected = "1000\n1000\n1000\n" },
-        .{ .user_json = "{\"uid\":1000,\"gid\":1000,\"additionalGids\":[1001,1002]}", .expected = "1000\n1000\n1000 1001 1002\n" },
+    const cases = [_]struct { process: Backend.Process, expected: []const u8 }{
+        .{ .process = .{ .args = &.{ "sh", "-c", "id -u; id -g; id -G" }, .cwd = "/", .uid = 1000, .gid = 1000 }, .expected = "1000\n1000\n1000\n" },
+        .{ .process = .{ .args = &.{ "sh", "-c", "id -u; id -g; id -G" }, .cwd = "/", .uid = 1000, .gid = 1000, .additional_gids = &.{} }, .expected = "1000\n1000\n1000\n" },
+        .{ .process = .{ .args = &.{ "sh", "-c", "id -u; id -g; id -G" }, .cwd = "/", .uid = 1000, .gid = 1000, .additional_gids = &.{ 1001, 1002 } }, .expected = "1000\n1000\n1000 1001 1002\n" },
     };
     for (cases) |case| {
-        const user = try std.json.parseFromSlice(oci.Spec.User, std.testing.allocator, case.user_json, .{
-            .ignore_unknown_fields = true,
-        });
-        defer user.deinit();
-        const spec: oci.Spec = .{
-            .ociVersion = "1.0.2",
-            .root = .{ .path = "/" },
-            .process = .{ .args = &.{ "sh", "-c", "id -u; id -g; id -G" }, .cwd = "/", .user = user.value },
-        };
         const argv = [_:null]?[*:0]const u8{ "sh", "-c", "id -u; id -g; id -G" };
         const envp = [_:null]?[*:0]const u8{"PATH=/does-not-exist:/usr/bin:/bin"};
         const output = try makePipe();
@@ -183,10 +169,10 @@ test "linux init applies uid gid and optional supplementary groups before exec" 
             checkResult(linux.setgroups(1, &.{42})) catch linux.exit_group(1);
             checkResult(linux.dup2(output[1], posix.STDOUT_FILENO)) catch linux.exit_group(1);
             closeFd(output[1]);
-            applyProcess(spec.process.?, null, &.{}) catch linux.exit_group(1);
+            applyProcess(case.process, null, &.{}) catch linux.exit_group(1);
             var executable_buffer: [std.fs.max_path_bytes]u8 = undefined;
             const executable = resolveExecutable(&argv, &envp, &executable_buffer) catch linux.exit_group(1);
-            runProcess(&spec, executable, &argv, &envp, null) catch linux.exit_group(1);
+            runProcess(case.process, executable, &argv, &envp, null) catch linux.exit_group(1);
         }
         closeFd(output[1]);
         closeFd(ready[1]);
@@ -250,11 +236,7 @@ test "linux init exits nonzero instead of exec for out of range oomScoreAdj" {
 
 test "linux init exits nonzero instead of exec when it cannot apply process user" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
-    const spec: oci.Spec = .{
-        .ociVersion = "1.0.2",
-        .root = .{ .path = "/" },
-        .process = .{ .args = &.{ "/bin/sh", "-c", "exit 0" }, .cwd = "/", .user = .{ .uid = 0, .gid = 0 } },
-    };
+    const process: Backend.Process = .{ .args = &.{ "/bin/sh", "-c", "exit 0" }, .cwd = "/", .uid = 0, .gid = 0 };
     const argv = [_:null]?[*:0]const u8{ "/bin/sh", "-c", "exit 0" };
     const envp = [_:null]?[*:0]const u8{};
     const ready = try makePipe();
@@ -269,8 +251,8 @@ test "linux init exits nonzero instead of exec when it cannot apply process user
             checkResult(linux.setgid(1000)) catch linux.exit_group(2);
             checkResult(linux.setuid(1000)) catch linux.exit_group(2);
         }
-        applyProcess(spec.process.?, null, &.{}) catch linux.exit_group(1);
-        runProcess(&spec, argv[0], &argv, &envp, null) catch linux.exit_group(1);
+        applyProcess(process, null, &.{}) catch linux.exit_group(1);
+        runProcess(process, argv[0], &argv, &envp, null) catch linux.exit_group(1);
     }
     closeFd(ready[1]);
     try std.testing.expectEqual(@as(u32, 1 << 8), try waitChild(pid));
@@ -280,15 +262,12 @@ test "linux init marks inherited descriptors CLOEXEC and sets noNewPrivileges" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     if (linux.geteuid() != 0) return error.SkipZigTest;
     const command = "test ! -e /proc/self/fd/200 && grep -q '^NoNewPrivs:[[:space:]]*1$' /proc/self/status";
-    const spec: oci.Spec = .{
-        .ociVersion = "1.0.2",
-        .root = .{ .path = "/" },
-        .process = .{
-            .args = &.{ "/bin/sh", "-c", command },
-            .cwd = "/",
-            .user = .{ .uid = 0, .gid = 0 },
-            .noNewPrivileges = true,
-        },
+    const process: Backend.Process = .{
+        .args = &.{ "/bin/sh", "-c", command },
+        .cwd = "/",
+        .uid = 0,
+        .gid = 0,
+        .no_new_privileges = true,
     };
     const argv = [_:null]?[*:0]const u8{ "/bin/sh", "-c", command };
     const envp = [_:null]?[*:0]const u8{};
@@ -302,8 +281,8 @@ test "linux init marks inherited descriptors CLOEXEC and sets noNewPrivileges" {
         closeFd(ready[0]);
         checkResult(linux.dup2(ready[1], 200)) catch linux.exit_group(2);
         closeExecFrom(3, null) catch linux.exit_group(1);
-        applyProcess(spec.process.?, null, &.{}) catch linux.exit_group(1);
-        runProcess(&spec, argv[0], &argv, &envp, null) catch linux.exit_group(1);
+        applyProcess(process, null, &.{}) catch linux.exit_group(1);
+        runProcess(process, argv[0], &argv, &envp, null) catch linux.exit_group(1);
     }
     closeFd(ready[1]);
     try std.testing.expectEqual(@as(u32, 0), try waitChild(pid));
@@ -360,10 +339,11 @@ test "linux process settings apply rlimits without changing inherited capabiliti
     try checkResult(linux.getrlimit(.NOFILE, &original));
     const hard = @min(original.max, 1024);
     const soft = @min(hard, 512);
-    const process: oci.Spec.Process = .{
+    const process: Backend.Process = .{
         .args = &.{"/bin/true"},
         .cwd = "/",
-        .user = .{ .uid = linux.geteuid(), .gid = linux.getegid(), .additionalGids = &.{} },
+        .uid = linux.geteuid(),
+        .gid = linux.getegid(),
     };
     const pid = try forkProcess();
     if (pid == 0) {
@@ -394,11 +374,12 @@ test "linux process settings retain configured capabilities across nonzero uid a
     if (linux.prctl(@intFromEnum(linux.PR.CAPBSET_READ), linux.CAP.CHOWN, 0, 0, 0) != 1)
         return error.SkipZigTest;
     const command = "test \"$(id -u)\" = 1000 && grep -q '^CapAmb:[[:space:]]*0000000000000001$' /proc/self/status";
-    const process: oci.Spec.Process = .{
+    const process: Backend.Process = .{
         .args = &.{ "/bin/sh", "-c", command },
         .cwd = "/",
-        .user = .{ .uid = 1000, .gid = 1000, .additionalGids = &.{} },
-        .noNewPrivileges = true,
+        .uid = 1000,
+        .gid = 1000,
+        .no_new_privileges = true,
     };
     const pid = try forkProcess();
     if (pid == 0) {

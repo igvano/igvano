@@ -1,5 +1,4 @@
 const std = @import("std");
-const oci = @import("oci.zig");
 
 pub const LinuxBackend = @import("backend/linux.zig").LinuxBackend;
 pub const apparmorEnabled = @import("backend/linux.zig").apparmorEnabled;
@@ -12,7 +11,7 @@ pub const Backend = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
 
-    /// Strings and the parsed spec are borrowed; the frontend owns their memory.
+    /// Strings and slices are borrowed; the caller owns their memory.
     pub const CreateOptions = struct {
         allocator: std.mem.Allocator,
         id: []const u8,
@@ -20,7 +19,12 @@ pub const Backend = struct {
         rootfs: []const u8,
         /// Absolute path to the FIFO created by the frontend.
         exec_fifo: []const u8,
-        spec: *const oci.Spec,
+        process: ?Process = null,
+        namespaces: []const Namespace = &.{},
+        uid_mappings: []const IDMapping = &.{},
+        gid_mappings: []const IDMapping = &.{},
+        hostname: ?[]const u8 = null,
+        readonly_rootfs: bool = false,
         /// Borrowed socketpair: init sends its PTY controller on [1]; the caller
         /// receives on [0]. Both ends are CLOEXEC and remain caller-owned.
         console_fds: ?[2]std.posix.fd_t = null,
@@ -52,6 +56,24 @@ pub const Backend = struct {
         rootfs_propagation: ?u32 = null,
         apparmor_profile: ?[]const u8 = null,
         seccomp: ?Backend.seccomp.Config = null,
+    };
+
+    pub const Process = struct {
+        args: []const []const u8,
+        env: []const []const u8 = &.{},
+        cwd: []const u8,
+        terminal: bool = false,
+        uid: u32,
+        gid: u32,
+        additional_gids: []const u32 = &.{},
+        no_new_privileges: bool = false,
+    };
+
+    pub const Namespace = struct {
+        kind: Kind,
+        path: ?[]const u8 = null,
+
+        pub const Kind = enum { pid, network, mount, ipc, uts, user, cgroup, time };
     };
 
     pub const Hook = hooks.Hook;
@@ -416,17 +438,12 @@ test "backend dispatches lifecycle operations through its vtable" {
         }
     };
 
-    const spec: oci.Spec = .{
-        .ociVersion = "1.0.2",
-        .root = .{ .path = "rootfs" },
-        .process = .{ .args = &.{"/bin/sh"}, .cwd = "/", .user = .{ .uid = 0, .gid = 0 } },
-    };
     const options: Backend.CreateOptions = .{
         .allocator = std.testing.allocator,
         .id = "example",
         .rootfs = "/tmp/bundle/rootfs",
         .exec_fifo = "/tmp/containers/example/exec.fifo",
-        .spec = &spec,
+        .process = .{ .args = &.{"/bin/sh"}, .cwd = "/", .uid = 0, .gid = 0 },
     };
     var implementation: TestBackend = .{};
     const backend: Backend = .{ .ptr = &implementation, .vtable = &TestBackend.vtable };
@@ -437,7 +454,7 @@ test "backend dispatches lifecycle operations through its vtable" {
     try std.testing.expectEqualStrings("example", implementation.options.?.id);
     try std.testing.expectEqualStrings("/tmp/bundle/rootfs", implementation.options.?.rootfs);
     try std.testing.expectEqualStrings("/tmp/containers/example/exec.fifo", implementation.options.?.exec_fifo);
-    try std.testing.expect(implementation.options.?.spec == &spec);
+    try std.testing.expectEqualDeep(options.process, implementation.options.?.process);
     try std.testing.expect(try backend.alive(handle));
     try std.testing.expectEqualStrings("example", implementation.checked.?.id);
     try std.testing.expectEqual(@as(i32, 1234), implementation.checked.?.pid);

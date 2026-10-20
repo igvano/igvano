@@ -3,7 +3,6 @@ const builtin = @import("builtin");
 const linux = std.os.linux;
 const posix = std.posix;
 const Backend = @import("../../backend.zig").Backend;
-const oci = @import("../../oci.zig");
 const hooks = @import("../hooks.zig");
 const seccomp = @import("../seccomp.zig");
 const dbus = @import("../dbus.zig");
@@ -91,11 +90,7 @@ const CreateNamespaces = struct {
     user_namespace: bool = undefined,
     joined_user_namespace: bool = undefined,
     joins: std.ArrayList(NamespaceJoin) = .empty,
-    uid_mappings: []const oci.Spec.IDMapping = undefined,
-    gid_mappings: []const oci.Spec.IDMapping = undefined,
     container_mappings: Backend.MountMappings = .{},
-    uid_ranges: []Backend.IDMapping = undefined,
-    gid_ranges: []Backend.IDMapping = undefined,
     joined_user_fd: ?posix.fd_t = null,
     joined_user_path: ?[]const u8 = null,
     fifo_uid: u32 = undefined,
@@ -181,16 +176,16 @@ pub fn create(ptr: *anyopaque, options: Backend.CreateOptions) Backend.Error!Bac
 }
 
 fn validateCreate(ctx: *CreateContext) Backend.Error!void {
-    ctx.namespaces.flags = try namespaceFlags(ctx.options.spec.linux);
+    ctx.namespaces.flags = try namespaceFlags(ctx.options.namespaces);
     ctx.namespaces.isolation_flags = ctx.namespaces.flags;
-    for (if (ctx.options.spec.linux) |settings| settings.namespaces orelse &.{} else &.{}) |namespace|
-        ctx.namespaces.isolation_flags |= namespaceFlag(namespace.type);
+    for (ctx.options.namespaces) |namespace|
+        ctx.namespaces.isolation_flags |= namespaceFlag(namespace.kind);
     ctx.namespaces.private_mount_namespace = ctx.namespaces.isolation_flags & linux.CLONE.NEWNS != 0;
     if (!ctx.namespaces.private_mount_namespace and ctx.options.rootfs_propagation != null) {
         reportDiagnostic("cannot change propagation without a private mount namespace", .{});
         return error.InvalidConfig;
     }
-    if (ctx.options.spec.hostname != null and ctx.namespaces.isolation_flags & linux.CLONE.NEWUTS == 0)
+    if (ctx.options.hostname != null and ctx.namespaces.isolation_flags & linux.CLONE.NEWUTS == 0)
         return error.InvalidConfig;
     try validateCreateProcess(ctx);
     try validateDeviceMounts(ctx.options.mounts, ctx.options.devices);
@@ -200,10 +195,10 @@ fn validateCreate(ctx: *CreateContext) Backend.Error!void {
 }
 
 fn validateCreateProcess(ctx: *CreateContext) Backend.Error!void {
-    if (ctx.options.spec.process) |process| {
+    if (ctx.options.process) |process| {
         if (process.args.len == 0) return error.InvalidProcess;
     }
-    const terminal = if (ctx.options.spec.process) |process| process.terminal orelse false else false;
+    const terminal = if (ctx.options.process) |process| process.terminal else false;
     if (terminal != (ctx.options.console_fds != null)) return error.InvalidConfig;
     if (ctx.options.capabilities) |caps| {
         if (caps.ambient & ~(caps.permitted & caps.inheritable) != 0)
@@ -225,9 +220,9 @@ fn prepareCreate(ctx: *CreateContext) Backend.Error!Backend.Handle {
         }
     else
         null;
-    for (if (ctx.options.spec.linux) |settings| settings.namespaces orelse &.{} else &.{}) |namespace| {
+    for (ctx.options.namespaces) |namespace| {
         if (namespace.path) |path| try ctx.namespaces.joins.append(ctx.allocator, .{
-            .flag = namespaceFlag(namespace.type),
+            .flag = namespaceFlag(namespace.kind),
             .path = try pathString(ctx.allocator, path),
         });
     }
@@ -263,23 +258,8 @@ fn prepareCreateMappings(ctx: *CreateContext) Backend.Error!void {
     ctx.namespaces.user_namespace = ctx.namespaces.flags & linux.CLONE.NEWUSER != 0;
     ctx.namespaces.joined_user_namespace = !ctx.namespaces.user_namespace and ctx.namespaces.isolation_flags & linux.CLONE.NEWUSER != 0;
     // Library callers bypass frontend validation, so mapping-presence checks are intentional.
-    ctx.namespaces.uid_mappings = if (ctx.options.spec.linux) |settings| settings.uidMappings orelse &.{} else &.{};
-    ctx.namespaces.gid_mappings = if (ctx.options.spec.linux) |settings| settings.gidMappings orelse &.{} else &.{};
-    if (ctx.namespaces.user_namespace and (ctx.namespaces.uid_mappings.len == 0 or ctx.namespaces.gid_mappings.len == 0)) return error.InvalidConfig;
-    ctx.namespaces.container_mappings = .{};
-    ctx.namespaces.uid_ranges = try ctx.allocator.alloc(Backend.IDMapping, ctx.namespaces.uid_mappings.len);
-    for (ctx.namespaces.uid_mappings, ctx.namespaces.uid_ranges) |mapping, *range| range.* = .{
-        .container_id = mapping.containerID,
-        .host_id = mapping.hostID,
-        .size = mapping.size,
-    };
-    ctx.namespaces.gid_ranges = try ctx.allocator.alloc(Backend.IDMapping, ctx.namespaces.gid_mappings.len);
-    for (ctx.namespaces.gid_mappings, ctx.namespaces.gid_ranges) |mapping, *range| range.* = .{
-        .container_id = mapping.containerID,
-        .host_id = mapping.hostID,
-        .size = mapping.size,
-    };
-    ctx.namespaces.container_mappings = .{ .uid = ctx.namespaces.uid_ranges, .gid = ctx.namespaces.gid_ranges };
+    if (ctx.namespaces.user_namespace and (ctx.options.uid_mappings.len == 0 or ctx.options.gid_mappings.len == 0)) return error.InvalidConfig;
+    ctx.namespaces.container_mappings = .{ .uid = ctx.options.uid_mappings, .gid = ctx.options.gid_mappings };
 }
 
 fn prepareJoinedUserNamespace(ctx: *CreateContext) Backend.Error!Backend.Handle {
@@ -293,7 +273,7 @@ fn prepareJoinedUserNamespace(ctx: *CreateContext) Backend.Error!Backend.Handle 
             ctx.namespaces.joined_user_path = join.path;
             try validateNamespaceFd(fd, linux.CLONE.NEWUSER);
             ctx.namespaces.container_mappings = try joinedUserNamespaceMappings(ctx.allocator, fd);
-            try validateJoinedMappings(ctx.allocator, ctx.namespaces.container_mappings, .{ .uid = ctx.namespaces.uid_ranges, .gid = ctx.namespaces.gid_ranges });
+            try validateJoinedMappings(ctx.allocator, ctx.namespaces.container_mappings, .{ .uid = ctx.options.uid_mappings, .gid = ctx.options.gid_mappings });
             break;
         }
     }
@@ -304,11 +284,11 @@ fn prepareJoinedUserNamespace(ctx: *CreateContext) Backend.Error!Backend.Handle 
 fn prepareCreatePaths(ctx: *CreateContext) Backend.Error!void {
     ctx.namespaces.fifo_uid = if (ctx.namespaces.user_namespace or ctx.namespaces.joined_user_namespace) try mappedRootID(ctx.namespaces.container_mappings.uid) else 0;
     ctx.namespaces.fifo_gid = if (ctx.namespaces.user_namespace or ctx.namespaces.joined_user_namespace) try mappedRootID(ctx.namespaces.container_mappings.gid) else 0;
-    ctx.namespaces.uid_map = try formatIDMappings(ctx.allocator, ctx.namespaces.uid_mappings);
-    ctx.namespaces.gid_map = try formatIDMappings(ctx.allocator, ctx.namespaces.gid_mappings);
+    ctx.namespaces.uid_map = try formatIDMappings(ctx.allocator, ctx.options.uid_mappings);
+    ctx.namespaces.gid_map = try formatIDMappings(ctx.allocator, ctx.options.gid_mappings);
     ctx.init.fifo = try ctx.allocator.dupeZ(u8, ctx.options.exec_fifo);
     ctx.init.rootfs = try processString(ctx.allocator, ctx.options.rootfs);
-    ctx.init.cwd = try processString(ctx.allocator, if (ctx.options.spec.process) |process| process.cwd else "/");
+    ctx.init.cwd = try processString(ctx.allocator, if (ctx.options.process) |process| process.cwd else "/");
     if (!std.fs.path.isAbsolute(ctx.init.cwd)) return error.InvalidProcess;
     if (!std.fs.path.isAbsolute(ctx.init.rootfs)) return error.InvalidPath;
     try probeInheritedRootfs(ctx);
@@ -405,8 +385,8 @@ fn prepareCreateDevices(ctx: *CreateContext) Backend.Error!void {
 }
 
 fn prepareCreateProcess(ctx: *CreateContext) Backend.Error!void {
-    const args: []const []const u8 = if (ctx.options.spec.process) |process| process.args else &.{};
-    const env: []const []const u8 = if (ctx.options.spec.process) |process| process.env orelse &.{} else &.{};
+    const args: []const []const u8 = if (ctx.options.process) |process| process.args else &.{};
+    const env: []const []const u8 = if (ctx.options.process) |process| process.env else &.{};
     ctx.init.argv = try ctx.allocator.allocSentinel(?[*:0]const u8, args.len, null);
     for (args, 0..) |arg, i| ctx.init.argv[i] = (try processString(ctx.allocator, arg)).ptr;
     ctx.init.envp = try ctx.allocator.allocSentinel(?[*:0]const u8, env.len, null);
@@ -599,7 +579,7 @@ fn runInitChild(ctx: *const CreateContext) noreturn {
     const start_input = std.fmt.bufPrint(ctx.init.start_state, "{s}{d}{s}", .{
         ctx.options.start_hook_state.prefix, host_pid, ctx.options.start_hook_state.suffix,
     }) catch linux.exit_group(1);
-    runInit(ctx.options.spec, ctx.init.capabilities, ctx.options.rlimits, ctx.namespaces.isolation_flags, ctx.init.rootfs, ctx.init.mounts, ctx.init.devices, ctx.options.device_symlinks, ctx.init.cwd, ctx.fifo_fd, fd_dir, ctx.init.argv.ptr, ctx.init.envp.ptr, ctx.sync.ready[1], .{
+    runInit(ctx.options.process, ctx.options.hostname, ctx.options.readonly_rootfs, ctx.init.capabilities, ctx.options.rlimits, ctx.namespaces.isolation_flags, ctx.init.rootfs, ctx.init.mounts, ctx.init.devices, ctx.options.device_symlinks, ctx.init.cwd, ctx.fifo_fd, fd_dir, ctx.init.argv.ptr, ctx.init.envp.ptr, ctx.sync.ready[1], .{
         .private_mount_namespace = ctx.namespaces.private_mount_namespace,
         .propagation = ctx.options.rootfs_propagation orelse (linux.MS.PRIVATE | linux.MS.REC),
         .create_hooks = ctx.init.create_hooks,
@@ -904,7 +884,9 @@ fn awaitInitializedInit(ctx: *CreateContext) Backend.Error!CreateResponse {
 }
 
 const InitContext = struct {
-    spec: *const oci.Spec,
+    process: ?Backend.Process,
+    hostname: ?[]const u8,
+    readonly_rootfs: bool,
     capabilities: ?Backend.Capabilities,
     rlimits: []const Backend.Rlimit,
     flags: usize,
@@ -926,7 +908,9 @@ const InitContext = struct {
 };
 
 pub fn runInit(
-    spec: *const oci.Spec,
+    process: ?Backend.Process,
+    hostname: ?[]const u8,
+    readonly_rootfs: bool,
     capabilities: ?Backend.Capabilities,
     rlimits: []const Backend.Rlimit,
     flags: usize,
@@ -947,7 +931,9 @@ pub fn runInit(
     seccomp_program: ?seccomp.Program,
 ) noreturn {
     const init: InitContext = .{
-        .spec = spec,
+        .process = process,
+        .hostname = hostname,
+        .readonly_rootfs = readonly_rootfs,
         .capabilities = capabilities,
         .rlimits = rlimits,
         .flags = flags,
@@ -976,13 +962,13 @@ fn runPreparedInit(init: *const InitContext) noreturn {
     var fifo_buffer: [32]u8 = undefined;
     const fifo_name = std.fmt.bufPrintZ(&fifo_buffer, "{d}", .{init.fifo_fd}) catch unreachable;
     setInitHostname(init);
-    setupRootfs(init.rootfs, init.mounts, init.devices, init.symlinks, init.spec.root.readonly, init.rootfs_options) catch |err| failCreate(init.ready_fd, err);
+    setupRootfs(init.rootfs, init.mounts, init.devices, init.symlinks, init.readonly_rootfs, init.rootfs_options) catch |err| failCreate(init.ready_fd, err);
     checkResult(linux.chdir(init.cwd)) catch |err| failCreate(init.ready_fd, err);
     applyAppArmor(init.apparmor_command) catch |err| failCreate(init.ready_fd, err);
     closeExecFrom(3, init.fd_dir) catch |err| failCreate(init.ready_fd, err);
     applyInitProcess(init, fifo_name);
     var executable_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const executable = if (init.spec.process != null)
+    const executable = if (init.process != null)
         resolveExecutable(init.argv, init.envp, &executable_buffer) catch |err| failCreate(init.ready_fd, err)
     else
         null;
@@ -996,7 +982,7 @@ fn runPreparedInit(init: *const InitContext) noreturn {
 fn setInitHostname(init: *const InitContext) void {
     // Sysctls in setupRootfs may override the configured hostname.
     if (init.flags & linux.CLONE.NEWUTS != 0) {
-        if (init.spec.hostname) |hostname| {
+        if (init.hostname) |hostname| {
             // Zig 0.16 has no sethostname wrapper.
             checkResult(linux.syscall2(.sethostname, @intFromPtr(hostname.ptr), hostname.len)) catch |err| failCreate(init.ready_fd, err);
         }
@@ -1004,15 +990,15 @@ fn setInitHostname(init: *const InitContext) void {
 }
 
 fn applyInitProcess(init: *const InitContext, fifo_name: [:0]const u8) void {
-    if (init.spec.process) |process| {
+    if (init.process) |process| {
         // Allow write-only reopen after setuid while keeping readers root-only.
-        if (process.user.uid != 0)
+        if (process.uid != 0)
             checkResult(linux.fchmodat(init.fd_dir, fifo_name, 0o622)) catch |err| failCreate(init.ready_fd, err);
         applyRlimits(init.rlimits) catch |err| failCreate(init.ready_fd, err);
         // Without NNP the kernel requires CAP_SYS_ADMIN, which applyProcess
-        // may drop. Do not change the OCI noNewPrivileges setting.
+        // may drop. Do not change the no_new_privileges setting.
         // With NNP=true, install after startContainer hooks (unfiltered); NNP=false hooks run filtered, intentionally.
-        if (!process.noNewPrivileges) {
+        if (!process.no_new_privileges) {
             if (init.seccomp_program) |program|
                 installSeccomp(program) catch |err| failCreate(init.ready_fd, err);
         }
@@ -1046,7 +1032,7 @@ fn startInitProcess(init: *const InitContext, executable: ?[*:0]const u8, fd: po
         linux.exit_group(1);
     };
     if (!writeAll(fd, &.{1})) linux.exit_group(1);
-    runProcess(init.spec, executable, init.argv, init.envp, init.seccomp_program) catch |err| {
+    runProcess(init.process, executable, init.argv, init.envp, init.seccomp_program) catch |err| {
         if (err != error.ExecFailed) childError("cannot execute process: ", err);
         _ = writeAll(fd, &.{0});
         linux.exit_group(1);

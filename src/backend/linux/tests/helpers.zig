@@ -3,7 +3,6 @@ const builtin = @import("builtin");
 const linux = std.os.linux;
 const posix = std.posix;
 const Backend = @import("../../../backend.zig").Backend;
-const oci = @import("../../../oci.zig");
 const queryDevicePrograms = @import("../devices.zig").queryDevicePrograms;
 const OPEN_TREE_CLONE = @import("../mount.zig").OPEN_TREE_CLONE;
 const OPEN_TREE_CLOEXEC = @import("../mount.zig").OPEN_TREE_CLOEXEC;
@@ -146,17 +145,20 @@ pub fn testIDMappedBindOwnership(base: []const u8, cgroup_path: []const u8) !voi
         const container_uid: u32 = if (with_userns) 100000 else 0;
         try checkResult(linux.chown(rootfs, container_uid, container_uid));
         try checkResult(linux.chown(source, source_uid, source_uid));
-        const container_mapping: oci.Spec.IDMapping = .{ .containerID = 0, .hostID = 100000, .size = 1 };
-        var spec: oci.Spec = .{
-            .ociVersion = "1.2.0",
-            .root = .{ .path = rootfs },
-            .linux = .{ .namespaces = &.{.{ .type = .mount }} },
+        const container_mapping: []const Backend.IDMapping = &.{.{ .container_id = 0, .host_id = 100000, .size = 1 }};
+        var options: Backend.CreateOptions = .{
+            .allocator = allocator,
+            .id = suffix,
+            .rootfs = rootfs,
+            .exec_fifo = fifo,
+            .namespaces = &.{.{ .kind = .mount }},
+            .cgroup_path = cgroup_path,
         };
-        if (with_userns) spec.linux = .{
-            .namespaces = &.{ .{ .type = .user }, .{ .type = .mount } },
-            .uidMappings = &.{container_mapping},
-            .gidMappings = &.{container_mapping},
-        };
+        if (with_userns) {
+            options.namespaces = &.{ .{ .kind = .user }, .{ .kind = .mount } };
+            options.uid_mappings = container_mapping;
+            options.gid_mappings = container_mapping;
+        }
         var joined_fd: ?posix.fd_t = null;
         defer if (joined_fd) |fd| closeFd(fd);
         if (joined) {
@@ -164,44 +166,33 @@ pub fn testIDMappedBindOwnership(base: []const u8, cgroup_path: []const u8) !voi
             const fd = try createMountUserNamespace(allocator, .{ .uid = ranges, .gid = ranges });
             joined_fd = fd;
             const path = try std.fmt.allocPrintSentinel(allocator, "/proc/self/fd/{d}", .{fd}, 0);
-            spec.linux.?.namespaces = &.{ .{ .type = .user, .path = path }, .{ .type = .mount } };
+            options.namespaces = &.{ .{ .kind = .user, .path = path }, .{ .kind = .mount } };
             if (mode == .joined_without_mappings) {
-                spec.linux.?.uidMappings = null;
-                spec.linux.?.gidMappings = null;
+                options.uid_mappings = &.{};
+                options.gid_mappings = &.{};
             }
         }
         // The mount map translates filesystem IDs to kernel IDs. Thus 0:100000
         // exposes a host-root-owned tree as root in a 0:100000 container.
-        const mapping: oci.Spec.IDMapping = .{ .containerID = source_uid, .hostID = container_uid, .size = 1 };
-        const mappings = try oci.mountMappings(allocator, if (joined) .{
-            .destination = "/data",
-            .type = "bind",
-            .options = &.{"idmap"},
+        const mapping: []const Backend.IDMapping = &.{.{ .container_id = source_uid, .host_id = container_uid, .size = 1 }};
+        const mappings: Backend.MountMappings = if (joined) .{
+            .userns_path = options.namespaces[0].path,
         } else .{
-            .destination = "/data",
-            .type = "bind",
-            .uidMappings = &.{mapping},
-            .gidMappings = &.{mapping},
-        }, spec.linux.?);
+            .uid = mapping,
+            .gid = mapping,
+        };
         var implementation: LinuxBackend = .{};
         const backend = implementation.backend();
-        const handle = try backend.create(.{
-            .allocator = allocator,
-            .id = suffix,
-            .rootfs = rootfs,
-            .exec_fifo = fifo,
-            .spec = &spec,
-            .cgroup_path = cgroup_path,
-            .mounts = &.{.{
-                .destination = "/data",
-                .source = source,
-                .type = null,
-                .flags = linux.MS.BIND,
-                .propagation = 0,
-                .data = "",
-                .mappings = mappings,
-            }},
-        });
+        options.mounts = &.{.{
+            .destination = "/data",
+            .source = source,
+            .type = null,
+            .flags = linux.MS.BIND,
+            .propagation = 0,
+            .data = "",
+            .mappings = mappings,
+        }};
+        const handle = try backend.create(options);
         defer {
             backend.kill(handle, 9) catch {};
             backend.delete(handle) catch {};

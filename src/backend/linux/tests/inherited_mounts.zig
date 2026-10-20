@@ -2,7 +2,6 @@ const std = @import("std");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 const Backend = @import("../../../backend.zig").Backend;
-const oci = @import("../../../oci.zig");
 const checkResult = @import("../syscall.zig").checkResult;
 const forkProcess = @import("../syscall.zig").forkProcess;
 const closeFd = @import("../syscall.zig").closeFd;
@@ -86,29 +85,25 @@ fn testInheritedMountNamespace(rootfs: [:0]const u8, fifo: [:0]const u8, cgroup_
     const namespace_size = linux.readlink("/proc/self/ns/mnt", &namespace_buffer, namespace_buffer.len);
     try checkResult(namespace_size);
     const namespace = namespace_buffer[0..namespace_size];
-    var spec: oci.Spec = .{
-        .ociVersion = "1.0.2",
-        .root = .{ .path = "rootfs", .readonly = true },
-        // Deliberately omit linux entirely: every namespace is inherited.
-        .process = .{
-            .args = &.{
-                "/bin/sh", "-c",
-                \\test "$(readlink /proc/self/ns/mnt)" = "$1" &&
-                \\test "$(cat /marker)" = "container root" &&
-                \\test -f /proc/self/stat && test -c /dev/null &&
-                \\test ! -s /masked-file && test ! -e /masked-dir/secret &&
-                \\test ! -s /bound/masked-file &&
-                \\! ( : > /readonly-file ) 2>/dev/null &&
-                \\! ( : > /bound/readonly-file ) 2>/dev/null &&
-                \\! ( : > /new-root-file ) 2>/dev/null &&
-                \\printf success > /dev/result
-                ,
-                "sh",      namespace,
-            },
-            .env = &.{"PATH=/bin:/usr/bin"},
-            .cwd = "/",
-            .user = .{ .uid = 0, .gid = 0 },
+    const process: Backend.Process = .{
+        .args = &.{
+            "/bin/sh", "-c",
+            \\test "$(readlink /proc/self/ns/mnt)" = "$1" &&
+            \\test "$(cat /marker)" = "container root" &&
+            \\test -f /proc/self/stat && test -c /dev/null &&
+            \\test ! -s /masked-file && test ! -e /masked-dir/secret &&
+            \\test ! -s /bound/masked-file &&
+            \\! ( : > /readonly-file ) 2>/dev/null &&
+            \\! ( : > /bound/readonly-file ) 2>/dev/null &&
+            \\! ( : > /new-root-file ) 2>/dev/null &&
+            \\printf success > /dev/result
+            ,
+            "sh",      namespace,
         },
+        .env = &.{"PATH=/bin:/usr/bin"},
+        .cwd = "/",
+        .uid = 0,
+        .gid = 0,
     };
     var mounts: [7]Backend.Mount = undefined;
     mounts[0] = .{ .destination = "/proc", .source = "proc", .type = "proc", .flags = 0, .propagation = 0, .data = "" };
@@ -150,7 +145,9 @@ fn testInheritedMountNamespace(rootfs: [:0]const u8, fifo: [:0]const u8, cgroup_
         .id = "inherited",
         .rootfs = rootfs,
         .exec_fifo = fifo,
-        .spec = &spec,
+        .process = process,
+        // Deliberately omit namespaces: every namespace is inherited.
+        .readonly_rootfs = true,
         .cgroup_path = cgroup_path,
         .mounts = mounts[0..mount_count],
         .devices = &.{.{ .path = "/dev/null", .kind = .character, .major = 1, .minor = 3 }},
@@ -171,9 +168,9 @@ fn testInheritedMountNamespace(rootfs: [:0]const u8, fifo: [:0]const u8, cgroup_
     options.resources = .{ .unified = &.{.{ .key = "igvano.invalid", .value = "1" }} };
     try std.testing.expectError(error.CgroupWriteFailed, backend.create(options));
     options.resources = .{};
-    spec.linux = .{ .namespaces = &.{.{ .type = .network, .path = "/igvano-missing-namespace" }} };
+    options.namespaces = &.{.{ .kind = .network, .path = "/igvano-missing-namespace" }};
     try std.testing.expectError(error.CreateFailed, backend.create(options));
-    spec.linux = null;
+    options.namespaces = &.{};
     const retained_mounts = try readMountinfo(std.testing.allocator);
     defer std.testing.allocator.free(retained_mounts);
     try std.testing.expectEqualStrings(existing_mounts, retained_mounts);
@@ -196,10 +193,10 @@ fn testInheritedMountNamespace(rootfs: [:0]const u8, fifo: [:0]const u8, cgroup_
     try expectNoRootfsMount(rootfs);
     options.on_create = null;
     // Also exercise a failure after chroot and path restrictions.
-    spec.process.?.cwd = "/missing-cwd";
+    options.process.?.cwd = "/missing-cwd";
     try std.testing.expectError(error.CreateFailed, backend.create(options));
     try expectNoRootfsMount(rootfs);
-    spec.process.?.cwd = "/";
+    options.process.?.cwd = "/";
     const handle = try backend.create(options);
     defer std.testing.allocator.free(handle.starttime);
     defer {
@@ -248,13 +245,11 @@ fn testInheritedMountNamespace(rootfs: [:0]const u8, fifo: [:0]const u8, cgroup_
     try std.testing.expectEqualStrings(before, after);
 
     // A configured root mount covers the self-bind whose identity cleanup owns.
-    // Exercise both "/" and an OCI destination that normalizes to it.
-    for ([_][]const u8{ "/", "/a/.." }) |destination| {
-        const normalized = try oci.resolveMountDestination(std.testing.allocator, destination);
-        defer std.testing.allocator.free(normalized);
+    // Both prepared root destinations are "/".
+    for ([_][]const u8{ "/", "/" }) |destination| {
         const stacked_mounts = [_]Backend.Mount{
             .{
-                .destination = normalized,
+                .destination = destination,
                 .source = source,
                 .type = null,
                 .flags = linux.MS.BIND | linux.MS.REC,
@@ -275,10 +270,10 @@ fn testInheritedMountNamespace(rootfs: [:0]const u8, fifo: [:0]const u8, cgroup_
         try std.testing.expectError(error.HookFailed, backend.create(options));
         try expectNoRootfsMount(rootfs);
         options.on_create = null;
-        spec.process.?.cwd = "/missing-cwd";
+        options.process.?.cwd = "/missing-cwd";
         try std.testing.expectError(error.CreateFailed, backend.create(options));
         try expectNoRootfsMount(rootfs);
-        spec.process.?.cwd = "/";
+        options.process.?.cwd = "/";
         const stacked_handle = try backend.create(options);
         defer std.testing.allocator.free(stacked_handle.starttime);
         defer {

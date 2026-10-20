@@ -3,7 +3,6 @@ const builtin = @import("builtin");
 const linux = std.os.linux;
 const posix = std.posix;
 const Backend = @import("../../../backend.zig").Backend;
-const oci = @import("../../../oci.zig");
 const diagnostics = @import("../diagnostic.zig");
 const checkResult = @import("../syscall.zig").checkResult;
 const forkProcess = @import("../syscall.zig").forkProcess;
@@ -35,11 +34,6 @@ test "linux update requires a persisted cgroup path" {
 
 test "linux backend is unavailable on other platforms" {
     if (comptime builtin.os.tag == .linux) return error.SkipZigTest;
-    const spec: oci.Spec = .{
-        .ociVersion = "1.0.2",
-        .root = .{ .path = "rootfs" },
-        .process = .{ .args = &.{"/bin/sh"}, .cwd = "/", .user = .{ .uid = 0, .gid = 0 } },
-    };
     const handle: Backend.Handle = .{ .id = "example", .pid = 1234, .starttime = "12345" };
     var implementation: LinuxBackend = .{};
     const backend = implementation.backend();
@@ -49,7 +43,7 @@ test "linux backend is unavailable on other platforms" {
             .id = "example",
             .rootfs = "/tmp/bundle/rootfs",
             .exec_fifo = "/tmp/containers/example/exec.fifo",
-            .spec = &spec,
+            .process = .{ .args = &.{"/bin/sh"}, .cwd = "/", .uid = 0, .gid = 0 },
         }));
     }
     try std.testing.expectError(error.NotImplemented, backend.alive(handle));
@@ -144,43 +138,35 @@ test "linux liveness rejects an unreaped zombie even though kill zero succeeds" 
 
 test "linux create rejects hostname without UTS isolation and terminals without a console" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
-    var spec: oci.Spec = .{
-        .ociVersion = "1.0.2",
-        .root = .{ .path = "/" },
-        .hostname = "must-not-change-the-host",
-    };
     var implementation: LinuxBackend = .{};
     const backend = implementation.backend();
-    const options: Backend.CreateOptions = .{
+    var options: Backend.CreateOptions = .{
         .allocator = std.testing.allocator,
         .id = "example",
         .rootfs = "/",
         .exec_fifo = "/dev/null",
-        .spec = &spec,
+        .hostname = "must-not-change-the-host",
     };
     try std.testing.expectError(error.InvalidConfig, backend.create(options));
-    spec.hostname = null;
-    spec.process = .{ .args = &.{"/bin/sh"}, .cwd = "/", .terminal = true, .user = .{ .uid = 0, .gid = 0 } };
+    options.hostname = null;
+    options.process = .{ .args = &.{"/bin/sh"}, .cwd = "/", .terminal = true, .uid = 0, .gid = 0 };
     try std.testing.expectError(error.InvalidConfig, backend.create(options));
 }
 
 test "linux create rejects propagation without mount isolation before acquiring resources" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
-    const spec: oci.Spec = .{ .ociVersion = "1.0.2", .root = .{ .path = "/" } };
     var implementation: LinuxBackend = .{};
     try std.testing.expectError(error.InvalidConfig, implementation.backend().create(.{
         .allocator = std.testing.allocator,
         .id = "example",
         .rootfs = "/",
         .exec_fifo = "/dev/null",
-        .spec = &spec,
         .rootfs_propagation = linux.MS.PRIVATE | linux.MS.REC,
     }));
 }
 
 test "linux inherited mount namespace rejects the runtime root before any mount" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
-    const spec: oci.Spec = .{ .ociVersion = "1.0.2", .root = .{ .path = "/" } };
     var implementation: LinuxBackend = .{};
     for ([_][]const u8{ "/", "/./", "/proc/self/root" }) |rootfs| {
         try std.testing.expectError(error.InvalidConfig, implementation.backend().create(.{
@@ -188,7 +174,6 @@ test "linux inherited mount namespace rejects the runtime root before any mount"
             .id = "example",
             .rootfs = rootfs,
             .exec_fifo = "/dev/null",
-            .spec = &spec,
             // An invalid cgroup path prevents mount setup if this guard regresses.
             .cgroup_path = "",
         }));
@@ -197,18 +182,13 @@ test "linux inherited mount namespace rejects the runtime root before any mount"
 
 test "linux create rejects joining the runtime's own mount namespace" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
-    const spec: oci.Spec = .{
-        .ociVersion = "1.0.2",
-        .root = .{ .path = "/" },
-        .linux = .{ .namespaces = &.{.{ .type = .mount, .path = "/proc/self/ns/mnt" }} },
-    };
     var implementation: LinuxBackend = .{};
     try std.testing.expectError(error.InvalidConfig, implementation.backend().create(.{
         .allocator = std.testing.allocator,
         .id = "example",
         .rootfs = "/",
         .exec_fifo = "/dev/null",
-        .spec = &spec,
+        .namespaces = &.{.{ .kind = .mount, .path = "/proc/self/ns/mnt" }},
         // An invalid cgroup path prevents mount setup if the guard regresses.
         .cgroup_path = "",
     }));
@@ -224,11 +204,6 @@ test "linux create rejects relative process cwd" {
     defer std.testing.allocator.free(rootfs);
     // These paths exist under rootfs, so existence alone cannot validate cwd.
     for ([_][]const u8{ "rootfs", ".", "" }) |cwd| {
-        const spec: oci.Spec = .{
-            .ociVersion = "1.0.2",
-            .root = .{ .path = rootfs },
-            .process = .{ .args = &.{"/bin/sh"}, .cwd = cwd, .user = .{ .uid = 0, .gid = 0 } },
-        };
         var implementation: LinuxBackend = .{};
         const backend = implementation.backend();
         const result = backend.create(.{
@@ -236,7 +211,7 @@ test "linux create rejects relative process cwd" {
             .id = "example",
             .rootfs = rootfs,
             .exec_fifo = "/dev/null",
-            .spec = &spec,
+            .process = .{ .args = &.{"/bin/sh"}, .cwd = cwd, .uid = 0, .gid = 0 },
         });
         if (result) |handle| {
             defer std.testing.allocator.free(handle.starttime);
@@ -251,11 +226,6 @@ test "linux create rejects relative process cwd" {
 }
 
 test "linux create rejects empty process args" {
-    const spec: oci.Spec = .{
-        .ociVersion = "1.0.2",
-        .root = .{ .path = "/" },
-        .process = .{ .args = &.{}, .cwd = "/", .user = .{ .uid = 0, .gid = 0 } },
-    };
     var implementation: LinuxBackend = .{};
     const backend = implementation.backend();
     const cgroup_path = try std.fmt.allocPrint(std.testing.allocator, "igvano/example-{d}", .{
@@ -267,7 +237,7 @@ test "linux create rejects empty process args" {
         .id = "example",
         .rootfs = "/",
         .exec_fifo = "/dev/null",
-        .spec = &spec,
+        .process = .{ .args = &.{}, .cwd = "/", .uid = 0, .gid = 0 },
         .cgroup_path = cgroup_path,
     });
     if (result) |handle| {
@@ -296,14 +266,7 @@ test "linux create rejects a cwd missing from the resolved rootfs" {
     defer std.testing.allocator.free(base);
     const rootfs = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, base, std.testing.allocator);
     defer std.testing.allocator.free(rootfs);
-    // The resolved backend option is authoritative, even when root.path is "/".
     // /proc exists on the Linux host, but not inside this empty rootfs.
-    const spec: oci.Spec = .{
-        .ociVersion = "1.0.2",
-        .root = .{ .path = "/" },
-        .linux = .{ .namespaces = &.{.{ .type = .mount }} },
-        .process = .{ .args = &.{ "/bin/sleep", "1000" }, .cwd = "/proc", .user = .{ .uid = 0, .gid = 0 } },
-    };
     var implementation: LinuxBackend = .{};
     const backend = implementation.backend();
     const cgroup_path = try std.fmt.allocPrint(std.testing.allocator, "igvano/example-{d}", .{
@@ -315,7 +278,8 @@ test "linux create rejects a cwd missing from the resolved rootfs" {
         .id = "example",
         .rootfs = rootfs,
         .exec_fifo = "/dev/null",
-        .spec = &spec,
+        .namespaces = &.{.{ .kind = .mount }},
+        .process = .{ .args = &.{ "/bin/sleep", "1000" }, .cwd = "/proc", .uid = 0, .gid = 0 },
         .cgroup_path = cgroup_path,
     });
     if (result) |handle| {
@@ -331,14 +295,12 @@ test "linux create rejects a cwd missing from the resolved rootfs" {
 
 test "linux create reports the frontend ambient capability validation error" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
-    const spec: oci.Spec = .{ .ociVersion = "1.0.2", .root = .{ .path = "/" } };
     var implementation: LinuxBackend = .{};
     try std.testing.expectError(error.AmbientCapabilitiesRequirePermittedAndInheritable, implementation.backend().create(.{
         .allocator = std.testing.allocator,
         .id = "example",
         .rootfs = "/",
         .exec_fifo = "/dev/null",
-        .spec = &spec,
         .capabilities = .{ .ambient = 1 },
     }));
 }
@@ -375,7 +337,8 @@ test "linux init reopens its root-owned pinned FIFO only for writing after dropp
         applyProcess(.{
             .args = &.{"/bin/true"},
             .cwd = "/",
-            .user = .{ .uid = 1000, .gid = 1000, .additionalGids = &.{} },
+            .uid = 1000,
+            .gid = 1000,
         }, null, &.{}) catch linux.exit_group(3);
         if (linux.errno(linux.openat(fd_dir, name, .{ .ACCMODE = .RDONLY, .NONBLOCK = true, .CLOEXEC = true }, 0)) != .ACCES)
             linux.exit_group(7);
@@ -427,24 +390,19 @@ test "linux create reports child setup failures without leaving an init" {
     const fifo_z = try std.testing.allocator.dupeZ(u8, fifo);
     defer std.testing.allocator.free(fifo_z);
     try checkResult(linux.mknod(fifo_z, linux.S.IFIFO | 0o600, 0));
-    var spec: oci.Spec = .{
-        .ociVersion = "1.0.2",
-        .root = .{ .path = "/" },
-        .linux = .{ .namespaces = &.{.{ .type = .mount }} },
-        .process = .{ .args = &.{"/bin/sh"}, .cwd = missing_cwd, .user = .{ .uid = 0, .gid = 0 } },
-    };
     var implementation: LinuxBackend = .{};
     var options: Backend.CreateOptions = .{
         .allocator = std.testing.allocator,
         .id = "example",
         .rootfs = "/",
         .exec_fifo = fifo,
-        .spec = &spec,
+        .namespaces = &.{.{ .kind = .mount }},
+        .process = .{ .args = &.{"/bin/sh"}, .cwd = missing_cwd, .uid = 0, .gid = 0 },
         .cgroup_path = cgroup_path,
     };
     try std.testing.expectError(error.CreateFailed, implementation.backend().create(options));
     try std.testing.expectEqual(@as(?posix.fd_t, null), try walkCgroup(cgroup_root.fd, cgroup_path, false, &.{}));
-    spec.process.?.cwd = "/";
+    options.process.?.cwd = "/";
     // Linux rejects NOFILE above fs.nr_open even with CAP_SYS_RESOURCE.
     options.rlimits = &.{.{ .resource = .NOFILE, .hard = std.math.maxInt(u64), .soft = 0 }};
     try std.testing.expectError(error.CreateFailed, implementation.backend().create(options));
@@ -459,7 +417,6 @@ test "linux create reports child setup failures without leaving an init" {
     try tmp.dir.createDir(std.testing.io, "rootfs", .default_dir);
     const rootfs = try std.fs.path.join(std.testing.allocator, &.{ absolute_base, "rootfs" });
     defer std.testing.allocator.free(rootfs);
-    spec.root.path = "rootfs";
     options.rootfs = rootfs;
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "rootfs/no-execute",
@@ -467,7 +424,7 @@ test "linux create reports child setup failures without leaving an init" {
         .flags = .{ .permissions = .fromMode(0o644) },
     });
     for ([_][]const u8{ "igvano-no-such-binary", "/igvano-no-such-binary", "/", "/no-execute" }) |arg0| {
-        spec.process.?.args = &.{arg0};
+        options.process.?.args = &.{arg0};
         try std.testing.expectError(error.ExecFailed, implementation.backend().create(options));
         const expected = try std.fmt.allocPrint(std.testing.allocator, "exec: \"{s}\": executable file not found in $PATH", .{arg0});
         defer std.testing.allocator.free(expected);
@@ -496,11 +453,6 @@ test "linux create retains the init child's rootfs diagnostic" {
     const fifo = try std.fmt.allocPrintSentinel(allocator, "{s}/exec.fifo", .{absolute}, 0);
     defer allocator.free(fifo);
     try checkResult(linux.mknod(fifo, linux.S.IFIFO | 0o600, 0));
-    const spec: oci.Spec = .{
-        .ociVersion = "1.0.2",
-        .root = .{ .path = "rootfs" },
-        .linux = .{ .namespaces = &.{.{ .type = .mount }} },
-    };
     var implementation: LinuxBackend = .{};
     const backend = implementation.backend();
     defer diagnostics.last_diagnostic_len = 0;
@@ -510,7 +462,7 @@ test "linux create retains the init child's rootfs diagnostic" {
         .id = "diagnostic",
         .rootfs = rootfs,
         .exec_fifo = fifo,
-        .spec = &spec,
+        .namespaces = &.{.{ .kind = .mount }},
         .cgroup_path = cgroup_path,
         .mounts = &.{.{
             .destination = "/proc",
@@ -587,16 +539,11 @@ test "linux create accepts a prepared executable or process-less rootfs and retu
             defer closeFd(fd);
         }
     };
-    const specs = [_]oci.Spec{
-        .{
-            .ociVersion = "1.0.2",
-            .root = .{ .path = "rootfs" },
-            .linux = .{ .namespaces = &.{ .{ .type = .mount }, .{ .type = .cgroup } } },
-            .process = .{ .args = &.{"/init"}, .cwd = "/", .user = .{ .uid = 0, .gid = 0 } },
-        },
-        .{ .ociVersion = "1.0.2", .root = .{ .path = "rootfs" }, .linux = .{ .namespaces = &.{.{ .type = .mount }} } },
+    const processes = [_]?Backend.Process{
+        .{ .args = &.{"/init"}, .cwd = "/", .uid = 0, .gid = 0 },
+        null,
     };
-    for (specs) |spec| {
+    for (processes) |process| {
         var implementation: LinuxBackend = .{};
         const backend = implementation.backend();
         var callback: Callback = .{ .parent_marker = parent_marker, .child_marker = child_marker, .fail = true };
@@ -605,10 +552,16 @@ test "linux create accepts a prepared executable or process-less rootfs and retu
             .id = "example",
             .rootfs = rootfs,
             .exec_fifo = fifo,
-            .spec = &spec,
+            .process = process,
+            .namespaces = if (process != null) &.{ .{ .kind = .mount }, .{ .kind = .cgroup } } else &.{.{ .kind = .mount }},
             .cgroup_path = cgroup_path,
             .devices = &.{.{ .path = "/dev/null", .kind = .character, .major = 1, .minor = 3 }},
-            .device_symlinks = oci.deviceSymlinks(&.{}),
+            .device_symlinks = &.{
+                .{ .path = "/dev/fd", .target = "/proc/self/fd" },
+                .{ .path = "/dev/stdin", .target = "/proc/self/fd/0" },
+                .{ .path = "/dev/stdout", .target = "/proc/self/fd/1" },
+                .{ .path = "/dev/stderr", .target = "/proc/self/fd/2" },
+            },
             .on_create = .{ .ptr = &callback, .run = Callback.run },
             .create_hooks = &.{.{
                 .path = "/bin/sh",
@@ -643,7 +596,7 @@ test "linux create accepts a prepared executable or process-less rootfs and retu
         try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.kill(handle.pid, @enumFromInt(0))));
         const fifo_stat = try tmp.dir.statFile(std.testing.io, "exec.fifo", .{});
         try std.testing.expectEqual(@as(posix.mode_t, 0o600), fifo_stat.permissions.toMode() & 0o7777);
-        if (spec.process != null) {
+        if (process != null) {
             var path_buffer: [64]u8 = undefined;
             const namespace_path = std.fmt.bufPrintZ(&path_buffer, "/proc/{d}/ns/cgroup", .{handle.pid}) catch unreachable;
             const namespace = try openPath(linux.AT.FDCWD, namespace_path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true });

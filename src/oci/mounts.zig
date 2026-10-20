@@ -221,7 +221,7 @@ pub fn mountMappings(allocator: std.mem.Allocator, mount: Spec.Mount, settings: 
     return .{ .uid = uid, .gid = gid, .userns_path = config.userns_path, .recursive = config.recursive };
 }
 
-fn backendIDMappings(allocator: std.mem.Allocator, mappings: []const Spec.IDMapping) ![]Backend.IDMapping {
+pub fn backendIDMappings(allocator: std.mem.Allocator, mappings: []const Spec.IDMapping) ![]Backend.IDMapping {
     const result = try allocator.alloc(Backend.IDMapping, mappings.len);
     for (mappings, result) |mapping, *converted| converted.* = .{
         .container_id = mapping.containerID,

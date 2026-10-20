@@ -278,13 +278,11 @@ test "backend error detail survives cleanup overwriting the borrowed buffer" {
     var detail = "original create failure".*;
     var implementation: LockTestBackend = .{ .detail = &detail };
     const backend: Backend = .{ .ptr = &implementation, .vtable = &LockTestBackend.vtable };
-    const spec: oci.Spec = .{ .ociVersion = "1.0.2", .root = .{ .path = "rootfs" } };
     try std.testing.expectError(error.NotImplemented, backendResult(backend, backend.create(.{
         .allocator = std.testing.allocator,
         .id = "example",
         .rootfs = "/bundle/rootfs",
         .exec_fifo = "/runtime/example/exec.fifo",
-        .spec = &spec,
     })));
     const handle: Backend.Handle = .{ .id = "example", .pid = 1234, .starttime = "alive" };
     @memset(&detail, 'x');

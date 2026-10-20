@@ -4,6 +4,19 @@ const validationError = @import("diagnostic.zig").validationError;
 const invalidConfig = @import("diagnostic.zig").invalidConfig;
 const Spec = @import("spec.zig").Spec;
 
+pub fn processConfig(process: Spec.Process) Backend.Process {
+    return .{
+        .args = process.args,
+        .env = process.env orelse &.{},
+        .cwd = process.cwd,
+        .terminal = process.terminal orelse false,
+        .uid = process.user.uid,
+        .gid = process.user.gid,
+        .additional_gids = process.user.additionalGids orelse &.{},
+        .no_new_privileges = process.noNewPrivileges,
+    };
+}
+
 pub const capability_names = names: {
     var result: [std.os.linux.CAP.LAST_CAP + 1][]const u8 = undefined;
     for (std.meta.declarations(std.os.linux.CAP)) |decl| {

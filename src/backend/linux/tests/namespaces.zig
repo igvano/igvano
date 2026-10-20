@@ -3,7 +3,6 @@ const builtin = @import("builtin");
 const linux = std.os.linux;
 const posix = std.posix;
 const Backend = @import("../../../backend.zig").Backend;
-const oci = @import("../../../oci.zig");
 const checkResult = @import("../syscall.zig").checkResult;
 const forkProcess = @import("../syscall.zig").forkProcess;
 const closeFd = @import("../syscall.zig").closeFd;
@@ -99,20 +98,6 @@ test "linux mapped init acknowledges start without path access to its private st
     const fifo = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/state/exec.fifo", .{absolute}, 0);
     defer std.testing.allocator.free(fifo);
     try checkResult(linux.mknod(fifo, linux.S.IFIFO | 0o600, 0));
-    const spec: oci.Spec = .{
-        .ociVersion = "1.0.2",
-        .root = .{ .path = "rootfs" },
-        .linux = .{
-            .namespaces = &.{ .{ .type = .user }, .{ .type = .mount }, .{ .type = .pid } },
-            .uidMappings = &.{.{ .containerID = 0, .hostID = 100000, .size = 2 }},
-            .gidMappings = &.{.{ .containerID = 0, .hostID = 200000, .size = 2 }},
-        },
-        .process = .{
-            .args = &.{"/init"},
-            .cwd = "/",
-            .user = .{ .uid = 1, .gid = 1 },
-        },
-    };
     var implementation: LinuxBackend = .{};
     const backend = implementation.backend();
     const handle = try backend.create(.{
@@ -120,7 +105,10 @@ test "linux mapped init acknowledges start without path access to its private st
         .id = "private",
         .rootfs = rootfs,
         .exec_fifo = fifo,
-        .spec = &spec,
+        .namespaces = &.{ .{ .kind = .user }, .{ .kind = .mount }, .{ .kind = .pid } },
+        .uid_mappings = &.{.{ .container_id = 0, .host_id = 100000, .size = 2 }},
+        .gid_mappings = &.{.{ .container_id = 0, .host_id = 200000, .size = 2 }},
+        .process = .{ .args = &.{"/init"}, .cwd = "/", .uid = 1, .gid = 1 },
         .cgroup_path = cgroup_path,
     });
     defer std.testing.allocator.free(handle.starttime);
@@ -206,33 +194,23 @@ test "linux mapped create installs maps outside init and cleans up rejected maps
     const fifo = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/exec.fifo", .{absolute}, 0);
     defer std.testing.allocator.free(fifo);
     try checkResult(linux.mknod(fifo, linux.S.IFIFO | 0o600, 0));
-    var spec: oci.Spec = .{
-        .ociVersion = "1.0.2",
-        .root = .{ .path = "rootfs", .readonly = true },
-        .linux = .{
-            .namespaces = &.{ .{ .type = .user }, .{ .type = .mount }, .{ .type = .pid } },
-            // Distinct container ranges with overlapping host ranges: the
-            // kernel rejects uid_map after gid_map is written.
-            .uidMappings = &.{
-                .{ .containerID = 0, .hostID = 100000, .size = 2 },
-                .{ .containerID = 2, .hostID = 100001, .size = 1 },
-            },
-            .gidMappings = &.{.{ .containerID = 0, .hostID = 200000, .size = 10 }},
-        },
-        .process = .{
-            .args = &.{"/init"},
-            .cwd = "/",
-            .user = .{ .uid = 0, .gid = 0, .additionalGids = &.{ 1, 2 } },
-        },
-    };
     var implementation: LinuxBackend = .{};
     const backend = implementation.backend();
-    const options: Backend.CreateOptions = .{
+    var options: Backend.CreateOptions = .{
         .allocator = std.testing.allocator,
         .id = "mapped",
         .rootfs = rootfs,
         .exec_fifo = fifo,
-        .spec = &spec,
+        .readonly_rootfs = true,
+        .namespaces = &.{ .{ .kind = .user }, .{ .kind = .mount }, .{ .kind = .pid } },
+        // Distinct container ranges with overlapping host ranges: the
+        // kernel rejects uid_map after gid_map is written.
+        .uid_mappings = &.{
+            .{ .container_id = 0, .host_id = 100000, .size = 2 },
+            .{ .container_id = 2, .host_id = 100001, .size = 1 },
+        },
+        .gid_mappings = &.{.{ .container_id = 0, .host_id = 200000, .size = 10 }},
+        .process = .{ .args = &.{"/init"}, .cwd = "/", .uid = 0, .gid = 0, .additional_gids = &.{ 1, 2 } },
         // Creating /dev/pts on the namespace-owned tmpfs needs mapped
         // fsuid/fsgid; unmapped host-root would fail mkdirat with EOVERFLOW.
         .mounts = &.{
@@ -248,12 +226,17 @@ test "linux mapped create installs maps outside init and cleans up rejected maps
             .{ .path = "/dev/pipe", .kind = .fifo, .mode = 0o620, .uid = 1, .gid = 2 },
         },
         .oom_score_adj = 500,
-        .device_symlinks = oci.deviceSymlinks(&.{}),
+        .device_symlinks = &.{
+            .{ .path = "/dev/fd", .target = "/proc/self/fd" },
+            .{ .path = "/dev/stdin", .target = "/proc/self/fd/0" },
+            .{ .path = "/dev/stdout", .target = "/proc/self/fd/1" },
+            .{ .path = "/dev/stderr", .target = "/proc/self/fd/2" },
+        },
         .cgroup_path = cgroup_path,
     };
     try std.testing.expectError(error.InvalidConfig, backend.create(options));
     try std.testing.expectEqual(@as(?posix.fd_t, null), try walkCgroup(cgroup_root.fd, cgroup_path, false, &.{}));
-    spec.linux.?.uidMappings = &.{.{ .containerID = 0, .hostID = 100000, .size = 10 }};
+    options.uid_mappings = &.{.{ .container_id = 0, .host_id = 100000, .size = 10 }};
     const handle = try backend.create(options);
     defer std.testing.allocator.free(handle.starttime);
     defer {
@@ -325,27 +308,25 @@ test "linux mapped create installs maps outside init and cleans up rejected maps
         try checkResult(linux.mknod(joined_fifo, linux.S.IFIFO | 0o600, 0));
         const joined_cgroup = try std.fmt.allocPrint(std.testing.allocator, "{s}-joined-{s}-{d}", .{ cgroup_path, if (with_mappings) "mapped" else "unmapped", case.uid });
         defer std.testing.allocator.free(joined_cgroup);
-        var joined_spec = spec;
-        joined_spec.linux.?.namespaces = &.{ .{ .type = .mount }, .{ .type = .user, .path = user_path }, .{ .type = .pid } };
-        joined_spec.process.?.user.uid = case.uid;
-        if (!with_mappings) {
-            joined_spec.linux.?.uidMappings = null;
-            joined_spec.linux.?.gidMappings = null;
-        }
         var joined_options = options;
+        joined_options.namespaces = &.{ .{ .kind = .mount }, .{ .kind = .user, .path = user_path }, .{ .kind = .pid } };
+        joined_options.process.?.uid = case.uid;
+        if (!with_mappings) {
+            joined_options.uid_mappings = &.{};
+            joined_options.gid_mappings = &.{};
+        }
         joined_options.id = "joined";
-        joined_options.spec = &joined_spec;
         joined_options.exec_fifo = joined_fifo;
         joined_options.cgroup_path = joined_cgroup;
         if (with_mappings) {
-            joined_spec.linux.?.uidMappings = &.{.{ .containerID = 0, .hostID = 100001, .size = 10 }};
+            joined_options.uid_mappings = &.{.{ .container_id = 0, .host_id = 100001, .size = 10 }};
             try std.testing.expectError(error.InvalidConfig, backend.create(joined_options));
             try std.testing.expectEqualStrings("user namespace mappings do not match the joined namespace", backend.diagnostic().?);
-            joined_spec.linux.?.uidMappings = spec.linux.?.uidMappings;
-            joined_spec.linux.?.gidMappings = &.{.{ .containerID = 0, .hostID = 200001, .size = 10 }};
+            joined_options.uid_mappings = options.uid_mappings;
+            joined_options.gid_mappings = &.{.{ .container_id = 0, .host_id = 200001, .size = 10 }};
             try std.testing.expectError(error.InvalidConfig, backend.create(joined_options));
             try std.testing.expectEqualStrings("user namespace mappings do not match the joined namespace", backend.diagnostic().?);
-            joined_spec.linux.?.gidMappings = spec.linux.?.gidMappings;
+            joined_options.gid_mappings = options.gid_mappings;
             try std.testing.expectEqual(@as(?posix.fd_t, null), try walkCgroup(cgroup_root.fd, joined_cgroup, false, &.{}));
         }
         // Lowering requires host CAP_SYS_RESOURCE even when joining a user
@@ -388,16 +369,14 @@ test "linux mapped create installs maps outside init and cleans up rejected maps
     if (caps[0].effective & (@as(u32, 1) << linux.CAP.SYS_RESOURCE) != 0) {
         // Identity maps isolate loss of host CAP_SYS_RESOURCE from the proc
         // ownership failure exercised by the nonidentity maps above.
-        var lowered_spec = spec;
-        lowered_spec.linux.?.uidMappings = &.{.{ .containerID = 0, .hostID = 0, .size = 10 }};
-        lowered_spec.linux.?.gidMappings = &.{.{ .containerID = 0, .hostID = 0, .size = 10 }};
         const lowered_fifo = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/lowered.fifo", .{absolute}, 0);
         defer std.testing.allocator.free(lowered_fifo);
         try checkResult(linux.mknod(lowered_fifo, linux.S.IFIFO | 0o600, 0));
         const lowered_cgroup = try std.fmt.allocPrint(std.testing.allocator, "{s}-lowered", .{cgroup_path});
         defer std.testing.allocator.free(lowered_cgroup);
         var lowered_options = options;
-        lowered_options.spec = &lowered_spec;
+        lowered_options.uid_mappings = &.{.{ .container_id = 0, .host_id = 0, .size = 10 }};
+        lowered_options.gid_mappings = &.{.{ .container_id = 0, .host_id = 0, .size = 10 }};
         lowered_options.exec_fifo = lowered_fifo;
         lowered_options.cgroup_path = lowered_cgroup;
         lowered_options.oom_score_adj = -500;

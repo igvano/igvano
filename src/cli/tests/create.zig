@@ -11,6 +11,7 @@ const createContainer = @import("../create.zig").createContainer;
 test "create uses private state directories and preserves existing root permissions" {
     const TestBackend = struct {
         state_mode: ?std.posix.mode_t = null,
+        configured: bool = false,
         const vtable: Backend.VTable = .{ .create = create, .alive = alive, .kill = kill, .killAll = kill, .delete = delete };
 
         fn create(ptr: *anyopaque, options: Backend.CreateOptions) Backend.Error!Backend.Handle {
@@ -19,6 +20,32 @@ test "create uses private state directories and preserves existing root permissi
             const stat = std.Io.Dir.cwd().statFile(std.testing.io, state_dir, .{}) catch return error.InvalidPath;
             // Inspect the real directory before setup failure rolls it back.
             self.state_mode = stat.permissions.toMode() & 0o7777;
+            if (self.configured) {
+                std.testing.expectEqualDeep(@as(?Backend.Process, .{
+                    .args = &.{"/bin/sh"},
+                    .env = &.{"PATH=/bin"},
+                    .cwd = "/work",
+                    .uid = 1000,
+                    .gid = 1001,
+                    .additional_gids = &.{42},
+                    .no_new_privileges = true,
+                }), options.process) catch return error.InvalidConfig;
+                std.testing.expectEqualDeep(@as([]const Backend.Namespace, &.{
+                    .{ .kind = .pid },    .{ .kind = .network, .path = "/proc/1234/ns/net" },
+                    .{ .kind = .mount },  .{ .kind = .ipc },
+                    .{ .kind = .uts },    .{ .kind = .user },
+                    .{ .kind = .cgroup }, .{ .kind = .time },
+                }), options.namespaces) catch return error.InvalidConfig;
+                std.testing.expectEqualDeep(@as([]const Backend.IDMapping, &.{.{ .container_id = 0, .host_id = 100000, .size = 65536 }}), options.uid_mappings) catch return error.InvalidConfig;
+                std.testing.expectEqualDeep(@as([]const Backend.IDMapping, &.{.{ .container_id = 0, .host_id = 200000, .size = 65536 }}), options.gid_mappings) catch return error.InvalidConfig;
+                std.testing.expectEqualStrings("container", options.hostname orelse return error.InvalidConfig) catch return error.InvalidConfig;
+                if (!options.readonly_rootfs) return error.InvalidConfig;
+            } else {
+                if (options.process != null or options.uid_mappings.len != 0 or options.gid_mappings.len != 0 or
+                    options.hostname != null or options.readonly_rootfs)
+                    return error.InvalidConfig;
+                std.testing.expectEqualDeep(@as([]const Backend.Namespace, &.{.{ .kind = .mount }}), options.namespaces) catch return error.InvalidConfig;
+            }
             const device_nodes = loadDeviceNodes(std.testing.allocator, std.testing.io, std.fs.path.dirname(state_dir).?, options.id) catch return error.InvalidConfig;
             defer oci.freeDevices(std.testing.allocator, device_nodes);
             std.testing.expectEqualDeep(options.devices, device_nodes) catch return error.InvalidConfig;
@@ -65,6 +92,21 @@ test "create uses private state directories and preserves existing root permissi
     }
     const parent = try tmp.dir.statFile(std.testing.io, "new", .{});
     try std.testing.expectEqual(@as(std.posix.mode_t, 0o700), parent.permissions.toMode() & 0o7777);
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "bundle/config.json",
+        .data =
+        \\{"ociVersion":"1.0.2","root":{"path":"/","readonly":true},"hostname":"container","process":{"args":["/bin/sh"],"env":["PATH=/bin"],"cwd":"/work","user":{"uid":1000,"gid":1001,"additionalGids":[42]},"noNewPrivileges":true},"linux":{"namespaces":[{"type":"pid"},{"type":"network","path":"/proc/1234/ns/net"},{"type":"mount"},{"type":"ipc"},{"type":"uts"},{"type":"user"},{"type":"cgroup"},{"type":"time"}],"uidMappings":[{"containerID":0,"hostID":100000,"size":65536}],"gidMappings":[{"containerID":0,"hostID":200000,"size":65536}]}}
+        ,
+    });
+    const configured_root = try std.fs.path.join(std.testing.allocator, &.{ base, "configured" });
+    defer std.testing.allocator.free(configured_root);
+    var configured_backend: TestBackend = .{ .configured = true };
+    try std.testing.expectError(error.NotImplemented, createContainer(std.testing.allocator, std.testing.io, .{
+        .ptr = &configured_backend,
+        .vtable = &TestBackend.vtable,
+    }, .{ .root = configured_root, .subcommand = .create, .id = "example", .bundle = bundle }));
+    if (comptime builtin.os.tag == .linux)
+        try std.testing.expectEqual(@as(?std.posix.mode_t, 0o700), configured_backend.state_mode);
 }
 
 test "create rejects a duplicate id without changing existing state" {
@@ -289,6 +331,15 @@ test "create with inherited mount isolation persists backend resources and rolls
                 .soft = 512,
             })) return error.InvalidConfig;
             if (options.oom_score_adj != 100) return error.InvalidConfig;
+            std.testing.expectEqualDeep(@as(?Backend.Process, .{
+                .args = &.{"/bin/sh"},
+                .cwd = "/",
+                .uid = 1000,
+                .gid = 1000,
+            }), options.process) catch return error.InvalidConfig;
+            if (options.hostname != null or options.readonly_rootfs or
+                options.uid_mappings.len != 0 or options.gid_mappings.len != 0)
+                return error.InvalidConfig;
             if (options.devices.len != 6 or
                 !std.mem.eql(u8, options.devices[0].path, "/dev/null") or
                 options.devices[0].kind != .character or options.devices[0].mode != 0o600 or

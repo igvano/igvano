@@ -53,12 +53,14 @@ pub const validateMountDestination = @import("oci/mounts.zig").validateMountDest
 pub const resolveMountDestination = @import("oci/mounts.zig").resolveMountDestination;
 pub const validateIDMappings = @import("oci/mounts.zig").validateIDMappings;
 pub const mountMappings = @import("oci/mounts.zig").mountMappings;
+pub const backendIDMappings = @import("oci/mounts.zig").backendIDMappings;
 
 pub const capability_names = @import("oci/process.zig").capability_names;
 pub const capabilityNumber = @import("oci/process.zig").capabilityNumber;
 pub const rlimitResource = @import("oci/process.zig").rlimitResource;
 pub const processCapabilities = @import("oci/process.zig").processCapabilities;
 pub const processRlimits = @import("oci/process.zig").processRlimits;
+pub const processConfig = @import("oci/process.zig").processConfig;
 
 pub const prepareSeccomp = @import("oci/seccomp.zig").prepareSeccomp;
 pub const freeSeccomp = @import("oci/seccomp.zig").freeSeccomp;
