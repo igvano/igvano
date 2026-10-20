@@ -1,7 +1,7 @@
 const std = @import("std");
 const oci = @import("igvano").oci;
-const backend_module = @import("igvano").backend;
-const Backend = backend_module.Backend;
+const libcontainer = @import("libcontainer");
+const Backend = libcontainer.Backend;
 const diagnostics = @import("diagnostic.zig");
 const backendResult = @import("diagnostic.zig").backendResult;
 const Config = @import("args.zig").Config;
@@ -162,7 +162,7 @@ test "forced delete of a missing container succeeds while ordinary delete errors
     defer tmp.cleanup();
     const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
     defer std.testing.allocator.free(root);
-    var implementation: backend_module.LinuxBackend = .{};
+    var implementation: libcontainer.LinuxBackend = .{};
     const config: Config = .{ .root = root, .subcommand = .delete, .id = "missing" };
     try std.testing.expectError(error.FileNotFound, deleteContainer(std.testing.allocator, std.testing.io, implementation.backend(), config));
     var forced = config;

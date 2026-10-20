@@ -1,8 +1,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const oci = @import("igvano").oci;
-const backend_module = @import("igvano").backend;
-const Backend = backend_module.Backend;
+const libcontainer = @import("libcontainer");
+const Backend = libcontainer.Backend;
 const Subcommand = @import("../args.zig").Subcommand;
 const Config = @import("../args.zig").Config;
 const parseArgs = @import("../args.zig").parseArgs;
@@ -75,7 +75,7 @@ test "linux lifecycle waits for exec FIFO EOF and persists running then stopped"
         .bundle = bundle,
     });
     try saveTestStarttime(root, pid);
-    var implementation: backend_module.LinuxBackend = .{};
+    var implementation: libcontainer.LinuxBackend = .{};
     const backend = implementation.backend();
     const config: Config = .{ .root = root, .subcommand = .start, .id = "example" };
     try killContainer(std.testing.allocator, std.testing.io, backend, .{ .root = root, .subcommand = .kill, .id = "example", .signal = "0" });
@@ -178,7 +178,7 @@ test "linux kill all succeeds on stopped containers while plain kill fails" {
         }
     }
     reaped = true;
-    var implementation: backend_module.LinuxBackend = .{};
+    var implementation: libcontainer.LinuxBackend = .{};
     const backend = implementation.backend();
     const all = try parseArgs(&.{ "igvano", "--root", root, "kill", "--all", "example", "9" });
     const plain = try parseArgs(&.{ "igvano", "--root", root, "kill", "example", "9" });
@@ -348,7 +348,7 @@ test "linux state kill and delete refresh stale creating created and running sta
     defer tmp.cleanup();
     const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
     defer std.testing.allocator.free(root);
-    var implementation: backend_module.LinuxBackend = .{};
+    var implementation: libcontainer.LinuxBackend = .{};
     const backend = implementation.backend();
     for ([_]oci.Status{ .creating, .created, .running, .paused }) |status| {
         for ([_]Subcommand{ .state, .kill, .delete }) |subcommand| {

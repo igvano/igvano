@@ -1,8 +1,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const oci = @import("igvano").oci;
-const backend_module = @import("igvano").backend;
-const Backend = backend_module.Backend;
+const libcontainer = @import("libcontainer");
+const Backend = libcontainer.Backend;
 const Config = @import("../args.zig").Config;
 const lockContainer = @import("../state.zig").lockContainer;
 const createContainer = @import("../create.zig").createContainer;
@@ -62,7 +62,7 @@ pub fn execTestCommand(config: Config, stdout: ?std.posix.fd_t) !u8 {
             if (linux.errno(linux.dup2(fd, 1)) != .SUCCESS) linux.exit_group(1);
         }
         var threaded: std.Io.Threaded = .init_single_threaded;
-        var implementation: backend_module.LinuxBackend = .{};
+        var implementation: libcontainer.LinuxBackend = .{};
         const status = execContainer(std.heap.page_allocator, threaded.io(), implementation.backend(), config) catch linux.exit_group(1);
         linux.exit_group(status);
     }
@@ -164,7 +164,7 @@ pub const LockTestProcess = struct {
         const linux = std.os.linux;
         const path_z = try std.testing.allocator.dupeZ(u8, path);
         defer std.testing.allocator.free(path_z);
-        const sockets = try backend_module.console.socketpair();
+        const sockets = try libcontainer.console.socketpair();
         const result = linux.fork();
         if (linux.errno(result) != .SUCCESS) {
             for (sockets) |fd| _ = linux.close(fd);
@@ -196,7 +196,7 @@ pub const LockTestProcess = struct {
 
     pub fn commandWithBackend(config: Config, expected_error: ?anyerror, backend: Backend) !LockTestProcess {
         const linux = std.os.linux;
-        const sockets = try backend_module.console.socketpair();
+        const sockets = try libcontainer.console.socketpair();
         const result = linux.fork();
         if (linux.errno(result) != .SUCCESS) {
             for (sockets) |fd| _ = linux.close(fd);

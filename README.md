@@ -97,24 +97,30 @@ Note: Nix flakes only see files tracked by git — `git add` new files before
 Pre-commit hooks run through [prek](https://github.com/j178/prek): `zig fmt --check`, and `cccc` enforcing the `cccc.toml` complexity limits (cognitive 25, cyclomatic 15 per function; `tests/` and `test/` exempt) on the staged files and on all of `src/`. Both tools come from the devShell. With a global `core.hooksPath` (e.g. a corporate hook that chains to local hooks), put `exec nix develop -c prek run --hook-stage pre-commit` in `.git/hooks/pre-commit` instead of `prek install`.
 
 ```sh
-# unit tests (library + CLI), run on any OS; Linux-only tests skip on macOS
+# unit tests (libcontainer + igvano library + CLI), run on any OS; Linux-only tests skip on macOS
 nix develop -c zig build test
 
 # one file's tests directly
-nix develop -c zig test --dep igvano -Mroot=src/main.zig -Migvano=src/lib.zig
+# Doubled --dep libcontainer is intentional: one for root, one for igvano.
+nix develop -c zig test --dep igvano --dep libcontainer -Mroot=src/main.zig \
+  --dep libcontainer -Migvano=src/lib.zig -Mlibcontainer=src/libcontainer/root.zig
 ```
 
 The Linux tests need root. Cross-compile the test binaries and run them in a
 privileged container or a Linux VM:
 
 ```sh
-nix develop -c zig test src/lib.zig --test-no-exec -target x86_64-linux-musl -femit-bin=zig-out/lib-tests-linux
+nix develop -c zig test src/libcontainer/root.zig --test-no-exec -target x86_64-linux-musl -femit-bin=zig-out/libcontainer-tests-linux
+nix develop -c zig test --test-no-exec -target x86_64-linux-musl -femit-bin=zig-out/lib-tests-linux \
+  --dep libcontainer -Mroot=src/lib.zig -Mlibcontainer=src/libcontainer/root.zig
+# Doubled --dep libcontainer is intentional: one for root, one for igvano.
 nix develop -c zig test --test-no-exec -target x86_64-linux-musl -femit-bin=zig-out/main-tests-linux \
-  --dep igvano -Mroot=src/main.zig -Migvano=src/lib.zig
+  --dep igvano --dep libcontainer -Mroot=src/main.zig \
+  --dep libcontainer -Migvano=src/lib.zig -Mlibcontainer=src/libcontainer/root.zig
 nix develop -c zig build-exe src/test/seccomp-probe.zig -target x86_64-linux-musl -femit-bin=zig-out/seccomp-probe-x86_64
 docker run --rm --init --privileged --platform linux/amd64 -v "$PWD/zig-out:/bins:ro" debian:bookworm-slim sh -c \
   'apt-get update -qq && apt-get install -y -qq procps >/dev/null; cp /bins/*-tests-linux /bins/seccomp-probe-x86_64 /tmp/ &&
-   mkdir -p /tmp/work && cd /tmp/work && /tmp/lib-tests-linux &&
+   mkdir -p /tmp/work && cd /tmp/work && /tmp/libcontainer-tests-linux && /tmp/lib-tests-linux &&
    IGVANO_SECCOMP_PROBE=/tmp/seccomp-probe-x86_64 /tmp/main-tests-linux'
 ```
 
@@ -162,16 +168,16 @@ containerd's CRI plugin. On both cgroup v1 and v2 the results match runc's.
   validation, and translation to backend types (resources, devices, mounts,
   process, seccomp, sysctls, systemd paths), `features`; fixture tests in
   `src/oci/tests/`
-- `src/backend.zig` — backend interface (vtable); isolation is pluggable by design
-- `src/backend/linux.zig` + `src/backend/linux/` — the namespace/cgroup backend
+- `src/libcontainer/root.zig` — standalone `libcontainer` module and backend interface (vtable); isolation is pluggable by design
+- `src/libcontainer/linux.zig` + `src/libcontainer/linux/` — the namespace/cgroup backend
   (the only one implemented): `linux.zig` holds `LinuxBackend` and its vtable;
   the implementation is split by area (cgroup v1/v2, freezer, systemd, devices,
   mounts, rootfs, namespaces, process, procfs, console, create, exec);
-  end-to-end tests in `src/backend/linux/tests/`
-- `src/backend/seccomp.zig` — seccomp BPF compiler
-- `src/backend/devices.zig`, `devicefilter.zig` — device-cgroup emulator and v2 BPF device filter
-- `src/backend/dbus.zig` — minimal D-Bus client for the systemd driver
-- `src/backend/hooks.zig` — hook execution
+  end-to-end tests in `src/libcontainer/linux/tests/`
+- `src/libcontainer/seccomp.zig` — seccomp BPF compiler
+- `src/libcontainer/devices.zig`, `devicefilter.zig` — device-cgroup emulator and v2 BPF device filter
+- `src/libcontainer/dbus.zig` — minimal D-Bus client for the systemd driver
+- `src/libcontainer/hooks.zig` — hook execution
 - `hack/conformance.sh` — runtime-tools conformance harness
 
 Small unit tests sit next to the code they test; tests that run real

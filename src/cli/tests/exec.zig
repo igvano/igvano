@@ -1,8 +1,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const oci = @import("igvano").oci;
-const backend_module = @import("igvano").backend;
-const Backend = backend_module.Backend;
+const libcontainer = @import("libcontainer");
+const Backend = libcontainer.Backend;
 const attached = @import("../../attached.zig");
 const diagnostics = @import("../diagnostic.zig");
 const Config = @import("../args.zig").Config;
@@ -155,7 +155,7 @@ fn testExecLifecycle(base: []const u8) !void {
     // Stand in for the shim, so detached children and init can be reaped.
     if (linux.errno(linux.prctl(@intFromEnum(linux.PR.SET_CHILD_SUBREAPER), 1, 0, 0, 0)) != .SUCCESS)
         return error.SubreaperFailed;
-    var implementation: backend_module.LinuxBackend = .{};
+    var implementation: libcontainer.LinuxBackend = .{};
     const backend = implementation.backend();
     var config: Config = .{ .root = root, .id = "example", .subcommand = .create, .bundle = bundle };
     try createContainer(allocator, io, backend, config);
@@ -471,7 +471,7 @@ fn testAttachedExec(allocator: std.mem.Allocator, io: std.Io, root: []const u8) 
     if (runner_pid == 0) {
         if (linux.errno(linux.dup2(capture[1], 1)) != .SUCCESS) linux.exit_group(1);
         var threaded: std.Io.Threaded = .init_single_threaded;
-        var implementation: backend_module.LinuxBackend = .{};
+        var implementation: libcontainer.LinuxBackend = .{};
         const status = execContainer(std.heap.page_allocator, threaded.io(), implementation.backend(), command) catch linux.exit_group(1);
         linux.exit_group(status);
     }
@@ -516,7 +516,7 @@ fn testAttachedExec(allocator: std.mem.Allocator, io: std.Io, root: []const u8) 
         _ = linux.close(terminal[0]);
         if (linux.errno(linux.dup2(terminal[1], 0)) != .SUCCESS or linux.errno(linux.dup2(terminal[1], 1)) != .SUCCESS) linux.exit_group(1);
         var threaded: std.Io.Threaded = .init_single_threaded;
-        var implementation: backend_module.LinuxBackend = .{};
+        var implementation: libcontainer.LinuxBackend = .{};
         const status = execContainer(std.heap.page_allocator, threaded.io(), implementation.backend(), tty_command) catch linux.exit_group(1);
         linux.exit_group(status);
     }
@@ -562,12 +562,12 @@ fn testAttachedExec(allocator: std.mem.Allocator, io: std.Io, root: []const u8) 
     if (closed_pid == 0) {
         for ([_]std.posix.fd_t{ 0, 1, 2 }) |fd| _ = linux.close(fd);
         var threaded: std.Io.Threaded = .init_single_threaded;
-        var backend: backend_module.LinuxBackend = .{};
+        var backend: libcontainer.LinuxBackend = .{};
         const status = execContainer(std.heap.page_allocator, threaded.io(), backend.backend(), closed_stdin) catch linux.exit_group(1);
         linux.exit_group(status);
     }
     try std.testing.expectEqual(@as(u8, 0), try waitExec(closed_pid));
-    var implementation: backend_module.LinuxBackend = .{};
+    var implementation: libcontainer.LinuxBackend = .{};
     const detached = try parseArgs(&.{ "igvano", "--root", root, "exec", "--detach", "-t", "example", "tty" });
     try std.testing.expectError(error.MissingConsoleSocket, execContainer(allocator, io, implementation.backend(), detached));
 }

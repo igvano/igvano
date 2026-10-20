@@ -1,8 +1,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const oci = @import("igvano").oci;
-const backend_module = @import("igvano").backend;
-const Backend = backend_module.Backend;
+const libcontainer = @import("libcontainer");
+const Backend = libcontainer.Backend;
 const Subcommand = @import("../args.zig").Subcommand;
 const Config = @import("../args.zig").Config;
 const openContainerLock = @import("../state.zig").openContainerLock;
@@ -135,7 +135,7 @@ test "linux kill delivers a signal while another process holds the container loc
     try saveTestStarttime(root, holder.pid);
     const watchdog = try std.Thread.spawn(.{}, LockTestProcess.releaseAfterTimeout, .{holder});
     defer watchdog.join();
-    var implementation: backend_module.LinuxBackend = .{};
+    var implementation: libcontainer.LinuxBackend = .{};
     // Recovery operations run in the parent; busy warnings must not print after fork.
     try killContainer(std.testing.allocator, std.testing.io, implementation.backend(), .{
         .root = root,

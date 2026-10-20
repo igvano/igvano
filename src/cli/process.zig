@@ -1,8 +1,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const oci = @import("igvano").oci;
-const backend_module = @import("igvano").backend;
-const Backend = backend_module.Backend;
+const libcontainer = @import("libcontainer");
+const Backend = libcontainer.Backend;
 
 pub fn prepareProcess(allocator: std.mem.Allocator, process: oci.Spec.Process, has_console: bool) !Backend.ExecOptions {
     try validateConsoleSocket(process.terminal, has_console);

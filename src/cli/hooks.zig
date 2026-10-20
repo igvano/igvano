@@ -1,7 +1,7 @@
 const std = @import("std");
 const oci = @import("igvano").oci;
-const backend_module = @import("igvano").backend;
-const Backend = backend_module.Backend;
+const libcontainer = @import("libcontainer");
+const Backend = libcontainer.Backend;
 
 /// State stays frontend-owned. The backend only inserts a decimal host PID
 /// into these opaque fragments, using a buffer allocated before fork.
@@ -24,9 +24,9 @@ pub fn runHooks(allocator: std.mem.Allocator, configured: ?[]const oci.Spec.Hook
     defer arena.deinit();
     const hook_allocator = arena.allocator();
     const hooks = try oci.prepareHooks(hook_allocator, entries);
-    const prepared = try backend_module.hooks.prepare(hook_allocator, hooks);
+    const prepared = try libcontainer.hooks.prepare(hook_allocator, hooks);
     const json = try oci.stateJson(hook_allocator, state);
-    try backend_module.hooks.run(prepared, json);
+    try libcontainer.hooks.run(prepared, json);
 }
 
 pub fn warnHooks(allocator: std.mem.Allocator, configured: ?[]const oci.Spec.Hook, state: oci.State, stage: []const u8) void {

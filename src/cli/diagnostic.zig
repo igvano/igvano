@@ -1,5 +1,5 @@
-const backend_module = @import("igvano").backend;
-const Backend = backend_module.Backend;
+const libcontainer = @import("libcontainer");
+const Backend = libcontainer.Backend;
 
 var backend_detail_buffer: [512]u8 = undefined;
 

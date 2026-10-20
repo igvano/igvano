@@ -1,7 +1,7 @@
 const std = @import("std");
 const oci = @import("igvano").oci;
-const backend_module = @import("igvano").backend;
-const Backend = backend_module.Backend;
+const libcontainer = @import("libcontainer");
+const Backend = libcontainer.Backend;
 const backendResult = @import("diagnostic.zig").backendResult;
 const Config = @import("args.zig").Config;
 const parseArgs = @import("args.zig").parseArgs;
@@ -44,7 +44,7 @@ test "update validates resource input before opening the container lock" {
     const path = try std.fs.path.join(allocator, &.{ root, "resources.json" });
     defer allocator.free(path);
     try tmp.dir.writeFile(io, .{ .sub_path = "resources.json", .data = "{\"memory\":{\"limit\":-2}}" });
-    var implementation: backend_module.LinuxBackend = .{};
+    var implementation: libcontainer.LinuxBackend = .{};
     const config: Config = .{ .root = root, .subcommand = .update, .id = "missing", .resources_file = path };
     try std.testing.expectError(error.InvalidConfig, updateContainer(allocator, io, implementation.backend(), config));
 }
@@ -149,7 +149,7 @@ test "update rejects stopped containers before applying resources" {
         .status = .stopped,
         .bundle = "/unused",
     });
-    var implementation: backend_module.LinuxBackend = .{};
+    var implementation: libcontainer.LinuxBackend = .{};
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "resources.json", .data = "{}" });
     const resources_file = try std.fs.path.join(std.testing.allocator, &.{ root, "resources.json" });
     defer std.testing.allocator.free(resources_file);

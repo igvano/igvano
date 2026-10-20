@@ -1,8 +1,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const oci = @import("igvano").oci;
-const backend_module = @import("igvano").backend;
-const Backend = backend_module.Backend;
+const libcontainer = @import("libcontainer");
+const Backend = libcontainer.Backend;
 const diagnostics = @import("diagnostic.zig");
 const backendResult = @import("diagnostic.zig").backendResult;
 const Config = @import("args.zig").Config;
@@ -29,7 +29,7 @@ pub fn createContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backen
     try oci.requireCreate(parsed.value);
     const process_options = try prepareCreateProcess(allocator, parsed.value.process, config.console_socket != null);
     defer if (process_options) |options| allocator.free(options.rlimits);
-    const console_fds = if (config.console_socket != null) try backend_module.console.socketpair() else null;
+    const console_fds = if (config.console_socket != null) try libcontainer.console.socketpair() else null;
     defer closeConsoleFds(console_fds);
     const rootfs = try oci.resolveRootfs(allocator, bundle, parsed.value.root.path);
     defer allocator.free(rootfs);
@@ -304,13 +304,13 @@ fn persistCreatingState(allocator: std.mem.Allocator, io: std.Io, root: []const 
 
 fn reportCreateConsole(console_fds: ?[2]std.posix.fd_t, console_socket: ?[]const u8) !void {
     if (console_fds) |fds| {
-        const controller = try backend_module.console.receiveFd(fds[0]);
+        const controller = try libcontainer.console.receiveFd(fds[0]);
         defer _ = std.os.linux.close(controller);
         // Connect after fork so the blocked init cannot keep this connection
         // alive after create closes its copy.
         const peer = try connectConsoleSocket(console_socket.?);
         defer _ = std.os.linux.close(peer);
-        try backend_module.console.sendFd(peer, controller);
+        try libcontainer.console.sendFd(peer, controller);
     }
 }
 

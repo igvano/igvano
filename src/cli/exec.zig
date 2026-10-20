@@ -1,8 +1,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const oci = @import("igvano").oci;
-const backend_module = @import("igvano").backend;
-const Backend = backend_module.Backend;
+const libcontainer = @import("libcontainer");
+const Backend = libcontainer.Backend;
 const attached = @import("../attached.zig");
 const backendResult = @import("diagnostic.zig").backendResult;
 const Config = @import("args.zig").Config;
@@ -123,7 +123,7 @@ fn prepareExecOptions(process_allocator: std.mem.Allocator, io: std.Io, state: L
     };
     options.seccomp = try oci.prepareSeccomp(process_allocator, seccomp);
     options.cgroup_path = state.handle.?.cgroup_path orelse return oci.validationError(error.InvalidState, "exec: saved cgroup path is missing", .{});
-    options.console_fds = if (process.terminal orelse false) try backend_module.console.socketpair() else null;
+    options.console_fds = if (process.terminal orelse false) try libcontainer.console.socketpair() else null;
     return options;
 }
 
@@ -218,11 +218,11 @@ fn receiveExecConsole(console_fds: ?[2]std.posix.fd_t, console_socket: ?[]const 
         _ = linux.close(fd);
     };
     if (console_fds) |fds| {
-        controller = try backend_module.console.receiveFd(fds[0]);
+        controller = try libcontainer.console.receiveFd(fds[0]);
         if (console_socket) |path| {
             const peer = try connectConsoleSocket(path);
             defer _ = linux.close(peer);
-            try backend_module.console.sendFd(peer, controller.?);
+            try libcontainer.console.sendFd(peer, controller.?);
             _ = linux.close(controller.?);
             controller = null;
         }

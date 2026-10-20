@@ -1,8 +1,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const oci = @import("igvano").oci;
-const backend_module = @import("igvano").backend;
-const Backend = backend_module.Backend;
+const libcontainer = @import("libcontainer");
+const Backend = libcontainer.Backend;
 const backendResult = @import("diagnostic.zig").backendResult;
 const Config = @import("args.zig").Config;
 
@@ -261,7 +261,7 @@ fn inferCleanupSystemdDriver(allocator: std.mem.Allocator, io: std.Io, root: []c
     defer if (saved_spec) |spec| spec.deinit();
     const configured = if (saved_spec) |spec| if (spec.value.linux) |settings| settings.cgroupsPath else null else null;
     if (!try systemdUnitMatchesContainer(allocator, unit, id, configured)) return false;
-    return backend_module.systemdCgroupMatches(allocator, unit, path) catch |query_err| {
+    return libcontainer.systemdCgroupMatches(allocator, unit, path) catch |query_err| {
         if (query_err == error.OutOfMemory) return query_err;
         return false;
     };

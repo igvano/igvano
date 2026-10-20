@@ -1,7 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const oci = @import("igvano").oci;
-const backend_module = @import("igvano").backend;
+const libcontainer = @import("libcontainer");
 const diagnostics = @import("../diagnostic.zig");
 const Config = @import("../args.zig").Config;
 const createContainer = @import("../create.zig").createContainer;
@@ -56,11 +56,11 @@ fn testSeccompLifecycle(base: []const u8) !void {
     const probe_path = std.testing.environ.getPosix("IGVANO_SECCOMP_PROBE") orelse return error.MissingSeccompProbe;
     const probe = try cwd.realPathFileAlloc(io, probe_path, allocator);
     try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.prctl(@intFromEnum(linux.PR.SET_CHILD_SUBREAPER), 1, 0, 0, 0)));
-    const docker = try std.json.parseFromSlice(oci.Spec.Seccomp, allocator, @embedFile("../../backend/testdata/docker-default.json"), .{});
+    const docker = try std.json.parseFromSlice(oci.Spec.Seccomp, allocator, @embedFile("../../libcontainer/testdata/docker-default.json"), .{});
     // runtime-tools generate uses an ERRNO allowlist and leaves NNP unset.
     // This older-style fixture has 314 names, including statx, but no
     // close_range, faccessat2 or landlock syscalls to raise the native maximum.
-    const runtime_tools = try std.json.parseFromSlice(oci.Spec.Seccomp, allocator, @embedFile("../../backend/testdata/runtime-tools-default.json"), .{});
+    const runtime_tools = try std.json.parseFromSlice(oci.Spec.Seccomp, allocator, @embedFile("../../libcontainer/testdata/runtime-tools-default.json"), .{});
     const restricted: oci.Spec.Seccomp = .{
         .defaultAction = "SCMP_ACT_ALLOW",
         .syscalls = &.{
@@ -112,7 +112,7 @@ fn testSeccompLifecycle(base: []const u8) !void {
                 .sub_path = try std.fs.path.join(allocator, &.{ bundle, "config.json" }),
                 .data = try std.json.Stringify.valueAlloc(allocator, spec, .{ .emit_null_optional_fields = false }),
             });
-            var implementation: backend_module.LinuxBackend = .{};
+            var implementation: libcontainer.LinuxBackend = .{};
             const backend = implementation.backend();
             var config: Config = .{ .root = root, .id = id, .subcommand = .create, .bundle = bundle };
             try createContainer(allocator, io, backend, config);
@@ -155,7 +155,7 @@ fn testSeccompLifecycle(base: []const u8) !void {
 
 test "linux AppArmor confines init and exec with inherited and explicit profiles" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
-    if (!backend_module.apparmorEnabled()) return error.SkipZigTest;
+    if (!libcontainer.apparmorEnabled()) return error.SkipZigTest;
     if (std.os.linux.prctl(@intFromEnum(std.os.linux.PR.GET_NO_NEW_PRIVS), 0, 0, 0, 0) != 0)
         return error.SkipZigTest;
     try runIsolatedSecurityTest(testAppArmorLifecycle);
@@ -240,7 +240,7 @@ fn testAppArmorLifecycle(base: []const u8) !void {
             .sub_path = try std.fs.path.join(allocator, &.{ bundle, "config.json" }),
             .data = try std.json.Stringify.valueAlloc(allocator, spec, .{ .emit_null_optional_fields = false }),
         });
-        var implementation: backend_module.LinuxBackend = .{};
+        var implementation: libcontainer.LinuxBackend = .{};
         const backend = implementation.backend();
         var config: Config = .{ .root = root, .id = id, .subcommand = .create, .bundle = bundle };
         try createContainer(allocator, io, backend, config);
@@ -365,7 +365,7 @@ fn testPropagationLifecycle(base: []const u8) !void {
             .sub_path = try std.fs.path.join(allocator, &.{ bundle, "config.json" }),
             .data = try std.json.Stringify.valueAlloc(allocator, spec, .{ .emit_null_optional_fields = false }),
         });
-        var implementation: backend_module.LinuxBackend = .{};
+        var implementation: libcontainer.LinuxBackend = .{};
         const backend = implementation.backend();
         var config: Config = .{ .root = root, .id = id, .subcommand = .create, .bundle = bundle };
         try createContainer(allocator, io, backend, config);

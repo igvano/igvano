@@ -1,8 +1,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const oci = @import("igvano").oci;
-const backend_module = @import("igvano").backend;
-const Backend = backend_module.Backend;
+const libcontainer = @import("libcontainer");
+const Backend = libcontainer.Backend;
 const Config = @import("../args.zig").Config;
 const loadDeviceNodes = @import("../state.zig").loadDeviceNodes;
 const loadRootfsMount = @import("../state.zig").loadRootfsMount;
@@ -128,7 +128,7 @@ test "create rejects a duplicate id without changing existing state" {
     defer std.testing.allocator.free(root);
     const bundle = try std.fs.path.join(std.testing.allocator, &.{ base, "bundle" });
     defer std.testing.allocator.free(bundle);
-    var implementation: backend_module.LinuxBackend = .{};
+    var implementation: libcontainer.LinuxBackend = .{};
     try std.testing.expectError(error.ContainerExists, createContainer(std.testing.allocator, std.testing.io, implementation.backend(), .{
         .root = root,
         .subcommand = .create,
@@ -150,7 +150,7 @@ test "create rejects a missing bundle before creating the state directory" {
     defer std.testing.allocator.free(base);
     const bundle = try std.fs.path.join(std.testing.allocator, &.{ base, "missing" });
     defer std.testing.allocator.free(bundle);
-    var implementation: backend_module.LinuxBackend = .{};
+    var implementation: libcontainer.LinuxBackend = .{};
     try std.testing.expectError(error.FileNotFound, createContainer(std.testing.allocator, std.testing.io, implementation.backend(), .{
         .root = base,
         .subcommand = .create,
@@ -174,7 +174,7 @@ test "create rejects propagation without mount isolation before creating runtime
     defer std.testing.allocator.free(root);
     const bundle = try std.fs.path.join(std.testing.allocator, &.{ root, "bundle" });
     defer std.testing.allocator.free(bundle);
-    var implementation: backend_module.LinuxBackend = .{};
+    var implementation: libcontainer.LinuxBackend = .{};
     try std.testing.expectError(error.InvalidConfig, createContainer(std.testing.allocator, std.testing.io, implementation.backend(), .{
         .root = root,
         .subcommand = .create,
@@ -211,7 +211,7 @@ test "create rejects invalid process settings before creating runtime state" {
         );
         defer std.testing.allocator.free(json);
         try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "bundle/config.json", .data = json });
-        var implementation: backend_module.LinuxBackend = .{};
+        var implementation: libcontainer.LinuxBackend = .{};
         try std.testing.expectError(case.expected, createContainer(std.testing.allocator, std.testing.io, implementation.backend(), .{
             .root = root,
             .subcommand = .create,
@@ -236,7 +236,7 @@ test "create rejects invalid devices before creating runtime state" {
     defer std.testing.allocator.free(root);
     const bundle = try std.fs.path.join(std.testing.allocator, &.{ root, "bundle" });
     defer std.testing.allocator.free(bundle);
-    var implementation: backend_module.LinuxBackend = .{};
+    var implementation: libcontainer.LinuxBackend = .{};
     try std.testing.expectError(error.InvalidConfig, createContainer(std.testing.allocator, std.testing.io, implementation.backend(), .{
         .root = root,
         .subcommand = .create,
@@ -260,7 +260,7 @@ test "create removes its new state directory when setup fails" {
     defer std.testing.allocator.free(root);
     const bundle = try std.fs.path.join(std.testing.allocator, &.{ root, "bundle" });
     defer std.testing.allocator.free(bundle);
-    var implementation: backend_module.LinuxBackend = .{};
+    var implementation: libcontainer.LinuxBackend = .{};
     try std.testing.expectError(
         if (builtin.os.tag == .linux) error.InvalidConfig else error.NotImplemented,
         createContainer(std.testing.allocator, std.testing.io, implementation.backend(), .{

@@ -1,5 +1,5 @@
 const std = @import("std");
-const Backend = @import("../backend.zig").Backend;
+const Backend = @import("libcontainer").Backend;
 const validationError = @import("diagnostic.zig").validationError;
 const invalidConfig = @import("diagnostic.zig").invalidConfig;
 const Spec = @import("spec.zig").Spec;

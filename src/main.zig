@@ -1,8 +1,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const oci = @import("igvano").oci;
-const backend_module = @import("igvano").backend;
-const Backend = backend_module.Backend;
+const libcontainer = @import("libcontainer");
+const Backend = libcontainer.Backend;
 const diagnostics = @import("cli/diagnostic.zig");
 const backendResult = @import("cli/diagnostic.zig").backendResult;
 const Subcommand = @import("cli/args.zig").Subcommand;
@@ -38,7 +38,7 @@ pub fn main(init: std.process.Init) !u8 {
         std.debug.print(@import("cli/args.zig").usage, .{});
         return 1;
     };
-    var implementation: backend_module.LinuxBackend = .{};
+    var implementation: libcontainer.LinuxBackend = .{};
     const backend = implementation.backend();
     diagnostics.last_backend_detail = null;
     return dispatchCommand(allocator, init.io, backend, config) catch |err| {
@@ -255,7 +255,7 @@ test "kill errors use shim-compatible messages in the log" {
     const log = try std.fs.path.join(allocator, &.{ root, "runtime.log" });
     defer allocator.free(log);
     try oci.saveState(allocator, io, root, .{ .id = "example", .status = .stopped, .bundle = "/unused" });
-    var implementation: backend_module.LinuxBackend = .{};
+    var implementation: libcontainer.LinuxBackend = .{};
     const config: Config = .{ .root = root, .subcommand = .kill, .id = "example", .log = log, .log_format = .json };
     killContainer(allocator, io, implementation.backend(), config) catch |err|
         reportError(allocator, io, null, config, err);

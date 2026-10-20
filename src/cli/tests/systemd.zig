@@ -1,7 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const oci = @import("igvano").oci;
-const backend_module = @import("igvano").backend;
+const libcontainer = @import("libcontainer");
 const backendResult = @import("../diagnostic.zig").backendResult;
 const parseArgs = @import("../args.zig").parseArgs;
 const updateContainer = @import("../update.zig").updateContainer;
@@ -74,7 +74,7 @@ fn testSystemdLifecycleDeletion(base: []const u8, kill_before_delete: bool) !voi
     try cwd.writeFile(io, .{ .sub_path = config_path, .data = try std.json.Stringify.valueAlloc(allocator, spec, .{ .emit_null_optional_fields = false }) });
     if (linux.errno(linux.prctl(@intFromEnum(linux.PR.SET_CHILD_SUBREAPER), 1, 0, 0, 0)) != .SUCCESS)
         return error.SubreaperFailed;
-    var implementation: backend_module.LinuxBackend = .{};
+    var implementation: libcontainer.LinuxBackend = .{};
     const backend = implementation.backend();
     const create = try parseArgs(&.{ "igvano", "--systemd-cgroup", "--root", root, "create", "--bundle", bundle, id });
     try createContainer(allocator, io, backend, create);

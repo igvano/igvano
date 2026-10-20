@@ -1,5 +1,5 @@
 const std = @import("std");
-const Backend = @import("../backend.zig").Backend;
+const Backend = @import("libcontainer").Backend;
 const invalidConfig = @import("diagnostic.zig").invalidConfig;
 const Spec = @import("spec.zig").Spec;
 
@@ -347,7 +347,7 @@ test "seccomp rejects unsupported or unknown schema values even for unknown sysc
 
 test "seccomp repeated argument indices deny personality alternatives" {
     const seccomp = Backend.seccomp;
-    const testing = @import("../test/seccomp.zig");
+    const testing = @import("libcontainer").testing.seccomp;
     // A repeated index makes every condition an alternative, including index 1.
     // Distinct indices in the second syscall still form a conjunction.
     const config = (try prepareSeccomp(std.testing.allocator, .{

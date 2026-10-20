@@ -1,7 +1,7 @@
 const std = @import("std");
 const oci = @import("igvano").oci;
-const backend_module = @import("igvano").backend;
-const Backend = backend_module.Backend;
+const libcontainer = @import("libcontainer");
+const Backend = libcontainer.Backend;
 const Config = @import("../args.zig").Config;
 const deleteContainer = @import("../delete.zig").deleteContainer;
 

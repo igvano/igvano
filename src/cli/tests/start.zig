@@ -1,7 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const backend_module = @import("igvano").backend;
-const Backend = backend_module.Backend;
+const libcontainer = @import("libcontainer");
+const Backend = libcontainer.Backend;
 const makeExecFifo = @import("../create.zig").makeExecFifo;
 const waitForStart = @import("../start.zig").waitForStart;
 const saveTestStarttime = @import("helpers.zig").saveTestStarttime;
@@ -101,7 +101,7 @@ test "linux start waits for FIFO close after acknowledgement" {
     try saveTestStarttime(root, pid);
     const starttime = try tmp.dir.readFileAlloc(std.testing.io, "example/starttime", std.testing.allocator, .limited(64));
     defer std.testing.allocator.free(starttime);
-    var implementation: backend_module.LinuxBackend = .{};
+    var implementation: libcontainer.LinuxBackend = .{};
     const started = std.Io.Clock.awake.now(std.testing.io);
     try waitForStart(std.testing.allocator, std.testing.io, implementation.backend(), .{
         .id = "example",

@@ -1,5 +1,5 @@
 const std = @import("std");
-const Backend = @import("../../backend.zig").Backend;
+const Backend = @import("libcontainer").Backend;
 const Spec = @import("../spec.zig").Spec;
 const cgroupResources = @import("../resources.zig").cgroupResources;
 const freeCgroupResources = @import("../resources.zig").freeCgroupResources;

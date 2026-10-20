@@ -1,13 +1,13 @@
 const std = @import("std");
-const Backend = @import("../../backend.zig").Backend;
+const Backend = @import("libcontainer").Backend;
 const Spec = @import("../spec.zig").Spec;
 const prepareSeccomp = @import("../seccomp.zig").prepareSeccomp;
 const freeSeccomp = @import("../seccomp.zig").freeSeccomp;
 
 test "seccomp Docker default profile stays below 2500 instructions and exercises long jumps" {
     const seccomp = Backend.seccomp;
-    const testing = @import("../../test/seccomp.zig");
-    const parsed = try std.json.parseFromSlice(Spec.Seccomp, std.testing.allocator, @embedFile("../../backend/testdata/docker-default.json"), .{});
+    const testing = @import("libcontainer").testing.seccomp;
+    const parsed = try std.json.parseFromSlice(Spec.Seccomp, std.testing.allocator, @embedFile("../../libcontainer/testdata/docker-default.json"), .{});
     defer parsed.deinit();
     const config = (try prepareSeccomp(std.testing.allocator, parsed.value)).?;
     defer freeSeccomp(std.testing.allocator, config);

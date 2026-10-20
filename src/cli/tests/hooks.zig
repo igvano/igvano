@@ -1,8 +1,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const oci = @import("igvano").oci;
-const backend_module = @import("igvano").backend;
-const Backend = backend_module.Backend;
+const libcontainer = @import("libcontainer");
+const Backend = libcontainer.Backend;
 const readLiveState = @import("../state.zig").readLiveState;
 const createContainer = @import("../create.zig").createContainer;
 const CreateContext = @import("../create.zig").CreateContext;
@@ -280,7 +280,7 @@ test "linux prestart receives created state before init unblocks and poststart r
     const json = try std.json.Stringify.valueAlloc(std.testing.allocator, configured, .{ .emit_null_optional_fields = false });
     defer std.testing.allocator.free(json);
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "example/hooks.json", .data = json });
-    var implementation: backend_module.LinuxBackend = .{};
+    var implementation: libcontainer.LinuxBackend = .{};
     try startContainer(std.testing.allocator, std.testing.io, implementation.backend(), .{
         .root = root,
         .id = "example",
