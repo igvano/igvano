@@ -1,11 +1,10 @@
 const std = @import("std");
 const oci = @import("igvano").oci;
 const libcontainer = @import("libcontainer");
-const Backend = libcontainer.Backend;
 
-/// State stays frontend-owned. The backend only inserts a decimal host PID
+/// State stays frontend-owned. The container only inserts a decimal host PID
 /// into these opaque fragments, using a buffer allocated before fork.
-pub fn hookStateTemplate(allocator: std.mem.Allocator, state: oci.State) !Backend.HookState {
+pub fn hookStateTemplate(allocator: std.mem.Allocator, state: oci.State) !libcontainer.HookState {
     var template = state;
     template.pid = 0;
     const json = try oci.stateJson(allocator, template);

@@ -2,7 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 const posix = std.posix;
-const Backend = @import("../root.zig").Backend;
+const libcontainer = @import("../root.zig");
 const OPEN_TREE_CLONE = @import("mount.zig").OPEN_TREE_CLONE;
 const OPEN_TREE_CLOEXEC = @import("mount.zig").OPEN_TREE_CLOEXEC;
 const MOUNT_ATTR_IDMAP = @import("mount.zig").MOUNT_ATTR_IDMAP;
@@ -36,7 +36,7 @@ pub fn closeMountFds(mounts: []const PreparedMount) void {
 
 /// Prepare mapping namespaces before fork; clones must come from init's mount
 /// namespace so they inherit its MNT_LOCK_* protection.
-pub fn prepareIDMappedMounts(allocator: std.mem.Allocator, mounts: []PreparedMount) Backend.Error!void {
+pub fn prepareIDMappedMounts(allocator: std.mem.Allocator, mounts: []PreparedMount) libcontainer.Error!void {
     if (comptime builtin.os.tag != .linux) return error.NotImplemented;
     for (mounts) |*mount| {
         const mappings = mount.mappings orelse continue;
@@ -59,7 +59,7 @@ pub fn prepareIDMappedMounts(allocator: std.mem.Allocator, mounts: []PreparedMou
 /// joined by path resolves bind sources there, just as ordinary binds do.
 /// Sources opened with host credentials in this mode must contain no symlinks.
 /// Ordinary bind mounts opened in the runtime's own namespace still allow them.
-pub fn startMountSourceHelper(mounts: []const PreparedMount) Backend.Error!struct { pid: i32, socket: posix.fd_t } {
+pub fn startMountSourceHelper(mounts: []const PreparedMount) libcontainer.Error!struct { pid: i32, socket: posix.fd_t } {
     const sockets = try console.socketpair();
     errdefer for (sockets) |fd| closeFd(fd);
     const child = try forkProcess();
@@ -76,7 +76,7 @@ pub fn startMountSourceHelper(mounts: []const PreparedMount) Backend.Error!struc
     return .{ .pid = child, .socket = sockets[1] };
 }
 
-pub fn sendMountSources(mounts: []const PreparedMount, socket: posix.fd_t) Backend.Error!void {
+pub fn sendMountSources(mounts: []const PreparedMount, socket: posix.fd_t) libcontainer.Error!void {
     for (mounts) |mount| {
         if (mount.flags & linux.MS.BIND == 0) continue;
         var step: RootfsStep = .{ .operation = "open bind source", .source = mount.source, .path = mount.destination };
@@ -106,7 +106,7 @@ pub fn sendMountSources(mounts: []const PreparedMount, socket: posix.fd_t) Backe
     }
 }
 
-pub fn receiveMountSources(mounts: []PreparedMount, socket: posix.fd_t, namespace: posix.fd_t) Backend.Error!void {
+pub fn receiveMountSources(mounts: []PreparedMount, socket: posix.fd_t, namespace: posix.fd_t) libcontainer.Error!void {
     try console.sendFd(socket, namespace);
     for (mounts) |*mount| {
         if (mount.flags & linux.MS.BIND == 0) continue;
@@ -118,14 +118,14 @@ pub fn receiveMountSources(mounts: []PreparedMount, socket: posix.fd_t, namespac
     }
 }
 
-fn mountSourceHelperExited() Backend.Error {
+fn mountSourceHelperExited() libcontainer.Error {
     reportDiagnostic("mount source helper exited unexpectedly", .{});
     return error.CreateFailed;
 }
 
 /// Called with host credentials inside the container's mount namespace.
 /// open_tree copies the source's kernel locks, including for recursive binds.
-pub fn cloneIDMappedMount(mount: PreparedMount, userns: posix.fd_t) Backend.Error!posix.fd_t {
+pub fn cloneIDMappedMount(mount: PreparedMount, userns: posix.fd_t) libcontainer.Error!posix.fd_t {
     var step: RootfsStep = .{ .operation = "open_tree for idmapped mount", .source = mount.source, .path = mount.destination };
     errdefer |err| if (step.operation.len != 0) step.report(err);
     const source = mount.source orelse return error.InvalidConfig;

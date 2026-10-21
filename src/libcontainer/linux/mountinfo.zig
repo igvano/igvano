@@ -1,11 +1,11 @@
 const std = @import("std");
 const linux = std.os.linux;
-const Backend = @import("../root.zig").Backend;
+const libcontainer = @import("../root.zig");
 const checkResult = @import("syscall.zig").checkResult;
 const closeFd = @import("syscall.zig").closeFd;
 const openPath = @import("syscall.zig").openPath;
 
-pub fn readMountinfo(allocator: std.mem.Allocator) Backend.Error![]u8 {
+pub fn readMountinfo(allocator: std.mem.Allocator) libcontainer.Error![]u8 {
     const fd = try openPath(linux.AT.FDCWD, "/proc/self/mountinfo", .{ .CLOEXEC = true });
     defer closeFd(fd);
     var text: std.ArrayList(u8) = .empty;
@@ -27,7 +27,7 @@ pub const MountInfo = struct {
     root: []const u8,
     mountpoint: []const u8,
 
-    pub fn parse(line: []const u8) Backend.Error!MountInfo {
+    pub fn parse(line: []const u8) libcontainer.Error!MountInfo {
         var fields = std.mem.tokenizeScalar(u8, line, ' ');
         return .{
             .id = std.fmt.parseInt(u64, fields.next() orelse return error.CreateFailed, 10) catch return error.CreateFailed,
@@ -39,7 +39,7 @@ pub const MountInfo = struct {
     }
 };
 
-pub fn mountinfoPath(buffer: []u8, escaped: []const u8) Backend.Error![]const u8 {
+pub fn mountinfoPath(buffer: []u8, escaped: []const u8) libcontainer.Error![]const u8 {
     var used: usize = 0;
     var i: usize = 0;
     while (i < escaped.len) : (i += 1) {

@@ -2,9 +2,8 @@ const std = @import("std");
 const builtin = @import("builtin");
 const oci = @import("igvano").oci;
 const libcontainer = @import("libcontainer");
-const Backend = libcontainer.Backend;
 const diagnostics = @import("cli/diagnostic.zig");
-const backendResult = @import("cli/diagnostic.zig").backendResult;
+const containerResult = @import("cli/diagnostic.zig").containerResult;
 const Subcommand = @import("cli/args.zig").Subcommand;
 const Config = @import("cli/args.zig").Config;
 const parseArgsWithLog = @import("cli/args.zig").parseArgsWithLog;
@@ -38,11 +37,9 @@ pub fn main(init: std.process.Init) !u8 {
         std.debug.print(@import("cli/args.zig").usage, .{});
         return 1;
     };
-    var implementation: libcontainer.LinuxBackend = .{};
-    const backend = implementation.backend();
-    diagnostics.last_backend_detail = null;
-    return dispatchCommand(allocator, init.io, backend, config) catch |err| {
-        reportError(allocator, init.io, diagnostics.last_backend_detail, config, err);
+    diagnostics.last_container_detail = null;
+    return dispatchCommand(allocator, init.io, config) catch |err| {
+        reportError(allocator, init.io, diagnostics.last_container_detail, config, err);
         return 1;
     };
 }
@@ -85,18 +82,18 @@ fn argumentErrorMessage(err: ParseArgsError) []const u8 {
     return messages.get(@errorName(err)).?;
 }
 
-fn dispatchCommand(allocator: std.mem.Allocator, io: std.Io, backend: Backend, config: Config) !u8 {
+fn dispatchCommand(allocator: std.mem.Allocator, io: std.Io, config: Config) !u8 {
     switch (config.subcommand) {
         .features => try features(allocator, io),
-        .state => try stateContainer(allocator, io, backend, config),
-        .create => try createContainer(allocator, io, backend, config),
-        .start => try startContainer(allocator, io, backend, config),
-        .exec => return execContainer(allocator, io, backend, config),
-        .kill => try killContainer(allocator, io, backend, config),
-        .update => try updateContainer(allocator, io, backend, config),
-        .ps => try psContainer(allocator, io, backend, config, std.Io.File.stdout()),
-        .pause, .@"resume" => try pauseContainer(allocator, io, backend, config),
-        .delete => try deleteContainer(allocator, io, backend, config),
+        .state => try stateContainer(allocator, io, null, config),
+        .create => try createContainer(allocator, io, null, config),
+        .start => try startContainer(allocator, io, null, config),
+        .exec => return execContainer(allocator, io, null, config),
+        .kill => try killContainer(allocator, io, null, config),
+        .update => try updateContainer(allocator, io, null, config),
+        .ps => try psContainer(allocator, io, null, config, std.Io.File.stdout()),
+        .pause, .@"resume" => try pauseContainer(allocator, io, null, config),
+        .delete => try deleteContainer(allocator, io, null, config),
     }
     return 0;
 }
@@ -255,9 +252,8 @@ test "kill errors use shim-compatible messages in the log" {
     const log = try std.fs.path.join(allocator, &.{ root, "runtime.log" });
     defer allocator.free(log);
     try oci.saveState(allocator, io, root, .{ .id = "example", .status = .stopped, .bundle = "/unused" });
-    var implementation: libcontainer.LinuxBackend = .{};
     const config: Config = .{ .root = root, .subcommand = .kill, .id = "example", .log = log, .log_format = .json };
-    killContainer(allocator, io, implementation.backend(), config) catch |err|
+    killContainer(allocator, io, null, config) catch |err|
         reportError(allocator, io, null, config, err);
     reportError(allocator, io, null, config, error.ProcessNotFound);
     const bytes = try tmp.dir.readFileAlloc(io, "runtime.log", allocator, .limited(4096));
@@ -272,31 +268,37 @@ test "kill errors use shim-compatible messages in the log" {
 }
 
 test "backend error detail survives cleanup overwriting the borrowed buffer" {
-    const LockTestBackend = @import("cli/tests/helpers.zig").LockTestBackend;
-    diagnostics.last_backend_detail = null;
-    defer diagnostics.last_backend_detail = null;
+    const overrideContainer = @import("cli/tests/helpers.zig").overrideContainer;
+    const LockTestContainer = @import("cli/tests/helpers.zig").LockTestContainer;
+    const createDiagnostic = @import("cli/state.zig").createDiagnostic;
+    diagnostics.last_container_detail = null;
+    defer diagnostics.last_container_detail = null;
     var detail = "original create failure".*;
-    var implementation: LockTestBackend = .{ .detail = &detail };
-    const backend: Backend = .{ .ptr = &implementation, .vtable = &LockTestBackend.vtable };
-    try std.testing.expectError(error.NotImplemented, backendResult(backend, backend.create(.{
+    var implementation: LockTestContainer = .{ .detail = &detail };
+    const container: libcontainer.Container = .{ .ptr = &implementation, .vtable = &LockTestContainer.vtable };
+    const created = LockTestContainer.create(&implementation, .{
         .allocator = std.testing.allocator,
         .id = "example",
         .rootfs = "/bundle/rootfs",
         .exec_fifo = "/runtime/example/exec.fifo",
-    })));
-    const handle: Backend.Handle = .{ .id = "example", .pid = 1234, .starttime = "alive" };
+    });
+    const message = createDiagnostic(overrideContainer(&implementation, container));
+    try std.testing.expectError(error.NotImplemented, diagnostics.createResult(message, created));
+    const handle: libcontainer.State = .{ .id = "example", .pid = 1234, .starttime = "alive" };
+    implementation.state = handle;
     @memset(&detail, 'x');
-    backend.kill(handle, 9) catch {};
-    backend.delete(handle) catch {};
-    try std.testing.expectEqualStrings("original create failure", diagnostics.last_backend_detail.?);
-    try backendResult(backend, backend.delete(handle));
-    try std.testing.expect(diagnostics.last_backend_detail == null);
+    container.kill(9) catch {};
+    container.delete() catch {};
+    try std.testing.expectEqualStrings("original create failure", diagnostics.last_container_detail.?);
+    try containerResult(container, container.delete());
+    try std.testing.expect(diagnostics.last_container_detail == null);
 }
 
 test "frontend failure after successful liveness does not log stale backend detail" {
-    const LockTestBackend = @import("cli/tests/helpers.zig").LockTestBackend;
-    diagnostics.last_backend_detail = null;
-    defer diagnostics.last_backend_detail = null;
+    const overrideContainer = @import("cli/tests/helpers.zig").overrideContainer;
+    const LockTestContainer = @import("cli/tests/helpers.zig").LockTestContainer;
+    diagnostics.last_container_detail = null;
+    defer diagnostics.last_container_detail = null;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDir(std.testing.io, "example", .default_dir);
@@ -312,12 +314,12 @@ test "frontend failure after successful liveness does not log stale backend deta
     });
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "example/starttime", .data = "alive" });
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "example/process", .data = "false\n" });
-    var implementation: LockTestBackend = .{ .detail = "stale backend failure" };
-    const backend: Backend = .{ .ptr = &implementation, .vtable = &LockTestBackend.vtable };
+    var implementation: LockTestContainer = .{ .detail = "stale container failure" };
+    const container: libcontainer.Container = .{ .ptr = &implementation, .vtable = &LockTestContainer.vtable };
     const config: Config = .{ .root = root, .subcommand = .start, .id = "example", .log = path };
-    startContainer(std.testing.allocator, std.testing.io, backend, config) catch |err| {
+    startContainer(std.testing.allocator, std.testing.io, overrideContainer(&implementation, container), config) catch |err| {
         try std.testing.expectEqual(error.MissingProcess, err);
-        reportError(std.testing.allocator, std.testing.io, diagnostics.last_backend_detail, config, err);
+        reportError(std.testing.allocator, std.testing.io, diagnostics.last_container_detail, config, err);
     };
     const bytes = try tmp.dir.readFileAlloc(std.testing.io, "runtime.log", std.testing.allocator, .limited(4096));
     defer std.testing.allocator.free(bytes);
@@ -343,7 +345,7 @@ test "error reporting prints frontend detail once and keeps backend detail only 
     if (std.posix.errno(std.posix.system.dup2(capture[1], 2)) != .SUCCESS) return error.SystemResources;
     {
         defer _ = std.posix.system.dup2(saved_fd, 2);
-        reportError(std.testing.allocator, std.testing.io, "backend detail already printed", config, error.Unsupported);
+        reportError(std.testing.allocator, std.testing.io, "container detail already printed", config, error.Unsupported);
         oci.recordDiagnostic(error.InvalidConfig, "frontend detail", .{});
         defer oci.clearDiagnostic();
         reportError(std.testing.allocator, std.testing.io, null, config, error.InvalidConfig);
@@ -359,6 +361,6 @@ test "error reporting prints frontend detail once and keeps backend detail only 
     );
     const log = try tmp.dir.readFileAlloc(std.testing.io, "runtime.log", std.testing.allocator, .limited(4096));
     defer std.testing.allocator.free(log);
-    try std.testing.expect(std.mem.indexOf(u8, log, "Unsupported: backend detail already printed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, log, "Unsupported: container detail already printed") != null);
     try std.testing.expect(std.mem.indexOf(u8, log, "InvalidConfig: frontend detail") != null);
 }

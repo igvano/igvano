@@ -1,18 +1,24 @@
 const libcontainer = @import("libcontainer");
-const Backend = libcontainer.Backend;
 
-var backend_detail_buffer: [512]u8 = undefined;
+var container_detail_buffer: [512]u8 = undefined;
 
-pub var last_backend_detail: ?[]const u8 = null;
+pub var last_container_detail: ?[]const u8 = null;
 
-// Copy failed-operation detail before cleanup can change the backend's buffer.
-pub fn backendResult(backend: Backend, result: anytype) @TypeOf(result) {
-    last_backend_detail = null;
+// Copy failed-operation detail before cleanup can change the container's buffer.
+pub fn containerResult(container: libcontainer.Container, result: anytype) @TypeOf(result) {
+    last_container_detail = null;
     return result catch |err| {
-        if (backend.diagnostic()) |detail| {
-            const len = @min(detail.len, backend_detail_buffer.len);
-            @memcpy(backend_detail_buffer[0..len], detail[0..len]);
-            last_backend_detail = backend_detail_buffer[0..len];
+        return createResult(container.diagnostic(), @as(@TypeOf(result), err));
+    };
+}
+
+pub fn createResult(detail: ?[]const u8, result: anytype) @TypeOf(result) {
+    last_container_detail = null;
+    return result catch |err| {
+        if (detail) |message| {
+            const len = @min(message.len, container_detail_buffer.len);
+            @memcpy(container_detail_buffer[0..len], message[0..len]);
+            last_container_detail = container_detail_buffer[0..len];
         }
         return err;
     };

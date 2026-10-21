@@ -1,6 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const Rule = @import("root.zig").Backend.Resources.DeviceRule;
+const Rule = @import("root.zig").Resources.DeviceRule;
 const devices = @import("devices.zig");
 
 /// Linux struct bpf_insn. Register nibbles follow the target's byte order.

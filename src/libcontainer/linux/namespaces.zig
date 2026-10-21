@@ -1,7 +1,7 @@
 const std = @import("std");
 const linux = std.os.linux;
 const posix = std.posix;
-const Backend = @import("../root.zig").Backend;
+const libcontainer = @import("../root.zig");
 const diagnostics = @import("diagnostic.zig");
 const checkResult = @import("syscall.zig").checkResult;
 const forkProcess = @import("syscall.zig").forkProcess;
@@ -15,7 +15,7 @@ const reportDiagnostic = @import("diagnostic.zig").reportDiagnostic;
 const CreateResponse = @import("diagnostic.zig").CreateResponse;
 const failCreate = @import("diagnostic.zig").failCreate;
 
-pub fn namespaceFlag(kind: Backend.Namespace.Kind) usize {
+pub fn namespaceFlag(kind: libcontainer.Namespace.Kind) usize {
     return switch (kind) {
         .pid => linux.CLONE.NEWPID,
         .network => linux.CLONE.NEWNET,
@@ -29,7 +29,7 @@ pub fn namespaceFlag(kind: Backend.Namespace.Kind) usize {
 }
 
 /// Only namespaces without paths are unshared. Constants work on macOS too.
-pub fn namespaceFlags(namespaces: []const Backend.Namespace) Backend.Error!usize {
+pub fn namespaceFlags(namespaces: []const libcontainer.Namespace) libcontainer.Error!usize {
     var flags: usize = 0;
     var seen: usize = 0;
     for (namespaces) |namespace| {
@@ -49,7 +49,7 @@ pub const NamespaceJoin = struct {
     path: [:0]const u8,
 };
 
-pub fn validateNamespaceFd(fd: posix.fd_t, flag: usize) Backend.Error!void {
+pub fn validateNamespaceFd(fd: posix.fd_t, flag: usize) libcontainer.Error!void {
     const result = linux.ioctl(fd, linux.IOCTL.IO(0xb7, 3), 0); // NS_GET_NSTYPE
     switch (linux.errno(result)) {
         .SUCCESS => if (result != flag) return error.InvalidConfig,
@@ -61,11 +61,11 @@ pub fn validateNamespaceFd(fd: posix.fd_t, flag: usize) Backend.Error!void {
 }
 
 /// Open every host path before entering a user or mount namespace.
-pub fn joinNamespaces(joins: []const NamespaceJoin) Backend.Error!void {
+pub fn joinNamespaces(joins: []const NamespaceJoin) libcontainer.Error!void {
     return joinNamespacesWithUser(joins, null);
 }
 
-pub fn joinNamespacesWithUser(joins: []const NamespaceJoin, user_fd: ?posix.fd_t) Backend.Error!void {
+pub fn joinNamespacesWithUser(joins: []const NamespaceJoin, user_fd: ?posix.fd_t) libcontainer.Error!void {
     var fds: [8]posix.fd_t = @splat(-1);
     if (joins.len > fds.len) return error.InvalidConfig;
     defer for (fds) |fd| {
@@ -81,7 +81,7 @@ pub fn joinNamespacesWithUser(joins: []const NamespaceJoin, user_fd: ?posix.fd_t
     try joinNamespaceFds(joins, fds[0..joins.len]);
 }
 
-pub fn joinNamespaceFds(joins: []const NamespaceJoin, fds: []const posix.fd_t) Backend.Error!void {
+pub fn joinNamespaceFds(joins: []const NamespaceJoin, fds: []const posix.fd_t) libcontainer.Error!void {
     // User first grants capabilities in the target owner; mount last keeps
     // host paths reachable until all other namespace operations have finished.
     for ([_]usize{
@@ -100,7 +100,7 @@ pub fn joinNamespaceFds(joins: []const NamespaceJoin, fds: []const posix.fd_t) B
     }
 }
 
-pub fn mappedRootID(mappings: []const Backend.IDMapping) Backend.Error!u32 {
+pub fn mappedRootID(mappings: []const libcontainer.IDMapping) libcontainer.Error!u32 {
     for (mappings) |mapping| {
         if (mapping.container_id == 0 and mapping.size > 0) return mapping.host_id;
     }
@@ -109,26 +109,26 @@ pub fn mappedRootID(mappings: []const Backend.IDMapping) Backend.Error!u32 {
 }
 
 /// Linux may return ranges in a different order; compare every range exactly.
-fn equalIDMappings(allocator: std.mem.Allocator, a: []const Backend.IDMapping, b: []const Backend.IDMapping) Backend.Error!bool {
+fn equalIDMappings(allocator: std.mem.Allocator, a: []const libcontainer.IDMapping, b: []const libcontainer.IDMapping) libcontainer.Error!bool {
     if (a.len != b.len) return false;
-    const left = try allocator.dupe(Backend.IDMapping, a);
+    const left = try allocator.dupe(libcontainer.IDMapping, a);
     defer allocator.free(left);
-    const right = try allocator.dupe(Backend.IDMapping, b);
+    const right = try allocator.dupe(libcontainer.IDMapping, b);
     defer allocator.free(right);
     const Order = struct {
-        fn lessThan(_: void, x: Backend.IDMapping, y: Backend.IDMapping) bool {
+        fn lessThan(_: void, x: libcontainer.IDMapping, y: libcontainer.IDMapping) bool {
             if (x.container_id != y.container_id) return x.container_id < y.container_id;
             if (x.host_id != y.host_id) return x.host_id < y.host_id;
             return x.size < y.size;
         }
     };
-    std.mem.sort(Backend.IDMapping, left, {}, Order.lessThan);
-    std.mem.sort(Backend.IDMapping, right, {}, Order.lessThan);
-    comptime std.debug.assert(std.meta.hasUniqueRepresentation(Backend.IDMapping));
+    std.mem.sort(libcontainer.IDMapping, left, {}, Order.lessThan);
+    std.mem.sort(libcontainer.IDMapping, right, {}, Order.lessThan);
+    comptime std.debug.assert(std.meta.hasUniqueRepresentation(libcontainer.IDMapping));
     return std.mem.eql(u8, std.mem.sliceAsBytes(left), std.mem.sliceAsBytes(right));
 }
 
-pub fn validateJoinedMappings(allocator: std.mem.Allocator, actual: Backend.MountMappings, configured: Backend.MountMappings) Backend.Error!void {
+pub fn validateJoinedMappings(allocator: std.mem.Allocator, actual: libcontainer.MountMappings, configured: libcontainer.MountMappings) libcontainer.Error!void {
     if ((configured.uid.len != 0 and !try equalIDMappings(allocator, actual.uid, configured.uid)) or
         (configured.gid.len != 0 and !try equalIDMappings(allocator, actual.gid, configured.gid)))
     {
@@ -137,7 +137,7 @@ pub fn validateJoinedMappings(allocator: std.mem.Allocator, actual: Backend.Moun
     }
 }
 
-fn readIDMappings(allocator: std.mem.Allocator, pid: i32, name: []const u8) Backend.Error![]Backend.IDMapping {
+fn readIDMappings(allocator: std.mem.Allocator, pid: i32, name: []const u8) libcontainer.Error![]libcontainer.IDMapping {
     var path_buffer: [64]u8 = undefined;
     const path = std.fmt.bufPrintZ(&path_buffer, "/proc/{d}/{s}", .{ pid, name }) catch unreachable;
     const fd = try openPath(linux.AT.FDCWD, path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true });
@@ -152,7 +152,7 @@ fn readIDMappings(allocator: std.mem.Allocator, pid: i32, name: []const u8) Back
         if (result == 0) break;
         used += result;
     }
-    var mappings: std.ArrayList(Backend.IDMapping) = .empty;
+    var mappings: std.ArrayList(libcontainer.IDMapping) = .empty;
     defer mappings.deinit(allocator);
     var lines = std.mem.tokenizeScalar(u8, buffer[0..used], '\n');
     while (lines.next()) |line| {
@@ -170,7 +170,7 @@ fn readIDMappings(allocator: std.mem.Allocator, pid: i32, name: []const u8) Back
 
 /// The parent reads /proc/<helper>/ maps so host IDs use the runtime's namespace.
 /// Like createMountUserNamespace, keep the helper alive with a pipe and reap it.
-pub fn joinedUserNamespaceMappings(allocator: std.mem.Allocator, fd: posix.fd_t) Backend.Error!Backend.MountMappings {
+pub fn joinedUserNamespaceMappings(allocator: std.mem.Allocator, fd: posix.fd_t) libcontainer.Error!libcontainer.MountMappings {
     const ready = try makePipe();
     defer closeFd(ready[0]);
     var ready_writer: ?posix.fd_t = ready[1];
@@ -208,7 +208,7 @@ pub fn joinedUserNamespaceMappings(allocator: std.mem.Allocator, fd: posix.fd_t)
     return .{ .uid = uid, .gid = gid };
 }
 
-pub fn formatIDMappings(allocator: std.mem.Allocator, mappings: []const Backend.IDMapping) std.mem.Allocator.Error![]u8 {
+pub fn formatIDMappings(allocator: std.mem.Allocator, mappings: []const libcontainer.IDMapping) std.mem.Allocator.Error![]u8 {
     var text: std.ArrayList(u8) = .empty;
     defer text.deinit(allocator);
     for (mappings) |mapping| {
@@ -220,7 +220,7 @@ pub fn formatIDMappings(allocator: std.mem.Allocator, mappings: []const Backend.
 /// A separate namespace also works when the container has no user namespace.
 /// As in runc's userns helpers, keep the child alive until maps are installed
 /// and the namespace is pinned, then reap it. Only the parent allocates.
-pub fn createMountUserNamespace(allocator: std.mem.Allocator, mappings: Backend.MountMappings) Backend.Error!posix.fd_t {
+pub fn createMountUserNamespace(allocator: std.mem.Allocator, mappings: libcontainer.MountMappings) libcontainer.Error!posix.fd_t {
     const uid_map = try formatIDMappings(allocator, mappings.uid);
     defer allocator.free(uid_map);
     const gid_map = try formatIDMappings(allocator, mappings.gid);
@@ -264,7 +264,7 @@ pub fn createMountUserNamespace(allocator: std.mem.Allocator, mappings: Backend.
 }
 
 /// The runtime parent writes maps from its original user namespace.
-pub fn writeUserMappings(pid: i32, gid_map: []const u8, uid_map: []const u8) Backend.Error!void {
+pub fn writeUserMappings(pid: i32, gid_map: []const u8, uid_map: []const u8) libcontainer.Error!void {
     var path_buffer: [32]u8 = undefined;
     const path = std.fmt.bufPrintZ(&path_buffer, "/proc/{d}", .{pid}) catch unreachable;
     const dir = try openPath(linux.AT.FDCWD, path, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true });
@@ -274,7 +274,7 @@ pub fn writeUserMappings(pid: i32, gid_map: []const u8, uid_map: []const u8) Bac
     try writeMappingFile(dir, "uid_map", uid_map);
 }
 
-fn writeMappingFile(dir: posix.fd_t, name: [*:0]const u8, text: []const u8) Backend.Error!void {
+fn writeMappingFile(dir: posix.fd_t, name: [*:0]const u8, text: []const u8) libcontainer.Error!void {
     const fd = try openPath(dir, name, .{ .ACCMODE = .WRONLY, .CLOEXEC = true });
     defer closeFd(fd);
     // proc ID maps must be supplied in a single write.
@@ -345,7 +345,7 @@ test "FIFO ownership uses namespace root's mapped host UID and GID" {
     }));
     try std.testing.expectEqual(@as(u32, 200000), try mappedRootID(&.{.{ .container_id = 0, .host_id = 200000, .size = 10 }}));
     try std.testing.expectEqual(@as(u32, 0), try mappedRootID(&.{.{ .container_id = 0, .host_id = 0, .size = 1 }}));
-    for ([_][]const Backend.IDMapping{
+    for ([_][]const libcontainer.IDMapping{
         &.{},
         &.{.{ .container_id = 1, .host_id = 100000, .size = 10 }},
         &.{.{ .container_id = 0, .host_id = 100000, .size = 0 }},
@@ -356,17 +356,17 @@ test "FIFO ownership uses namespace root's mapped host UID and GID" {
 
 test "joined user namespace mappings compare ranges without regard to order" {
     defer diagnostics.last_diagnostic_len = 0;
-    const mappings: []const Backend.IDMapping = &.{
+    const mappings: []const libcontainer.IDMapping = &.{
         .{ .container_id = 0, .host_id = 1000, .size = 10 },
         .{ .container_id = 20, .host_id = 2000, .size = 2 },
     };
-    const reversed: []const Backend.IDMapping = &.{ mappings[1], mappings[0] };
-    const actual: Backend.MountMappings = .{ .uid = mappings, .gid = reversed };
+    const reversed: []const libcontainer.IDMapping = &.{ mappings[1], mappings[0] };
+    const actual: libcontainer.MountMappings = .{ .uid = mappings, .gid = reversed };
     try validateJoinedMappings(std.testing.allocator, actual, .{ .uid = reversed, .gid = mappings });
     try validateJoinedMappings(std.testing.allocator, actual, .{});
     try validateJoinedMappings(std.testing.allocator, actual, .{ .uid = reversed });
     try validateJoinedMappings(std.testing.allocator, actual, .{ .gid = mappings });
-    for ([_][]const Backend.IDMapping{
+    for ([_][]const libcontainer.IDMapping{
         mappings[0..1],
         &.{ mappings[0], mappings[0] },
         &.{ mappings[0], mappings[1], .{ .container_id = 30, .host_id = 3000, .size = 1 } },

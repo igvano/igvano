@@ -2,7 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 const posix = std.posix;
-const Backend = @import("../root.zig").Backend;
+const libcontainer = @import("../root.zig");
 const hooks = @import("../hooks.zig");
 const seccomp = @import("../seccomp.zig");
 const dbus = @import("../dbus.zig");
@@ -90,7 +90,7 @@ const CreateNamespaces = struct {
     user_namespace: bool = undefined,
     joined_user_namespace: bool = undefined,
     joins: std.ArrayList(NamespaceJoin) = .empty,
-    container_mappings: Backend.MountMappings = .{},
+    container_mappings: libcontainer.MountMappings = .{},
     joined_user_fd: ?posix.fd_t = null,
     joined_user_path: ?[]const u8 = null,
     fifo_uid: u32 = undefined,
@@ -100,7 +100,7 @@ const CreateNamespaces = struct {
 };
 
 const CreateInit = struct {
-    capabilities: ?Backend.Capabilities = undefined,
+    capabilities: ?libcontainer.Capabilities = undefined,
     apparmor_command: ?[]const u8 = undefined,
     seccomp_program: ?seccomp.Program = undefined,
     fifo: [:0]const u8 = undefined,
@@ -142,8 +142,7 @@ const CreateSync = struct {
 };
 
 const CreateContext = struct {
-    ptr: *anyopaque,
-    options: Backend.CreateOptions,
+    options: libcontainer.CreateOptions,
     allocator: std.mem.Allocator,
     namespaces: CreateNamespaces = .{},
     init: CreateInit = .{},
@@ -160,10 +159,10 @@ const CreateContext = struct {
 // Step chain: validate → prepare → joined user namespace → cgroups → mounts
 // → resources → host descriptors → mount sources → fork → await parent.
 // Each step owns a defer scope that stays active through the following steps.
-pub fn create(ptr: *anyopaque, options: Backend.CreateOptions) Backend.Error!Backend.Handle {
+pub fn create(options: libcontainer.CreateOptions) libcontainer.Error!libcontainer.State {
     diagnostics.last_diagnostic_len = 0;
     if (comptime builtin.os.tag == .linux) {
-        var context: CreateContext = .{ .ptr = ptr, .options = options, .allocator = options.allocator };
+        var context: CreateContext = .{ .options = options, .allocator = options.allocator };
         try validateCreate(&context);
         // Prepare the init's strings before either fork.
         var arena: std.heap.ArenaAllocator = .init(options.allocator);
@@ -175,7 +174,7 @@ pub fn create(ptr: *anyopaque, options: Backend.CreateOptions) Backend.Error!Bac
     }
 }
 
-fn validateCreate(ctx: *CreateContext) Backend.Error!void {
+fn validateCreate(ctx: *CreateContext) libcontainer.Error!void {
     ctx.namespaces.flags = try namespaceFlags(ctx.options.namespaces);
     ctx.namespaces.isolation_flags = ctx.namespaces.flags;
     for (ctx.options.namespaces) |namespace|
@@ -194,7 +193,7 @@ fn validateCreate(ctx: *CreateContext) Backend.Error!void {
         return error.InvalidPath;
 }
 
-fn validateCreateProcess(ctx: *CreateContext) Backend.Error!void {
+fn validateCreateProcess(ctx: *CreateContext) libcontainer.Error!void {
     if (ctx.options.process) |process| {
         if (process.args.len == 0) return error.InvalidProcess;
     }
@@ -210,7 +209,7 @@ fn validateCreateProcess(ctx: *CreateContext) Backend.Error!void {
     }
 }
 
-fn prepareCreate(ctx: *CreateContext) Backend.Error!Backend.Handle {
+fn prepareCreate(ctx: *CreateContext) libcontainer.Error!libcontainer.State {
     ctx.init.apparmor_command = try prepareAppArmor(ctx.allocator, ctx.options.apparmor_profile);
     ctx.init.seccomp_program = if (ctx.options.seccomp) |config|
         seccomp.compile(ctx.allocator, config, seccomp.Arch.native() orelse return error.Unsupported) catch |err| {
@@ -231,7 +230,7 @@ fn prepareCreate(ctx: *CreateContext) Backend.Error!Backend.Handle {
     return prepareJoinedUserNamespace(ctx);
 }
 
-fn validateMountNamespaceJoins(ctx: *const CreateContext) Backend.Error!void {
+fn validateMountNamespaceJoins(ctx: *const CreateContext) libcontainer.Error!void {
     // Safety guard: rootfs setup in our mount namespace would mutate host mounts.
     for (ctx.namespaces.joins.items) |join| {
         if (join.flag != linux.CLONE.NEWNS) continue;
@@ -254,7 +253,7 @@ fn validateMountNamespaceJoins(ctx: *const CreateContext) Backend.Error!void {
     }
 }
 
-fn prepareCreateMappings(ctx: *CreateContext) Backend.Error!void {
+fn prepareCreateMappings(ctx: *CreateContext) libcontainer.Error!void {
     ctx.namespaces.user_namespace = ctx.namespaces.flags & linux.CLONE.NEWUSER != 0;
     ctx.namespaces.joined_user_namespace = !ctx.namespaces.user_namespace and ctx.namespaces.isolation_flags & linux.CLONE.NEWUSER != 0;
     // Library callers bypass frontend validation, so mapping-presence checks are intentional.
@@ -262,7 +261,7 @@ fn prepareCreateMappings(ctx: *CreateContext) Backend.Error!void {
     ctx.namespaces.container_mappings = .{ .uid = ctx.options.uid_mappings, .gid = ctx.options.gid_mappings };
 }
 
-fn prepareJoinedUserNamespace(ctx: *CreateContext) Backend.Error!Backend.Handle {
+fn prepareJoinedUserNamespace(ctx: *CreateContext) libcontainer.Error!libcontainer.State {
     // Pin the validated namespace and use that same descriptor in init.
     defer if (ctx.namespaces.joined_user_fd) |fd| closeFd(fd);
     if (ctx.namespaces.joined_user_namespace) {
@@ -281,7 +280,7 @@ fn prepareJoinedUserNamespace(ctx: *CreateContext) Backend.Error!Backend.Handle 
     return prepareCreateCgroups(ctx);
 }
 
-fn prepareCreatePaths(ctx: *CreateContext) Backend.Error!void {
+fn prepareCreatePaths(ctx: *CreateContext) libcontainer.Error!void {
     ctx.namespaces.fifo_uid = if (ctx.namespaces.user_namespace or ctx.namespaces.joined_user_namespace) try mappedRootID(ctx.namespaces.container_mappings.uid) else 0;
     ctx.namespaces.fifo_gid = if (ctx.namespaces.user_namespace or ctx.namespaces.joined_user_namespace) try mappedRootID(ctx.namespaces.container_mappings.gid) else 0;
     ctx.namespaces.uid_map = try formatIDMappings(ctx.allocator, ctx.options.uid_mappings);
@@ -294,7 +293,7 @@ fn prepareCreatePaths(ctx: *CreateContext) Backend.Error!void {
     try probeInheritedRootfs(ctx);
 }
 
-fn probeInheritedRootfs(ctx: *CreateContext) Backend.Error!void {
+fn probeInheritedRootfs(ctx: *CreateContext) libcontainer.Error!void {
     if (!ctx.namespaces.private_mount_namespace) {
         const root_fd = try openPath(linux.AT.FDCWD, ctx.init.rootfs, .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true });
         defer closeFd(root_fd);
@@ -321,7 +320,7 @@ fn probeInheritedRootfs(ctx: *CreateContext) Backend.Error!void {
     }
 }
 
-fn prepareCreateCgroups(ctx: *CreateContext) Backend.Error!Backend.Handle {
+fn prepareCreateCgroups(ctx: *CreateContext) libcontainer.Error!libcontainer.State {
     try validateCgroupPath(ctx.options.cgroup_path);
     ctx.cgroups.systemd_client = dbus.Client.init(ctx.allocator);
     defer ctx.cgroups.systemd_client.deinit();
@@ -334,7 +333,7 @@ fn prepareCreateCgroups(ctx: *CreateContext) Backend.Error!Backend.Handle {
     return prepareCreateMounts(ctx);
 }
 
-fn connectCreateSystemd(ctx: *CreateContext) Backend.Error!void {
+fn connectCreateSystemd(ctx: *CreateContext) libcontainer.Error!void {
     if (ctx.options.systemd) {
         if (!std.mem.eql(u8, ctx.options.systemd_unit, std.fs.path.basename(ctx.options.cgroup_path)) or
             !std.mem.endsWith(u8, ctx.options.systemd_unit, ".scope") or
@@ -345,7 +344,7 @@ fn connectCreateSystemd(ctx: *CreateContext) Backend.Error!void {
     }
 }
 
-fn prepareCreateMounts(ctx: *CreateContext) Backend.Error!Backend.Handle {
+fn prepareCreateMounts(ctx: *CreateContext) libcontainer.Error!libcontainer.State {
     ctx.init.mounts = try prepareMounts(ctx.allocator, ctx.options.mounts, ctx.cgroups.cgroup_root.fs_type, ctx.cgroups.hierarchies, ctx.options.cgroup_path);
     defer closeMountFds(ctx.init.mounts);
     if (ctx.namespaces.joined_user_fd) |fd| {
@@ -363,7 +362,7 @@ fn prepareCreateMounts(ctx: *CreateContext) Backend.Error!Backend.Handle {
     return prepareCreateResources(ctx);
 }
 
-fn prepareCreateDevices(ctx: *CreateContext) Backend.Error!void {
+fn prepareCreateDevices(ctx: *CreateContext) libcontainer.Error!void {
     ctx.init.devices = try ctx.allocator.alloc(PreparedDevice, ctx.options.devices.len);
     for (ctx.options.devices, ctx.init.devices) |device, *prepared| {
         if (!std.mem.startsWith(u8, device.path, "/") or
@@ -384,7 +383,7 @@ fn prepareCreateDevices(ctx: *CreateContext) Backend.Error!void {
     }
 }
 
-fn prepareCreateProcess(ctx: *CreateContext) Backend.Error!void {
+fn prepareCreateProcess(ctx: *CreateContext) libcontainer.Error!void {
     const args: []const []const u8 = if (ctx.options.process) |process| process.args else &.{};
     const env: []const []const u8 = if (ctx.options.process) |process| process.env else &.{};
     ctx.init.argv = try ctx.allocator.allocSentinel(?[*:0]const u8, args.len, null);
@@ -399,7 +398,7 @@ fn prepareCreateProcess(ctx: *CreateContext) Backend.Error!void {
     ctx.init.readonly_paths = try preparePaths(ctx.allocator, ctx.options.readonly_paths);
 }
 
-fn prepareCreateResources(ctx: *CreateContext) Backend.Error!Backend.Handle {
+fn prepareCreateResources(ctx: *CreateContext) libcontainer.Error!libcontainer.State {
     ctx.cgroups.cgroup_writes = if (ctx.cgroups.cgroup_root.mode == .unified) try v2Writes(ctx.allocator, ctx.options.resources) else &.{};
     defer if (ctx.cgroups.cgroup_root.mode == .unified) freeWrites(ctx.allocator, ctx.cgroups.cgroup_writes);
     if (ctx.cgroups.cgroup_root.mode == .legacy and ctx.options.resources.unified.len != 0) {
@@ -415,7 +414,7 @@ fn prepareCreateResources(ctx: *CreateContext) Backend.Error!Backend.Handle {
     return createWithHostDescriptors(ctx);
 }
 
-fn createWithHostDescriptors(ctx: *CreateContext) Backend.Error!Backend.Handle {
+fn createWithHostDescriptors(ctx: *CreateContext) libcontainer.Error!libcontainer.State {
     // pivot_root also changes child1's root while it waits in the same
     // mount namespace. Pin host /proc so it can still capture identity.
     ctx.proc_dir = try openPath(linux.AT.FDCWD, "/proc", .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true });
@@ -456,7 +455,7 @@ fn cleanupFailedCreate(ctx: *CreateContext) void {
         .{ .before_create = before }) catch {};
 }
 
-fn createWithMountSources(ctx: *CreateContext) Backend.Error!Backend.Handle {
+fn createWithMountSources(ctx: *CreateContext) libcontainer.Error!libcontainer.State {
     var needs_mount_sources = false;
     for (ctx.init.mounts) |mount| {
         if (mount.flags & linux.MS.BIND != 0 and
@@ -475,7 +474,7 @@ fn createWithMountSources(ctx: *CreateContext) Backend.Error!Backend.Handle {
     return forkCreate(ctx);
 }
 
-fn forkCreate(ctx: *CreateContext) Backend.Error!Backend.Handle {
+fn forkCreate(ctx: *CreateContext) libcontainer.Error!libcontainer.State {
     // getpid() in child2 may be 1. Child1 supplies its host PID for
     // opaque hook input; buffers and JSON fragments were prepared above.
     ctx.sync.pid_pipe = try makePipe();
@@ -496,7 +495,7 @@ fn forkCreate(ctx: *CreateContext) Backend.Error!Backend.Handle {
     return awaitCreateParent(ctx);
 }
 
-fn prepareCreatePipes(ctx: *CreateContext) Backend.Error!void {
+fn prepareCreatePipes(ctx: *CreateContext) libcontainer.Error!void {
     ctx.sync.report = try makePipe();
     ctx.sync.ready = makePipe() catch |err| {
         for (ctx.sync.report) |fd| closeFd(fd);
@@ -717,7 +716,7 @@ fn reportCreatedInit(ctx: *const CreateContext, child2: i32) noreturn {
     linux.exit_group(0);
 }
 
-fn awaitCreateParent(ctx: *CreateContext) Backend.Error!Backend.Handle {
+fn awaitCreateParent(ctx: *CreateContext) libcontainer.Error!libcontainer.State {
     if (ctx.mount_source_socket) |fd| closeFd(fd);
     ctx.mount_source_socket = null;
     // Only child1 writes the PID. Keeping a writer in this parent
@@ -756,7 +755,7 @@ fn reapFailedCreateChild(ctx: *CreateContext) void {
     _ = waitChild(ctx.sync.child1) catch {};
 }
 
-fn releaseInitMappings(ctx: *CreateContext) Backend.Error!void {
+fn releaseInitMappings(ctx: *CreateContext) libcontainer.Error!void {
     if (ctx.sync.map_writer) |fd| {
         var mapping_response: CreateResponse = .{};
         if (!readAll(ctx.sync.report[0], std.mem.asBytes(&mapping_response))) return error.CreateFailed;
@@ -777,7 +776,7 @@ fn releaseInitMappings(ctx: *CreateContext) Backend.Error!void {
     }
 }
 
-fn adoptInitSystemd(ctx: *CreateContext, init_pid: i32) Backend.Error!void {
+fn adoptInitSystemd(ctx: *CreateContext, init_pid: i32) libcontainer.Error!void {
     const device_rules = if (ctx.cgroups.cgroup_root.mode == .legacy)
         try v2DeviceRules(ctx.allocator, ctx.options.resources.devices, ctx.options.devices)
     else
@@ -811,7 +810,7 @@ fn adoptInitSystemd(ctx: *CreateContext, init_pid: i32) Backend.Error!void {
     }
 }
 
-fn receiveRootfsMount(ctx: *CreateContext) Backend.Error!void {
+fn receiveRootfsMount(ctx: *CreateContext) libcontainer.Error!void {
     if (ctx.rootfs_mount_before) |before| {
         var mount_response: CreateResponse = .{};
         if (!readAll(ctx.sync.report[0], std.mem.asBytes(&mount_response))) return error.CreateFailed;
@@ -822,13 +821,13 @@ fn receiveRootfsMount(ctx: *CreateContext) Backend.Error!void {
     }
 }
 
-fn finishCreateParent(ctx: *CreateContext) Backend.Error!Backend.Handle {
+fn finishCreateParent(ctx: *CreateContext) libcontainer.Error!libcontainer.State {
     var response: CreateResponse = .{};
     const reported = readAll(ctx.sync.report[0], std.mem.asBytes(&response));
     var starttime_buffer: [20]u8 = undefined;
     const starttime = std.fmt.bufPrint(&starttime_buffer, "{d}", .{response.starttime}) catch unreachable;
     const handle = createHandle(ctx, response.pid, starttime);
-    errdefer killReportedInit(ctx, reported, handle);
+    errdefer killReportedInit(reported, handle);
     if (!reported) return error.CreateFailed;
     try validateInitResponse(response);
     if (ctx.options.on_create) |callback| try callback.run(callback.ptr, handle);
@@ -841,7 +840,7 @@ fn finishCreateParent(ctx: *CreateContext) Backend.Error!Backend.Handle {
     return createHandle(ctx, initialized_response.pid, owned_starttime);
 }
 
-fn createHandle(ctx: *const CreateContext, pid: i32, starttime: []const u8) Backend.Handle {
+fn createHandle(ctx: *const CreateContext, pid: i32, starttime: []const u8) libcontainer.State {
     return .{
         .id = ctx.options.id,
         .pid = pid,
@@ -855,22 +854,22 @@ fn createHandle(ctx: *const CreateContext, pid: i32, starttime: []const u8) Back
     };
 }
 
-fn killReportedInit(ctx: *const CreateContext, reported: bool, handle: Backend.Handle) void {
+fn killReportedInit(reported: bool, handle: libcontainer.State) void {
     if (reported and handle.pid > 0) {
         const saved_diagnostic = diagnostics.last_diagnostic;
         const saved_len = diagnostics.last_diagnostic_len;
-        kill(ctx.ptr, handle, 9) catch {};
+        kill(handle, 9) catch {};
         diagnostics.last_diagnostic = saved_diagnostic;
         diagnostics.last_diagnostic_len = saved_len;
     }
 }
 
-fn validateInitResponse(response: CreateResponse) Backend.Error!void {
+fn validateInitResponse(response: CreateResponse) libcontainer.Error!void {
     if (response.failureError()) |err| return err;
     if (response.pid <= 0) return error.CreateFailed;
 }
 
-fn awaitInitializedInit(ctx: *CreateContext) Backend.Error!CreateResponse {
+fn awaitInitializedInit(ctx: *CreateContext) libcontainer.Error!CreateResponse {
     var response: CreateResponse = .{};
     const initialized = readAll(ctx.sync.report[0], std.mem.asBytes(&response));
     ctx.sync.child1_reaped = true;
@@ -884,16 +883,16 @@ fn awaitInitializedInit(ctx: *CreateContext) Backend.Error!CreateResponse {
 }
 
 const InitContext = struct {
-    process: ?Backend.Process,
+    process: ?libcontainer.Process,
     hostname: ?[]const u8,
     readonly_rootfs: bool,
-    capabilities: ?Backend.Capabilities,
-    rlimits: []const Backend.Rlimit,
+    capabilities: ?libcontainer.Capabilities,
+    rlimits: []const libcontainer.Rlimit,
     flags: usize,
     rootfs: [:0]const u8,
     mounts: []const PreparedMount,
     devices: []const PreparedDevice,
-    symlinks: []const Backend.Symlink,
+    symlinks: []const libcontainer.Symlink,
     cwd: [:0]const u8,
     fifo_fd: posix.fd_t,
     fd_dir: posix.fd_t,
@@ -908,16 +907,16 @@ const InitContext = struct {
 };
 
 pub fn runInit(
-    process: ?Backend.Process,
+    process: ?libcontainer.Process,
     hostname: ?[]const u8,
     readonly_rootfs: bool,
-    capabilities: ?Backend.Capabilities,
-    rlimits: []const Backend.Rlimit,
+    capabilities: ?libcontainer.Capabilities,
+    rlimits: []const libcontainer.Rlimit,
     flags: usize,
     rootfs: [:0]const u8,
     mounts: []const PreparedMount,
     devices: []const PreparedDevice,
-    symlinks: []const Backend.Symlink,
+    symlinks: []const libcontainer.Symlink,
     cwd: [:0]const u8,
     fifo_fd: posix.fd_t,
     fd_dir: posix.fd_t,

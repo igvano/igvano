@@ -2,9 +2,12 @@ const std = @import("std");
 const builtin = @import("builtin");
 const oci = @import("igvano").oci;
 const libcontainer = @import("libcontainer");
-const Backend = libcontainer.Backend;
 const diagnostics = @import("diagnostic.zig");
-const backendResult = @import("diagnostic.zig").backendResult;
+const containerResult = @import("diagnostic.zig").containerResult;
+const ContainerOverride = @import("state.zig").ContainerOverride;
+const ContainerInstance = @import("state.zig").ContainerInstance;
+const createInstance = @import("state.zig").createInstance;
+const createDiagnostic = @import("state.zig").createDiagnostic;
 const Config = @import("args.zig").Config;
 const prepareProcess = @import("process.zig").prepareProcess;
 const validateConsoleSocket = @import("process.zig").validateConsoleSocket;
@@ -20,7 +23,7 @@ const hookStateTemplate = @import("hooks.zig").hookStateTemplate;
 const runHooks = @import("hooks.zig").runHooks;
 const warnHooks = @import("hooks.zig").warnHooks;
 
-pub fn createContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, config: Config) !void {
+pub fn createContainer(allocator: std.mem.Allocator, io: std.Io, injected: ?ContainerOverride, config: Config) !void {
     const cwd = std.Io.Dir.cwd();
     const bundle = try cwd.realPathFileAlloc(io, config.bundle orelse ".", allocator);
     defer allocator.free(bundle);
@@ -54,7 +57,7 @@ pub fn createContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backen
     defer allocator.free(cgroup_path);
     const resources = try oci.cgroupResources(allocator, settings.resources);
     defer oci.freeCgroupResources(allocator, resources);
-    var options: Backend.CreateOptions = .{
+    var options: libcontainer.CreateOptions = .{
         .allocator = allocator,
         .id = config.id,
         .rootfs = rootfs,
@@ -78,15 +81,15 @@ pub fn createContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backen
     };
     try applyCreateSpec(mount_allocator, &options, parsed.value);
     applyCreateProcess(&options, process_options);
-    try createPreparedContainer(allocator, mount_allocator, io, backend, config, bundle, parsed.value, options);
+    try createPreparedContainer(allocator, mount_allocator, io, injected, config, bundle, parsed.value, options);
 }
 
-fn prepareCreateProcess(allocator: std.mem.Allocator, process: ?oci.Spec.Process, console_socket: bool) !?Backend.ExecOptions {
+fn prepareCreateProcess(allocator: std.mem.Allocator, process: ?oci.Spec.Process, console_socket: bool) !?libcontainer.ExecOptions {
     return if (process) |value|
         try prepareProcess(allocator, value, console_socket)
     else options: {
         try validateConsoleSocket(null, console_socket);
-        break :options @as(?Backend.ExecOptions, null);
+        break :options @as(?libcontainer.ExecOptions, null);
     };
 }
 
@@ -96,9 +99,9 @@ fn closeConsoleFds(console_fds: ?[2]std.posix.fd_t) void {
     };
 }
 
-fn prepareCreateNamespaces(allocator: std.mem.Allocator, configured: ?[]const oci.Spec.Namespace) ![]Backend.Namespace {
+fn prepareCreateNamespaces(allocator: std.mem.Allocator, configured: ?[]const oci.Spec.Namespace) ![]libcontainer.Namespace {
     const namespaces = configured orelse &.{};
-    const result = try allocator.alloc(Backend.Namespace, namespaces.len);
+    const result = try allocator.alloc(libcontainer.Namespace, namespaces.len);
     for (namespaces, result) |namespace, *prepared| prepared.* = .{
         .kind = namespaceKind(namespace.type),
         .path = namespace.path,
@@ -106,7 +109,7 @@ fn prepareCreateNamespaces(allocator: std.mem.Allocator, configured: ?[]const oc
     return result;
 }
 
-fn namespaceKind(kind: @FieldType(oci.Spec.Namespace, "type")) Backend.Namespace.Kind {
+fn namespaceKind(kind: @FieldType(oci.Spec.Namespace, "type")) libcontainer.Namespace.Kind {
     return switch (kind) {
         .pid => .pid,
         .network => .network,
@@ -119,9 +122,9 @@ fn namespaceKind(kind: @FieldType(oci.Spec.Namespace, "type")) Backend.Namespace
     };
 }
 
-fn prepareCreateMounts(mount_allocator: std.mem.Allocator, bundle: []const u8, configured: ?[]const oci.Spec.Mount, settings: oci.Spec.Linux) ![]Backend.Mount {
+fn prepareCreateMounts(mount_allocator: std.mem.Allocator, bundle: []const u8, configured: ?[]const oci.Spec.Mount, settings: oci.Spec.Linux) ![]libcontainer.Mount {
     const spec_mounts = configured orelse &.{};
-    const mounts = try mount_allocator.alloc(Backend.Mount, spec_mounts.len);
+    const mounts = try mount_allocator.alloc(libcontainer.Mount, spec_mounts.len);
     for (spec_mounts, mounts, 0..) |mount, *prepared, i| {
         errdefer |err| if (err == error.InvalidConfig) oci.diagnosticContext("mounts[{d}]", .{i});
         const options = try oci.parseMountOptions(mount_allocator, mount.options orelse &.{}, mount.type);
@@ -146,7 +149,7 @@ fn prepareCreateMounts(mount_allocator: std.mem.Allocator, bundle: []const u8, c
     return mounts;
 }
 
-fn applyCreateSpec(allocator: std.mem.Allocator, options: *Backend.CreateOptions, spec: oci.Spec) !void {
+fn applyCreateSpec(allocator: std.mem.Allocator, options: *libcontainer.CreateOptions, spec: oci.Spec) !void {
     const settings: oci.Spec.Linux = spec.linux orelse .{};
     options.process = if (spec.process) |process| oci.processConfig(process) else null;
     options.namespaces = try prepareCreateNamespaces(allocator, settings.namespaces);
@@ -156,7 +159,7 @@ fn applyCreateSpec(allocator: std.mem.Allocator, options: *Backend.CreateOptions
     options.readonly_rootfs = spec.root.readonly;
 }
 
-fn applyCreateProcess(options: *Backend.CreateOptions, process: ?Backend.ExecOptions) void {
+fn applyCreateProcess(options: *libcontainer.CreateOptions, process: ?libcontainer.ExecOptions) void {
     if (process) |value| {
         options.capabilities = value.capabilities;
         options.rlimits = value.rlimits;
@@ -165,14 +168,14 @@ fn applyCreateProcess(options: *Backend.CreateOptions, process: ?Backend.ExecOpt
     }
 }
 
-fn createPreparedContainer(allocator: std.mem.Allocator, mount_allocator: std.mem.Allocator, io: std.Io, backend: Backend, config: Config, bundle: []const u8, spec: oci.Spec, prepared: Backend.CreateOptions) !void {
+fn createPreparedContainer(allocator: std.mem.Allocator, mount_allocator: std.mem.Allocator, io: std.Io, injected: ?ContainerOverride, config: Config, bundle: []const u8, spec: oci.Spec, prepared: libcontainer.CreateOptions) !void {
     const cwd = std.Io.Dir.cwd();
     const configured_hooks: oci.Spec.Hooks = spec.hooks orelse .{};
     var options = prepared;
     _ = try cwd.createDirPathStatus(io, config.root, .fromMode(0o700));
     const root = try cwd.realPathFileAlloc(io, config.root, allocator);
     defer allocator.free(root);
-    if (inheritsMountNamespace(spec.linux orelse .{})) try requireUnusedRootfs(allocator, io, backend, root, config.id, options.rootfs);
+    if (inheritsMountNamespace(spec.linux orelse .{})) try requireUnusedRootfs(allocator, io, injected, root, config.id, options.rootfs);
     const state_dir = try std.fs.path.join(allocator, &.{ root, config.id });
     defer allocator.free(state_dir);
     var state: oci.State = .{
@@ -214,13 +217,15 @@ fn createPreparedContainer(allocator: std.mem.Allocator, mount_allocator: std.me
     options.create_hook_state = create_hook_state;
     options.start_hook_state = start_hook_state;
     options.on_create = .{ .ptr = &create_context, .run = CreateContext.run };
-    const created = backend.create(options);
-    const handle = try createdHandle(backend, created, create_context.failure);
-    defer allocator.free(handle.starttime);
+    var instance: ContainerInstance = undefined;
+    const created = createInstance(&instance, injected, options);
+    const container = try createdContainer(createDiagnostic(injected), created, create_context.failure);
+    defer instance.deinit(allocator);
+    const handle = instance.state;
     errdefer cleanup: {
         if (lock) |file| requireLinkedLock(io, file) catch break :cleanup;
-        backend.kill(handle, 9) catch {};
-        backend.delete(handle) catch {};
+        container.kill(9) catch {};
+        container.delete() catch {};
     }
     state.pid = handle.pid;
     try saveRootfsMount(allocator, io, state_dir, handle);
@@ -234,10 +239,10 @@ fn createPreparedContainer(allocator: std.mem.Allocator, mount_allocator: std.me
     }
 }
 
-fn createdHandle(backend: Backend, created: Backend.Error!Backend.Handle, failure: ?anyerror) !Backend.Handle {
-    return backendResult(backend, created) catch |err| {
+fn createdContainer(detail: ?[]const u8, created: libcontainer.Error!libcontainer.Container, failure: ?anyerror) !libcontainer.Container {
+    return diagnostics.createResult(detail, created) catch |err| {
         if (failure) |reason| {
-            diagnostics.last_backend_detail = null;
+            diagnostics.last_container_detail = null;
             return reason;
         }
         return err;
@@ -259,14 +264,14 @@ fn cleanupCreateState(allocator: std.mem.Allocator, io: std.Io, state_dir: []con
         file.close(io);
         lock.* = null;
     }
-    // Backend failures clean up init; later failures kill it before this defer.
+    // Library failures clean up init; later failures kill it before this defer.
     if (setup_attempted) {
         state.status = .stopped;
         warnHooks(allocator, poststop, state.*, "poststop");
     }
 }
 
-fn persistCreatingState(allocator: std.mem.Allocator, io: std.Io, root: []const u8, state_dir: []const u8, state: oci.State, spec: oci.Spec, options: Backend.CreateOptions) ![]u8 {
+fn persistCreatingState(allocator: std.mem.Allocator, io: std.Io, root: []const u8, state_dir: []const u8, state: oci.State, spec: oci.Spec, options: libcontainer.CreateOptions) ![]u8 {
     const cgroup_state_path = try std.fs.path.join(allocator, &.{ state_dir, oci.cgroup_file_name });
     defer allocator.free(cgroup_state_path);
     try oci.atomicWrite(io, cgroup_state_path, options.cgroup_path);
@@ -324,16 +329,16 @@ pub const CreateContext = struct {
     lock: ?std.Io.File = null,
     failure: ?anyerror = null,
 
-    pub fn run(ptr: *anyopaque, handle: Backend.Handle) Backend.Error!void {
+    pub fn run(ptr: *anyopaque, handle: libcontainer.State) libcontainer.Error!void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         self.ready(handle) catch |err| {
-            // Preserve frontend I/O errors across the backend's narrower error set.
+            // Preserve frontend I/O errors across the library's narrower error set.
             self.failure = err;
             return error.CreateFailed;
         };
     }
 
-    pub fn ready(self: *@This(), handle: Backend.Handle) !void {
+    pub fn ready(self: *@This(), handle: libcontainer.State) !void {
         if (self.lock) |file| try requireLinkedLock(self.io, file);
         self.state.pid = handle.pid;
         const path = try std.fs.path.join(self.allocator, &.{ self.state_dir, oci.starttime_file_name });

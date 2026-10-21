@@ -2,7 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 const posix = std.posix;
-const Backend = @import("../root.zig").Backend;
+const libcontainer = @import("../root.zig");
 const diagnostics = @import("diagnostic.zig");
 const checkResult = @import("syscall.zig").checkResult;
 const closeFd = @import("syscall.zig").closeFd;
@@ -18,7 +18,7 @@ const freeV1Hierarchies = @import("cgroup_v1.zig").freeV1Hierarchies;
 const openV1Hierarchies = @import("cgroup_v1.zig").openV1Hierarchies;
 const walkV1Cgroup = @import("cgroup_v1.zig").walkV1Cgroup;
 
-pub fn openFreezerCgroup(handle: Backend.Handle) Backend.Error!?struct { fd: posix.fd_t, mode: CgroupMode } {
+pub fn openFreezerCgroup(handle: libcontainer.State) libcontainer.Error!?struct { fd: posix.fd_t, mode: CgroupMode } {
     const path = handle.cgroup_path orelse return null;
     try validateCgroupPath(path);
     const root = openCgroupRoot() catch |err| switch (err) {
@@ -48,7 +48,7 @@ pub fn openFreezerCgroup(handle: Backend.Handle) Backend.Error!?struct { fd: pos
     return .{ .fd = fd, .mode = root.mode };
 }
 
-pub fn cgroupFrozen(dir: posix.fd_t, mode: CgroupMode) Backend.Error!bool {
+pub fn cgroupFrozen(dir: posix.fd_t, mode: CgroupMode) libcontainer.Error!bool {
     const fd = try openPath(dir, if (mode == .unified) "cgroup.freeze" else "freezer.state", .{ .ACCMODE = .RDONLY, .NOFOLLOW = true, .CLOEXEC = true });
     defer closeFd(fd);
     var buffer: [4096]u8 = undefined;
@@ -68,7 +68,7 @@ pub fn cgroupFrozen(dir: posix.fd_t, mode: CgroupMode) Backend.Error!bool {
 }
 
 /// Both freezer implementations are asynchronous; poll every ten milliseconds.
-pub fn waitFrozen(dir: posix.fd_t, mode: CgroupMode, wanted: bool, attempts: usize) Backend.Error!bool {
+pub fn waitFrozen(dir: posix.fd_t, mode: CgroupMode, wanted: bool, attempts: usize) libcontainer.Error!bool {
     const allocator = std.heap.page_allocator;
     const delay: linux.timespec = .{ .sec = 0, .nsec = 10_000_000 };
     for (0..attempts) |_| {
@@ -95,7 +95,7 @@ pub fn waitFrozen(dir: posix.fd_t, mode: CgroupMode, wanted: bool, attempts: usi
     return false;
 }
 
-pub fn setFrozen(handle: Backend.Handle, wanted: bool) Backend.Error!void {
+pub fn setFrozen(handle: libcontainer.State, wanted: bool) libcontainer.Error!void {
     diagnostics.last_diagnostic_len = 0;
     if (comptime builtin.os.tag != .linux) return error.NotImplemented;
     const cgroup = (try openFreezerCgroup(handle)) orelse {
@@ -107,7 +107,7 @@ pub fn setFrozen(handle: Backend.Handle, wanted: bool) Backend.Error!void {
     try setCgroupFrozen(cgroup.fd, cgroup.mode, wanted, handle.cgroup_path.?, if (wanted) 1000 else 50);
 }
 
-pub fn setCgroupFrozen(dir: posix.fd_t, mode: CgroupMode, wanted: bool, path: []const u8, attempts: usize) Backend.Error!void {
+pub fn setCgroupFrozen(dir: posix.fd_t, mode: CgroupMode, wanted: bool, path: []const u8, attempts: usize) libcontainer.Error!void {
     const name: []const u8 = if (mode == .unified) "cgroup.freeze" else "freezer.state";
     const value: []const u8 = if (mode == .unified)
         (if (wanted) "1" else "0")

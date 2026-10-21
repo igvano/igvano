@@ -2,9 +2,42 @@ const std = @import("std");
 const builtin = @import("builtin");
 const oci = @import("igvano").oci;
 const libcontainer = @import("libcontainer");
-const Backend = libcontainer.Backend;
-const backendResult = @import("diagnostic.zig").backendResult;
+const containerResult = @import("diagnostic.zig").containerResult;
 const Config = @import("args.zig").Config;
+
+pub const ContainerInstance = libcontainer.linux.Container;
+
+/// Test seam binding runtime data to a fake instance. Production always passes null.
+pub const ContainerOverride = struct {
+    container: libcontainer.Container,
+    state: *libcontainer.State,
+    create: ?*const fn (*anyopaque, libcontainer.CreateOptions) libcontainer.Error!libcontainer.State = null,
+};
+
+pub fn bindContainer(instance: *ContainerInstance, injected: ?ContainerOverride, state: libcontainer.State) libcontainer.Container {
+    instance.* = ContainerInstance.load(state);
+    if (injected) |override| {
+        override.state.* = state;
+        return override.container;
+    }
+    return instance.container();
+}
+
+/// On success, deinit instance with options.allocator, including test instances.
+pub fn createInstance(instance: *ContainerInstance, injected: ?ContainerOverride, options: libcontainer.CreateOptions) libcontainer.Error!libcontainer.Container {
+    if (injected) |override| {
+        const create = override.create orelse return error.NotImplemented;
+        instance.* = .{ .state = try create(override.container.ptr, options), .owned = true };
+        override.state.* = instance.state;
+        return override.container;
+    }
+    instance.* = try ContainerInstance.create(options);
+    return instance.container();
+}
+
+pub fn createDiagnostic(injected: ?ContainerOverride) ?[]const u8 {
+    return if (injected) |override| override.container.diagnostic() else libcontainer.linux.diagnostic();
+}
 
 pub fn openContainerLock(allocator: std.mem.Allocator, config: Config, create: bool) !?std.Io.File {
     if (comptime builtin.os.tag != .linux) return null;
@@ -98,7 +131,7 @@ pub fn loadHasProcess(allocator: std.mem.Allocator, io: std.Io, config: Config) 
     return oci.validationError(error.InvalidState, "has-process record: expected true or false", .{});
 }
 
-pub fn stateHandle(allocator: std.mem.Allocator, io: std.Io, root: []const u8, state: oci.State, force_cleanup: bool) !Backend.Handle {
+pub fn containerState(allocator: std.mem.Allocator, io: std.Io, root: []const u8, state: oci.State, force_cleanup: bool) !libcontainer.State {
     const pid = state.pid orelse return oci.validationError(error.InvalidState, "state.pid: required for a live container", .{});
     if (pid <= 0) return oci.validationError(error.InvalidState, "state.pid: must be positive", .{});
     const path = try std.fs.path.join(allocator, &.{ root, state.id, oci.starttime_file_name });
@@ -125,7 +158,7 @@ pub fn stateHandle(allocator: std.mem.Allocator, io: std.Io, root: []const u8, s
     };
 }
 
-pub fn loadDeviceNodes(allocator: std.mem.Allocator, io: std.Io, root: []const u8, id: []const u8) ![]const Backend.Device {
+pub fn loadDeviceNodes(allocator: std.mem.Allocator, io: std.Io, root: []const u8, id: []const u8) ![]const libcontainer.Device {
     const path = try std.fs.path.join(allocator, &.{ root, id, "devices.json" });
     defer allocator.free(path);
     // Prepared records include defaults and fields absent from compact config.json.
@@ -142,12 +175,12 @@ pub fn loadDeviceNodes(allocator: std.mem.Allocator, io: std.Io, root: []const u
         else => return err,
     };
     defer allocator.free(text);
-    const parsed = std.json.parseFromSlice([]Backend.Device, allocator, text, .{}) catch |err| {
+    const parsed = std.json.parseFromSlice([]libcontainer.Device, allocator, text, .{}) catch |err| {
         if (err == error.OutOfMemory) return err;
         return oci.validationError(error.InvalidState, "saved device nodes: invalid JSON or schema ({s})", .{@errorName(err)});
     };
     defer parsed.deinit();
-    const result = try allocator.alloc(Backend.Device, parsed.value.len);
+    const result = try allocator.alloc(libcontainer.Device, parsed.value.len);
     var used: usize = 0;
     errdefer {
         for (result[0..used]) |device| allocator.free(device.path);
@@ -168,7 +201,7 @@ test "saved device nodes survive reload and allocation failure, with legacy snap
             defer oci.freeDevices(allocator, nodes);
             for (nodes) |node| {
                 if (std.mem.eql(u8, node.path, "/dev/custom")) {
-                    try std.testing.expectEqual(Backend.Device.Kind.character, node.kind);
+                    try std.testing.expectEqual(libcontainer.Device.Kind.character, node.kind);
                     try std.testing.expectEqual(@as(u32, 10), node.major);
                     try std.testing.expectEqual(@as(u32, 237), node.minor);
                     return;
@@ -288,7 +321,7 @@ pub const RootfsMount = struct {
     boot_id: ?[36]u8 = null,
 };
 
-pub fn saveRootfsMount(allocator: std.mem.Allocator, io: std.Io, state_dir: []const u8, handle: Backend.Handle) !void {
+pub fn saveRootfsMount(allocator: std.mem.Allocator, io: std.Io, state_dir: []const u8, handle: libcontainer.State) !void {
     const mount = RootfsMount{
         .path = handle.rootfs_mount orelse return,
         .mount_id_unique = handle.rootfs_mount_id orelse return oci.validationError(error.InvalidState, "rootfs mount record: missing unique mount ID", .{}),
@@ -343,7 +376,7 @@ fn rootfsComparisonPath(allocator: std.mem.Allocator, io: std.Io, path: []const 
     };
 }
 
-pub fn requireUnusedRootfs(allocator: std.mem.Allocator, io: std.Io, backend: Backend, root: []const u8, id: []const u8, rootfs: []const u8) !void {
+pub fn requireUnusedRootfs(allocator: std.mem.Allocator, io: std.Io, injected: ?ContainerOverride, root: []const u8, id: []const u8, rootfs: []const u8) !void {
     const cwd = std.Io.Dir.cwd();
     const resolved = try rootfsComparisonPath(allocator, io, rootfs);
     defer allocator.free(resolved);
@@ -357,7 +390,7 @@ pub fn requireUnusedRootfs(allocator: std.mem.Allocator, io: std.Io, backend: Ba
     while (try entries.next(io)) |entry| {
         if (entry.kind != .directory or std.mem.eql(u8, entry.name, id)) continue;
         if (!try rootfsSiblingMatches(allocator, io, root, entry.name, resolved)) continue;
-        if (try rootfsSiblingAlive(allocator, io, backend, root, entry.name))
+        if (try rootfsSiblingAlive(allocator, io, injected, root, entry.name))
             return oci.validationError(error.InvalidConfig, "rootfs '{s}' is already used by live container '{s}' in the inherited mount namespace", .{ rootfs, entry.name });
     }
 }
@@ -378,7 +411,7 @@ fn rootfsSiblingMatches(allocator: std.mem.Allocator, io: std.Io, root: []const 
     return std.mem.eql(u8, mounted_path, resolved);
 }
 
-fn rootfsSiblingAlive(allocator: std.mem.Allocator, io: std.Io, backend: Backend, root: []const u8, id: []const u8) !bool {
+fn rootfsSiblingAlive(allocator: std.mem.Allocator, io: std.Io, injected: ?ContainerOverride, root: []const u8, id: []const u8) !bool {
     const saved = oci.loadState(allocator, io, root, id) catch |err| switch (err) {
         error.FileNotFound => return false, // Concurrent deletion.
         error.OutOfMemory => return err,
@@ -393,7 +426,7 @@ fn rootfsSiblingAlive(allocator: std.mem.Allocator, io: std.Io, backend: Backend
         return false;
     }
     if (saved.value.pid == null) return false;
-    const handle = stateHandle(allocator, io, root, saved.value, false) catch |err| switch (err) {
+    const handle = containerState(allocator, io, root, saved.value, false) catch |err| switch (err) {
         error.FileNotFound => return false,
         error.OutOfMemory => return err,
         else => {
@@ -401,8 +434,10 @@ fn rootfsSiblingAlive(allocator: std.mem.Allocator, io: std.Io, backend: Backend
             return false;
         },
     };
-    defer freeStateHandle(allocator, handle);
-    return backendResult(backend, backend.alive(handle));
+    defer freeContainerState(allocator, handle);
+    var instance: ContainerInstance = undefined;
+    const container = bindContainer(&instance, injected, handle);
+    return containerResult(container, container.alive());
 }
 
 fn warnRootfsSibling(id: []const u8, err: anyerror) void {
@@ -411,14 +446,17 @@ fn warnRootfsSibling(id: []const u8, err: anyerror) void {
 }
 
 test "inherited rootfs ownership rejects live aliases and permits dead or private containers" {
-    const LockTestBackend = @import("tests/helpers.zig").LockTestBackend;
+    const overrideContainer = @import("tests/helpers.zig").overrideContainer;
+    const LockTestContainer = @import("tests/helpers.zig").LockTestContainer;
     defer oci.clearDiagnostic();
-    const TestBackend = struct {
-        fn alive(_: *anyopaque, handle: Backend.Handle) Backend.Error!bool {
+    const TestContainer = struct {
+        fn alive(ptr: *anyopaque) libcontainer.Error!bool {
+            const self: *LockTestContainer = @ptrCast(@alignCast(ptr));
+            const handle = self.state;
             return std.mem.eql(u8, handle.starttime, "live");
         }
-        fn check(allocator: std.mem.Allocator, backend: Backend, root: []const u8, rootfs: []const u8) !void {
-            requireUnusedRootfs(allocator, std.testing.io, backend, root, "other", rootfs) catch |err| {
+        fn check(allocator: std.mem.Allocator, container: ?ContainerOverride, root: []const u8, rootfs: []const u8) !void {
+            requireUnusedRootfs(allocator, std.testing.io, container, root, "other", rootfs) catch |err| {
                 if (err == error.OutOfMemory) return err;
                 try std.testing.expectEqual(error.InvalidConfig, err);
                 return;
@@ -450,48 +488,48 @@ test "inherited rootfs ownership rejects live aliases and permits dead or privat
         .rootfs_mount_boot_id = "00000000-0000-0000-0000-000000000000".*,
     });
     try tmp.dir.writeFile(io, .{ .sub_path = "example/starttime", .data = "live" });
-    var implementation: LockTestBackend = .{};
-    var vtable = LockTestBackend.vtable;
-    vtable.alive = TestBackend.alive;
-    const backend: Backend = .{ .ptr = &implementation, .vtable = &vtable };
+    var implementation: LockTestContainer = .{};
+    var vtable = LockTestContainer.vtable;
+    vtable.alive = TestContainer.alive;
+    const container: libcontainer.Container = .{ .ptr = &implementation, .vtable = &vtable };
     for ([_]oci.Status{ .creating, .created, .running, .paused }) |status| {
         try oci.saveState(allocator, io, root, .{ .id = "example", .status = status, .pid = 1234, .bundle = root });
-        try TestBackend.check(allocator, backend, root, rootfs);
+        try TestContainer.check(allocator, overrideContainer(&implementation, container), root, rootfs);
     }
-    try std.testing.checkAllAllocationFailures(allocator, TestBackend.check, .{ backend, root, rootfs });
-    try requireUnusedRootfs(allocator, io, backend, root, "example", rootfs);
-    try requireUnusedRootfs(allocator, io, backend, root, "other", "/unrelated/rootfs");
+    try std.testing.checkAllAllocationFailures(allocator, TestContainer.check, .{ overrideContainer(&implementation, container), root, rootfs });
+    try requireUnusedRootfs(allocator, io, overrideContainer(&implementation, container), root, "example", rootfs);
+    try requireUnusedRootfs(allocator, io, overrideContainer(&implementation, container), root, "other", "/unrelated/rootfs");
     try tmp.dir.writeFile(io, .{ .sub_path = "example/starttime", .data = "dead" });
-    try requireUnusedRootfs(allocator, io, backend, root, "other", rootfs);
+    try requireUnusedRootfs(allocator, io, overrideContainer(&implementation, container), root, "other", rootfs);
     try tmp.dir.writeFile(io, .{ .sub_path = "example/starttime", .data = "live" });
     const good_state = try tmp.dir.readFileAlloc(io, "example/state.json", allocator, .unlimited);
     defer allocator.free(good_state);
     try tmp.dir.writeFile(io, .{ .sub_path = "example/state.json", .data = "{" });
-    try requireUnusedRootfs(allocator, io, backend, root, "other", rootfs);
+    try requireUnusedRootfs(allocator, io, overrideContainer(&implementation, container), root, "other", rootfs);
     try std.testing.expect(oci.diagnostic() == null);
     try oci.saveState(allocator, io, root, .{ .id = "example", .status = .running, .pid = -1, .bundle = root });
-    try requireUnusedRootfs(allocator, io, backend, root, "other", rootfs);
+    try requireUnusedRootfs(allocator, io, overrideContainer(&implementation, container), root, "other", rootfs);
     try tmp.dir.writeFile(io, .{ .sub_path = "example/state.json", .data =
         \\{"ociVersion":"1.0.2","id":"wrong","status":"running","pid":1234,"bundle":"/"}
     });
-    try requireUnusedRootfs(allocator, io, backend, root, "other", rootfs);
+    try requireUnusedRootfs(allocator, io, overrideContainer(&implementation, container), root, "other", rootfs);
     try tmp.dir.writeFile(io, .{ .sub_path = "example/state.json", .data = good_state });
     try tmp.dir.deleteFile(io, "example/starttime");
-    try requireUnusedRootfs(allocator, io, backend, root, "other", rootfs);
+    try requireUnusedRootfs(allocator, io, overrideContainer(&implementation, container), root, "other", rootfs);
     try tmp.dir.writeFile(io, .{ .sub_path = "example/starttime", .data = "live" });
-    try TestBackend.check(allocator, backend, root, rootfs);
+    try TestContainer.check(allocator, overrideContainer(&implementation, container), root, rootfs);
     try tmp.dir.writeFile(io, .{ .sub_path = "example/rootfs_mount", .data = "{" });
-    try requireUnusedRootfs(allocator, io, backend, root, "other", rootfs);
+    try requireUnusedRootfs(allocator, io, overrideContainer(&implementation, container), root, "other", rootfs);
     try tmp.dir.deleteFile(io, "example/rootfs_mount");
     try tmp.dir.createDir(io, "example/rootfs_mount", .default_dir);
-    try requireUnusedRootfs(allocator, io, backend, root, "other", rootfs);
+    try requireUnusedRootfs(allocator, io, overrideContainer(&implementation, container), root, "other", rootfs);
     try tmp.dir.deleteDir(io, "example/rootfs_mount");
     try tmp.dir.writeFile(io, .{ .sub_path = "example/rootfs_mount", .data = alias });
     try tmp.dir.deleteFile(io, "example/rootfs_mount");
-    try requireUnusedRootfs(allocator, io, backend, root, "other", rootfs);
+    try requireUnusedRootfs(allocator, io, overrideContainer(&implementation, container), root, "other", rootfs);
 }
 
-fn freeStateHandle(allocator: std.mem.Allocator, handle: Backend.Handle) void {
+fn freeContainerState(allocator: std.mem.Allocator, handle: libcontainer.State) void {
     allocator.free(handle.starttime);
     if (handle.cgroup_path) |path| allocator.free(path);
     if (handle.rootfs_mount) |path| allocator.free(path);
@@ -499,39 +537,41 @@ fn freeStateHandle(allocator: std.mem.Allocator, handle: Backend.Handle) void {
 
 pub const LiveState = struct {
     parsed: std.json.Parsed(oci.State),
-    handle: ?Backend.Handle,
+    container_state: ?libcontainer.State,
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: LiveState) void {
-        if (self.handle) |handle| freeStateHandle(self.allocator, handle);
+        if (self.container_state) |handle| freeContainerState(self.allocator, handle);
         self.parsed.deinit();
     }
 };
 
-pub fn readLiveState(allocator: std.mem.Allocator, io: std.Io, backend: Backend, config: Config, persist_recovery: bool) !LiveState {
-    return recoverLiveState(allocator, io, backend, config, try oci.loadState(allocator, io, config.root, config.id), persist_recovery);
+pub fn readLiveState(allocator: std.mem.Allocator, io: std.Io, injected: ?ContainerOverride, config: Config, persist_recovery: bool) !LiveState {
+    return recoverLiveState(allocator, io, injected, config, try oci.loadState(allocator, io, config.root, config.id), persist_recovery);
 }
 
-pub fn recoverLiveState(allocator: std.mem.Allocator, io: std.Io, backend: Backend, config: Config, saved: std.json.Parsed(oci.State), persist_recovery: bool) !LiveState {
+pub fn recoverLiveState(allocator: std.mem.Allocator, io: std.Io, injected: ?ContainerOverride, config: Config, saved: std.json.Parsed(oci.State), persist_recovery: bool) !LiveState {
     var parsed = saved;
     errdefer parsed.deinit();
     if (!std.mem.eql(u8, parsed.value.id, config.id)) return oci.validationError(error.InvalidState, "state.id: does not match requested container", .{});
-    var handle: ?Backend.Handle = null;
-    errdefer if (handle) |value| freeStateHandle(allocator, value);
+    var handle: ?libcontainer.State = null;
+    errdefer if (handle) |value| freeContainerState(allocator, value);
     if (parsed.value.status == .creating or parsed.value.status == .created or parsed.value.status == .running or parsed.value.status == .paused) {
-        handle = try loadLiveHandle(allocator, io, config, parsed.value);
-        if (handle == null or !try backendResult(backend, backend.alive(handle.?))) {
+        handle = try loadLiveContainerState(allocator, io, config, parsed.value);
+        var instance: ContainerInstance = undefined;
+        const container = if (handle) |value| bindContainer(&instance, injected, value) else null;
+        if (container == null or !try containerResult(container.?, container.?.alive())) {
             parsed.value.status = .stopped;
             if (persist_recovery) try oci.saveState(allocator, io, config.root, parsed.value);
         } else if (parsed.value.status != .creating) {
-            try recoverFrozenState(backend, config, &parsed.value, handle.?);
+            try recoverFrozenState(container.?, config, &parsed.value);
         }
     }
-    return .{ .parsed = parsed, .handle = handle, .allocator = allocator };
+    return .{ .parsed = parsed, .container_state = handle, .allocator = allocator };
 }
 
-fn loadLiveHandle(allocator: std.mem.Allocator, io: std.Io, config: Config, state: oci.State) !?Backend.Handle {
-    return stateHandle(allocator, io, config.root, state, config.subcommand == .delete and config.force) catch |err| switch (err) {
+fn loadLiveContainerState(allocator: std.mem.Allocator, io: std.Io, config: Config, state: oci.State) !?libcontainer.State {
+    return containerState(allocator, io, config.root, state, config.subcommand == .delete and config.force) catch |err| switch (err) {
         error.InvalidState => if (state.status == .creating) recovered: {
             oci.clearDiagnostic();
             break :recovered null;
@@ -540,11 +580,11 @@ fn loadLiveHandle(allocator: std.mem.Allocator, io: std.Io, config: Config, stat
     };
 }
 
-fn recoverFrozenState(backend: Backend, config: Config, state: *oci.State, handle: Backend.Handle) !void {
+fn recoverFrozenState(container: libcontainer.Container, config: Config, state: *oci.State) !void {
     const frozen = if (config.subcommand == .kill or (config.subcommand == .delete and config.force))
-        backend.frozen(handle) catch false
+        container.frozen() catch false
     else
-        try backendResult(backend, backend.frozen(handle));
+        try containerResult(container, container.frozen());
     if (frozen) {
         state.status = .paused;
     } else if (state.status == .paused) {
@@ -559,13 +599,13 @@ test "state handle requires a nonempty starttime file" {
     const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
     defer std.testing.allocator.free(root);
     const state: oci.State = .{ .id = "example", .pid = 1234, .status = .created, .bundle = "/bundle" };
-    try std.testing.expectError(error.InvalidState, stateHandle(std.testing.allocator, std.testing.io, root, state, false));
+    try std.testing.expectError(error.InvalidState, containerState(std.testing.allocator, std.testing.io, root, state, false));
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "example/starttime", .data = "" });
-    try std.testing.expectError(error.InvalidState, stateHandle(std.testing.allocator, std.testing.io, root, state, false));
+    try std.testing.expectError(error.InvalidState, containerState(std.testing.allocator, std.testing.io, root, state, false));
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "example/starttime", .data = "987654321" });
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "example/cgroup", .data = "/custom/from-state" });
-    const handle = try stateHandle(std.testing.allocator, std.testing.io, root, state, false);
-    defer freeStateHandle(std.testing.allocator, handle);
+    const handle = try containerState(std.testing.allocator, std.testing.io, root, state, false);
+    defer freeContainerState(std.testing.allocator, handle);
     try std.testing.expectEqualStrings("987654321", handle.starttime);
     try std.testing.expectEqualStrings("custom/from-state", handle.cgroup_path.?);
     try std.testing.expect(handle.rootfs_mount == null);
@@ -574,8 +614,8 @@ test "state handle requires a nonempty starttime file" {
         .sub_path = "example/rootfs_mount",
         .data = "{\"path\":\"/bundle/rootfs\",\"mount_id_unique\":12345,\"boot_id\":\"00000000-0000-0000-0000-000000000000\"}",
     });
-    const mounted_handle = try stateHandle(std.testing.allocator, std.testing.io, root, state, false);
-    defer freeStateHandle(std.testing.allocator, mounted_handle);
+    const mounted_handle = try containerState(std.testing.allocator, std.testing.io, root, state, false);
+    defer freeContainerState(std.testing.allocator, mounted_handle);
     try std.testing.expectEqualStrings("/bundle/rootfs", mounted_handle.rootfs_mount.?);
     try std.testing.expectEqual(@as(?u64, 12345), mounted_handle.rootfs_mount_id);
     try std.testing.expectEqualStrings("00000000-0000-0000-0000-000000000000", &mounted_handle.rootfs_mount_boot_id.?);
@@ -584,18 +624,18 @@ test "state handle requires a nonempty starttime file" {
         .sub_path = "example/rootfs_mount",
         .data = "{\"path\":\"/bundle/rootfs\",\"mount_id\":12345}",
     });
-    const old_id_handle = try stateHandle(std.testing.allocator, std.testing.io, root, state, false);
-    defer freeStateHandle(std.testing.allocator, old_id_handle);
+    const old_id_handle = try containerState(std.testing.allocator, std.testing.io, root, state, false);
+    defer freeContainerState(std.testing.allocator, old_id_handle);
     try std.testing.expectEqualStrings("/bundle/rootfs", old_id_handle.rootfs_mount.?);
     try std.testing.expect(old_id_handle.rootfs_mount_id == null);
     try std.testing.expect(old_id_handle.rootfs_mount_boot_id == null);
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "example/rootfs_mount", .data = "/bundle/rootfs" });
-    const legacy_handle = try stateHandle(std.testing.allocator, std.testing.io, root, state, false);
-    defer freeStateHandle(std.testing.allocator, legacy_handle);
+    const legacy_handle = try containerState(std.testing.allocator, std.testing.io, root, state, false);
+    defer freeContainerState(std.testing.allocator, legacy_handle);
     try std.testing.expectEqualStrings("/bundle/rootfs", legacy_handle.rootfs_mount.?);
     try std.testing.expect(legacy_handle.rootfs_mount_id == null);
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "example/rootfs_mount", .data = "relative" });
-    try std.testing.expectError(error.InvalidState, stateHandle(std.testing.allocator, std.testing.io, root, state, false));
+    try std.testing.expectError(error.InvalidState, containerState(std.testing.allocator, std.testing.io, root, state, false));
 }
 
 test "loading rootfs mounts rejects invalid ownership records" {
@@ -644,13 +684,13 @@ test "saved systemd driver survives commands without the global flag" {
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "example/cgroup-driver", .data = "systemd\n" });
     const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
     defer std.testing.allocator.free(root);
-    const handle = try stateHandle(std.testing.allocator, std.testing.io, root, .{
+    const handle = try containerState(std.testing.allocator, std.testing.io, root, .{
         .id = "example",
         .pid = 42,
         .status = .created,
         .bundle = "/bundle",
     }, false);
-    defer freeStateHandle(std.testing.allocator, handle);
+    defer freeContainerState(std.testing.allocator, handle);
     try std.testing.expect(handle.systemd);
     try std.testing.expectEqualStrings("system.slice/test-example.scope", handle.cgroup_path.?);
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "example/cgroup-driver", .data = "unknown" });

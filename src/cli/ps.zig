@@ -1,8 +1,10 @@
 const std = @import("std");
 const oci = @import("igvano").oci;
 const libcontainer = @import("libcontainer");
-const Backend = libcontainer.Backend;
-const backendResult = @import("diagnostic.zig").backendResult;
+const ContainerInstance = @import("state.zig").ContainerInstance;
+const containerResult = @import("diagnostic.zig").containerResult;
+const ContainerOverride = @import("state.zig").ContainerOverride;
+const bindContainer = @import("state.zig").bindContainer;
 const Config = @import("args.zig").Config;
 const openContainerLock = @import("state.zig").openContainerLock;
 const lockContainer = @import("state.zig").lockContainer;
@@ -37,17 +39,19 @@ fn filterPsOutput(allocator: std.mem.Allocator, text: []const u8, pids: []const 
     return output.toOwnedSlice();
 }
 
-pub fn psContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, config: Config, output: std.Io.File) !void {
+pub fn psContainer(allocator: std.mem.Allocator, io: std.Io, injected: ?ContainerOverride, config: Config, output: std.Io.File) !void {
     const lock = try openContainerLock(allocator, config, false);
     defer if (lock) |file| file.close(io);
     const locked = if (lock) |file| try lockContainer(file, false) else true;
     if (locked) {
         if (lock) |file| try requireLinkedLock(io, file);
     }
-    const state = try readLiveState(allocator, io, backend, config, locked);
+    const state = try readLiveState(allocator, io, injected, config, locked);
     defer state.deinit();
+    var instance: ContainerInstance = undefined;
+    const container = if (state.container_state) |value| bindContainer(&instance, injected, value) else null;
     if (state.parsed.value.status == .stopped) return oci.validationError(error.InvalidStatus, "ps: container is stopped", .{});
-    const pids = try backendResult(backend, backend.pids(state.handle.?, allocator));
+    const pids = try containerResult(container.?, container.?.pids(allocator));
     defer allocator.free(pids);
     if (config.ps_format == .json) {
         const json = try std.json.Stringify.valueAlloc(allocator, pids, .{});

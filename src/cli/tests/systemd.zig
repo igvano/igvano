@@ -1,11 +1,13 @@
 const std = @import("std");
+const overrideContainer = @import("helpers.zig").overrideContainer;
 const builtin = @import("builtin");
 const oci = @import("igvano").oci;
 const libcontainer = @import("libcontainer");
-const backendResult = @import("../diagnostic.zig").backendResult;
+const ContainerInstance = @import("../state.zig").ContainerInstance;
+const containerResult = @import("../diagnostic.zig").containerResult;
 const parseArgs = @import("../args.zig").parseArgs;
 const updateContainer = @import("../update.zig").updateContainer;
-const stateHandle = @import("../state.zig").stateHandle;
+const containerState = @import("../state.zig").containerState;
 const createContainer = @import("../create.zig").createContainer;
 const startContainer = @import("../start.zig").startContainer;
 const waitExec = @import("../exec.zig").waitExec;
@@ -74,21 +76,23 @@ fn testSystemdLifecycleDeletion(base: []const u8, kill_before_delete: bool) !voi
     try cwd.writeFile(io, .{ .sub_path = config_path, .data = try std.json.Stringify.valueAlloc(allocator, spec, .{ .emit_null_optional_fields = false }) });
     if (linux.errno(linux.prctl(@intFromEnum(linux.PR.SET_CHILD_SUBREAPER), 1, 0, 0, 0)) != .SUCCESS)
         return error.SubreaperFailed;
-    var implementation: libcontainer.LinuxBackend = .{};
-    const backend = implementation.backend();
+
     const create = try parseArgs(&.{ "igvano", "--systemd-cgroup", "--root", root, "create", "--bundle", bundle, id });
-    try createContainer(allocator, io, backend, create);
+    try createContainer(allocator, io, null, create);
     const remove = try parseArgs(&.{ "igvano", "--root", root, "delete", "--force", id });
-    defer deleteContainer(allocator, io, backend, remove) catch {};
+    defer deleteContainer(allocator, io, null, remove) catch {};
     const saved = try oci.loadState(allocator, io, root, id);
     defer saved.deinit();
-    const handle = try stateHandle(allocator, io, root, saved.value, false);
+    const handle = try containerState(allocator, io, root, saved.value, false);
     try std.testing.expect(handle.systemd);
     try std.testing.expectEqualStrings(path, handle.cgroup_path.?);
     var reaped = false;
     defer if (!reaped) {
         _ = linux.kill(handle.pid, .KILL);
-        backend.thaw(handle) catch {};
+        (thaw: {
+            var instance = ContainerInstance.load(handle);
+            break :thaw instance.container().thaw();
+        }) catch {};
         _ = waitExec(handle.pid) catch {};
     };
     const active = try std.process.run(allocator, io, .{ .argv = &.{ "systemctl", "show", unit, "-p", "ActiveState", "--value" } });
@@ -103,11 +107,11 @@ fn testSystemdLifecycleDeletion(base: []const u8, kill_before_delete: bool) !voi
     });
     try std.testing.expectEqualStrings("67108864", std.mem.trim(u8, try readTestCgroup(allocator, io, memory_path), " \t\n"));
     const start = try parseArgs(&.{ "igvano", "--root", root, "start", id });
-    try startContainer(allocator, io, backend, start);
+    try startContainer(allocator, io, null, start);
     const update_path = try std.fs.path.join(allocator, &.{ base, "resources.json" });
     const update = try parseArgs(&.{ "igvano", "--root", root, "update", "--resources", update_path, id });
     try cwd.writeFile(io, .{ .sub_path = update_path, .data = "{\"memory\":{\"limit\":134217728}}" });
-    try updateContainer(allocator, io, backend, update);
+    try updateContainer(allocator, io, null, update);
     try std.testing.expectEqualStrings("134217728", std.mem.trim(u8, try readTestCgroup(allocator, io, memory_path), " \t\n"));
     if (!unified) {
         try checkSystemdV1Devices(allocator, io, path, "c 10:237 rw\n", "c 10:238 rwm\n");
@@ -117,7 +121,7 @@ fn testSystemdLifecycleDeletion(base: []const u8, kill_before_delete: bool) !voi
         // A new allowlist must clear cached DeviceAllow entries, so reload
         // cannot restore devices removed by an explicit resource update.
         try cwd.writeFile(io, .{ .sub_path = update_path, .data = "{\"devices\":[{\"allow\":false},{\"allow\":true,\"type\":\"c\",\"major\":10,\"minor\":239,\"access\":\"rw\"}]}" });
-        try updateContainer(allocator, io, backend, update);
+        try updateContainer(allocator, io, null, update);
         const reload_updated = try std.process.run(allocator, io, .{ .argv = &.{ "systemctl", "daemon-reload" } });
         try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, reload_updated.term);
         // Create-time linux.devices allows survive explicit resource updates.
@@ -126,9 +130,9 @@ fn testSystemdLifecycleDeletion(base: []const u8, kill_before_delete: bool) !voi
         try std.testing.expect(std.mem.indexOf(u8, devices, "10:237") == null);
         // Privileged allow-all containers also need memory-only updates to work.
         try cwd.writeFile(io, .{ .sub_path = update_path, .data = "{\"devices\":[{\"allow\":true}]}" });
-        try updateContainer(allocator, io, backend, update);
+        try updateContainer(allocator, io, null, update);
         try cwd.writeFile(io, .{ .sub_path = update_path, .data = "{\"memory\":{\"limit\":134217728}}" });
-        try updateContainer(allocator, io, backend, update);
+        try updateContainer(allocator, io, null, update);
         const allow_all = try readTestCgroup(allocator, io, try std.fmt.allocPrint(allocator, "/sys/fs/cgroup/devices/{s}/devices.list", .{path}));
         try std.testing.expect(std.mem.indexOf(u8, allow_all, "a *:* rwm") == null);
         try std.testing.expect(std.mem.indexOf(u8, allow_all, "c *:* rwm\n") != null);
@@ -136,26 +140,39 @@ fn testSystemdLifecycleDeletion(base: []const u8, kill_before_delete: bool) !voi
     }
     // Updating only quota preserves the period, including systemd's cached value.
     try cwd.writeFile(io, .{ .sub_path = update_path, .data = "{\"cpu\":{\"quota\":25000}}" });
-    try updateContainer(allocator, io, backend, update);
+    try updateContainer(allocator, io, null, update);
     const pause = try parseArgs(&.{ "igvano", "--root", root, "pause", id });
-    try pauseContainer(allocator, io, backend, pause);
-    try std.testing.expect(try backend.frozen(handle));
+    try pauseContainer(allocator, io, null, pause);
+    try std.testing.expect(try (frozen: {
+        var instance = ContainerInstance.load(handle);
+        break :frozen instance.container().frozen();
+    }));
     const resume_config = try parseArgs(&.{ "igvano", "--root", root, "resume", id });
-    try pauseContainer(allocator, io, backend, resume_config);
-    try std.testing.expect(!try backend.frozen(handle));
+    try pauseContainer(allocator, io, null, resume_config);
+    try std.testing.expect(!try (frozen: {
+        var instance = ContainerInstance.load(handle);
+        break :frozen instance.container().frozen();
+    }));
     const command = try parseArgs(&.{ "igvano", "--root", root, "exec", id, "sh", "-c", "test \"$(cat /proc/self/cgroup)\" = \"$(cat /proc/1/cgroup)\"" });
     try std.testing.expectEqual(@as(u8, 0), try execTestCommand(command, null));
-    const members = try backend.pids(handle, allocator);
+    const members = try (pids: {
+        var instance = ContainerInstance.load(handle);
+        break :pids instance.container().pids(allocator);
+    });
     try std.testing.expect(std.mem.indexOfScalar(i32, members, handle.pid) != null);
     if (kill_before_delete) {
         const kill = try parseArgs(&.{ "igvano", "--root", root, "kill", id, "9" });
-        try killContainer(allocator, io, backend, kill);
+        try killContainer(allocator, io, null, kill);
         _ = try waitExec(handle.pid);
         reaped = true;
     }
     // Exercise StopUnit on an active scope as well as ordinary CLI deletion.
-    if (!kill_before_delete) try backendResult(backend, backend.delete(handle));
-    try deleteContainer(allocator, io, backend, remove);
+    if (!kill_before_delete) {
+        var instance = ContainerInstance.load(handle);
+        const loaded = instance.container();
+        try containerResult(loaded, loaded.delete());
+    }
+    try deleteContainer(allocator, io, null, remove);
     if (!reaped) {
         _ = try waitExec(handle.pid);
         reaped = true;

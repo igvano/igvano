@@ -1,4 +1,5 @@
 const std = @import("std");
+const overrideContainer = @import("helpers.zig").overrideContainer;
 const builtin = @import("builtin");
 const oci = @import("igvano").oci;
 const libcontainer = @import("libcontainer");
@@ -112,14 +113,13 @@ fn testSeccompLifecycle(base: []const u8) !void {
                 .sub_path = try std.fs.path.join(allocator, &.{ bundle, "config.json" }),
                 .data = try std.json.Stringify.valueAlloc(allocator, spec, .{ .emit_null_optional_fields = false }),
             });
-            var implementation: libcontainer.LinuxBackend = .{};
-            const backend = implementation.backend();
+
             var config: Config = .{ .root = root, .id = id, .subcommand = .create, .bundle = bundle };
-            try createContainer(allocator, io, backend, config);
+            try createContainer(allocator, io, null, config);
             defer {
                 config.subcommand = .delete;
                 config.force = true;
-                deleteContainer(allocator, io, backend, config) catch {};
+                deleteContainer(allocator, io, null, config) catch {};
             }
             const saved = try oci.loadState(allocator, io, root, id);
             const pid = saved.value.pid.?;
@@ -132,10 +132,10 @@ fn testSeccompLifecycle(base: []const u8) !void {
             // both with inherited process settings and an explicit --process.
             config.subcommand = .exec;
             config.exec_args = spec.process.?.args;
-            try std.testing.expectEqual(@as(u8, 0), try execContainer(allocator, io, backend, config));
+            try std.testing.expectEqual(@as(u8, 0), try execContainer(allocator, io, null, config));
             if (profile_index == 2) {
                 config.exec_args = &.{ "/probe", nnp_arg, "runtime-tools" };
-                try std.testing.expectEqual(@as(u8, 0), try execContainer(allocator, io, backend, config));
+                try std.testing.expectEqual(@as(u8, 0), try execContainer(allocator, io, null, config));
                 config.exec_args = spec.process.?.args;
             }
             config.process_file = try std.fs.path.join(allocator, &.{ bundle, "process.json" });
@@ -143,9 +143,9 @@ fn testSeccompLifecycle(base: []const u8) !void {
                 .sub_path = config.process_file.?,
                 .data = try std.json.Stringify.valueAlloc(allocator, spec.process.?, .{ .emit_null_optional_fields = false }),
             });
-            try std.testing.expectEqual(@as(u8, 0), try execContainer(allocator, io, backend, config));
+            try std.testing.expectEqual(@as(u8, 0), try execContainer(allocator, io, null, config));
             config.subcommand = .start;
-            try startContainer(allocator, io, backend, config);
+            try startContainer(allocator, io, null, config);
             const status = try waitExec(pid);
             reaped = true;
             try std.testing.expectEqual(@as(u8, 0), status);
@@ -240,14 +240,13 @@ fn testAppArmorLifecycle(base: []const u8) !void {
             .sub_path = try std.fs.path.join(allocator, &.{ bundle, "config.json" }),
             .data = try std.json.Stringify.valueAlloc(allocator, spec, .{ .emit_null_optional_fields = false }),
         });
-        var implementation: libcontainer.LinuxBackend = .{};
-        const backend = implementation.backend();
+
         var config: Config = .{ .root = root, .id = id, .subcommand = .create, .bundle = bundle };
-        try createContainer(allocator, io, backend, config);
+        try createContainer(allocator, io, null, config);
         defer {
             config.subcommand = .delete;
             config.force = true;
-            deleteContainer(allocator, io, backend, config) catch {};
+            deleteContainer(allocator, io, null, config) catch {};
         }
         const saved = try oci.loadState(allocator, io, root, id);
         const pid = saved.value.pid.?;
@@ -258,7 +257,7 @@ fn testAppArmorLifecycle(base: []const u8) !void {
         };
         config.subcommand = .exec;
         config.exec_args = spec.process.?.args;
-        try std.testing.expectEqual(@as(u8, 0), try execContainer(allocator, io, backend, config));
+        try std.testing.expectEqual(@as(u8, 0), try execContainer(allocator, io, null, config));
         config.process_file = try std.fs.path.join(allocator, &.{ bundle, "process.json" });
         // --process without a profile must still use the container's profile.
         var process = spec.process.?;
@@ -269,17 +268,17 @@ fn testAppArmorLifecycle(base: []const u8) !void {
                 .sub_path = config.process_file.?,
                 .data = try std.json.Stringify.valueAlloc(allocator, process, .{ .emit_null_optional_fields = false }),
             });
-            try std.testing.expectEqual(@as(u8, 0), try execContainer(allocator, io, backend, config));
+            try std.testing.expectEqual(@as(u8, 0), try execContainer(allocator, io, null, config));
         }
         process.apparmorProfile = try std.fmt.allocPrint(allocator, "{s}-not-loaded", .{profile});
         try cwd.writeFile(io, .{
             .sub_path = config.process_file.?,
             .data = try std.json.Stringify.valueAlloc(allocator, process, .{ .emit_null_optional_fields = false }),
         });
-        try std.testing.expectError(error.CreateFailed, execContainer(allocator, io, backend, config));
-        try std.testing.expect(std.mem.indexOf(u8, diagnostics.last_backend_detail.?, "profile not loaded") != null);
+        try std.testing.expectError(error.CreateFailed, execContainer(allocator, io, null, config));
+        try std.testing.expect(std.mem.indexOf(u8, diagnostics.last_container_detail.?, "profile not loaded") != null);
         config.subcommand = .start;
-        try startContainer(allocator, io, backend, config);
+        try startContainer(allocator, io, null, config);
         const status = try waitExec(pid);
         reaped = true;
         try std.testing.expectEqual(@as(u8, 0), status);
@@ -365,14 +364,13 @@ fn testPropagationLifecycle(base: []const u8) !void {
             .sub_path = try std.fs.path.join(allocator, &.{ bundle, "config.json" }),
             .data = try std.json.Stringify.valueAlloc(allocator, spec, .{ .emit_null_optional_fields = false }),
         });
-        var implementation: libcontainer.LinuxBackend = .{};
-        const backend = implementation.backend();
+
         var config: Config = .{ .root = root, .id = id, .subcommand = .create, .bundle = bundle };
-        try createContainer(allocator, io, backend, config);
+        try createContainer(allocator, io, null, config);
         defer {
             config.subcommand = .delete;
             config.force = true;
-            deleteContainer(allocator, io, backend, config) catch {};
+            deleteContainer(allocator, io, null, config) catch {};
         }
         const saved = try oci.loadState(allocator, io, root, id);
         const pid = saved.value.pid.?;
@@ -381,15 +379,15 @@ fn testPropagationLifecycle(base: []const u8) !void {
             _ = waitExec(pid) catch {};
         }
         config.subcommand = .start;
-        try startContainer(allocator, io, backend, config);
+        try startContainer(allocator, io, null, config);
         // The source was already bound into the running container.
         try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.mount(host_data, host_mount, null, linux.MS.BIND, 0)));
         defer _ = linux.umount2(host_mount, linux.MNT.DETACH);
         config.subcommand = .exec;
         config.exec_args = &.{ "/probe", "true", "propagation-host" };
-        try std.testing.expectEqual(@as(u8, 0), try execContainer(allocator, io, backend, config));
+        try std.testing.expectEqual(@as(u8, 0), try execContainer(allocator, io, null, config));
         config.exec_args = &.{ "/probe", "true", "propagation-container" };
-        try std.testing.expectEqual(@as(u8, 0), try execContainer(allocator, io, backend, config));
+        try std.testing.expectEqual(@as(u8, 0), try execContainer(allocator, io, null, config));
         const flag = try std.fmt.allocPrintSentinel(allocator, "{s}/flag", .{container_mount}, 0);
         if (case.userns) {
             // The container's user namespace is downstream of the host.

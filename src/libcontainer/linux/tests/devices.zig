@@ -1,8 +1,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const linux = std.os.linux;
-const Backend = @import("../../root.zig").Backend;
-const Resources = Backend.Resources;
+const libcontainer = @import("../../root.zig");
+const Resources = libcontainer.Resources;
 const seccomp = @import("../../seccomp.zig");
 const diagnostics = @import("../diagnostic.zig");
 const v2DeviceRules = @import("../devices.zig").v2DeviceRules;
@@ -31,7 +31,7 @@ const requireTestMountNamespace = @import("helpers.zig").requireTestMountNamespa
 const PreparedDevice = @import("../device_nodes.zig").PreparedDevice;
 const validateDeviceNode = @import("../device_nodes.zig").validateDeviceNode;
 const createDevice = @import("../device_nodes.zig").createDevice;
-const LinuxBackend = @import("../../linux.zig").LinuxBackend;
+const LinuxContainer = @import("../../linux.zig").Container;
 
 test "linux v2 device filter loads a large rule set without overflowing the verifier log" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
@@ -150,7 +150,7 @@ test "linux v1 container allowlist opens dev null while a denied device fails" {
     try checkResult(linux.mknod(denied, linux.S.IFCHR | 0o600, (10 << 8) | 237));
     const path = try std.fmt.allocPrint(allocator, "igvano-v1-devices-{d}", .{linux.getpid()});
     defer allocator.free(path);
-    const devices: []const Backend.Device = &.{
+    const devices: []const libcontainer.Device = &.{
         .{ .path = "/dev/null", .kind = .character, .major = 1, .minor = 3, .required = false },
         .{ .path = "/dev/zero", .kind = .character, .major = 1, .minor = 5, .required = false },
         .{ .path = "/dev/full", .kind = .character, .major = 1, .minor = 7, .required = false },
@@ -158,9 +158,7 @@ test "linux v1 container allowlist opens dev null while a denied device fails" {
         .{ .path = "/dev/urandom", .kind = .character, .major = 1, .minor = 9, .required = false },
         .{ .path = "/dev/tty", .kind = .character, .major = 5, .minor = 0, .required = false },
     };
-    var implementation: LinuxBackend = .{};
-    const backend = implementation.backend();
-    const handle = try backend.create(.{
+    var handle_instance = try LinuxContainer.create(.{
         .allocator = allocator,
         .id = "v1-devices",
         .rootfs = rootfs,
@@ -179,17 +177,21 @@ test "linux v1 container allowlist opens dev null while a denied device fails" {
             .timeout_seconds = 2,
         }},
     });
-    defer allocator.free(handle.starttime);
-    defer backend.delete(handle) catch {};
-    try std.testing.expect(try backend.alive(handle));
+    defer handle_instance.deinit(allocator);
+    const handle = handle_instance.state;
+    const handle_container = handle_instance.container();
+    defer handle_container.delete() catch {};
+    try std.testing.expect(try handle_container.alive());
     const reader = try openPath(linux.AT.FDCWD, fifo, .{ .ACCMODE = .RDONLY, .CLOEXEC = true });
     defer closeFd(reader);
     var byte: [1]u8 = undefined;
     try std.testing.expect(readAll(reader, &byte));
     try std.testing.expectEqual(@as(u8, 1), byte[0]);
     // Delete must rediscover hierarchies even when the saved init PID is gone.
-    try backend.delete(.{ .id = handle.id, .pid = 0, .starttime = "", .cgroup_path = path });
-    try std.testing.expect(!try backend.alive(handle));
+    var stopped_instance = LinuxContainer.load(.{ .id = handle.id, .pid = 0, .starttime = "", .cgroup_path = path });
+    const stopped_container = stopped_instance.container();
+    try stopped_container.delete();
+    try std.testing.expect(!try handle_container.alive());
 }
 
 test "linux v2 container device filter preserves defaults and replaces unlisted device policy on update" {
@@ -227,14 +229,12 @@ test "linux v2 container device filter preserves defaults and replaces unlisted 
         .{ .allow = true, .kind = .char, .major = 1, .minor = 3 },
         .{ .allow = true, .kind = .char, .major = 10, .minor = 237 },
     };
-    var implementation: LinuxBackend = .{};
-    const backend = implementation.backend();
     var original_memlock: linux.rlimit = undefined;
     try checkResult(linux.getrlimit(.MEMLOCK, &original_memlock));
     const limited_memlock: linux.rlimit = .{ .cur = @min(original_memlock.cur, 64 * 1024), .max = original_memlock.max };
     try checkResult(linux.setrlimit(.MEMLOCK, &limited_memlock));
     defer _ = linux.setrlimit(.MEMLOCK, &original_memlock);
-    const handle = try backend.create(.{
+    var handle_instance = try LinuxContainer.create(.{
         .allocator = allocator,
         .id = "v2-devices",
         .rootfs = rootfs,
@@ -249,10 +249,12 @@ test "linux v2 container device filter preserves defaults and replaces unlisted 
         .device_symlinks = &.{.{ .path = "/dev/ptmx", .target = "pts/ptmx" }},
         .resources = .{ .devices = rules[0..2] },
     });
-    defer allocator.free(handle.starttime);
+    defer handle_instance.deinit(allocator);
+    const handle = handle_instance.state;
+    const handle_container = handle_instance.container();
     defer {
-        backend.kill(handle, 9) catch {};
-        backend.delete(handle) catch {};
+        handle_container.kill(9) catch {};
+        handle_container.delete() catch {};
     }
     var inherited_memlock: linux.rlimit = undefined;
     try checkResult(linux.prlimit(handle.pid, .MEMLOCK, null, &inherited_memlock));
@@ -269,17 +271,17 @@ test "linux v2 container device filter preserves defaults and replaces unlisted 
     defer closeFd(init_root);
     try checkV2TestDevices(cgroup, namespace, init_root, false);
     try checkV2TestDefaultDevices(cgroup, namespace, init_root);
-    try backend.update(handle, .{});
+    try handle_container.update(.{});
     try checkV2TestDevices(cgroup, namespace, init_root, false);
-    try backend.update(handle, .{ .devices = &rules });
+    try handle_container.update(.{ .devices = &rules });
     try checkV2TestDevices(cgroup, namespace, init_root, true);
-    try backend.update(handle, .{ .devices = &rules });
+    try handle_container.update(.{ .devices = &rules });
     try checkV2TestDevices(cgroup, namespace, init_root, true);
-    try backend.update(handle, .{ .devices = &.{.{ .allow = false }} });
+    try handle_container.update(.{ .devices = &.{.{ .allow = false }} });
     try checkV2TestDevices(cgroup, namespace, init_root, false);
     try checkV2TestDefaultDevices(cgroup, namespace, init_root);
     // An unrestricted update must also replace the old restrictive program.
-    try backend.update(handle, .{ .devices = &.{.{ .allow = true }} });
+    try handle_container.update(.{ .devices = &.{.{ .allow = true }} });
     const ids = try queryDevicePrograms(allocator, cgroup, path);
     defer allocator.free(ids);
     try std.testing.expectEqual(@as(usize, 1), ids.len);

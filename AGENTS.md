@@ -8,21 +8,21 @@ igvano is a toy OCI container runtime written in Zig. It conforms to the OCI run
 
 ## Architecture
 
-Two layers, split so new isolation backends (wasm, VM-based, ...) can be added without touching the runtime frontend:
+Two layers, split so future isolation implementations can be added without touching the runtime frontend:
 
 - **Runtime frontend** (`src/main.zig`, `src/cli/`, `src/attached.zig`, `src/oci.zig` + `src/oci/`): runc-compatible CLI, OCI spec types (config.json / state.json schemas), state persistence under `--root`, lifecycle state machine and exit codes. Knows nothing about HOW isolation happens.
-- **Backend library** (`src/libcontainer/root.zig`, `src/libcontainer/`): exposed as the standalone `libcontainer` Zig module importable without the CLI. `Backend` is a runtime-polymorphic interface (`std.mem.Allocator`-style ptr + vtable) with the ops `create`, `exec`, `alive`, `kill`, `killAll`, `update`, `pids`, `freeze`, `thaw`, `frozen`, `delete`, `diagnostic`. Supporting modules: `libcontainer/seccomp.zig` (BPF compiler), `libcontainer/devices.zig` + `devicefilter.zig` (device emulator, v2 BPF filter), `libcontainer/dbus.zig` (systemd driver), `libcontainer/hooks.zig`.
+- **Container library** (`src/libcontainer/root.zig`, `src/libcontainer/`): exposed as the standalone `libcontainer` Zig module importable without the CLI. `Container` is a per-instance interface (`std.mem.Allocator`-style ptr + vtable) with the ops `exec`, `alive`, `kill`, `killAll`, `update`, `pids`, `freeze`, `thaw`, `frozen`, `delete`, `diagnostic`. `State` holds the per-container runtime data persisted by the frontend; option and data types are module-level declarations. Supporting modules: `libcontainer/seccomp.zig` (BPF compiler), `libcontainer/devices.zig` + `devicefilter.zig` (device emulator, v2 BPF filter), `libcontainer/dbus.zig` (systemd driver), `libcontainer/hooks.zig`.
 
-`libcontainer/linux.zig` is a thin facade (`LinuxBackend` + vtable); the Linux implementation lives in `libcontainer/linux/` by area.
+`libcontainer/linux.zig` is a thin facade: `linux.Container.create(options)` constructs an instance, `load(state)` restores one from borrowed runtime data, and `container()` exposes its interface. Its vtable adapters read the instance's `State`; the Linux implementation lives in `libcontainer/linux/` by area. `linux.diagnostic()` also exposes failure detail when construction fails before an instance exists.
 
-Scope: the ONLY backend in scope is `libcontainer/linux.zig` (general container: namespaces + cgroups). wasm / VM-based isolation are future directions that justify the interface — do NOT scaffold stubs, enum variants, or config options for them.
+Scope: the ONLY implementation in scope is `libcontainer/linux.zig` (general container: namespaces + cgroups). wasm / VM-based isolation are future directions that justify the interface — do NOT scaffold stubs, enum variants, or config options for them.
 
 Rules:
-- OCI spec knowledge (JSON schemas, lifecycle semantics, CLI conventions) lives in the frontend only, never in backends. Backends receive parsed config, not config.json.
+- OCI spec knowledge (JSON schemas, lifecycle semantics, CLI conventions) lives in the frontend only, never in the library. The library receives parsed config, not config.json.
 - Platform-specific code goes behind comptime `builtin.os.tag` guards; `zig build test` must pass on macOS (the dev machine) even though namespace isolation is Linux-only.
 - No C dependencies (static musl binary): seccomp, D-Bus and BPF programs are generated in Zig.
 - No allocation or std.Io calls in forked children before exec; prepare everything in the parent.
-- Errors must carry a reason: frontend validation records a diagnostic, backend failures use `reportDiagnostic` (it crosses the fork boundary in the failure response) and reach stderr and `--log`.
+- Errors must carry a reason: frontend validation records a diagnostic, library failures use `reportDiagnostic` (it crosses the fork boundary in the failure response) and reach stderr and `--log`.
 - Security-sensitive paths fail closed (seccomp, device filter, AppArmor/procfs writes, mount locks for user-namespace containers).
 - File layout: keep files roughly under 1,000–1,500 lines; small unit tests next to the code, container-running end-to-end tests in the area's `tests/` directory. Every new file must be reachable from test discovery (`test { _ = @import("x.zig"); }`); a refactor must not change test names or counts.
 - Inclusive naming: no master/slave/whitelist/blacklist identifiers (kernel API names such as `MS_SLAVE` excepted).
@@ -42,7 +42,7 @@ nix develop -c zig test --dep igvano --dep libcontainer -Mroot=src/main.zig \
   --dep libcontainer -Migvano=src/lib.zig -Mlibcontainer=src/libcontainer/root.zig   # CLI tests directly
 ```
 
-macOS skips every Linux-gated test, so a passing `zig build test` is not enough for backend changes. Linux checks (see README "Test"):
+macOS skips every Linux-gated test, so a passing `zig build test` is not enough for Linux implementation changes. Linux checks (see README "Test"):
 - x86_64 cgroup v2: cross-compile the libcontainer/lib/main test binaries for `x86_64-linux-musl` (`--test-no-exec`) and run them as root in privileged `debian:bookworm-slim` (install `procps`) from a container-local directory. The main tests need `IGVANO_SECCOMP_PROBE` pointing at `src/test/seccomp-probe.zig` built for the same target.
 - arm64 cgroup v1 and v2, systemd, AppArmor: the same binaries built for `aarch64-linux-musl`, run as root in the Lima VMs (one pure cgroup v1, one cgroup v2).
 - Conformance: `hack/conformance.sh` (cgroup v2, Colima) and `CONFORMANCE_VM=<vm> hack/conformance.sh` (cgroup v1), from a checkout under `$HOME`. Gate per suite: no previously clean suite may gain failures; known runtime-tools/kernel failures are labelled.

@@ -2,9 +2,11 @@ const std = @import("std");
 const builtin = @import("builtin");
 const oci = @import("igvano").oci;
 const libcontainer = @import("libcontainer");
-const Backend = libcontainer.Backend;
+const ContainerInstance = @import("state.zig").ContainerInstance;
 const diagnostics = @import("diagnostic.zig");
-const backendResult = @import("diagnostic.zig").backendResult;
+const containerResult = @import("diagnostic.zig").containerResult;
+const ContainerOverride = @import("state.zig").ContainerOverride;
+const bindContainer = @import("state.zig").bindContainer;
 const Config = @import("args.zig").Config;
 const openContainerLock = @import("state.zig").openContainerLock;
 const lockContainer = @import("state.zig").lockContainer;
@@ -18,24 +20,26 @@ const warnHooks = @import("hooks.zig").warnHooks;
 const stopContainer = @import("delete.zig").stopContainer;
 const destroyContainer = @import("delete.zig").destroyContainer;
 
-pub fn startContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, config: Config) !void {
+pub fn startContainer(allocator: std.mem.Allocator, io: std.Io, injected: ?ContainerOverride, config: Config) !void {
     var lock = try openContainerLock(allocator, config, false);
     defer if (lock) |file| file.close(io);
     if (lock) |file| {
         _ = try lockContainer(file, true);
         try requireLinkedLock(io, file);
     }
-    var state = try readLiveState(allocator, io, backend, config, true);
+    var state = try readLiveState(allocator, io, injected, config, true);
     defer state.deinit();
+    var instance: ContainerInstance = undefined;
+    const container = if (state.container_state) |value| bindContainer(&instance, injected, value) else null;
     try oci.requireStart(state.parsed.value.status, true);
     try oci.requireStart(state.parsed.value.status, try loadHasProcess(allocator, io, config));
     const saved_hooks = try loadSavedHooks(allocator, io, config);
     defer if (saved_hooks) |entries| entries.deinit();
     const path = try std.fs.path.join(allocator, &.{ config.root, config.id, oci.exec_fifo_name });
     defer allocator.free(path);
-    try runPrestartHooks(allocator, io, backend, config, &state, &lock, saved_hooks);
+    try runPrestartHooks(allocator, io, injected, config, &state, &lock, saved_hooks);
     if (lock) |file| try requireLinkedLock(io, file);
-    try waitForStart(allocator, io, backend, state.handle.?, path);
+    try waitForStart(allocator, io, container.?, path);
     state.parsed.value.status = .running;
     if (lock) |file| try requireLinkedLock(io, file);
     try oci.saveState(allocator, io, config.root, state.parsed.value);
@@ -47,14 +51,16 @@ pub fn startContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend
     warnHooks(allocator, if (saved_hooks) |entries| entries.value.poststart else null, state.parsed.value, "poststart");
 }
 
-fn runPrestartHooks(allocator: std.mem.Allocator, io: std.Io, backend: Backend, config: Config, state: *LiveState, lock: *?std.Io.File, saved_hooks: ?std.json.Parsed(oci.Spec.Hooks)) !void {
+fn runPrestartHooks(allocator: std.mem.Allocator, io: std.Io, injected: ?ContainerOverride, config: Config, state: *LiveState, lock: *?std.Io.File, saved_hooks: ?std.json.Parsed(oci.Spec.Hooks)) !void {
     runHooks(allocator, if (saved_hooks) |entries| entries.value.prestart else null, state.parsed.value) catch |err| {
-        // Cleanup failures must not add backend detail to this frontend failure.
-        defer diagnostics.last_backend_detail = null;
+        // Cleanup failures must not add container detail to this frontend failure.
+        defer diagnostics.last_container_detail = null;
         if (lock.*) |file| requireLinkedLock(io, file) catch return err;
-        stopContainer(io, backend, state.handle) catch |cleanup_err|
+        var instance: ContainerInstance = undefined;
+        const container = if (state.container_state) |value| bindContainer(&instance, injected, value) else null;
+        stopContainer(io, container) catch |cleanup_err|
             std.debug.print("igvano: warning: cannot stop container after prestart failure: {s}\n", .{@errorName(cleanup_err)});
-        destroyContainer(allocator, io, backend, config, state, lock, if (saved_hooks) |entries| entries.value.poststop else null) catch |cleanup_err|
+        destroyContainer(allocator, io, injected, config, state, lock, if (saved_hooks) |entries| entries.value.poststop else null) catch |cleanup_err|
             std.debug.print("igvano: warning: cannot destroy container after prestart failure: {s}\n", .{@errorName(cleanup_err)});
         return err;
     };
@@ -77,18 +83,18 @@ fn requireStartWait(is_alive: bool, elapsed: std.Io.Duration) !void {
     if (elapsed.nanoseconds >= std.Io.Duration.fromSeconds(10).nanoseconds) return error.StartTimeout;
 }
 
-pub fn waitForStart(allocator: std.mem.Allocator, io: std.Io, backend: Backend, handle: Backend.Handle, path: []const u8) !void {
+pub fn waitForStart(allocator: std.mem.Allocator, io: std.Io, container: libcontainer.Container, path: []const u8) !void {
     if (comptime builtin.os.tag == .linux) {
         const linux = std.os.linux;
         const path_z = try allocator.dupeZ(u8, path);
         defer allocator.free(path_z);
         const started = std.Io.Clock.awake.now(io);
-        const fd = try openStartFifo(io, backend, handle, path_z, started);
+        const fd = try openStartFifo(io, container, path_z, started);
         defer _ = linux.close(fd);
         var writer_seen = false;
         var acked = false;
         while (true) {
-            const is_alive = try backendResult(backend, backend.alive(handle));
+            const is_alive = try containerResult(container, container.alive());
             if (try readStartFifo(fd, &writer_seen, &acked) orelse continue) return;
             try requireStartProgress(io, started, is_alive, writer_seen, acked);
             try std.Io.sleep(io, .fromMilliseconds(10), .awake);
@@ -98,10 +104,10 @@ pub fn waitForStart(allocator: std.mem.Allocator, io: std.Io, backend: Backend, 
     }
 }
 
-fn openStartFifo(io: std.Io, backend: Backend, handle: Backend.Handle, path_z: [:0]const u8, started: std.Io.Timestamp) !std.posix.fd_t {
+fn openStartFifo(io: std.Io, container: libcontainer.Container, path_z: [:0]const u8, started: std.Io.Timestamp) !std.posix.fd_t {
     const linux = std.os.linux;
     return open: while (true) {
-        try requireStartWait(try backendResult(backend, backend.alive(handle)), started.untilNow(io, .awake));
+        try requireStartWait(try containerResult(container, container.alive()), started.untilNow(io, .awake));
         const result = linux.open(path_z, .{ .ACCMODE = .RDONLY, .NONBLOCK = true, .CLOEXEC = true }, 0);
         switch (linux.errno(result)) {
             .SUCCESS => break :open @as(std.posix.fd_t, @intCast(result)),

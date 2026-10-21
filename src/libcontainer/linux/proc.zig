@@ -2,7 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 const posix = std.posix;
-const Backend = @import("../root.zig").Backend;
+const libcontainer = @import("../root.zig");
 const diagnostics = @import("diagnostic.zig");
 const closeFd = @import("syscall.zig").closeFd;
 const openCgroupRoot = @import("cgroup.zig").openCgroupRoot;
@@ -10,7 +10,7 @@ const writeCgroupFile = @import("cgroup.zig").writeCgroupFile;
 const openFreezerCgroup = @import("freezer.zig").openFreezerCgroup;
 const cgroupFrozen = @import("freezer.zig").cgroupFrozen;
 
-pub fn alive(_: *anyopaque, handle: Backend.Handle) Backend.Error!bool {
+pub fn alive(handle: libcontainer.State) libcontainer.Error!bool {
     diagnostics.last_diagnostic_len = 0;
     if (comptime builtin.os.tag == .linux) {
         if (handle.pid <= 0) return error.InvalidProcess;
@@ -32,7 +32,7 @@ pub fn alive(_: *anyopaque, handle: Backend.Handle) Backend.Error!bool {
     }
 }
 
-pub fn kill(_: *anyopaque, handle: Backend.Handle, signal: i32) Backend.Error!void {
+pub fn kill(handle: libcontainer.State, signal: i32) libcontainer.Error!void {
     diagnostics.last_diagnostic_len = 0;
     if (comptime builtin.os.tag == .linux) {
         if (handle.pid <= 0) return error.InvalidProcess;
@@ -49,7 +49,7 @@ pub fn kill(_: *anyopaque, handle: Backend.Handle, signal: i32) Backend.Error!vo
     }
 }
 
-fn thawKilledV1Cgroup(handle: Backend.Handle) void {
+fn thawKilledV1Cgroup(handle: libcontainer.State) void {
     // A v1 freezer holds SIGKILL until the paused cgroup is thawed.
     const root = openCgroupRoot() catch return;
     defer closeFd(root.fd);
@@ -70,7 +70,7 @@ const ProcStat = struct {
     }
 };
 
-fn parseProcStat(bytes: []const u8) Backend.Error!ProcStat {
+fn parseProcStat(bytes: []const u8) libcontainer.Error!ProcStat {
     // comm can contain spaces and parentheses; only its final ')' delimits it.
     const end = std.mem.lastIndexOfScalar(u8, bytes, ')') orelse return error.LivenessFailed;
     var fields = std.mem.tokenizeAny(u8, bytes[end + 1 ..], " \t\n");
@@ -83,15 +83,15 @@ fn parseProcStat(bytes: []const u8) Backend.Error!ProcStat {
     return .{ .state = state[0], .starttime = starttime };
 }
 
-pub fn readProcStat(pid: i32, buffer: []u8) Backend.Error!ProcStat {
+pub fn readProcStat(pid: i32, buffer: []u8) libcontainer.Error!ProcStat {
     return readProcStatAt(linux.AT.FDCWD, pid, buffer);
 }
 
-pub fn readProcStatAt(proc_dir: posix.fd_t, pid: i32, buffer: []u8) Backend.Error!ProcStat {
+pub fn readProcStatAt(proc_dir: posix.fd_t, pid: i32, buffer: []u8) libcontainer.Error!ProcStat {
     return parseProcStat(try readProcFileAt(proc_dir, pid, "stat", buffer));
 }
 
-pub fn readProcFileAt(proc_dir: posix.fd_t, pid: i32, comptime filename: []const u8, buffer: []u8) Backend.Error![]const u8 {
+pub fn readProcFileAt(proc_dir: posix.fd_t, pid: i32, comptime filename: []const u8, buffer: []u8) libcontainer.Error![]const u8 {
     var path_buffer: [64]u8 = undefined;
     const path = if (proc_dir == linux.AT.FDCWD)
         std.fmt.bufPrintZ(&path_buffer, "/proc/{d}/" ++ filename, .{pid}) catch unreachable
@@ -123,7 +123,7 @@ pub fn readProcFileAt(proc_dir: posix.fd_t, pid: i32, comptime filename: []const
     return error.LivenessFailed;
 }
 
-pub fn openPidfd(pid: i32) Backend.Error!?posix.fd_t {
+pub fn openPidfd(pid: i32) libcontainer.Error!?posix.fd_t {
     while (true) {
         const opened = linux.pidfd_open(pid, 0);
         switch (linux.errno(opened)) {
@@ -136,7 +136,7 @@ pub fn openPidfd(pid: i32) Backend.Error!?posix.fd_t {
     }
 }
 
-pub fn signalPid(pid: i32, pidfd: ?posix.fd_t, signal: i32) Backend.Error!void {
+pub fn signalPid(pid: i32, pidfd: ?posix.fd_t, signal: i32) libcontainer.Error!void {
     const sig: linux.SIG = @enumFromInt(@as(u32, @intCast(signal)));
     if (pidfd) |fd| {
         while (true) {

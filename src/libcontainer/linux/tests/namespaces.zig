@@ -2,7 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 const posix = std.posix;
-const Backend = @import("../../root.zig").Backend;
+const libcontainer = @import("../../root.zig");
 const checkResult = @import("../syscall.zig").checkResult;
 const forkProcess = @import("../syscall.zig").forkProcess;
 const closeFd = @import("../syscall.zig").closeFd;
@@ -18,7 +18,8 @@ const validateJoinedMappings = @import("../namespaces.zig").validateJoinedMappin
 const joinedUserNamespaceMappings = @import("../namespaces.zig").joinedUserNamespaceMappings;
 const createMountUserNamespace = @import("../namespaces.zig").createMountUserNamespace;
 const CapabilityHeader = @import("../process.zig").CapabilityHeader;
-const LinuxBackend = @import("../../linux.zig").LinuxBackend;
+const LinuxContainer = @import("../../linux.zig").Container;
+const expectCreateError = @import("helpers.zig").expectCreateError;
 
 test "linux namespace descriptors reject a mismatched configured type" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
@@ -33,11 +34,11 @@ test "linux namespace descriptors reject a mismatched configured type" {
 test "linux joined user namespace helper reads host mappings from a pinned namespace" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     if (linux.geteuid() != 0) return error.SkipZigTest;
-    const uid: []const Backend.IDMapping = &.{
+    const uid: []const libcontainer.IDMapping = &.{
         .{ .container_id = 20, .host_id = 200000, .size = 2 },
         .{ .container_id = 0, .host_id = 100000, .size = 10 },
     };
-    const gid: []const Backend.IDMapping = &.{
+    const gid: []const libcontainer.IDMapping = &.{
         .{ .container_id = 0, .host_id = 300000, .size = 10 },
         .{ .container_id = 20, .host_id = 400000, .size = 2 },
     };
@@ -98,9 +99,7 @@ test "linux mapped init acknowledges start without path access to its private st
     const fifo = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/state/exec.fifo", .{absolute}, 0);
     defer std.testing.allocator.free(fifo);
     try checkResult(linux.mknod(fifo, linux.S.IFIFO | 0o600, 0));
-    var implementation: LinuxBackend = .{};
-    const backend = implementation.backend();
-    const handle = try backend.create(.{
+    var handle_instance = try LinuxContainer.create(.{
         .allocator = std.testing.allocator,
         .id = "private",
         .rootfs = rootfs,
@@ -111,10 +110,11 @@ test "linux mapped init acknowledges start without path access to its private st
         .process = .{ .args = &.{"/init"}, .cwd = "/", .uid = 1, .gid = 1 },
         .cgroup_path = cgroup_path,
     });
-    defer std.testing.allocator.free(handle.starttime);
+    defer handle_instance.deinit(std.testing.allocator);
+    const handle_container = handle_instance.container();
     defer {
-        backend.kill(handle, 9) catch {};
-        backend.delete(handle) catch {};
+        handle_container.kill(9) catch {};
+        handle_container.delete() catch {};
     }
     const stat = try tmp.dir.statFile(std.testing.io, "state", .{});
     try std.testing.expectEqual(@as(posix.mode_t, 0o700), stat.permissions.toMode() & 0o7777);
@@ -194,9 +194,7 @@ test "linux mapped create installs maps outside init and cleans up rejected maps
     const fifo = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/exec.fifo", .{absolute}, 0);
     defer std.testing.allocator.free(fifo);
     try checkResult(linux.mknod(fifo, linux.S.IFIFO | 0o600, 0));
-    var implementation: LinuxBackend = .{};
-    const backend = implementation.backend();
-    var options: Backend.CreateOptions = .{
+    var options: libcontainer.CreateOptions = .{
         .allocator = std.testing.allocator,
         .id = "mapped",
         .rootfs = rootfs,
@@ -234,16 +232,18 @@ test "linux mapped create installs maps outside init and cleans up rejected maps
         },
         .cgroup_path = cgroup_path,
     };
-    try std.testing.expectError(error.InvalidConfig, backend.create(options));
+    try expectCreateError(error.InvalidConfig, options);
     try std.testing.expectEqual(@as(?posix.fd_t, null), try walkCgroup(cgroup_root.fd, cgroup_path, false, &.{}));
     options.uid_mappings = &.{.{ .container_id = 0, .host_id = 100000, .size = 10 }};
-    const handle = try backend.create(options);
-    defer std.testing.allocator.free(handle.starttime);
+    var handle_instance = try LinuxContainer.create(options);
+    defer handle_instance.deinit(options.allocator);
+    const handle = handle_instance.state;
+    const handle_container = handle_instance.container();
     defer {
-        backend.kill(handle, 9) catch {};
-        backend.delete(handle) catch {};
+        handle_container.kill(9) catch {};
+        handle_container.delete() catch {};
     }
-    try std.testing.expect(try backend.alive(handle));
+    try std.testing.expect(try handle_container.alive());
     for ([_][]const u8{ "dev/bind-file", "dev/bind-dir/content" }) |destination| {
         const path = try std.fmt.allocPrint(std.testing.allocator, "/proc/{d}/root/{s}", .{ handle.pid, destination });
         defer std.testing.allocator.free(path);
@@ -320,12 +320,12 @@ test "linux mapped create installs maps outside init and cleans up rejected maps
         joined_options.cgroup_path = joined_cgroup;
         if (with_mappings) {
             joined_options.uid_mappings = &.{.{ .container_id = 0, .host_id = 100001, .size = 10 }};
-            try std.testing.expectError(error.InvalidConfig, backend.create(joined_options));
-            try std.testing.expectEqualStrings("user namespace mappings do not match the joined namespace", backend.diagnostic().?);
+            try expectCreateError(error.InvalidConfig, joined_options);
+            try std.testing.expectEqualStrings("user namespace mappings do not match the joined namespace", libcontainer.linux.diagnostic().?);
             joined_options.uid_mappings = options.uid_mappings;
             joined_options.gid_mappings = &.{.{ .container_id = 0, .host_id = 200001, .size = 10 }};
-            try std.testing.expectError(error.InvalidConfig, backend.create(joined_options));
-            try std.testing.expectEqualStrings("user namespace mappings do not match the joined namespace", backend.diagnostic().?);
+            try expectCreateError(error.InvalidConfig, joined_options);
+            try std.testing.expectEqualStrings("user namespace mappings do not match the joined namespace", libcontainer.linux.diagnostic().?);
             joined_options.gid_mappings = options.gid_mappings;
             try std.testing.expectEqual(@as(?posix.fd_t, null), try walkCgroup(cgroup_root.fd, joined_cgroup, false, &.{}));
         }
@@ -333,13 +333,15 @@ test "linux mapped create installs maps outside init and cleans up rejected maps
         // namespace whose root maps to a different host UID.
         if (caps[0].effective & (@as(u32, 1) << linux.CAP.SYS_RESOURCE) != 0)
             joined_options.oom_score_adj = -500;
-        const joined = try backend.create(joined_options);
-        defer std.testing.allocator.free(joined.starttime);
+        var joined_instance = try LinuxContainer.create(joined_options);
+        defer joined_instance.deinit(joined_options.allocator);
+        const joined = joined_instance.state;
+        const joined_container = joined_instance.container();
         defer {
-            backend.kill(joined, 9) catch {};
-            backend.delete(joined) catch {};
+            joined_container.kill(9) catch {};
+            joined_container.delete() catch {};
         }
-        try std.testing.expect(try backend.alive(joined));
+        try std.testing.expect(try joined_container.alive());
         for ([_][]const u8{ "dev/bind-file", "dev/bind-dir/content" }) |destination| {
             const path = try std.fmt.allocPrint(std.testing.allocator, "/proc/{d}/root/{s}", .{ joined.pid, destination });
             defer std.testing.allocator.free(path);
@@ -380,11 +382,13 @@ test "linux mapped create installs maps outside init and cleans up rejected maps
         lowered_options.exec_fifo = lowered_fifo;
         lowered_options.cgroup_path = lowered_cgroup;
         lowered_options.oom_score_adj = -500;
-        const lowered = try backend.create(lowered_options);
-        defer std.testing.allocator.free(lowered.starttime);
+        var lowered_instance = try LinuxContainer.create(lowered_options);
+        defer lowered_instance.deinit(lowered_options.allocator);
+        const lowered = lowered_instance.state;
+        const lowered_container = lowered_instance.container();
         defer {
-            backend.kill(lowered, 9) catch {};
-            backend.delete(lowered) catch {};
+            lowered_container.kill(9) catch {};
+            lowered_container.delete() catch {};
         }
         const lowered_oom_path = try std.fmt.allocPrint(std.testing.allocator, "/proc/{d}/oom_score_adj", .{lowered.pid});
         defer std.testing.allocator.free(lowered_oom_path);

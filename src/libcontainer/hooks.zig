@@ -266,8 +266,8 @@ test "linux hook execution uses explicit argv environment and state stdin" {
         .{ .path = "/bin/sh", .args = &.{ "sh", "-c", "exit 7" } },
     });
     try std.testing.expectError(error.HookFailed, run(failing, "{}\n"));
-    var implementation: @import("linux.zig").LinuxBackend = .{};
-    try std.testing.expect(std.mem.indexOf(u8, implementation.backend().diagnostic().?, "hook #1: exit status 7") != null);
+
+    try std.testing.expect(std.mem.indexOf(u8, @import("linux.zig").diagnostic().?, "hook #1: exit status 7") != null);
     const missing = try prepare(arena.allocator(), &.{.{ .path = "/igvano-missing-hook" }});
     try std.testing.expectError(error.HookFailed, run(missing, "{}\n"));
 }
@@ -284,8 +284,8 @@ test "linux hook timeout kills a hook that never reads large stdin" {
     const state = try arena.allocator().alloc(u8, 1 << 20);
     @memset(state, 'x');
     try std.testing.expectError(error.HookTimeout, run(entries, state));
-    var implementation: @import("linux.zig").LinuxBackend = .{};
-    const detail = implementation.backend().diagnostic() orelse return error.TestUnexpectedResult;
+
+    const detail = @import("linux.zig").diagnostic() orelse return error.TestUnexpectedResult;
     try std.testing.expect(std.mem.indexOf(u8, detail, "timeout") != null);
     try std.testing.expect(std.mem.indexOf(u8, detail, "stdout: timeout-out") != null);
     try std.testing.expect(std.mem.indexOf(u8, detail, "stderr: timeout-err") != null);
@@ -328,8 +328,8 @@ fn checkCapturedHookOutput(entries: []const Prepared, failure: ?Error, reason: [
     run(entries, "{}\n") catch |err| {
         const expected = failure orelse linux.exit_group(1);
         if (expected != err) linux.exit_group(1);
-        var implementation: @import("linux.zig").LinuxBackend = .{};
-        const detail = implementation.backend().diagnostic() orelse linux.exit_group(2);
+
+        const detail = @import("linux.zig").diagnostic() orelse linux.exit_group(2);
         if (detail.len > 512 or
             std.mem.indexOf(u8, detail, "error running hook #0:") == null or
             std.mem.indexOf(u8, detail, reason) == null or

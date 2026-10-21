@@ -2,7 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 const posix = std.posix;
-const Backend = @import("../root.zig").Backend;
+const libcontainer = @import("../root.zig");
 const seccomp = @import("../seccomp.zig");
 const diagnostics = @import("diagnostic.zig");
 const processString = @import("syscall.zig").processString;
@@ -58,8 +58,8 @@ const ExecProcess = struct {
 };
 
 const ExecContext = struct {
-    options: Backend.ExecOptions,
-    handle: Backend.Handle,
+    options: libcontainer.ExecOptions,
+    handle: libcontainer.State,
     process: ExecProcess,
     proc_dir: posix.fd_t,
     root: posix.fd_t,
@@ -71,10 +71,10 @@ const ExecContext = struct {
     ready: [2]posix.fd_t = undefined,
 };
 
-pub fn exec(ptr: *anyopaque, handle: Backend.Handle, options: Backend.ExecOptions) Backend.Error!i32 {
+pub fn exec(handle: libcontainer.State, options: libcontainer.ExecOptions) libcontainer.Error!i32 {
     diagnostics.last_diagnostic_len = 0;
     if (comptime builtin.os.tag != .linux) return error.NotImplemented;
-    if (!try alive(ptr, handle)) return error.ProcessNotFound;
+    if (!try alive(handle)) return error.ProcessNotFound;
     if (options.argv.len == 0 or options.argv[0].len == 0 or !std.fs.path.isAbsolute(options.cwd))
         return error.InvalidProcess;
     try validateCgroupPath(options.cgroup_path);
@@ -87,10 +87,10 @@ pub fn exec(ptr: *anyopaque, handle: Backend.Handle, options: Backend.ExecOption
     const root_path = try std.fmt.allocPrintSentinel(allocator, "/proc/{d}/root", .{handle.pid}, 0);
     const root = try openPath(linux.AT.FDCWD, root_path, .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true });
     defer closeFd(root);
-    return execWithCgroups(ptr, handle, options, allocator, prepared, proc_dir, root);
+    return execWithCgroups(handle, options, allocator, prepared, proc_dir, root);
 }
 
-fn prepareExecProcess(allocator: std.mem.Allocator, options: Backend.ExecOptions) Backend.Error!ExecProcess {
+fn prepareExecProcess(allocator: std.mem.Allocator, options: libcontainer.ExecOptions) libcontainer.Error!ExecProcess {
     const apparmor_command = try prepareAppArmor(allocator, options.apparmor_profile);
     const seccomp_program = if (options.seccomp) |config|
         seccomp.compile(allocator, config, seccomp.Arch.native() orelse return error.Unsupported) catch |err| {
@@ -121,7 +121,7 @@ fn prepareExecProcess(allocator: std.mem.Allocator, options: Backend.ExecOptions
     return .{ .apparmor_command = apparmor_command, .seccomp_program = seccomp_program, .cwd = cwd, .argv = argv, .envp = envp, .settings = process };
 }
 
-fn execWithCgroups(ptr: *anyopaque, handle: Backend.Handle, options: Backend.ExecOptions, allocator: std.mem.Allocator, prepared: ExecProcess, proc_dir: posix.fd_t, root: posix.fd_t) Backend.Error!i32 {
+fn execWithCgroups(handle: libcontainer.State, options: libcontainer.ExecOptions, allocator: std.mem.Allocator, prepared: ExecProcess, proc_dir: posix.fd_t, root: posix.fd_t) libcontainer.Error!i32 {
     const cgroup_root = try openCgroupRoot();
     defer closeFd(cgroup_root.fd);
     const cgroup: ?posix.fd_t = if (cgroup_root.mode == .unified)
@@ -139,7 +139,7 @@ fn execWithCgroups(ptr: *anyopaque, handle: Backend.Handle, options: Backend.Exe
     defer for (ns_fds) |fd| if (fd >= 0) closeFd(fd);
     try prepareExecNamespaces(allocator, handle, &joins, &ns_fds);
     // Recheck after pinning root and namespaces, before entering any of them.
-    if (!try alive(ptr, handle)) return error.ProcessNotFound;
+    if (!try alive(handle)) return error.ProcessNotFound;
     var context: ExecContext = .{
         .options = options,
         .handle = handle,
@@ -154,7 +154,7 @@ fn execWithCgroups(ptr: *anyopaque, handle: Backend.Handle, options: Backend.Exe
     return execWithNamespaces(&context);
 }
 
-fn prepareExecNamespaces(allocator: std.mem.Allocator, handle: Backend.Handle, joins: *[8]NamespaceJoin, ns_fds: *[8]posix.fd_t) Backend.Error!void {
+fn prepareExecNamespaces(allocator: std.mem.Allocator, handle: libcontainer.State, joins: *[8]NamespaceJoin, ns_fds: *[8]posix.fd_t) libcontainer.Error!void {
     const flags = [_]usize{
         linux.CLONE.NEWUSER, linux.CLONE.NEWCGROUP, linux.CLONE.NEWIPC, linux.CLONE.NEWUTS,
         linux.CLONE.NEWNET,  linux.CLONE.NEWPID,    linux.CLONE.NEWNS,  linux.CLONE.NEWTIME,
@@ -170,7 +170,7 @@ fn prepareExecNamespaces(allocator: std.mem.Allocator, handle: Backend.Handle, j
     }
 }
 
-fn execWithNamespaces(context: *ExecContext) Backend.Error!i32 {
+fn execWithNamespaces(context: *ExecContext) libcontainer.Error!i32 {
     const report = try makePipe();
     defer closeFd(report[0]);
     var report_writer: ?posix.fd_t = report[1];
@@ -395,7 +395,7 @@ fn finishExecHelper(context: *const ExecContext, child: i32) noreturn {
     linux.exit_group(0);
 }
 
-fn waitExecReady(fd: posix.fd_t) Backend.Error!void {
+fn waitExecReady(fd: posix.fd_t) libcontainer.Error!void {
     var response: CreateResponse = .{};
     const bytes = std.mem.asBytes(&response);
     while (true) {

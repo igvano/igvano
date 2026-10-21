@@ -1,7 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const linux = std.os.linux;
-const Backend = @import("../../root.zig").Backend;
+const libcontainer = @import("../../root.zig");
 const checkResult = @import("../syscall.zig").checkResult;
 const forkProcess = @import("../syscall.zig").forkProcess;
 const closeFd = @import("../syscall.zig").closeFd;
@@ -17,7 +17,8 @@ const expectNoRootfsMount = @import("helpers.zig").expectNoRootfsMount;
 const expectOutsideRootfsUnchanged = @import("helpers.zig").expectOutsideRootfsUnchanged;
 const requireTestMountNamespace = @import("helpers.zig").requireTestMountNamespace;
 const requireTestUniqueMountIds = @import("helpers.zig").requireTestUniqueMountIds;
-const LinuxBackend = @import("../../linux.zig").LinuxBackend;
+const LinuxContainer = @import("../../linux.zig").Container;
+const expectCreateError = @import("helpers.zig").expectCreateError;
 
 test "linux inherited mount namespace creates starts and detaches rootfs on delete and failure" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
@@ -85,7 +86,7 @@ fn testInheritedMountNamespace(rootfs: [:0]const u8, fifo: [:0]const u8, cgroup_
     const namespace_size = linux.readlink("/proc/self/ns/mnt", &namespace_buffer, namespace_buffer.len);
     try checkResult(namespace_size);
     const namespace = namespace_buffer[0..namespace_size];
-    const process: Backend.Process = .{
+    const process: libcontainer.Process = .{
         .args = &.{
             "/bin/sh", "-c",
             \\test "$(readlink /proc/self/ns/mnt)" = "$1" &&
@@ -105,7 +106,7 @@ fn testInheritedMountNamespace(rootfs: [:0]const u8, fifo: [:0]const u8, cgroup_
         .uid = 0,
         .gid = 0,
     };
-    var mounts: [7]Backend.Mount = undefined;
+    var mounts: [7]libcontainer.Mount = undefined;
     mounts[0] = .{ .destination = "/proc", .source = "proc", .type = "proc", .flags = 0, .propagation = 0, .data = "" };
     mounts[1] = .{ .destination = "/dev", .source = "tmpfs", .type = "tmpfs", .flags = linux.MS.NOSUID, .propagation = 0, .data = "mode=755" };
     var mount_count: usize = 2;
@@ -134,13 +135,12 @@ fn testInheritedMountNamespace(rootfs: [:0]const u8, fifo: [:0]const u8, cgroup_
     };
     mount_count += 1;
     const Callback = struct {
-        fn fail(_: *anyopaque, _: Backend.Handle) Backend.Error!void {
+        fn fail(_: *anyopaque, _: libcontainer.State) libcontainer.Error!void {
             return error.HookFailed;
         }
     };
-    var implementation: LinuxBackend = .{};
-    const backend = implementation.backend();
-    var options: Backend.CreateOptions = .{
+    var callback_context: u8 = 0;
+    var options: libcontainer.CreateOptions = .{
         .allocator = std.testing.allocator,
         .id = "inherited",
         .rootfs = rootfs,
@@ -153,7 +153,7 @@ fn testInheritedMountNamespace(rootfs: [:0]const u8, fifo: [:0]const u8, cgroup_
         .devices = &.{.{ .path = "/dev/null", .kind = .character, .major = 1, .minor = 3 }},
         .masked_paths = &.{ "/masked-file", "/masked-dir", "/bound/masked-file" },
         .readonly_paths = &.{ "/readonly-file", "/bound/readonly-file" },
-        .on_create = .{ .ptr = &implementation, .run = Callback.fail },
+        .on_create = .{ .ptr = &callback_context, .run = Callback.fail },
     };
     // Failure before init mounts anything must preserve an existing self-bind,
     // including its flags and submounts.
@@ -166,10 +166,10 @@ fn testInheritedMountNamespace(rootfs: [:0]const u8, fifo: [:0]const u8, cgroup_
     const existing_mounts = try readMountinfo(std.testing.allocator);
     defer std.testing.allocator.free(existing_mounts);
     options.resources = .{ .unified = &.{.{ .key = "igvano.invalid", .value = "1" }} };
-    try std.testing.expectError(error.CgroupWriteFailed, backend.create(options));
+    try expectCreateError(error.CgroupWriteFailed, options);
     options.resources = .{};
     options.namespaces = &.{.{ .kind = .network, .path = "/igvano-missing-namespace" }};
-    try std.testing.expectError(error.CreateFailed, backend.create(options));
+    try expectCreateError(error.CreateFailed, options);
     options.namespaces = &.{};
     const retained_mounts = try readMountinfo(std.testing.allocator);
     defer std.testing.allocator.free(retained_mounts);
@@ -185,23 +185,25 @@ fn testInheritedMountNamespace(rootfs: [:0]const u8, fifo: [:0]const u8, cgroup_
         .propagation = 0,
         .data = "",
     }};
-    try std.testing.expectError(error.CreateFailed, backend.create(options));
+    try expectCreateError(error.CreateFailed, options);
     options.mounts = mounts[0..mount_count];
     try expectNoRootfsMount(rootfs);
 
-    try std.testing.expectError(error.HookFailed, backend.create(options));
+    try expectCreateError(error.HookFailed, options);
     try expectNoRootfsMount(rootfs);
     options.on_create = null;
     // Also exercise a failure after chroot and path restrictions.
     options.process.?.cwd = "/missing-cwd";
-    try std.testing.expectError(error.CreateFailed, backend.create(options));
+    try expectCreateError(error.CreateFailed, options);
     try expectNoRootfsMount(rootfs);
     options.process.?.cwd = "/";
-    const handle = try backend.create(options);
-    defer std.testing.allocator.free(handle.starttime);
+    var handle_instance = try LinuxContainer.create(options);
+    defer handle_instance.deinit(options.allocator);
+    const handle = handle_instance.state;
+    const handle_container = handle_instance.container();
     defer {
-        backend.kill(handle, 9) catch {};
-        backend.delete(handle) catch {};
+        handle_container.kill(9) catch {};
+        handle_container.delete() catch {};
     }
     try std.testing.expectEqualStrings(rootfs, handle.rootfs_mount.?);
     {
@@ -224,10 +226,10 @@ fn testInheritedMountNamespace(rootfs: [:0]const u8, fifo: [:0]const u8, cgroup_
     }
     const delay: linux.timespec = .{ .sec = 0, .nsec = 10_000_000 };
     for (0..200) |_| {
-        if (!try backend.alive(handle)) break;
+        if (!try handle_container.alive()) break;
         _ = linux.nanosleep(&delay, null);
     }
-    try std.testing.expect(!try backend.alive(handle));
+    try std.testing.expect(!try handle_container.alive());
     const result_path = try std.fmt.bufPrintZ(&path_buffer, "{s}/dev/result", .{rootfs});
     {
         const result_fd = try openPath(linux.AT.FDCWD, result_path, .{ .CLOEXEC = true });
@@ -236,9 +238,9 @@ fn testInheritedMountNamespace(rootfs: [:0]const u8, fifo: [:0]const u8, cgroup_
         try std.testing.expect(readAll(result_fd, &result));
         try std.testing.expectEqualStrings("success", &result);
     }
-    try backend.delete(handle);
+    try handle_container.delete();
     try expectNoRootfsMount(rootfs);
-    try backend.delete(handle);
+    try handle_container.delete();
     // Existing mount records, including /'s shared propagation, are unchanged.
     const after = try readMountinfo(std.testing.allocator);
     defer std.testing.allocator.free(after);
@@ -248,7 +250,7 @@ fn testInheritedMountNamespace(rootfs: [:0]const u8, fifo: [:0]const u8, cgroup_
     // Both prepared root destinations are "/".
     // The second pass checks repeated stacked-root create/fail/delete leaves no residue.
     for ([_][]const u8{ "/", "/" }) |destination| {
-        const stacked_mounts = [_]Backend.Mount{
+        const stacked_mounts = [_]libcontainer.Mount{
             .{
                 .destination = destination,
                 .source = source,
@@ -264,31 +266,33 @@ fn testInheritedMountNamespace(rootfs: [:0]const u8, fifo: [:0]const u8, cgroup_
             stacked_mounts[0],
             .{ .destination = "/invalid", .source = "none", .type = "igvano.invalid", .flags = 0, .propagation = 0, .data = "" },
         };
-        try std.testing.expectError(error.CreateFailed, backend.create(options));
+        try expectCreateError(error.CreateFailed, options);
         try expectNoRootfsMount(rootfs);
         options.mounts = &stacked_mounts;
-        options.on_create = .{ .ptr = &implementation, .run = Callback.fail };
-        try std.testing.expectError(error.HookFailed, backend.create(options));
+        options.on_create = .{ .ptr = &callback_context, .run = Callback.fail };
+        try expectCreateError(error.HookFailed, options);
         try expectNoRootfsMount(rootfs);
         options.on_create = null;
         options.process.?.cwd = "/missing-cwd";
-        try std.testing.expectError(error.CreateFailed, backend.create(options));
+        try expectCreateError(error.CreateFailed, options);
         try expectNoRootfsMount(rootfs);
         options.process.?.cwd = "/";
-        const stacked_handle = try backend.create(options);
-        defer std.testing.allocator.free(stacked_handle.starttime);
+        var stacked_handle_instance = try LinuxContainer.create(options);
+        defer stacked_handle_instance.deinit(options.allocator);
+        const stacked_handle = stacked_handle_instance.state;
+        const stacked_handle_container = stacked_handle_instance.container();
         defer {
-            backend.kill(stacked_handle, 9) catch {};
-            backend.delete(stacked_handle) catch {};
+            stacked_handle_container.kill(9) catch {};
+            stacked_handle_container.delete() catch {};
         }
         const top_fd = try openPath(linux.AT.FDCWD, rootfs, .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true });
         defer closeFd(top_fd);
         try std.testing.expect(stacked_handle.rootfs_mount_id.? != try mountId(top_fd));
         try expectOutsideRootfsUnchanged(before, rootfs);
-        try backend.kill(stacked_handle, 9);
-        try backend.delete(stacked_handle);
+        try stacked_handle_container.kill(9);
+        try stacked_handle_container.delete();
         try expectNoRootfsMount(rootfs);
-        try backend.delete(stacked_handle);
+        try stacked_handle_container.delete();
     }
     options.mounts = mounts[0..mount_count];
 
@@ -296,7 +300,7 @@ fn testInheritedMountNamespace(rootfs: [:0]const u8, fifo: [:0]const u8, cgroup_
     try checkResult(linux.mount("tmpfs", rootfs, "tmpfs", 0, 0));
     var replacement: linux.Statx = undefined;
     try checkResult(linux.statx(linux.AT.FDCWD, rootfs, 0, .{ .MNT_ID = true }, &replacement));
-    try backend.delete(handle);
+    try handle_container.delete();
     var retained: linux.Statx = undefined;
     try checkResult(linux.statx(linux.AT.FDCWD, rootfs, 0, .{ .MNT_ID = true }, &retained));
     try std.testing.expectEqual(replacement.mnt_id, retained.mnt_id);
@@ -305,12 +309,14 @@ fn testInheritedMountNamespace(rootfs: [:0]const u8, fifo: [:0]const u8, cgroup_
     // A replacement self-bind also belongs to someone else.
     try checkResult(linux.mount(rootfs, rootfs, null, linux.MS.BIND | linux.MS.REC, 0));
     try checkResult(linux.statx(linux.AT.FDCWD, rootfs, 0, .{ .MNT_ID = true }, &replacement));
-    try backend.delete(handle);
+    try handle_container.delete();
     try checkResult(linux.statx(linux.AT.FDCWD, rootfs, 0, .{ .MNT_ID = true }, &retained));
     try std.testing.expectEqual(replacement.mnt_id, retained.mnt_id);
     var legacy_handle = handle;
     legacy_handle.rootfs_mount_id = null;
-    try backend.delete(legacy_handle);
+    var legacy_handle_instance = LinuxContainer.load(legacy_handle);
+    const legacy_handle_container = legacy_handle_instance.container();
+    try legacy_handle_container.delete();
     try checkResult(linux.statx(linux.AT.FDCWD, rootfs, 0, .{ .MNT_ID = true }, &retained));
     try std.testing.expectEqual(replacement.mnt_id, retained.mnt_id);
     try checkResult(linux.umount2(rootfs, linux.MNT.DETACH));

@@ -1,8 +1,8 @@
 const std = @import("std");
 const linux = std.os.linux;
 const posix = std.posix;
-const Backend = @import("../root.zig").Backend;
-const Resources = Backend.Resources;
+const libcontainer = @import("../root.zig");
+const Resources = libcontainer.Resources;
 const devicefilter = @import("../devicefilter.zig");
 const v2DeviceRules = @import("devices.zig").v2DeviceRules;
 const applyV2DeviceFilter = @import("devices.zig").applyV2DeviceFilter;
@@ -50,7 +50,7 @@ test "resource updates write only requested limits and replace explicit v1 devic
     try std.testing.expectEqual(@as(usize, 0), devices.len);
 }
 
-pub fn validateCgroupPath(path: []const u8) Backend.Error!void {
+pub fn validateCgroupPath(path: []const u8) libcontainer.Error!void {
     if (path.len == 0 or path[0] == '/' or std.mem.indexOfScalar(u8, path, 0) != null)
         return error.InvalidPath;
     var components = std.mem.splitScalar(u8, path, '/');
@@ -62,7 +62,7 @@ pub fn validateCgroupPath(path: []const u8) Backend.Error!void {
 }
 
 /// Intermediate directories may exist; creation must own a new leaf.
-pub fn createCgroupDirectory(parent: posix.fd_t, name: [:0]const u8, path: []const u8, leaf: bool) Backend.Error!bool {
+pub fn createCgroupDirectory(parent: posix.fd_t, name: [:0]const u8, path: []const u8, leaf: bool) libcontainer.Error!bool {
     const result = linux.mkdirat(parent, name, 0o755);
     switch (linux.errno(result)) {
         .SUCCESS => return true,
@@ -77,7 +77,7 @@ pub fn createCgroupDirectory(parent: posix.fd_t, name: [:0]const u8, path: []con
     return false;
 }
 
-fn cgroupMode(fs_type: usize) Backend.Error!CgroupMode {
+fn cgroupMode(fs_type: usize) libcontainer.Error!CgroupMode {
     return switch (fs_type) {
         0x63677270 => .unified, // CGROUP2_SUPER_MAGIC
         0x01021994 => .legacy, // TMPFS_MAGIC
@@ -85,7 +85,7 @@ fn cgroupMode(fs_type: usize) Backend.Error!CgroupMode {
     };
 }
 
-pub fn openCgroupRoot() Backend.Error!CgroupRoot {
+pub fn openCgroupRoot() libcontainer.Error!CgroupRoot {
     const opened = linux.openat(linux.AT.FDCWD, "/sys/fs/cgroup", .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .NOFOLLOW = true, .CLOEXEC = true }, 0);
     switch (linux.errno(opened)) {
         .SUCCESS => {},
@@ -107,7 +107,7 @@ pub fn openCgroupRoot() Backend.Error!CgroupRoot {
     return .{ .fd = root, .fs_type = fs_type, .mode = mode };
 }
 
-pub fn readCgroupFile(allocator: std.mem.Allocator, dir: posix.fd_t, filename: [:0]const u8) Backend.Error![]u8 {
+pub fn readCgroupFile(allocator: std.mem.Allocator, dir: posix.fd_t, filename: [:0]const u8) libcontainer.Error![]u8 {
     const fd = try openPath(dir, filename, .{ .ACCMODE = .RDONLY, .NOFOLLOW = true, .CLOEXEC = true });
     defer closeFd(fd);
     var text: std.ArrayList(u8) = .empty;
@@ -125,7 +125,7 @@ pub fn readCgroupFile(allocator: std.mem.Allocator, dir: posix.fd_t, filename: [
     }
 }
 
-pub fn collectCgroupPids(allocator: std.mem.Allocator, dir: posix.fd_t, result: *std.ArrayList(i32)) Backend.Error!void {
+pub fn collectCgroupPids(allocator: std.mem.Allocator, dir: posix.fd_t, result: *std.ArrayList(i32)) libcontainer.Error!void {
     const text = try readCgroupFile(allocator, dir, "cgroup.procs");
     defer allocator.free(text);
     var fields = std.mem.tokenizeAny(u8, text, " \t\n");
@@ -169,7 +169,7 @@ test "backend cgroup paths must name a normalized child directory" {
     }
 }
 
-pub fn writeCgroupFile(dir: posix.fd_t, filename: []const u8, value: []const u8, path: []const u8) Backend.Error!void {
+pub fn writeCgroupFile(dir: posix.fd_t, filename: []const u8, value: []const u8, path: []const u8) libcontainer.Error!void {
     if (filename.len == 0 or std.mem.indexOfAny(u8, filename, "/\x00") != null or
         std.mem.eql(u8, filename, ".") or std.mem.eql(u8, filename, "..")) return error.InvalidPath;
     var buffer: [256]u8 = undefined;
@@ -203,7 +203,7 @@ pub fn writeCgroupFile(dir: posix.fd_t, filename: []const u8, value: []const u8,
     }
 }
 
-pub fn cgroupPopulated(dir: posix.fd_t) Backend.Error!bool {
+pub fn cgroupPopulated(dir: posix.fd_t) libcontainer.Error!bool {
     const fd = try openPath(dir, "cgroup.events", .{ .ACCMODE = .RDONLY, .NOFOLLOW = true, .CLOEXEC = true });
     defer closeFd(fd);
     var buffer: [256]u8 = undefined;
@@ -231,7 +231,7 @@ pub fn cgroupPopulated(dir: posix.fd_t) Backend.Error!bool {
     return error.CgroupDeleteFailed;
 }
 
-pub fn removeCreatedCgroup(root: posix.fd_t, path: []const u8, cgroup: posix.fd_t) Backend.Error!void {
+pub fn removeCreatedCgroup(root: posix.fd_t, path: []const u8, cgroup: posix.fd_t) libcontainer.Error!void {
     var owned: linux.Statx = undefined;
     try checkResult(linux.statx(cgroup, "", linux.AT.EMPTY_PATH, .{ .INO = true }, &owned));
     var buffer: [std.fs.max_path_bytes]u8 = undefined;
@@ -248,14 +248,14 @@ pub fn removeCreatedCgroup(root: posix.fd_t, path: []const u8, cgroup: posix.fd_
     try removeCgroup(root, path);
 }
 
-pub fn removeCgroup(root: posix.fd_t, path: []const u8) Backend.Error!void {
+pub fn removeCgroup(root: posix.fd_t, path: []const u8) libcontainer.Error!void {
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const len = @min(path.len, path_buffer.len);
     @memcpy(path_buffer[0..len], path[0..len]);
     return removeCgroupAt(root, path, &path_buffer, len);
 }
 
-fn removeCgroupAt(root: posix.fd_t, path: []const u8, path_buffer: []u8, path_len: usize) Backend.Error!void {
+fn removeCgroupAt(root: posix.fd_t, path: []const u8, path_buffer: []u8, path_len: usize) libcontainer.Error!void {
     const full_path = path_buffer[0..path_len];
     try validateCgroupPath(path);
     const parent = if (std.fs.path.dirname(path)) |parent_path|
@@ -297,14 +297,14 @@ fn removeCgroupAt(root: posix.fd_t, path: []const u8, path_buffer: []u8, path_le
 }
 
 /// Remove descendants before their parent, without touching cgroup control files.
-pub fn removeCgroupChildren(dir: posix.fd_t, path: []const u8) Backend.Error!void {
+pub fn removeCgroupChildren(dir: posix.fd_t, path: []const u8) libcontainer.Error!void {
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const len = @min(path.len, path_buffer.len);
     @memcpy(path_buffer[0..len], path[0..len]);
     return removeCgroupChildrenAt(dir, &path_buffer, len);
 }
 
-fn removeCgroupChildrenAt(dir: posix.fd_t, path_buffer: []u8, path_len: usize) Backend.Error!void {
+fn removeCgroupChildrenAt(dir: posix.fd_t, path_buffer: []u8, path_len: usize) libcontainer.Error!void {
     var buffer: [4096]u8 = undefined;
     while (true) {
         const result = linux.getdents64(dir, &buffer, buffer.len);
@@ -424,7 +424,7 @@ test "cgroup membership verifies hierarchy and subtree boundaries" {
     try std.testing.expect(!procCgroupMatches("1:name=systemd:/docker/cid/igvano/example\n", "/docker/cid", "igvano/example", ""));
 }
 
-pub fn configureCgroup(allocator: std.mem.Allocator, root: posix.fd_t, mode: CgroupMode, cgroup: *?posix.fd_t, hierarchies: []V1Hierarchy, options: Backend.CreateOptions, writes: []const Write, v1_writes: []const V1Write) Backend.Error!void {
+pub fn configureCgroup(allocator: std.mem.Allocator, root: posix.fd_t, mode: CgroupMode, cgroup: *?posix.fd_t, hierarchies: []V1Hierarchy, options: libcontainer.CreateOptions, writes: []const Write, v1_writes: []const V1Write) libcontainer.Error!void {
     if (mode == .unified) {
         cgroup.* = (try walkCgroup(root, options.cgroup_path, !options.systemd, writes)) orelse return error.CreateFailed;
         for (writes) |write| try writeCgroupFile(cgroup.*.?, write.name, write.value, options.cgroup_path);

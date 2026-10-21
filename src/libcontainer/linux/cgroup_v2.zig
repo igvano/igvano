@@ -1,8 +1,8 @@
 const std = @import("std");
 const linux = std.os.linux;
 const posix = std.posix;
-const Backend = @import("../root.zig").Backend;
-const Resources = Backend.Resources;
+const libcontainer = @import("../root.zig");
+const Resources = libcontainer.Resources;
 const diagnostics = @import("diagnostic.zig");
 const checkResult = @import("syscall.zig").checkResult;
 const closeFd = @import("syscall.zig").closeFd;
@@ -21,7 +21,7 @@ const waitFrozen = @import("freezer.zig").waitFrozen;
 pub const Write = struct { name: []const u8, value: []const u8 };
 
 /// Pure cgroup v2 mapping. The caller owns the slice and both strings.
-pub fn v2Writes(allocator: std.mem.Allocator, resources: Resources) Backend.Error![]Write {
+pub fn v2Writes(allocator: std.mem.Allocator, resources: Resources) libcontainer.Error![]Write {
     var writes: std.ArrayList(Write) = .empty;
     defer writes.deinit(allocator);
     errdefer for (writes.items) |write| {
@@ -37,7 +37,7 @@ pub fn v2Writes(allocator: std.mem.Allocator, resources: Resources) Backend.Erro
     return writes.toOwnedSlice(allocator);
 }
 
-fn appendV2MemoryWrites(allocator: std.mem.Allocator, writes: *std.ArrayList(Write), memory: Resources.Memory) Backend.Error!void {
+fn appendV2MemoryWrites(allocator: std.mem.Allocator, writes: *std.ArrayList(Write), memory: Resources.Memory) libcontainer.Error!void {
     if (memory.limit) |limit| {
         if (limit != 0)
             try appendWrite(allocator, writes, "memory.max", try cgroupLimit(allocator, limit));
@@ -60,7 +60,7 @@ fn appendV2MemoryWrites(allocator: std.mem.Allocator, writes: *std.ArrayList(Wri
     }
 }
 
-fn appendV2CpuWrites(allocator: std.mem.Allocator, writes: *std.ArrayList(Write), cpu: Resources.Cpu) Backend.Error!void {
+fn appendV2CpuWrites(allocator: std.mem.Allocator, writes: *std.ArrayList(Write), cpu: Resources.Cpu) libcontainer.Error!void {
     const quota = cpu.quota orelse -1;
     if (quota < -1) return error.InvalidConfig;
     const period = if ((cpu.period orelse 0) == 0) 100000 else cpu.period.?;
@@ -82,14 +82,14 @@ fn appendV2CpuWrites(allocator: std.mem.Allocator, writes: *std.ArrayList(Write)
         try appendWrite(allocator, writes, "cpuset.mems", try allocator.dupe(u8, mems));
 }
 
-fn appendV2PidsWrites(allocator: std.mem.Allocator, writes: *std.ArrayList(Write), pids: Resources.Pids) Backend.Error!void {
+fn appendV2PidsWrites(allocator: std.mem.Allocator, writes: *std.ArrayList(Write), pids: Resources.Pids) libcontainer.Error!void {
     if (pids.limit) |limit| {
         if (limit != 0)
             try appendWrite(allocator, writes, "pids.max", try cgroupLimit(allocator, limit));
     }
 }
 
-fn appendV2BlockIOWrites(allocator: std.mem.Allocator, writes: *std.ArrayList(Write), block: Resources.BlockIO) Backend.Error!void {
+fn appendV2BlockIOWrites(allocator: std.mem.Allocator, writes: *std.ArrayList(Write), block: Resources.BlockIO) libcontainer.Error!void {
     if (block.weight) |weight| {
         const converted = try ioWeight(weight);
         if (converted != 0)
@@ -113,7 +113,7 @@ fn appendV2BlockIOWrites(allocator: std.mem.Allocator, writes: *std.ArrayList(Wr
     }
 }
 
-fn appendV2HugepageWrites(allocator: std.mem.Allocator, writes: *std.ArrayList(Write), pages: []const Resources.HugepageLimit) Backend.Error!void {
+fn appendV2HugepageWrites(allocator: std.mem.Allocator, writes: *std.ArrayList(Write), pages: []const Resources.HugepageLimit) libcontainer.Error!void {
     for (pages) |page| {
         if (page.page_size.len == 0 or std.mem.indexOfAny(u8, page.page_size, "/\x00") != null)
             return error.InvalidConfig;
@@ -123,32 +123,32 @@ fn appendV2HugepageWrites(allocator: std.mem.Allocator, writes: *std.ArrayList(W
     }
 }
 
-fn appendV2UnifiedWrites(allocator: std.mem.Allocator, writes: *std.ArrayList(Write), entries: []const Resources.Unified) Backend.Error!void {
+fn appendV2UnifiedWrites(allocator: std.mem.Allocator, writes: *std.ArrayList(Write), entries: []const Resources.Unified) libcontainer.Error!void {
     // Raw settings are last so they override any typed resource mapping.
     for (entries) |entry|
         try appendWrite(allocator, writes, entry.key, try allocator.dupe(u8, entry.value));
 }
 
-pub fn cgroupLimit(allocator: std.mem.Allocator, limit: i64) Backend.Error![]u8 {
+pub fn cgroupLimit(allocator: std.mem.Allocator, limit: i64) libcontainer.Error![]u8 {
     if (limit < -1) return error.InvalidConfig;
     if (limit == -1) return allocator.dupe(u8, "max");
     return std.fmt.allocPrint(allocator, "{d}", .{limit});
 }
 
 /// Zero shares means unset; the remaining range maps to [1, 10000].
-pub fn cpuWeight(shares: u64) Backend.Error!u64 {
+pub fn cpuWeight(shares: u64) libcontainer.Error!u64 {
     if (shares == 0) return 0;
     if (shares < 2 or shares > 262144) return error.InvalidConfig;
     return 1 + ((shares - 2) * 9999) / 262142;
 }
 
-pub fn ioWeight(weight: u16) Backend.Error!u64 {
+pub fn ioWeight(weight: u16) libcontainer.Error!u64 {
     if (weight == 0) return 0;
     if (weight < 10 or weight > 1000) return error.InvalidConfig;
     return 1 + (@as(u64, weight - 10) * 9999) / 990;
 }
 
-fn appendWrite(allocator: std.mem.Allocator, writes: *std.ArrayList(Write), name: []const u8, value: []u8) Backend.Error!void {
+fn appendWrite(allocator: std.mem.Allocator, writes: *std.ArrayList(Write), name: []const u8, value: []u8) libcontainer.Error!void {
     errdefer allocator.free(value);
     const owned_name = try allocator.dupe(u8, name);
     errdefer allocator.free(owned_name);
@@ -195,7 +195,7 @@ fn appendIgnoredField(allocator: std.mem.Allocator, fields: *std.ArrayList(u8), 
     try fields.appendSlice(allocator, name);
 }
 
-fn enabledControllers(allocator: std.mem.Allocator, available: []const u8, writes: []const Write) Backend.Error![]u8 {
+fn enabledControllers(allocator: std.mem.Allocator, available: []const u8, writes: []const Write) libcontainer.Error![]u8 {
     var result: std.ArrayList(u8) = .empty;
     errdefer result.deinit(allocator);
     var controllers = std.mem.tokenizeAny(u8, available, " \t\n");
@@ -531,7 +531,7 @@ test "v2 controller selection uses write prefixes and enables each controller on
     try std.testing.expectEqualStrings("", unavailable);
 }
 
-pub fn v2MountRoot(allocator: std.mem.Allocator, text: []const u8) Backend.Error![]u8 {
+pub fn v2MountRoot(allocator: std.mem.Allocator, text: []const u8) libcontainer.Error![]u8 {
     var root: ?[]const u8 = null;
     var buffer: [std.fs.max_path_bytes]u8 = undefined;
     var lines = std.mem.tokenizeScalar(u8, text, '\n');
@@ -572,7 +572,7 @@ test "v2 mount roots are unescaped and use the last mount at the cgroup root" {
     }) |text| try std.testing.expectError(error.CreateFailed, v2MountRoot(std.testing.allocator, text));
 }
 
-pub fn killV2Members(dir: posix.fd_t, signal: i32, mount_root: []const u8, path: []const u8) Backend.Error!void {
+pub fn killV2Members(dir: posix.fd_t, signal: i32, mount_root: []const u8, path: []const u8) libcontainer.Error!void {
     const was_frozen = try cgroupFrozen(dir, .unified);
     // Only undo a freeze owned by this operation.
     defer if (!was_frozen) {
@@ -594,7 +594,7 @@ pub fn killV2Members(dir: posix.fd_t, signal: i32, mount_root: []const u8, path:
 /// Enable requested controllers in every ancestor before descending to the leaf.
 /// Creation requires a new leaf. Nested paths can still change controllers in
 /// existing parents, including other containers' cgroups. Like runc, config is trusted.
-pub fn walkCgroup(root: posix.fd_t, path: []const u8, create: bool, writes: []const Write) Backend.Error!?posix.fd_t {
+pub fn walkCgroup(root: posix.fd_t, path: []const u8, create: bool, writes: []const Write) libcontainer.Error!?posix.fd_t {
     try validateCgroupPath(path);
     var current = try openPath(root, ".", .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true });
     errdefer closeFd(current);
@@ -629,7 +629,7 @@ fn needsCgroupController(writes: []const Write) bool {
     } else false;
 }
 
-fn enableRequestedControllers(dir: posix.fd_t, writes: []const Write, path: []const u8) Backend.Error!void {
+fn enableRequestedControllers(dir: posix.fd_t, writes: []const Write, path: []const u8) libcontainer.Error!void {
     // 8 KiB bounds controller discovery and the enabled-name list.
     // This runs after fork too: exhaustion is a policy-size failure,
     // not heap OOM, and must retain a useful cgroup diagnostic.
@@ -645,7 +645,7 @@ fn enableRequestedControllers(dir: posix.fd_t, writes: []const Write, path: []co
     if (controllers.len != 0) try enableCgroupControllers(dir, controllers, path);
 }
 
-fn controllerBufferError(err: Backend.Error, path: []const u8) Backend.Error {
+fn controllerBufferError(err: libcontainer.Error, path: []const u8) libcontainer.Error {
     if (err != error.OutOfMemory) return err;
     reportDiagnostic("cannot enable cgroup controllers for '{s}': controller data exceeds the 8 KiB buffer", .{path});
     return error.CgroupWriteFailed;
@@ -653,7 +653,7 @@ fn controllerBufferError(err: Backend.Error, path: []const u8) Backend.Error {
 
 // A populated non-root cgroup cannot hold domain controllers, and threaded
 // ones alone would make it a thread root whose new children are invalid.
-fn enableCgroupControllers(dir: posix.fd_t, controllers: []const u8, path: []const u8) Backend.Error!void {
+fn enableCgroupControllers(dir: posix.fd_t, controllers: []const u8, path: []const u8) libcontainer.Error!void {
     // cgroup.type exists everywhere except the real root, which is exempt.
     if (linux.errno(linux.faccessat(dir, "cgroup.type", linux.F_OK, 0)) == .SUCCESS) {
         const procs = try readCgroupFile(std.heap.page_allocator, dir, "cgroup.procs");

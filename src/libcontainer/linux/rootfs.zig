@@ -1,7 +1,7 @@
 const std = @import("std");
 const linux = std.os.linux;
 const posix = std.posix;
-const Backend = @import("../root.zig").Backend;
+const libcontainer = @import("../root.zig");
 const hooks = @import("../hooks.zig");
 const needsSetupDev = @import("mount.zig").needsSetupDev;
 const PreparedMount = @import("mount.zig").PreparedMount;
@@ -30,7 +30,7 @@ const applySysctls = @import("procfs.zig").applySysctls;
 
 /// A self-bind has the same filesystem root as its directory in the parent
 /// mount. This checks its shape, not ownership; mountinfo IDs are reusable.
-fn isRootfsSelfBind(text: []const u8, mount_id: u64, path: []const u8) Backend.Error!bool {
+fn isRootfsSelfBind(text: []const u8, mount_id: u64, path: []const u8) libcontainer.Error!bool {
     var mount: ?MountInfo = null;
     var lines = std.mem.tokenizeScalar(u8, text, '\n');
     while (lines.next()) |line| {
@@ -53,7 +53,7 @@ fn isRootfsSelfBind(text: []const u8, mount_id: u64, path: []const u8) Backend.E
     return false;
 }
 
-fn selfBindRootMatches(entry: MountInfo, parent: MountInfo, path: []const u8) Backend.Error!bool {
+fn selfBindRootMatches(entry: MountInfo, parent: MountInfo, path: []const u8) libcontainer.Error!bool {
     if (!std.mem.eql(u8, entry.device, parent.device)) return false;
     var point_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const parent_point = try mountinfoPath(&point_buffer, parent.mountpoint);
@@ -77,14 +77,14 @@ fn selfBindRootMatches(entry: MountInfo, parent: MountInfo, path: []const u8) Ba
     return std.mem.eql(u8, try mountinfoPath(&root_buffer, entry.root), expected);
 }
 
-pub fn mountId(fd: posix.fd_t) Backend.Error!u64 {
+pub fn mountId(fd: posix.fd_t) libcontainer.Error!u64 {
     var stat: linux.Statx = undefined;
     try checkResult(linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .MNT_ID_UNIQUE = true }, &stat));
     if (!stat.mask.MNT_ID_UNIQUE) return error.Unsupported;
     return stat.mnt_id;
 }
 
-pub fn bootId() Backend.Error![36]u8 {
+pub fn bootId() libcontainer.Error![36]u8 {
     const fd = try openPath(linux.AT.FDCWD, "/proc/sys/kernel/random/boot_id", .{ .CLOEXEC = true });
     defer closeFd(fd);
     var id: [36]u8 = undefined;
@@ -116,7 +116,7 @@ const StatMount = extern struct {
     spare2: [50]u64,
 };
 
-pub fn statMount(id: u64) Backend.Error!?StatMount {
+pub fn statMount(id: u64) libcontainer.Error!?StatMount {
     const Request = extern struct {
         size: u32 = @sizeOf(@This()),
         spare: u32 = 0,
@@ -142,7 +142,7 @@ const RootfsMountIdentity = union(enum) {
 };
 
 /// Configured mounts at "/" cover the self-bind, but remain its descendants.
-fn rootfsSelfBindId(text: []const u8, current_id: u64, path: []const u8, identity: RootfsMountIdentity) Backend.Error!?u64 {
+fn rootfsSelfBindId(text: []const u8, current_id: u64, path: []const u8, identity: RootfsMountIdentity) libcontainer.Error!?u64 {
     var id = current_id;
     var buffer: [std.fs.max_path_bytes]u8 = undefined;
     while (true) {
@@ -166,7 +166,7 @@ fn rootfsSelfBindId(text: []const u8, current_id: u64, path: []const u8, identit
     }
 }
 
-pub fn detachRootfs(path: []const u8, identity: RootfsMountIdentity) Backend.Error!void {
+pub fn detachRootfs(path: []const u8, identity: RootfsMountIdentity) libcontainer.Error!void {
     if (!std.fs.path.isAbsolute(path) or std.mem.indexOfScalar(u8, path, 0) != null)
         return error.InvalidPath;
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
@@ -249,13 +249,13 @@ pub const RootfsOptions = struct {
     create_hook_state: []const u8 = "",
     masked_paths: []const [:0]const u8 = &.{},
     readonly_paths: []const [:0]const u8 = &.{},
-    sysctls: []const Backend.Sysctl = &.{},
+    sysctls: []const libcontainer.Sysctl = &.{},
     runtime_sync: ?struct { ready_fd: posix.fd_t, go_fd: posix.fd_t } = null,
 };
 
 /// Paths now resolve entirely inside the container rootfs. Missing targets are
 /// ignored; other mount failures must not silently weaken isolation.
-fn applyPathRestrictions(masked: []const [:0]const u8, readonly: []const [:0]const u8, step: *RootfsStep) Backend.Error!void {
+fn applyPathRestrictions(masked: []const [:0]const u8, readonly: []const [:0]const u8, step: *RootfsStep) libcontainer.Error!void {
     const ms = linux.MS;
     for (masked) |path| {
         step.* = .{ .operation = "stat masked path", .path = path };
@@ -292,7 +292,7 @@ fn applyPathRestrictions(masked: []const [:0]const u8, readonly: []const [:0]con
 
 /// Like runc, make the containing mount slave when requested, otherwise private.
 /// Only that mount must stop being shared; submounts retain their peer groups.
-fn makeRootfsParentUnshared(rootfs: [:0]const u8, propagation: u32, step: *RootfsStep) Backend.Error!void {
+fn makeRootfsParentUnshared(rootfs: [:0]const u8, propagation: u32, step: *RootfsStep) libcontainer.Error!void {
     const flags: u32 = if (propagation & linux.MS.SLAVE != 0) linux.MS.SLAVE else linux.MS.PRIVATE;
     const operation: []const u8 = if (flags == linux.MS.SLAVE) "mount parent slave propagation" else "mount parent private propagation";
     var buffer: [std.fs.max_path_bytes]u8 = undefined;
@@ -327,7 +327,7 @@ fn makeRootfsParentUnshared(rootfs: [:0]const u8, propagation: u32, step: *Rootf
 /// All paths, hook arguments and state buffers are prepared before fork.
 /// Allocating in child2 risks inherited allocator locks (POSIX only permits
 /// async-signal-safe work after fork). The raw hook runner needs no allocation.
-pub fn setupRootfs(rootfs: [:0]const u8, mounts: []const PreparedMount, devices: []const PreparedDevice, symlinks: []const Backend.Symlink, readonly: bool, options: RootfsOptions) Backend.Error!void {
+pub fn setupRootfs(rootfs: [:0]const u8, mounts: []const PreparedMount, devices: []const PreparedDevice, symlinks: []const libcontainer.Symlink, readonly: bool, options: RootfsOptions) libcontainer.Error!void {
     var owns_mount_fds = true;
     defer if (owns_mount_fds) closeMountFds(mounts);
     const ms = linux.MS;
@@ -376,7 +376,7 @@ pub fn setupRootfs(rootfs: [:0]const u8, mounts: []const PreparedMount, devices:
         try checkResult(linux.mount(null, "/", null, options.propagation, 0));
 }
 
-fn prepareRootfsBind(rootfs: [:0]const u8, options: RootfsOptions, step: *RootfsStep) Backend.Error!void {
+fn prepareRootfsBind(rootfs: [:0]const u8, options: RootfsOptions, step: *RootfsStep) libcontainer.Error!void {
     const ms = linux.MS;
     if (options.private_mount_namespace)
         try checkResult(linux.mount(null, "/", null, options.propagation, 0));
@@ -406,7 +406,7 @@ fn prepareRootfsBind(rootfs: [:0]const u8, options: RootfsOptions, step: *Rootfs
         try checkResult(linux.mount(null, rootfs, null, ms.PRIVATE | ms.REC, 0));
 }
 
-fn applyRootfsMounts(rootfs: [:0]const u8, mounts: []const PreparedMount, options: RootfsOptions, step: *RootfsStep) Backend.Error!void {
+fn applyRootfsMounts(rootfs: [:0]const u8, mounts: []const PreparedMount, options: RootfsOptions, step: *RootfsStep) libcontainer.Error!void {
     for (mounts) |mount| {
         step.* = .{ .operation = "open rootfs", .path = rootfs };
         const root_fd = try openPath(linux.AT.FDCWD, rootfs, .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true });
@@ -416,7 +416,7 @@ fn applyRootfsMounts(rootfs: [:0]const u8, mounts: []const PreparedMount, option
     }
 }
 
-fn runCreateHooks(options: RootfsOptions, step: *RootfsStep) Backend.Error!void {
+fn runCreateHooks(options: RootfsOptions, step: *RootfsStep) libcontainer.Error!void {
     if (options.runtime_sync) |sync| {
         step.* = .{ .operation = "create synchronization" };
         var response: CreateResponse = .{};
@@ -432,11 +432,11 @@ fn runCreateHooks(options: RootfsOptions, step: *RootfsStep) Backend.Error!void 
     hooks.run(options.create_hooks, options.create_hook_state) catch |err| {
         // The hook runner already recorded its captured output.
         step.operation = "";
-        return @as(Backend.Error!void, err);
+        return @as(libcontainer.Error!void, err);
     };
 }
 
-fn enterRootfs(rootfs: [:0]const u8, old_root: ?posix.fd_t, new_root: posix.fd_t, step: *RootfsStep) Backend.Error!void {
+fn enterRootfs(rootfs: [:0]const u8, old_root: ?posix.fd_t, new_root: posix.fd_t, step: *RootfsStep) libcontainer.Error!void {
     const ms = linux.MS;
     step.* = .{ .operation = "fchdir rootfs", .path = rootfs };
     try checkResult(linux.fchdir(new_root));

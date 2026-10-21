@@ -2,7 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 const posix = std.posix;
-const Backend = @import("../root.zig").Backend;
+const libcontainer = @import("../root.zig");
 const diagnostics = @import("diagnostic.zig");
 const RESOLVE_NO_XDEV = @import("syscall.zig").RESOLVE_NO_XDEV;
 const RESOLVE_NO_MAGICLINKS = @import("syscall.zig").RESOLVE_NO_MAGICLINKS;
@@ -24,7 +24,7 @@ pub const Procfs = struct {
     /// Only the fallback uses a visible mount, requiring statx verification.
     mount_id: ?u64 = null,
 
-    pub fn open(subset_pid: bool) Backend.Error!Procfs {
+    pub fn open(subset_pid: bool) libcontainer.Error!Procfs {
         if (try privateProcfs(subset_pid)) |fd| return .{ .fd = fd };
         const opened = linux.openat(linux.AT.FDCWD, "/proc", .{ .PATH = true, .DIRECTORY = true, .NOFOLLOW = true, .CLOEXEC = true }, 0);
         if (linux.errno(opened) != .SUCCESS) {
@@ -36,7 +36,7 @@ pub const Procfs = struct {
         return fallback(fd);
     }
 
-    pub fn fallback(fd: posix.fd_t) Backend.Error!Procfs {
+    pub fn fallback(fd: posix.fd_t) libcontainer.Error!Procfs {
         var fs: [32]usize = undefined;
         try checkResult(linux.syscall2(.fstatfs, @intCast(fd), @intFromPtr(&fs)));
         if (statfsType(&fs) != 0x9fa0) {
@@ -52,7 +52,7 @@ pub const Procfs = struct {
         return .{ .fd = fd, .mount_id = stat.mnt_id };
     }
 
-    pub fn openWrite(self: Procfs, path: [:0]const u8) Backend.Error!?posix.fd_t {
+    pub fn openWrite(self: Procfs, path: [:0]const u8) libcontainer.Error!?posix.fd_t {
         // Fallback allows procfs's own self/thread-self symlinks, but never
         // crosses a mount. Numeric paths on the private mount need no symlinks.
         const how: OpenHow = .{
@@ -88,7 +88,7 @@ pub const Procfs = struct {
 /// EACCES may likewise result from LSM mount mediation.
 /// Old kernels may lack the new mount API or subset=pid; fail closed on other
 /// errors and let the caller verify the visible procfs if mounting is denied.
-fn privateProcfs(subset_pid: bool) Backend.Error!?posix.fd_t {
+fn privateProcfs(subset_pid: bool) libcontainer.Error!?posix.fd_t {
     const opened = linux.fsopen("proc", .{ .CLOEXEC = true });
     if (linux.errno(opened) == .PERM or linux.errno(opened) == .ACCES or linux.errno(opened) == .NOSYS) return null;
     try checkResult(opened);
@@ -119,7 +119,7 @@ fn privateProcfs(subset_pid: bool) Backend.Error!?posix.fd_t {
     return @intCast(mounted);
 }
 
-fn sysctlPath(buffer: []u8, key: []const u8) Backend.Error![:0]const u8 {
+fn sysctlPath(buffer: []u8, key: []const u8) libcontainer.Error![:0]const u8 {
     if (std.mem.indexOfAny(u8, key, "/\x00") != null) return error.InvalidConfig;
     var components = std.mem.splitScalar(u8, key, '.');
     while (components.next()) |component| {
@@ -142,7 +142,7 @@ test "sysctl paths are relative to procfs and reject traversal and overflow" {
 }
 
 /// Namespace policy belongs to the frontend; only translate and write here.
-pub fn writeSysctl(proc: Procfs, setting: Backend.Sysctl) Backend.Error!void {
+pub fn writeSysctl(proc: Procfs, setting: libcontainer.Sysctl) libcontainer.Error!void {
     if (std.mem.indexOfAny(u8, setting.value, "\x00\n") != null) return error.InvalidConfig;
     var buffer: [std.fs.max_path_bytes]u8 = undefined;
     const path = try sysctlPath(&buffer, setting.key);
@@ -158,7 +158,7 @@ pub fn writeSysctl(proc: Procfs, setting: Backend.Sysctl) Backend.Error!void {
     }
 }
 
-pub fn applySysctls(settings: []const Backend.Sysctl) Backend.Error!void {
+pub fn applySysctls(settings: []const libcontainer.Sysctl) libcontainer.Error!void {
     if (settings.len == 0) return;
     var key = settings[0].key;
     errdefer |err| if (err != error.MissingProcfs or diagnostics.last_diagnostic_len == 0)
@@ -196,7 +196,7 @@ test "AppArmor profile preparation ignores empty profiles and rejects unavailabl
     }
 }
 
-pub fn prepareAppArmor(allocator: std.mem.Allocator, profile: ?[]const u8) Backend.Error!?[]const u8 {
+pub fn prepareAppArmor(allocator: std.mem.Allocator, profile: ?[]const u8) libcontainer.Error!?[]const u8 {
     const name = profile orelse return null;
     if (name.len == 0) return null;
     if (std.mem.indexOfScalar(u8, name, 0) != null) return error.InvalidProcess;
@@ -208,7 +208,7 @@ pub fn prepareAppArmor(allocator: std.mem.Allocator, profile: ?[]const u8) Backe
     return try std.fmt.allocPrint(allocator, "exec {s}", .{name});
 }
 
-pub fn applyAppArmor(command: ?[]const u8) Backend.Error!void {
+pub fn applyAppArmor(command: ?[]const u8) libcontainer.Error!void {
     const text = command orelse return;
     const profile = text["exec ".len..];
     var unknown_profile = false;
@@ -238,7 +238,7 @@ pub fn applyAppArmor(command: ?[]const u8) Backend.Error!void {
     return error.MissingProcfs;
 }
 
-fn writeAppArmorCommand(fd: posix.fd_t, text: []const u8, unknown_profile: *bool) Backend.Error!void {
+fn writeAppArmorCommand(fd: posix.fd_t, text: []const u8, unknown_profile: *bool) libcontainer.Error!void {
     while (true) {
         const result = linux.write(fd, text.ptr, text.len);
         if (linux.errno(result) == .INTR) continue;

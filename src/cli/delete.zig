@@ -1,9 +1,11 @@
 const std = @import("std");
 const oci = @import("igvano").oci;
 const libcontainer = @import("libcontainer");
-const Backend = libcontainer.Backend;
+const ContainerInstance = @import("state.zig").ContainerInstance;
 const diagnostics = @import("diagnostic.zig");
-const backendResult = @import("diagnostic.zig").backendResult;
+const containerResult = @import("diagnostic.zig").containerResult;
+const ContainerOverride = @import("state.zig").ContainerOverride;
+const bindContainer = @import("state.zig").bindContainer;
 const Config = @import("args.zig").Config;
 const openContainerLock = @import("state.zig").openContainerLock;
 const lockContainer = @import("state.zig").lockContainer;
@@ -22,15 +24,15 @@ fn requireDelete(status: oci.Status, force: bool) !void {
     if (!force) try oci.requireDelete(status);
 }
 
-pub fn stopContainer(io: std.Io, backend: Backend, handle: ?Backend.Handle) !void {
-    if (handle) |value| {
-        if (try backendResult(backend, backend.alive(value))) {
-            backendResult(backend, backend.kill(value, 9)) catch |err| switch (err) {
+pub fn stopContainer(io: std.Io, container: ?libcontainer.Container) !void {
+    if (container) |value| {
+        if (try containerResult(value, value.alive())) {
+            containerResult(value, value.kill(9)) catch |err| switch (err) {
                 error.ProcessNotFound => {},
                 else => return err,
             };
             const started = std.Io.Clock.awake.now(io);
-            while (try backendResult(backend, backend.alive(value))) {
+            while (try containerResult(value, value.alive())) {
                 if (started.untilNow(io, .awake).nanoseconds >= std.Io.Duration.fromSeconds(1).nanoseconds) {
                     std.debug.print("igvano: warning: container init still alive 1s after SIGKILL\n", .{});
                     break;
@@ -41,7 +43,7 @@ pub fn stopContainer(io: std.Io, backend: Backend, handle: ?Backend.Handle) !voi
     }
 }
 
-pub fn deleteContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, config: Config) !void {
+pub fn deleteContainer(allocator: std.mem.Allocator, io: std.Io, injected: ?ContainerOverride, config: Config) !void {
     var lock = try openContainerLock(allocator, config, false);
     defer if (lock) |file| file.close(io);
     var persist_recovery = true;
@@ -70,38 +72,40 @@ pub fn deleteContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backen
         },
         else => return err,
     };
-    var state = try recoverLiveState(allocator, io, backend, config, saved, persist_recovery);
+    var state = try recoverLiveState(allocator, io, injected, config, saved, persist_recovery);
     defer state.deinit();
     try requireDelete(state.parsed.value.status, config.force);
-    if (config.force) try stopContainer(io, backend, state.handle);
+    var instance: ContainerInstance = undefined;
+    const container = if (state.container_state) |value| bindContainer(&instance, injected, value) else null;
+    if (config.force) try stopContainer(io, container);
     const hooks = loadSavedHooks(allocator, io, config) catch |err| hooks: {
         std.debug.print("igvano: warning: cannot load poststop hooks: {s}\n", .{@errorName(err)});
         oci.clearDiagnostic();
         break :hooks null;
     };
     defer if (hooks) |parsed| parsed.deinit();
-    try destroyContainer(allocator, io, backend, config, &state, &lock, if (hooks) |parsed| parsed.value.poststop else null);
+    try destroyContainer(allocator, io, injected, config, &state, &lock, if (hooks) |parsed| parsed.value.poststop else null);
 }
 
-pub fn destroyContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, config: Config, state: *LiveState, lock: *?std.Io.File, poststop: ?[]const oci.Spec.Hook) !void {
+pub fn destroyContainer(allocator: std.mem.Allocator, io: std.Io, injected: ?ContainerOverride, config: Config, state: *LiveState, lock: *?std.Io.File, poststop: ?[]const oci.Spec.Hook) !void {
     if (lock.*) |file| try requireLinkedLock(io, file);
-    const cgroup_path = if (state.handle) |handle|
+    const cgroup_path = if (state.container_state) |handle|
         handle.cgroup_path
     else
         try loadCgroupPath(allocator, io, config.root, config.id);
-    defer if (state.handle == null) {
+    defer if (state.container_state == null) {
         if (cgroup_path) |path| allocator.free(path);
     };
-    const rootfs_mount = if (state.handle) |handle|
-        handleRootfsMount(handle)
+    const rootfs_mount = if (state.container_state) |handle|
+        stateRootfsMount(handle)
     else
         try loadRootfsMount(allocator, io, config.root, config.id);
-    defer if (state.handle == null) {
+    defer if (state.container_state == null) {
         if (rootfs_mount) |mount| allocator.free(mount.path);
     };
-    const systemd = if (state.handle) |handle| handle.systemd else try loadCleanupSystemdDriver(allocator, io, config.root, config.id, cgroup_path, config.force);
-    const cleanup_handle = state.handle orelse savedCleanupHandle(state.parsed.value, cgroup_path, systemd, rootfs_mount);
-    try deleteBackendContainer(backend, cleanup_handle, config);
+    const systemd = if (state.container_state) |handle| handle.systemd else try loadCleanupSystemdDriver(allocator, io, config.root, config.id, cgroup_path, config.force);
+    const cleanup_handle = state.container_state orelse savedCleanupState(state.parsed.value, cgroup_path, systemd, rootfs_mount);
+    try deleteLibraryContainer(injected, cleanup_handle, config);
     state.parsed.value.status = .stopped;
     const path = try std.fs.path.join(allocator, &.{ config.root, config.id });
     defer allocator.free(path);
@@ -113,7 +117,7 @@ pub fn destroyContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backe
     warnHooks(allocator, poststop, state.parsed.value, "poststop");
 }
 
-fn handleRootfsMount(handle: Backend.Handle) ?RootfsMount {
+fn stateRootfsMount(handle: libcontainer.State) ?RootfsMount {
     return if (handle.rootfs_mount) |path| RootfsMount{
         .path = path,
         .mount_id_unique = handle.rootfs_mount_id,
@@ -121,7 +125,7 @@ fn handleRootfsMount(handle: Backend.Handle) ?RootfsMount {
     } else null;
 }
 
-fn savedCleanupHandle(state: oci.State, cgroup_path: ?[]const u8, systemd: bool, rootfs_mount: ?RootfsMount) Backend.Handle {
+fn savedCleanupState(state: oci.State, cgroup_path: ?[]const u8, systemd: bool, rootfs_mount: ?RootfsMount) libcontainer.State {
     return .{
         .id = state.id,
         .pid = state.pid orelse 0,
@@ -134,15 +138,18 @@ fn savedCleanupHandle(state: oci.State, cgroup_path: ?[]const u8, systemd: bool,
     };
 }
 
-fn deleteBackendContainer(backend: Backend, handle: Backend.Handle, config: Config) !void {
+fn deleteLibraryContainer(injected: ?ContainerOverride, handle: libcontainer.State, config: Config) !void {
     var cleanup_handle = handle;
-    backendResult(backend, backend.delete(cleanup_handle)) catch |err| {
+    var instance: ContainerInstance = undefined;
+    var container = bindContainer(&instance, injected, cleanup_handle);
+    containerResult(container, container.delete()) catch |err| {
         if (!config.force or !cleanup_handle.systemd) return err;
         std.debug.print("igvano: warning: systemd cleanup failed for '{s}': {s}; trying cgroupfs cleanup\n", .{ config.id, @errorName(err) });
-        diagnostics.last_backend_detail = null;
+        diagnostics.last_container_detail = null;
         cleanup_handle.systemd = false;
         cleanup_handle.systemd_cleanup = true;
-        try backendResult(backend, backend.delete(cleanup_handle));
+        container = bindContainer(&instance, injected, cleanup_handle);
+        try containerResult(container, container.delete());
     };
 }
 
@@ -162,16 +169,15 @@ test "forced delete of a missing container succeeds while ordinary delete errors
     defer tmp.cleanup();
     const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
     defer std.testing.allocator.free(root);
-    var implementation: libcontainer.LinuxBackend = .{};
     const config: Config = .{ .root = root, .subcommand = .delete, .id = "missing" };
-    try std.testing.expectError(error.FileNotFound, deleteContainer(std.testing.allocator, std.testing.io, implementation.backend(), config));
+    try std.testing.expectError(error.FileNotFound, deleteContainer(std.testing.allocator, std.testing.io, null, config));
     var forced = config;
     forced.force = true;
-    try deleteContainer(std.testing.allocator, std.testing.io, implementation.backend(), forced);
+    try deleteContainer(std.testing.allocator, std.testing.io, null, forced);
     for ([_]bool{ false, true }) |has_lock| {
         try tmp.dir.createDir(std.testing.io, "missing", .default_dir);
         if (has_lock) try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "missing/lock", .data = "" });
-        try deleteContainer(std.testing.allocator, std.testing.io, implementation.backend(), forced);
+        try deleteContainer(std.testing.allocator, std.testing.io, null, forced);
         try std.testing.expectError(error.FileNotFound, tmp.dir.openDir(std.testing.io, "missing", .{}));
     }
 }

@@ -1,25 +1,27 @@
+const libcontainer = @import("../../root.zig");
 const std = @import("std");
-const LinuxBackend = @import("../../linux.zig").LinuxBackend;
+const LinuxContainer = @import("../../linux.zig").Container;
 const diagnostics = @import("../diagnostic.zig");
 const reportDiagnostic = diagnostics.reportDiagnostic;
 const childError = diagnostics.childError;
 
 test "backend diagnostic records formatted detail and truncates safely" {
-    var implementation: LinuxBackend = .{};
-    const backend = implementation.backend();
     defer diagnostics.last_diagnostic_len = 0;
     diagnostics.last_diagnostic_len = 0;
-    try std.testing.expect(backend.diagnostic() == null);
+    var instance = LinuxContainer.load(.{ .id = "example", .pid = 0, .starttime = "" });
+    const container = instance.container();
+    try std.testing.expect(container.diagnostic() == null);
     reportDiagnostic("failed at {s}: {d}", .{ "/proc", 42 });
-    try std.testing.expectEqualStrings("failed at /proc: 42", backend.diagnostic().?);
+    try std.testing.expectEqualStrings("failed at /proc: 42", container.diagnostic().?);
     reportDiagnostic("{s}", .{"x" ** 600});
-    try std.testing.expectEqualStrings("x" ** 512, backend.diagnostic().?);
+    try std.testing.expectEqualStrings("x" ** 512, container.diagnostic().?);
     reportDiagnostic("{s}{s}", .{ "x" ** 511, "é" });
-    try std.testing.expectEqualStrings("x" ** 511, backend.diagnostic().?);
+    try std.testing.expectEqualStrings("x" ** 511, container.diagnostic().?);
     reportDiagnostic("short", .{});
-    try std.testing.expectEqualStrings("short", backend.diagnostic().?);
+    try std.testing.expectEqualStrings("short", container.diagnostic().?);
+    try std.testing.expectEqualStrings("short", libcontainer.linux.diagnostic().?);
     childError(": ", error.CreateFailed);
-    try std.testing.expectEqualStrings(": CreateFailed", backend.diagnostic().?);
+    try std.testing.expectEqualStrings(": CreateFailed", container.diagnostic().?);
 }
 
 test "backend diagnostics are isolated between threads" {
@@ -31,6 +33,5 @@ test "backend diagnostics are isolated between threads" {
         }
     }.run, .{});
     worker.join();
-    var implementation: LinuxBackend = .{};
-    try std.testing.expectEqualStrings("main thread", implementation.backend().diagnostic().?);
+    try std.testing.expectEqualStrings("main thread", libcontainer.linux.diagnostic().?);
 }

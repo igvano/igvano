@@ -1,4 +1,5 @@
-const Backend = @import("root.zig").Backend;
+const std = @import("std");
+const libcontainer = @import("root.zig");
 
 pub const reportDiagnostic = @import("linux/diagnostic.zig").reportDiagnostic;
 pub const lockedMountFlags = @import("linux/mount.zig").lockedMountFlags;
@@ -9,25 +10,102 @@ pub const console = @import("linux/console.zig").console;
 pub const apparmorEnabled = @import("linux/procfs.zig").apparmorEnabled;
 pub const systemdCgroupMatches = @import("linux/systemd.zig").systemdCgroupMatches;
 
-pub const LinuxBackend = struct {
-    pub fn backend(self: *LinuxBackend) Backend {
+pub fn diagnostic() ?[]const u8 {
+    return @import("linux/diagnostic.zig").diagnostic();
+}
+
+pub const Container = struct {
+    state: libcontainer.State,
+    owned: bool = false,
+
+    /// Creates an instance owning state.starttime; all other state fields borrow options.
+    /// Call deinit with options.allocator when the instance is no longer needed.
+    pub fn create(options: libcontainer.CreateOptions) libcontainer.Error!Container {
+        return .{ .state = try @import("linux/create.zig").create(options), .owned = true };
+    }
+
+    /// Borrows state; deinit is a no-op on loaded instances.
+    pub fn load(state: libcontainer.State) Container {
+        return .{ .state = state };
+    }
+
+    /// Frees the starttime owned by created instances, using the same allocator.
+    /// Does nothing for loaded instances.
+    pub fn deinit(self: *Container, allocator: std.mem.Allocator) void {
+        if (self.owned) allocator.free(self.state.starttime);
+    }
+
+    pub fn container(self: *Container) libcontainer.Container {
         return .{ .ptr = self, .vtable = &vtable };
     }
 
-    const vtable: Backend.VTable = .{
-        .create = @import("linux/create.zig").create,
-        .exec = @import("linux/exec.zig").exec,
-        .alive = @import("linux/proc.zig").alive,
-        .kill = @import("linux/proc.zig").kill,
-        .killAll = @import("linux/cgroup_ops.zig").killAll,
-        .update = @import("linux/cgroup_ops.zig").update,
-        .pids = @import("linux/cgroup_ops.zig").pids,
-        .freeze = @import("linux/cgroup_ops.zig").freeze,
-        .thaw = @import("linux/cgroup_ops.zig").thaw,
-        .frozen = @import("linux/cgroup_ops.zig").frozen,
-        .delete = @import("linux/cgroup_ops.zig").delete,
-        .diagnostic = @import("linux/diagnostic.zig").diagnostic,
+    const vtable: libcontainer.Container.VTable = .{
+        .exec = exec,
+        .alive = alive,
+        .kill = kill,
+        .killAll = killAll,
+        .update = update,
+        .pids = pids,
+        .freeze = freeze,
+        .thaw = thaw,
+        .frozen = frozen,
+        .delete = delete,
+        .diagnostic = containerDiagnostic,
     };
+
+    fn exec(ptr: *anyopaque, options: libcontainer.ExecOptions) libcontainer.Error!i32 {
+        const self: *Container = @ptrCast(@alignCast(ptr));
+        return @import("linux/exec.zig").exec(self.state, options);
+    }
+
+    fn alive(ptr: *anyopaque) libcontainer.Error!bool {
+        const self: *Container = @ptrCast(@alignCast(ptr));
+        return @import("linux/proc.zig").alive(self.state);
+    }
+
+    fn kill(ptr: *anyopaque, signal: i32) libcontainer.Error!void {
+        const self: *Container = @ptrCast(@alignCast(ptr));
+        return @import("linux/proc.zig").kill(self.state, signal);
+    }
+
+    fn killAll(ptr: *anyopaque, signal: i32) libcontainer.Error!void {
+        const self: *Container = @ptrCast(@alignCast(ptr));
+        return @import("linux/cgroup_ops.zig").killAll(self.state, signal);
+    }
+
+    fn update(ptr: *anyopaque, resources: libcontainer.Resources) libcontainer.Error!void {
+        const self: *Container = @ptrCast(@alignCast(ptr));
+        return @import("linux/cgroup_ops.zig").update(self.state, resources);
+    }
+
+    fn pids(ptr: *anyopaque, allocator: std.mem.Allocator) libcontainer.Error![]i32 {
+        const self: *Container = @ptrCast(@alignCast(ptr));
+        return @import("linux/cgroup_ops.zig").pids(self.state, allocator);
+    }
+
+    fn freeze(ptr: *anyopaque) libcontainer.Error!void {
+        const self: *Container = @ptrCast(@alignCast(ptr));
+        return @import("linux/cgroup_ops.zig").freeze(self.state);
+    }
+
+    fn thaw(ptr: *anyopaque) libcontainer.Error!void {
+        const self: *Container = @ptrCast(@alignCast(ptr));
+        return @import("linux/cgroup_ops.zig").thaw(self.state);
+    }
+
+    fn frozen(ptr: *anyopaque) libcontainer.Error!bool {
+        const self: *Container = @ptrCast(@alignCast(ptr));
+        return @import("linux/cgroup_ops.zig").frozen(self.state);
+    }
+
+    fn delete(ptr: *anyopaque) libcontainer.Error!void {
+        const self: *Container = @ptrCast(@alignCast(ptr));
+        return @import("linux/cgroup_ops.zig").delete(self.state);
+    }
+
+    fn containerDiagnostic(_: *anyopaque) ?[]const u8 {
+        return diagnostic();
+    }
 };
 
 test {

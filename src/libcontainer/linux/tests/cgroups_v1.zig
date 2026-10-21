@@ -2,8 +2,8 @@ const std = @import("std");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 const posix = std.posix;
-const Backend = @import("../../root.zig").Backend;
-const Resources = Backend.Resources;
+const libcontainer = @import("../../root.zig");
+const Resources = libcontainer.Resources;
 const checkResult = @import("../syscall.zig").checkResult;
 const forkProcess = @import("../syscall.zig").forkProcess;
 const makePipe = @import("../syscall.zig").makePipe;
@@ -28,7 +28,7 @@ const removeV1Cgroups = @import("../cgroup_v1.zig").removeV1Cgroups;
 const removeV1Cgroup = @import("../cgroup_v1.zig").removeV1Cgroup;
 const cleanupV1TestHierarchies = @import("helpers.zig").cleanupV1TestHierarchies;
 const requireTestMountNamespace = @import("helpers.zig").requireTestMountNamespace;
-const LinuxBackend = @import("../../linux.zig").LinuxBackend;
+const LinuxContainer = @import("../../linux.zig").Container;
 
 test "linux v1 create exposes readonly controller leaves containing init" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
@@ -70,9 +70,7 @@ test "linux v1 create exposes readonly controller leaves containing init" {
     try checkResult(linux.mknod(fifo, linux.S.IFIFO | 0o600, 0));
     const controller_path = try std.fmt.allocPrintSentinel(allocator, "/sys/fs/cgroup/{s}", .{std.fs.path.basename(selected.mountpoint)}, 0);
     defer allocator.free(controller_path);
-    var implementation: LinuxBackend = .{};
-    const backend = implementation.backend();
-    const handle = try backend.create(.{
+    var handle_instance = try LinuxContainer.create(.{
         .allocator = allocator,
         .id = "v1-mount",
         .rootfs = rootfs,
@@ -88,10 +86,12 @@ test "linux v1 create exposes readonly controller leaves containing init" {
             .data = "",
         }},
     });
-    defer allocator.free(handle.starttime);
+    defer handle_instance.deinit(allocator);
+    const handle = handle_instance.state;
+    const handle_container = handle_instance.container();
     defer {
-        backend.kill(handle, 9) catch {};
-        backend.delete(handle) catch {};
+        handle_container.kill(9) catch {};
+        handle_container.delete() catch {};
     }
     var buffer: [64]u8 = undefined;
     const namespace_path = try std.fmt.bufPrintZ(&buffer, "/proc/{d}/ns/mnt", .{handle.pid});
@@ -275,13 +275,17 @@ test "linux v1 creates seeds writes joins and deletes each hierarchy" {
             try checkResult(linux.kill(child, @enumFromInt(0)));
         }
     }
-    var backend: LinuxBackend = .{};
-    try backend.backend().delete(.{ .id = "v1-test", .pid = child, .starttime = "", .cgroup_path = path });
+
+    var delete_instance = LinuxContainer.load(.{ .id = "v1-test", .pid = child, .starttime = "", .cgroup_path = path });
+    const delete_container = delete_instance.container();
+    try delete_container.delete();
     try std.testing.expectEqual(@as(u32, 9), try waitChild(child));
     reaped = true;
     for (hierarchies) |hierarchy|
         try std.testing.expectEqual(@as(?posix.fd_t, null), try walkCgroup(hierarchy.root.?, path, false, &.{}));
-    try backend.backend().delete(.{ .id = "v1-test", .pid = 0, .starttime = "", .cgroup_path = path });
+    var stopped_instance = LinuxContainer.load(.{ .id = "v1-test", .pid = 0, .starttime = "", .cgroup_path = path });
+    const stopped_container = stopped_instance.container();
+    try stopped_container.delete();
 }
 
 test "linux v1 cleanup attempts later hierarchies after the first removal fails" {

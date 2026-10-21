@@ -1,8 +1,8 @@
 const std = @import("std");
 const linux = std.os.linux;
 const posix = std.posix;
-const Backend = @import("../root.zig").Backend;
-const Resources = Backend.Resources;
+const libcontainer = @import("../root.zig");
+const Resources = libcontainer.Resources;
 const devicefilter = @import("../devicefilter.zig");
 const devices_emulator = @import("../devices.zig");
 const diagnostics = @import("diagnostic.zig");
@@ -26,7 +26,7 @@ const default_device_rules = [_]Resources.DeviceRule{
 };
 
 /// As on v1, append required device allows after the user's policy.
-pub fn v2DeviceRules(allocator: std.mem.Allocator, rules: []const Resources.DeviceRule, devices: []const Backend.Device) Backend.Error![]Resources.DeviceRule {
+pub fn v2DeviceRules(allocator: std.mem.Allocator, rules: []const Resources.DeviceRule, devices: []const libcontainer.Device) libcontainer.Error![]Resources.DeviceRule {
     var result: std.ArrayList(Resources.DeviceRule) = .empty;
     defer result.deinit(allocator);
     try result.appendSlice(allocator, rules);
@@ -76,7 +76,7 @@ test "v2 device rules append default and configured allows after explicit denies
     try std.testing.expectEqualDeep(expected, @as([]const Resources.DeviceRule, rules));
 }
 
-fn deviceBpfError(path: []const u8, operation: []const u8, err: linux.E) Backend.Error {
+fn deviceBpfError(path: []const u8, operation: []const u8, err: linux.E) libcontainer.Error {
     reportDiagnostic("cgroup '{s}' cannot enforce v2 devices: {s}(BPF_CGROUP_DEVICE): {s}", .{ path, operation, @tagName(err) });
     return error.CgroupWriteFailed;
 }
@@ -98,7 +98,7 @@ pub fn runningInUserNamespace() bool {
 
 /// Query only this cgroup's programs, never effective filters inherited from
 /// ancestors. Retry if the kernel reports a larger list than our buffer.
-pub fn queryDevicePrograms(allocator: std.mem.Allocator, cgroup: posix.fd_t, path: []const u8) Backend.Error![]u32 {
+pub fn queryDevicePrograms(allocator: std.mem.Allocator, cgroup: posix.fd_t, path: []const u8) libcontainer.Error![]u32 {
     var ids = try allocator.alloc(u32, 64);
     errdefer allocator.free(ids);
     for (0..10) |_| {
@@ -119,7 +119,7 @@ pub fn queryDevicePrograms(allocator: std.mem.Allocator, cgroup: posix.fd_t, pat
     return error.CgroupWriteFailed;
 }
 
-pub fn applyV2DeviceFilter(allocator: std.mem.Allocator, cgroup: posix.fd_t, rules: []const Resources.DeviceRule, path: []const u8, update: bool) Backend.Error!void {
+pub fn applyV2DeviceFilter(allocator: std.mem.Allocator, cgroup: posix.fd_t, rules: []const Resources.DeviceRule, path: []const u8, update: bool) libcontainer.Error!void {
     var emu = deviceEmulator(allocator, rules) catch |err| {
         if (err == error.InvalidConfig and diagnostics.last_diagnostic_len == 0)
             reportDiagnostic("cgroup '{s}' has invalid v2 device rules", .{path});
@@ -163,7 +163,7 @@ pub fn applyV2DeviceFilter(allocator: std.mem.Allocator, cgroup: posix.fd_t, rul
     }
 }
 
-fn loadV2DeviceProgram(allocator: std.mem.Allocator, insns: []const devicefilter.Insn, rules: []const Resources.DeviceRule, path: []const u8) Backend.Error!?posix.fd_t {
+fn loadV2DeviceProgram(allocator: std.mem.Allocator, insns: []const devicefilter.Insn, rules: []const Resources.DeviceRule, path: []const u8) libcontainer.Error!?posix.fd_t {
     var log: []u8 = &.{};
     defer allocator.free(log);
     var load: linux.BPF.Attr = .{ .prog_load = std.mem.zeroes(linux.BPF.ProgLoadAttr) };
@@ -209,7 +209,7 @@ fn loadV2DeviceProgram(allocator: std.mem.Allocator, insns: []const devicefilter
     return @intCast(loaded);
 }
 
-fn openDevicePrograms(allocator: std.mem.Allocator, ids: []const u32, path: []const u8, old: *std.ArrayList(posix.fd_t)) Backend.Error!void {
+fn openDevicePrograms(allocator: std.mem.Allocator, ids: []const u32, path: []const u8, old: *std.ArrayList(posix.fd_t)) libcontainer.Error!void {
     for (ids) |id| {
         var attr: linux.BPF.Attr = .{ .get_id = std.mem.zeroes(linux.BPF.GetIdAttr) };
         attr.get_id.id.prog_id = id;
@@ -228,7 +228,7 @@ fn openDevicePrograms(allocator: std.mem.Allocator, ids: []const u32, path: []co
     }
 }
 
-fn applyDeviceRule(allocator: std.mem.Allocator, emu: *devices_emulator.Emulator, rule: Resources.DeviceRule) Backend.Error!void {
+fn applyDeviceRule(allocator: std.mem.Allocator, emu: *devices_emulator.Emulator, rule: Resources.DeviceRule) libcontainer.Error!void {
     emu.apply(allocator, rule) catch |err| {
         if (emu.hole) |hole| {
             const requested = hole.requested;
@@ -254,14 +254,14 @@ fn applyDeviceRule(allocator: std.mem.Allocator, emu: *devices_emulator.Emulator
     };
 }
 
-pub fn deviceEmulator(allocator: std.mem.Allocator, rules: []const Resources.DeviceRule) Backend.Error!devices_emulator.Emulator {
+pub fn deviceEmulator(allocator: std.mem.Allocator, rules: []const Resources.DeviceRule) libcontainer.Error!devices_emulator.Emulator {
     var emu: devices_emulator.Emulator = .{};
     errdefer emu.deinit(allocator);
     for (rules) |rule| try applyDeviceRule(allocator, &emu, rule);
     return emu;
 }
 
-pub fn deviceEmulatorFromList(allocator: std.mem.Allocator, list: []const u8) Backend.Error!devices_emulator.Emulator {
+pub fn deviceEmulatorFromList(allocator: std.mem.Allocator, list: []const u8) libcontainer.Error!devices_emulator.Emulator {
     return devices_emulator.Emulator.fromList(allocator, list) catch |err| switch (err) {
         error.CannotPunchHole => error.InvalidConfig,
         else => |other| other,

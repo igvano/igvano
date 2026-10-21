@@ -1,10 +1,10 @@
 const std = @import("std");
-const Backend = @import("libcontainer").Backend;
+const libcontainer = @import("libcontainer");
 const validationError = @import("diagnostic.zig").validationError;
 const invalidConfig = @import("diagnostic.zig").invalidConfig;
 const Spec = @import("spec.zig").Spec;
 
-pub fn processConfig(process: Spec.Process) Backend.Process {
+pub fn processConfig(process: Spec.Process) libcontainer.Process {
     return .{
         .args = process.args,
         .env = process.env orelse &.{},
@@ -47,9 +47,9 @@ pub fn rlimitResource(name: []const u8) error{InvalidConfig}!std.os.linux.rlimit
     return std.meta.stringToEnum(std.os.linux.rlimit_resource, name["RLIMIT_".len..]) orelse invalidConfig("process.rlimits.type: unknown name '{s}'", .{name});
 }
 
-pub fn processCapabilities(config: Spec.Capabilities) !Backend.Capabilities {
-    var result: Backend.Capabilities = .{};
-    inline for (std.meta.fields(Backend.Capabilities)) |field| {
+pub fn processCapabilities(config: Spec.Capabilities) !libcontainer.Capabilities {
+    var result: libcontainer.Capabilities = .{};
+    inline for (std.meta.fields(libcontainer.Capabilities)) |field| {
         for (@field(config, field.name) orelse &.{}) |name| {
             const number = try capabilityNumber(name) orelse {
                 return invalidConfig("process.capabilities.{s}: unknown capability {s}", .{ field.name, name });
@@ -62,9 +62,9 @@ pub fn processCapabilities(config: Spec.Capabilities) !Backend.Capabilities {
     return result;
 }
 
-pub fn processRlimits(allocator: std.mem.Allocator, config: ?[]const Spec.Rlimit) ![]Backend.Rlimit {
+pub fn processRlimits(allocator: std.mem.Allocator, config: ?[]const Spec.Rlimit) ![]libcontainer.Rlimit {
     const limits = config orelse &.{};
-    const result = try allocator.alloc(Backend.Rlimit, limits.len);
+    const result = try allocator.alloc(libcontainer.Rlimit, limits.len);
     errdefer allocator.free(result);
     for (limits, result, 0..) |limit, *prepared, i| {
         if (limit.soft > limit.hard) return invalidConfig("process.rlimits[{d}]: soft exceeds hard", .{i});
@@ -107,7 +107,7 @@ test "capability names map the complete Linux set and reject malformed names" {
         .inheritable = &names,
         .ambient = &names,
     });
-    inline for (std.meta.fields(Backend.Capabilities)) |field|
+    inline for (std.meta.fields(libcontainer.Capabilities)) |field|
         try std.testing.expectEqual(@as(u64, 0x1ffffffffff), @field(caps, field.name));
     for ([_][]const u8{ "", "CHOWN", "cap_chown", "CAP_", "CAP_chown", "CAP_CHOWN\x00", "CAP_CHOWN!" }) |name|
         try std.testing.expectError(error.InvalidConfig, capabilityNumber(name));
@@ -140,14 +140,14 @@ test "ambient capabilities require membership in both permitted and inheritable"
         .inheritable = &.{"CAP_NET_BIND_SERVICE"},
         .ambient = &.{"CAP_NET_BIND_SERVICE"},
     });
-    try std.testing.expectEqual(Backend.Capabilities{
+    try std.testing.expectEqual(libcontainer.Capabilities{
         .bounding = cap,
         .effective = cap,
         .permitted = cap,
         .inheritable = cap,
         .ambient = cap,
     }, valid);
-    try std.testing.expectEqual(Backend.Capabilities{}, try processCapabilities(.{}));
+    try std.testing.expectEqual(libcontainer.Capabilities{}, try processCapabilities(.{}));
     for ([_]Spec.Capabilities{
         .{ .ambient = &.{"CAP_NET_BIND_SERVICE"} },
         .{ .ambient = &.{"CAP_NET_BIND_SERVICE"}, .permitted = &.{"CAP_NET_BIND_SERVICE"} },
@@ -187,8 +187,8 @@ test "process parses capabilities rlimits and supplementary groups" {
     const limits = try processRlimits(std.testing.allocator, process.rlimits);
     defer std.testing.allocator.free(limits);
     try std.testing.expectEqual(@as(usize, 2), limits.len);
-    try std.testing.expectEqual(Backend.Rlimit{ .resource = .NOFILE, .hard = 1024, .soft = 512 }, limits[0]);
-    try std.testing.expectEqual(Backend.Rlimit{ .resource = .CORE, .hard = std.math.maxInt(u64), .soft = 0 }, limits[1]);
+    try std.testing.expectEqual(libcontainer.Rlimit{ .resource = .NOFILE, .hard = 1024, .soft = 512 }, limits[0]);
+    try std.testing.expectEqual(libcontainer.Rlimit{ .resource = .CORE, .hard = std.math.maxInt(u64), .soft = 0 }, limits[1]);
 }
 
 test "rlimit preparation rejects invalid names inverted limits and duplicates without leaking" {

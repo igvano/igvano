@@ -1,14 +1,15 @@
 const std = @import("std");
+const overrideContainer = @import("helpers.zig").overrideContainer;
 const builtin = @import("builtin");
 const oci = @import("igvano").oci;
 const libcontainer = @import("libcontainer");
-const Backend = libcontainer.Backend;
+const ContainerInstance = @import("../state.zig").ContainerInstance;
 const attached = @import("../../attached.zig");
 const diagnostics = @import("../diagnostic.zig");
 const Config = @import("../args.zig").Config;
 const parseArgs = @import("../args.zig").parseArgs;
 const updateContainer = @import("../update.zig").updateContainer;
-const stateHandle = @import("../state.zig").stateHandle;
+const containerState = @import("../state.zig").containerState;
 const readLiveState = @import("../state.zig").readLiveState;
 const createContainer = @import("../create.zig").createContainer;
 const startContainer = @import("../start.zig").startContainer;
@@ -22,23 +23,24 @@ const readTestCgroup = @import("helpers.zig").readTestCgroup;
 const execTestCommand = @import("helpers.zig").execTestCommand;
 const testPtyPair = @import("helpers.zig").testPtyPair;
 const waitTestExec = @import("helpers.zig").waitTestExec;
-const LockTestBackend = @import("helpers.zig").LockTestBackend;
+const LockTestContainer = @import("helpers.zig").LockTestContainer;
 const LockTestProcess = @import("helpers.zig").LockTestProcess;
 
 test "attached exec catches signals inside backend exec while detached exec has no handler" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const linux = std.os.linux;
-    const TestBackend = struct {
+    const TestContainer = struct {
+        state: libcontainer.State = undefined,
         var detached = false;
 
-        fn exec(_: *anyopaque, _: Backend.Handle, _: Backend.ExecOptions) Backend.Error!i32 {
+        fn exec(_: *anyopaque, _: libcontainer.ExecOptions) libcontainer.Error!i32 {
             for ([_]linux.SIG{ .TERM, .HUP }) |signal| {
                 var action: linux.Sigaction = undefined;
                 if (linux.errno(linux.sigaction(signal, null, &action)) != .SUCCESS)
                     return error.ExecFailed;
                 if ((action.handler.handler == linux.SIG.DFL) != detached)
                     return error.InvalidProcess;
-                // Delivered before backend.exec returns; the attached frontend
+                // Delivered before container.exec returns; the attached frontend
                 // must already supervise signals even on the failure path.
                 if (!detached) _ = linux.kill(@intCast(linux.getpid()), signal);
             }
@@ -67,16 +69,16 @@ test "attached exec catches signals inside backend exec while detached exec has 
         if (std.posix.errno(forked) != .SUCCESS) return error.SystemResources;
         const pid: i32 = @intCast(forked);
         if (pid == 0) {
-            TestBackend.detached = detached;
+            TestContainer.detached = detached;
             const action: linux.Sigaction = .{ .handler = .{ .handler = linux.SIG.DFL }, .mask = linux.sigemptyset(), .flags = 0 };
             for ([_]linux.SIG{ .TERM, .HUP }) |signal| _ = linux.sigaction(signal, &action, null);
             var threaded: std.Io.Threaded = .init_single_threaded;
-            var implementation: LockTestBackend = .{};
-            var vtable = LockTestBackend.vtable;
-            vtable.exec = TestBackend.exec;
-            const backend: Backend = .{ .ptr = &implementation, .vtable = &vtable };
+            var implementation: LockTestContainer = .{};
+            var vtable = LockTestContainer.vtable;
+            vtable.exec = TestContainer.exec;
+            const container: libcontainer.Container = .{ .ptr = &implementation, .vtable = &vtable };
             const config: Config = .{ .root = root, .id = "example", .subcommand = .exec, .process_file = process_file, .detach = detached };
-            _ = execContainer(std.heap.page_allocator, threaded.io(), backend, config) catch |err|
+            _ = execContainer(std.heap.page_allocator, threaded.io(), overrideContainer(&implementation, container), config) catch |err|
                 linux.exit_group(if (err == error.ExecFailed) 0 else 1);
             linux.exit_group(2);
         }
@@ -155,22 +157,28 @@ fn testExecLifecycle(base: []const u8) !void {
     // Stand in for the shim, so detached children and init can be reaped.
     if (linux.errno(linux.prctl(@intFromEnum(linux.PR.SET_CHILD_SUBREAPER), 1, 0, 0, 0)) != .SUCCESS)
         return error.SubreaperFailed;
-    var implementation: libcontainer.LinuxBackend = .{};
-    const backend = implementation.backend();
+
+    const container = null;
     var config: Config = .{ .root = root, .id = "example", .subcommand = .create, .bundle = bundle };
-    try createContainer(allocator, io, backend, config);
+    try createContainer(allocator, io, null, config);
     defer {
         config.subcommand = .delete;
         config.force = true;
-        deleteContainer(allocator, io, backend, config) catch {};
+        deleteContainer(allocator, io, null, config) catch {};
     }
     const saved = try oci.loadState(allocator, io, root, config.id);
     const init_pid = saved.value.pid.?;
-    const init_handle = try stateHandle(allocator, io, root, saved.value, false);
+    const init_handle = try containerState(allocator, io, root, saved.value, false);
     var init_reaped = false;
     defer if (!init_reaped) {
         _ = linux.kill(init_pid, .KILL);
-        if (backend.frozen(init_handle) catch false) backend.thaw(init_handle) catch {};
+        if ((frozen: {
+            var instance = ContainerInstance.load(init_handle);
+            break :frozen instance.container().frozen();
+        }) catch false) (thaw: {
+            var instance = ContainerInstance.load(init_handle);
+            break :thaw instance.container().thaw();
+        }) catch {};
         _ = waitExec(init_pid) catch {};
     };
     const ps = try parseArgs(&.{ "igvano", "--root", root, "ps", "--format", "json", "example" });
@@ -178,26 +186,32 @@ fn testExecLifecycle(base: []const u8) !void {
     {
         const file = try cwd.createFile(io, ps_path, .{});
         defer file.close(io);
-        try psContainer(allocator, io, backend, ps, file);
+        try psContainer(allocator, io, null, ps, file);
         const json = try cwd.readFileAlloc(io, ps_path, allocator, .limited(4096));
         const pids = try std.json.parseFromSlice([]i32, allocator, json, .{});
         defer pids.deinit();
         try std.testing.expect(std.mem.indexOfScalar(i32, pids.value, init_pid) != null);
     }
     // An externally frozen init must also override its saved created status.
-    try backend.freeze(init_handle);
+    try (freeze: {
+        var instance = ContainerInstance.load(init_handle);
+        break :freeze instance.container().freeze();
+    });
     {
-        const state = try readLiveState(allocator, io, backend, config, false);
+        const state = try readLiveState(allocator, io, null, config, false);
         defer state.deinit();
         try std.testing.expectEqual(oci.Status.paused, state.parsed.value.status);
-        try std.testing.expectError(error.InvalidStatus, startContainer(allocator, io, backend, config));
+        try std.testing.expectError(error.InvalidStatus, startContainer(allocator, io, null, config));
     }
-    try backend.thaw(init_handle);
+    try (thaw: {
+        var instance = ContainerInstance.load(init_handle);
+        break :thaw instance.container().thaw();
+    });
     const created_command = try parseArgs(&.{ "igvano", "--root", root, "exec", "example", "sh", "-c", "exit 23" });
     try std.testing.expectEqual(@as(u8, 23), try execTestCommand(created_command, null));
     config.subcommand = .start;
-    try startContainer(allocator, io, backend, config);
-    try testUpdateResources(allocator, io, backend, root, cgroup, base);
+    try startContainer(allocator, io, null, config);
+    try testUpdateResources(allocator, io, container, root, cgroup, base);
     try testAttachedExec(allocator, io, root);
     // The saved config, rather than the now-missing bundle config, supplies exec defaults.
     try cwd.deleteFile(io, config_path);
@@ -207,8 +221,8 @@ fn testExecLifecycle(base: []const u8) !void {
         defer host_dir.close(io);
         const leaked_cwd = try std.fmt.allocPrint(allocator, "/proc/self/fd/{d}", .{host_dir.handle});
         const escaping = try parseArgs(&.{ "igvano", "--root", root, "exec", "--cwd", leaked_cwd, "example", "true" });
-        try std.testing.expectError(error.CreateFailed, execContainer(allocator, io, backend, escaping));
-        try std.testing.expect(std.mem.indexOf(u8, diagnostics.last_backend_detail.?, "cannot change exec cwd") != null);
+        try std.testing.expectError(error.CreateFailed, execContainer(allocator, io, null, escaping));
+        try std.testing.expect(std.mem.indexOf(u8, diagnostics.last_container_detail.?, "cannot change exec cwd") != null);
     }
     var capture: [2]std.posix.fd_t = undefined;
     if (std.posix.errno(std.posix.system.pipe2(&capture, .{ .CLOEXEC = true })) != .SUCCESS)
@@ -276,8 +290,8 @@ fn testExecLifecycle(base: []const u8) !void {
         try std.testing.expectEqual(@as(u8, 0), try waitExec(try std.fmt.parseInt(i32, ignored_pid_text, 10)));
     }
     const invalid = try parseArgs(&.{ "igvano", "--root", root, "exec", "example", "/igvano-missing-exec" });
-    try std.testing.expectError(error.CreateFailed, execContainer(allocator, io, backend, invalid));
-    try std.testing.expectEqualStrings("exec: \"/igvano-missing-exec\": executable file not found in $PATH", diagnostics.last_backend_detail.?);
+    try std.testing.expectError(error.CreateFailed, execContainer(allocator, io, null, invalid));
+    try std.testing.expectEqualStrings("exec: \"/igvano-missing-exec\": executable file not found in $PATH", diagnostics.last_container_detail.?);
     const process_file = try std.fs.path.join(allocator, &.{ base, "process.json" });
     try cwd.writeFile(io, .{
         .sub_path = process_file,
@@ -304,57 +318,69 @@ fn testExecLifecycle(base: []const u8) !void {
 
     const pause = try parseArgs(&.{ "igvano", "--root", root, "pause", "example" });
     const resume_config = try parseArgs(&.{ "igvano", "--root", root, "resume", "example" });
-    try std.testing.expectError(error.InvalidStatus, pauseContainer(allocator, io, backend, resume_config));
-    try pauseContainer(allocator, io, backend, pause);
+    try std.testing.expectError(error.InvalidStatus, pauseContainer(allocator, io, null, resume_config));
+    try pauseContainer(allocator, io, null, pause);
     {
-        const paused = try readLiveState(allocator, io, backend, pause, false);
+        const paused = try readLiveState(allocator, io, null, pause, false);
         defer paused.deinit();
         try std.testing.expectEqual(oci.Status.paused, paused.parsed.value.status);
-        try std.testing.expect(try backend.frozen(paused.handle.?));
-        try testUpdateResources(allocator, io, backend, root, cgroup, base);
-        try std.testing.expect(try backend.frozen(paused.handle.?));
-        try std.testing.expectError(error.InvalidStatus, pauseContainer(allocator, io, backend, pause));
-        try std.testing.expectError(error.InvalidStatus, startContainer(allocator, io, backend, config));
-        try std.testing.expectError(error.InvalidStatus, execContainer(allocator, io, backend, command));
-        try std.testing.expectError(error.InvalidStatus, deleteContainer(allocator, io, backend, config));
+        try std.testing.expect(try (frozen: {
+            var instance = ContainerInstance.load(paused.container_state.?);
+            break :frozen instance.container().frozen();
+        }));
+        try testUpdateResources(allocator, io, container, root, cgroup, base);
+        try std.testing.expect(try (frozen: {
+            var instance = ContainerInstance.load(paused.container_state.?);
+            break :frozen instance.container().frozen();
+        }));
+        try std.testing.expectError(error.InvalidStatus, pauseContainer(allocator, io, null, pause));
+        try std.testing.expectError(error.InvalidStatus, startContainer(allocator, io, null, config));
+        try std.testing.expectError(error.InvalidStatus, execContainer(allocator, io, null, command));
+        try std.testing.expectError(error.InvalidStatus, deleteContainer(allocator, io, null, config));
         const file = try cwd.createFile(io, ps_path, .{});
         defer file.close(io);
-        try psContainer(allocator, io, backend, ps, file);
+        try psContainer(allocator, io, null, ps, file);
         const paused_json = try cwd.readFileAlloc(io, ps_path, allocator, .limited(4096));
         const paused_pids = try std.json.parseFromSlice([]i32, allocator, paused_json, .{});
         defer paused_pids.deinit();
         try std.testing.expect(std.mem.indexOfScalar(i32, paused_pids.value, init_pid) != null);
         const signal_all = try parseArgs(&.{ "igvano", "--root", root, "kill", "--all", "example", "15" });
-        try killContainer(allocator, io, backend, signal_all);
-        try std.testing.expect(try backend.frozen(paused.handle.?));
+        try killContainer(allocator, io, null, signal_all);
+        try std.testing.expect(try (frozen: {
+            var instance = ContainerInstance.load(paused.container_state.?);
+            break :frozen instance.container().frozen();
+        }));
     }
     // PID namespace init ignores a default SIGTERM, so it stays running after thaw.
-    try pauseContainer(allocator, io, backend, resume_config);
+    try pauseContainer(allocator, io, null, resume_config);
     {
-        const running = try readLiveState(allocator, io, backend, config, false);
+        const running = try readLiveState(allocator, io, null, config, false);
         defer running.deinit();
         try std.testing.expectEqual(oci.Status.running, running.parsed.value.status);
-        try std.testing.expect(!try backend.frozen(running.handle.?));
+        try std.testing.expect(!try (frozen: {
+            var instance = ContainerInstance.load(running.container_state.?);
+            break :frozen instance.container().frozen();
+        }));
         const file = try cwd.createFile(io, ps_path, .{});
         defer file.close(io);
         const table = try parseArgs(&.{ "igvano", "--root", root, "ps", "example", "-ef" });
-        try psContainer(allocator, io, backend, table, file);
+        try psContainer(allocator, io, null, table, file);
         const text = try cwd.readFileAlloc(io, ps_path, allocator, .limited(4096));
         try std.testing.expect(std.mem.startsWith(u8, text, "UID"));
         try std.testing.expect(std.mem.indexOf(u8, text, try std.fmt.allocPrint(allocator, "{d}", .{init_pid})) != null);
         const custom = try parseArgs(&.{ "igvano", "--root", root, "ps", "example", "-o", "pid,comm", "-e" });
         const custom_file = try cwd.createFile(io, ps_path, .{});
         defer custom_file.close(io);
-        try psContainer(allocator, io, backend, custom, custom_file);
+        try psContainer(allocator, io, null, custom, custom_file);
         const custom_text = try cwd.readFileAlloc(io, ps_path, allocator, .limited(4096));
         try std.testing.expect(std.mem.indexOf(u8, custom_text, "PID") != null);
         try std.testing.expect(std.mem.indexOf(u8, custom_text, "sleep") != null);
     }
-    try pauseContainer(allocator, io, backend, pause);
+    try pauseContainer(allocator, io, null, pause);
     config.subcommand = .delete;
     config.force = true;
     const deleting = std.Io.Clock.awake.now(io);
-    try deleteContainer(allocator, io, backend, config);
+    try deleteContainer(allocator, io, null, config);
     try std.testing.expect(deleting.untilNow(io, .awake).nanoseconds < std.Io.Duration.fromSeconds(5).nanoseconds);
     _ = try waitExec(init_pid);
     init_reaped = true;
@@ -370,10 +396,10 @@ fn testExecLifecycle(base: []const u8) !void {
         const members_path = try std.fmt.allocPrint(allocator, "{s}/{s}/cgroup.procs", .{ hierarchy, cgroup });
         try std.testing.expectError(error.FileNotFound, cwd.openFile(io, members_path, .{}));
     }
-    try std.testing.expectError(error.FileNotFound, execContainer(allocator, io, backend, command));
+    try std.testing.expectError(error.FileNotFound, execContainer(allocator, io, null, command));
 }
 
-fn testUpdateResources(allocator: std.mem.Allocator, io: std.Io, backend: Backend, root: []const u8, cgroup: []const u8, base: []const u8) !void {
+fn testUpdateResources(allocator: std.mem.Allocator, io: std.Io, container: ?@import("../state.zig").ContainerOverride, root: []const u8, cgroup: []const u8, base: []const u8) !void {
     const cwd = std.Io.Dir.cwd();
     const unified = std.os.linux.errno(std.os.linux.access("/sys/fs/cgroup/cgroup.controllers", std.os.linux.F_OK)) == .SUCCESS;
     const memory_path = try std.fmt.allocPrint(allocator, "{s}/{s}/{s}", .{
@@ -392,24 +418,24 @@ fn testUpdateResources(allocator: std.mem.Allocator, io: std.Io, backend: Backen
         if (std.mem.trim(u8, procs, " \t\n").len != 0) {
             const controllers = try readTestCgroup(allocator, io, "/sys/fs/cgroup/cgroup.subtree_control");
             const kind = try readTestCgroup(allocator, io, "/sys/fs/cgroup/cgroup.type");
-            try std.testing.expectError(error.CgroupWriteFailed, updateContainer(allocator, io, backend, update));
-            try std.testing.expect(std.mem.indexOf(u8, diagnostics.last_backend_detail orelse return error.TestUnexpectedResult, "has processes") != null);
+            try std.testing.expectError(error.CgroupWriteFailed, updateContainer(allocator, io, container, update));
+            try std.testing.expect(std.mem.indexOf(u8, diagnostics.last_container_detail orelse return error.TestUnexpectedResult, "has processes") != null);
             try std.testing.expectEqualStrings(controllers, try readTestCgroup(allocator, io, "/sys/fs/cgroup/cgroup.subtree_control"));
             try std.testing.expectEqualStrings(kind, try readTestCgroup(allocator, io, "/sys/fs/cgroup/cgroup.type"));
             return;
         }
     }
-    try updateContainer(allocator, io, backend, update);
+    try updateContainer(allocator, io, container, update);
     try std.testing.expectEqualStrings("33554432", std.mem.trim(u8, try readTestCgroup(allocator, io, memory_path), " \t\n"));
     const memory_flag = try parseArgs(&.{ "igvano", "--root", root, "update", "--memory", "64m", "example" });
-    try updateContainer(allocator, io, backend, memory_flag);
+    try updateContainer(allocator, io, container, memory_flag);
     const memory = try readTestCgroup(allocator, io, memory_path);
     try std.testing.expectEqualStrings("67108864", std.mem.trim(u8, memory, " \t\n"));
     const pids = try readTestCgroup(allocator, io, pids_path);
     try std.testing.expectEqualStrings("50", std.mem.trim(u8, pids, " \t\n"));
 
     try cwd.writeFile(io, .{ .sub_path = resource_file, .data = "{\"cpu\":{\"shares\":512}}" });
-    try updateContainer(allocator, io, backend, update);
+    try updateContainer(allocator, io, container, update);
     const unchanged = try readTestCgroup(allocator, io, memory_path);
     try std.testing.expectEqualStrings(memory, unchanged);
     const unchanged_pids = try readTestCgroup(allocator, io, pids_path);
@@ -424,13 +450,13 @@ fn testUpdateResources(allocator: std.mem.Allocator, io: std.Io, backend: Backen
     if (unified) {
         const max_path = try std.fmt.allocPrint(allocator, "/sys/fs/cgroup/{s}/cpu.max", .{cgroup});
         try cwd.writeFile(io, .{ .sub_path = resource_file, .data = "{\"cpu\":{\"quota\":50000,\"period\":200000}}" });
-        try updateContainer(allocator, io, backend, update);
+        try updateContainer(allocator, io, container, update);
         try cwd.writeFile(io, .{ .sub_path = resource_file, .data = "{\"cpu\":{\"quota\":25000}}" });
-        try updateContainer(allocator, io, backend, update);
+        try updateContainer(allocator, io, container, update);
         const max = try readTestCgroup(allocator, io, max_path);
         try std.testing.expectEqualStrings("25000 200000", std.mem.trim(u8, max, " \t\n"));
         try cwd.writeFile(io, .{ .sub_path = resource_file, .data = "{\"memory\":{\"swap\":134217728}}" });
-        try updateContainer(allocator, io, backend, update);
+        try updateContainer(allocator, io, container, update);
         const swap_path = try std.fmt.allocPrint(allocator, "/sys/fs/cgroup/{s}/memory.swap.max", .{cgroup});
         const swap = try readTestCgroup(allocator, io, swap_path);
         try std.testing.expectEqualStrings("67108864", std.mem.trim(u8, swap, " \t\n"));
@@ -449,7 +475,7 @@ fn testUpdateResources(allocator: std.mem.Allocator, io: std.Io, backend: Backen
         var threaded: std.Io.Threaded = .init_single_threaded;
         var stdin_update = update;
         stdin_update.resources_file = "-";
-        updateContainer(std.heap.page_allocator, threaded.io(), backend, stdin_update) catch linux.exit_group(1);
+        updateContainer(std.heap.page_allocator, threaded.io(), container, stdin_update) catch linux.exit_group(1);
         linux.exit_group(0);
     }
     try std.testing.expectEqual(@as(u8, 0), try waitExec(child));
@@ -471,8 +497,8 @@ fn testAttachedExec(allocator: std.mem.Allocator, io: std.Io, root: []const u8) 
     if (runner_pid == 0) {
         if (linux.errno(linux.dup2(capture[1], 1)) != .SUCCESS) linux.exit_group(1);
         var threaded: std.Io.Threaded = .init_single_threaded;
-        var implementation: libcontainer.LinuxBackend = .{};
-        const status = execContainer(std.heap.page_allocator, threaded.io(), implementation.backend(), command) catch linux.exit_group(1);
+
+        const status = execContainer(std.heap.page_allocator, threaded.io(), null, command) catch linux.exit_group(1);
         linux.exit_group(status);
     }
     var runner_reaped = false;
@@ -516,8 +542,8 @@ fn testAttachedExec(allocator: std.mem.Allocator, io: std.Io, root: []const u8) 
         _ = linux.close(terminal[0]);
         if (linux.errno(linux.dup2(terminal[1], 0)) != .SUCCESS or linux.errno(linux.dup2(terminal[1], 1)) != .SUCCESS) linux.exit_group(1);
         var threaded: std.Io.Threaded = .init_single_threaded;
-        var implementation: libcontainer.LinuxBackend = .{};
-        const status = execContainer(std.heap.page_allocator, threaded.io(), implementation.backend(), tty_command) catch linux.exit_group(1);
+
+        const status = execContainer(std.heap.page_allocator, threaded.io(), null, tty_command) catch linux.exit_group(1);
         linux.exit_group(status);
     }
     var tty_reaped = false;
@@ -562,14 +588,14 @@ fn testAttachedExec(allocator: std.mem.Allocator, io: std.Io, root: []const u8) 
     if (closed_pid == 0) {
         for ([_]std.posix.fd_t{ 0, 1, 2 }) |fd| _ = linux.close(fd);
         var threaded: std.Io.Threaded = .init_single_threaded;
-        var backend: libcontainer.LinuxBackend = .{};
-        const status = execContainer(std.heap.page_allocator, threaded.io(), backend.backend(), closed_stdin) catch linux.exit_group(1);
+
+        const status = execContainer(std.heap.page_allocator, threaded.io(), null, closed_stdin) catch linux.exit_group(1);
         linux.exit_group(status);
     }
     try std.testing.expectEqual(@as(u8, 0), try waitExec(closed_pid));
-    var implementation: libcontainer.LinuxBackend = .{};
+
     const detached = try parseArgs(&.{ "igvano", "--root", root, "exec", "--detach", "-t", "example", "tty" });
-    try std.testing.expectError(error.MissingConsoleSocket, execContainer(allocator, io, implementation.backend(), detached));
+    try std.testing.expectError(error.MissingConsoleSocket, execContainer(allocator, io, null, detached));
 }
 
 test "attached wait drains buffered output after PTY hangup" {

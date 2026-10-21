@@ -2,7 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 const posix = std.posix;
-const Backend = @import("../../root.zig").Backend;
+const libcontainer = @import("../../root.zig");
 const diagnostics = @import("../diagnostic.zig");
 const PreparedMount = @import("../mount.zig").PreparedMount;
 const checkResult = @import("../syscall.zig").checkResult;
@@ -111,7 +111,7 @@ test "linux sysctls precede readonly restrictions and preserve the runtime netwo
         return error.TestUnexpectedResult;
     }
     // Joined namespaces also validate when their inode differs from ours.
-    for ([_]struct { kind: Backend.Namespace.Kind, name: []const u8 }{
+    for ([_]struct { kind: libcontainer.Namespace.Kind, name: []const u8 }{
         .{ .kind = .network, .name = "net" },
         .{ .kind = .ipc, .name = "ipc" },
     }) |case| {

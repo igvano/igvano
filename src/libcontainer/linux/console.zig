@@ -2,7 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 const posix = std.posix;
-const Backend = @import("../root.zig").Backend;
+const libcontainer = @import("../root.zig");
 const OPEN_TREE_CLONE = @import("mount.zig").OPEN_TREE_CLONE;
 const OPEN_TREE_CLOEXEC = @import("mount.zig").OPEN_TREE_CLOEXEC;
 const mountDestination = @import("mount.zig").mountDestination;
@@ -23,7 +23,7 @@ pub const console = struct {
     };
     pub const rights_len = @sizeOf(linux.cmsghdr) + @sizeOf(posix.fd_t);
 
-    pub fn socketpair() Backend.Error![2]posix.fd_t {
+    pub fn socketpair() libcontainer.Error![2]posix.fd_t {
         if (comptime builtin.os.tag != .linux) return error.NotImplemented;
         var fds: [2]posix.fd_t = undefined;
         try checkResult(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0, &fds));
@@ -39,7 +39,7 @@ pub const console = struct {
         return fds;
     }
 
-    pub fn sendFd(socket: posix.fd_t, fd: posix.fd_t) Backend.Error!void {
+    pub fn sendFd(socket: posix.fd_t, fd: posix.fd_t) libcontainer.Error!void {
         if (comptime builtin.os.tag != .linux) return error.NotImplemented;
         var rights: Rights = std.mem.zeroes(Rights);
         rights.header = .{ .len = rights_len, .level = linux.SOL.SOCKET, .type = linux.SCM.RIGHTS };
@@ -71,11 +71,11 @@ pub const console = struct {
         }
     }
 
-    pub fn receiveFd(socket: posix.fd_t) Backend.Error!posix.fd_t {
+    pub fn receiveFd(socket: posix.fd_t) libcontainer.Error!posix.fd_t {
         return (try receiveFdOrEof(socket)) orelse error.ConsoleFailed;
     }
 
-    pub fn receiveFdOrEof(socket: posix.fd_t) Backend.Error!?posix.fd_t {
+    pub fn receiveFdOrEof(socket: posix.fd_t) libcontainer.Error!?posix.fd_t {
         if (comptime builtin.os.tag != .linux) return error.NotImplemented;
         var rights: Rights = std.mem.zeroes(Rights);
         var data: [4]u8 = undefined;
@@ -126,7 +126,7 @@ pub const console = struct {
     }
 };
 
-pub fn setupConsole(socket: posix.fd_t, mount_console: bool) Backend.Error!void {
+pub fn setupConsole(socket: posix.fd_t, mount_console: bool) libcontainer.Error!void {
     const pts = consolePath("/dev/pts", .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true }) catch
         return error.MissingDevpts;
     defer closeFd(pts);
@@ -192,7 +192,7 @@ pub fn setupConsole(socket: posix.fd_t, mount_console: bool) Backend.Error!void 
     try console.sendFd(socket, controller);
 }
 
-fn consoleAboveStdio(fd: posix.fd_t) Backend.Error!posix.fd_t {
+fn consoleAboveStdio(fd: posix.fd_t) libcontainer.Error!posix.fd_t {
     if (fd > 2) return fd;
     defer closeFd(fd);
     const moved = linux.fcntl(fd, linux.F.DUPFD_CLOEXEC, 3);
@@ -200,6 +200,6 @@ fn consoleAboveStdio(fd: posix.fd_t) Backend.Error!posix.fd_t {
     return @intCast(moved);
 }
 
-pub fn consolePath(path: [*:0]const u8, flags: linux.O) Backend.Error!posix.fd_t {
+pub fn consolePath(path: [*:0]const u8, flags: linux.O) libcontainer.Error!posix.fd_t {
     return consoleAboveStdio(try openPath(linux.AT.FDCWD, path, flags));
 }

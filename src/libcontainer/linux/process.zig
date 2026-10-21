@@ -2,7 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 const posix = std.posix;
-const Backend = @import("../root.zig").Backend;
+const libcontainer = @import("../root.zig");
 const seccomp = @import("../seccomp.zig");
 const checkResult = @import("syscall.zig").checkResult;
 const closeFd = @import("syscall.zig").closeFd;
@@ -12,12 +12,12 @@ const reportDiagnostic = @import("diagnostic.zig").reportDiagnostic;
 
 /// Mark inherited descriptors before installing seccomp. A pinned self/fd
 /// directory allows the fallback even when the container has no /proc mount.
-pub fn closeExecFrom(first: u32, fd_dir: ?posix.fd_t) Backend.Error!void {
+pub fn closeExecFrom(first: u32, fd_dir: ?posix.fd_t) libcontainer.Error!void {
     if (comptime builtin.os.tag != .linux) return error.NotImplemented;
     return closeFdRange(first, std.math.maxInt(u32), true, fd_dir);
 }
 
-pub fn closeFdRange(first: u32, last: u32, cloexec: bool, fd_dir: ?posix.fd_t) Backend.Error!void {
+pub fn closeFdRange(first: u32, last: u32, cloexec: bool, fd_dir: ?posix.fd_t) libcontainer.Error!void {
     // Linux CLOSE_RANGE_CLOEXEC is 1 << 2; Zig 0.16's packed flags differ.
     const result = linux.syscall3(.close_range, first, last, if (cloexec) @as(u32, 1 << 2) else 0);
     switch (linux.errno(result)) {
@@ -37,7 +37,7 @@ pub fn closeFdRange(first: u32, last: u32, cloexec: bool, fd_dir: ?posix.fd_t) B
     }
 }
 
-fn closeDirectoryFdEntries(entries: []const u8, first: u32, last: u32, cloexec: bool, dir: posix.fd_t) Backend.Error!void {
+fn closeDirectoryFdEntries(entries: []const u8, first: u32, last: u32, cloexec: bool, dir: posix.fd_t) libcontainer.Error!void {
     var offset: usize = 0;
     while (offset < entries.len) {
         const entry: *align(1) const linux.dirent64 = @ptrCast(&entries[offset]);
@@ -60,7 +60,7 @@ fn closeDirectoryFdEntries(entries: []const u8, first: u32, last: u32, cloexec: 
 }
 
 /// Filter before fork so warnings and any stderr bookkeeping stay in the parent.
-pub fn kernelCapabilities(configured: Backend.Capabilities) Backend.Error!Backend.Capabilities {
+pub fn kernelCapabilities(configured: libcontainer.Capabilities) libcontainer.Error!libcontainer.Capabilities {
     var supported: u64 = 0;
     for (0..64) |cap| {
         const result = linux.prctl(@intFromEnum(linux.PR.CAPBSET_READ), cap, 0, 0, 0);
@@ -70,7 +70,7 @@ pub fn kernelCapabilities(configured: Backend.Capabilities) Backend.Error!Backen
     }
     var result = configured;
     var ignored: u64 = 0;
-    inline for (std.meta.fields(Backend.Capabilities)) |field| {
+    inline for (std.meta.fields(libcontainer.Capabilities)) |field| {
         ignored |= @field(result, field.name) & ~supported;
         @field(result, field.name) &= supported;
     }
@@ -86,7 +86,7 @@ pub const CapabilityHeader = extern struct {
     pid: i32 = 0,
 };
 
-pub fn runProcess(configured: ?Backend.Process, executable: ?[*:0]const u8, argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*:0]const u8, seccomp_program: ?seccomp.Program) !noreturn {
+pub fn runProcess(configured: ?libcontainer.Process, executable: ?[*:0]const u8, argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*:0]const u8, seccomp_program: ?seccomp.Program) !noreturn {
     // A process-less config can be created; it cannot be started.
     const process = configured orelse return error.InvalidProcess;
     // With NNP=true, install after startContainer hooks (unfiltered); NNP=false hooks run filtered, intentionally.
@@ -110,7 +110,7 @@ pub fn runProcess(configured: ?Backend.Process, executable: ?[*:0]const u8, argv
 // No descriptor sweep or rlimit syscall belongs after this point. FIFO opens
 // use O_CLOEXEC; hook memfds and relocated fds use MFD_CLOEXEC/F_DUPFD_CLOEXEC,
 // and only intentional hook stdio dup2/dup3 targets clear CLOEXEC.
-pub fn installSeccomp(program: seccomp.Program) Backend.Error!void {
+pub fn installSeccomp(program: seccomp.Program) libcontainer.Error!void {
     const result = seccomp.install(program);
     if (result != .SUCCESS) {
         var errno_buffer: [16]u8 = undefined;
@@ -121,7 +121,7 @@ pub fn installSeccomp(program: seccomp.Program) Backend.Error!void {
     }
 }
 
-pub fn applyOomScoreAdj(proc_dir: posix.fd_t, oom_score_adj: ?i32) Backend.Error!void {
+pub fn applyOomScoreAdj(proc_dir: posix.fd_t, oom_score_adj: ?i32) libcontainer.Error!void {
     if (comptime builtin.os.tag == .linux) {
         // The runtime pins this procfs before joining namespaces; this write
         // precedes isolation, so it never uses the container's /proc.
@@ -141,14 +141,14 @@ pub const ProcessSettings = struct {
     gid: u32,
     additional_gids: []const u32,
     no_new_privileges: bool,
-    capabilities: ?Backend.Capabilities,
-    rlimits: []const Backend.Rlimit,
+    capabilities: ?libcontainer.Capabilities,
+    rlimits: []const libcontainer.Rlimit,
 };
 
 /// Runs before readiness, without allocating. Keep privileges until limits and
 /// bounding drops finish, then retain permitted caps across the UID transition.
 // For UID 0, exec recomputes permitted/effective as inheritable | bounding (as in runc).
-pub fn applyProcess(process: Backend.Process, capabilities: ?Backend.Capabilities, rlimits: []const Backend.Rlimit) Backend.Error!void {
+pub fn applyProcess(process: libcontainer.Process, capabilities: ?libcontainer.Capabilities, rlimits: []const libcontainer.Rlimit) libcontainer.Error!void {
     return applyProcessSettings(.{
         .uid = process.uid,
         .gid = process.gid,
@@ -159,7 +159,7 @@ pub fn applyProcess(process: Backend.Process, capabilities: ?Backend.Capabilitie
     });
 }
 
-pub fn applyProcessSettings(process: ProcessSettings) Backend.Error!void {
+pub fn applyProcessSettings(process: ProcessSettings) libcontainer.Error!void {
     if (comptime builtin.os.tag == .linux) {
         try applyRlimits(process.rlimits);
         if (process.no_new_privileges)
@@ -179,7 +179,7 @@ pub fn applyProcessSettings(process: ProcessSettings) Backend.Error!void {
     }
 }
 
-fn dropBoundingCapabilities(bounding: u64) Backend.Error!void {
+fn dropBoundingCapabilities(bounding: u64) libcontainer.Error!void {
     for (0..64) |cap| {
         // EINVAL marks the running kernel's last supported capability.
         const result = linux.prctl(@intFromEnum(linux.PR.CAPBSET_READ), cap, 0, 0, 0);
@@ -190,7 +190,7 @@ fn dropBoundingCapabilities(bounding: u64) Backend.Error!void {
     }
 }
 
-fn applyCapabilities(caps: Backend.Capabilities) Backend.Error!void {
+fn applyCapabilities(caps: libcontainer.Capabilities) libcontainer.Error!void {
     // Linux's header uses a 32-bit pid, unlike Zig 0.16's usize field.
     const header: CapabilityHeader = .{};
     const data = [2]linux.cap_user_data_t{
@@ -207,7 +207,7 @@ fn applyCapabilities(caps: Backend.Capabilities) Backend.Error!void {
     }
 }
 
-pub fn applyRlimits(rlimits: []const Backend.Rlimit) Backend.Error!void {
+pub fn applyRlimits(rlimits: []const libcontainer.Rlimit) libcontainer.Error!void {
     for (rlimits) |limit| {
         const value: linux.rlimit = .{ .cur = limit.soft, .max = limit.hard };
         try checkResult(linux.setrlimit(limit.resource, &value));

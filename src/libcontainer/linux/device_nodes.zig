@@ -2,7 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 const posix = std.posix;
-const Backend = @import("../root.zig").Backend;
+const libcontainer = @import("../root.zig");
 const mountDestination = @import("mount.zig").mountDestination;
 const checkResult = @import("syscall.zig").checkResult;
 const closeFd = @import("syscall.zig").closeFd;
@@ -18,7 +18,7 @@ pub const PreparedDevice = struct {
     gid: u32 = 0,
 };
 
-pub fn validateDeviceNode(fd: posix.fd_t, device: PreparedDevice) Backend.Error!void {
+pub fn validateDeviceNode(fd: posix.fd_t, device: PreparedDevice) libcontainer.Error!void {
     var stat: linux.Statx = undefined;
     try checkResult(linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .TYPE = true }, &stat));
     if (!stat.mask.TYPE) return error.CreateFailed;
@@ -32,7 +32,7 @@ pub fn validateDeviceNode(fd: posix.fd_t, device: PreparedDevice) Backend.Error!
     }
 }
 
-pub fn createDevice(root_fd: posix.fd_t, device: PreparedDevice, private_mount_namespace: bool, step: *RootfsStep) Backend.Error!void {
+pub fn createDevice(root_fd: posix.fd_t, device: PreparedDevice, private_mount_namespace: bool, step: *RootfsStep) libcontainer.Error!void {
     if (comptime builtin.os.tag == .linux) {
         step.* = .{ .operation = "prepare device parent", .path = device.path };
         const parent = std.fs.path.dirname(device.path) orelse return error.InvalidPath;
@@ -99,7 +99,7 @@ pub fn createDevice(root_fd: posix.fd_t, device: PreparedDevice, private_mount_n
     }
 }
 
-pub fn setupDevices(root_fd: posix.fd_t, devices: []const PreparedDevice, symlinks: []const Backend.Symlink, private_mount_namespace: bool, step: *RootfsStep) Backend.Error!void {
+pub fn setupDevices(root_fd: posix.fd_t, devices: []const PreparedDevice, symlinks: []const libcontainer.Symlink, private_mount_namespace: bool, step: *RootfsStep) libcontainer.Error!void {
     if (comptime builtin.os.tag == .linux) {
         for (devices) |device| try createDevice(root_fd, device, private_mount_namespace, step);
         try setupSymlinks(root_fd, symlinks, step);
@@ -108,7 +108,7 @@ pub fn setupDevices(root_fd: posix.fd_t, devices: []const PreparedDevice, symlin
     }
 }
 
-pub fn setupSymlinks(root_fd: posix.fd_t, symlinks: []const Backend.Symlink, step: *RootfsStep) Backend.Error!void {
+pub fn setupSymlinks(root_fd: posix.fd_t, symlinks: []const libcontainer.Symlink, step: *RootfsStep) libcontainer.Error!void {
     if (comptime builtin.os.tag == .linux) {
         for (symlinks) |link| {
             step.* = .{ .operation = "prepare symlink parent", .path = link.path };

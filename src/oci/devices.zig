@@ -1,11 +1,11 @@
 const std = @import("std");
-const Backend = @import("libcontainer").Backend;
+const libcontainer = @import("libcontainer");
 const invalidConfig = @import("diagnostic.zig").invalidConfig;
 const diagnosticContext = @import("diagnostic.zig").diagnosticContext;
 const Spec = @import("spec.zig").Spec;
 const resolveMountDestination = @import("mounts.zig").resolveMountDestination;
 
-const default_devices = [_]Backend.Device{
+const default_devices = [_]libcontainer.Device{
     .{ .path = "/dev/null", .kind = .character, .major = 1, .minor = 3, .required = false },
     .{ .path = "/dev/zero", .kind = .character, .major = 1, .minor = 5, .required = false },
     .{ .path = "/dev/full", .kind = .character, .major = 1, .minor = 7, .required = false },
@@ -15,8 +15,8 @@ const default_devices = [_]Backend.Device{
 };
 
 /// Configured devices take precedence over defaults. Paths are owned by the result.
-pub fn prepareDevices(allocator: std.mem.Allocator, configured: ?[]const Spec.Device) ![]Backend.Device {
-    var devices: std.ArrayList(Backend.Device) = .empty;
+pub fn prepareDevices(allocator: std.mem.Allocator, configured: ?[]const Spec.Device) ![]libcontainer.Device {
+    var devices: std.ArrayList(libcontainer.Device) = .empty;
     errdefer {
         for (devices.items) |device| allocator.free(device.path);
         devices.deinit(allocator);
@@ -40,7 +40,7 @@ pub fn prepareDevices(allocator: std.mem.Allocator, configured: ?[]const Spec.De
     return devices.toOwnedSlice(allocator);
 }
 
-fn deviceKind(device: Spec.Device, i: usize) !Backend.Device.Kind {
+fn deviceKind(device: Spec.Device, i: usize) !libcontainer.Device.Kind {
     return if (std.mem.eql(u8, device.type, "c") or std.mem.eql(u8, device.type, "u"))
         .character
     else if (std.mem.eql(u8, device.type, "b"))
@@ -51,7 +51,7 @@ fn deviceKind(device: Spec.Device, i: usize) !Backend.Device.Kind {
         return invalidConfig("linux.devices[{d}].type: expected c, u, b or p", .{i});
 }
 
-fn deviceNumbers(device: Spec.Device, kind: Backend.Device.Kind, i: usize) !struct { major: u32, minor: u32 } {
+fn deviceNumbers(device: Spec.Device, kind: libcontainer.Device.Kind, i: usize) !struct { major: u32, minor: u32 } {
     const major = device.major orelse if (kind == .fifo) 0 else return invalidConfig("linux.devices[{d}].major: required", .{i});
     const minor = device.minor orelse if (kind == .fifo) 0 else return invalidConfig("linux.devices[{d}].minor: required", .{i});
     // Linux mknod encodes 12 major bits and 20 minor bits.
@@ -60,7 +60,7 @@ fn deviceNumbers(device: Spec.Device, kind: Backend.Device.Kind, i: usize) !stru
     return .{ .major = @intCast(major), .minor = @intCast(minor) };
 }
 
-fn prepareDevice(allocator: std.mem.Allocator, device: Spec.Device, i: usize, previous_devices: []const Backend.Device) !Backend.Device {
+fn prepareDevice(allocator: std.mem.Allocator, device: Spec.Device, i: usize, previous_devices: []const libcontainer.Device) !libcontainer.Device {
     const kind = try deviceKind(device, i);
     const numbers = try deviceNumbers(device, kind, i);
     const mode = device.fileMode orelse 0o666;
@@ -89,12 +89,12 @@ fn prepareDevice(allocator: std.mem.Allocator, device: Spec.Device, i: usize, pr
     };
 }
 
-pub fn freeDevices(allocator: std.mem.Allocator, devices: []const Backend.Device) void {
+pub fn freeDevices(allocator: std.mem.Allocator, devices: []const libcontainer.Device) void {
     for (devices) |device| allocator.free(device.path);
     allocator.free(devices);
 }
 
-const default_device_symlinks = [_]Backend.Symlink{
+const default_device_symlinks = [_]libcontainer.Symlink{
     .{ .path = "/dev/fd", .target = "/proc/self/fd" },
     .{ .path = "/dev/stdin", .target = "/proc/self/fd/0" },
     .{ .path = "/dev/stdout", .target = "/proc/self/fd/1" },
@@ -102,7 +102,7 @@ const default_device_symlinks = [_]Backend.Symlink{
     .{ .path = "/dev/ptmx", .target = "pts/ptmx" },
 };
 
-pub fn deviceSymlinks(mounts: []const Backend.Mount) []const Backend.Symlink {
+pub fn deviceSymlinks(mounts: []const libcontainer.Mount) []const libcontainer.Symlink {
     for (mounts) |mount| {
         if (std.mem.eql(u8, mount.destination, "/dev/pts") and
             mount.flags & std.os.linux.MS.BIND == 0 and
@@ -120,18 +120,18 @@ test "linux devices parse all types and default permissions and ownership" {
     const devices = try prepareDevices(std.testing.allocator, parsed.value.devices);
     defer freeDevices(std.testing.allocator, devices);
     try std.testing.expectEqual(@as(usize, 10), devices.len);
-    try std.testing.expectEqual(Backend.Device.Kind.character, devices[0].kind);
+    try std.testing.expectEqual(libcontainer.Device.Kind.character, devices[0].kind);
     try std.testing.expectEqual(@as(u32, 0o666), devices[0].mode);
     try std.testing.expectEqual(@as(u32, 0), devices[0].uid);
     try std.testing.expectEqual(@as(u32, 0), devices[0].gid);
-    try std.testing.expectEqual(Backend.Device.Kind.block, devices[1].kind);
+    try std.testing.expectEqual(libcontainer.Device.Kind.block, devices[1].kind);
     try std.testing.expectEqualStrings("/disk", devices[1].path);
     try std.testing.expectEqual(@as(u32, 0o640), devices[1].mode);
     try std.testing.expectEqual(@as(u32, 1000), devices[1].uid);
     try std.testing.expectEqual(@as(u32, 1001), devices[1].gid);
-    try std.testing.expectEqual(Backend.Device.Kind.character, devices[2].kind);
+    try std.testing.expectEqual(libcontainer.Device.Kind.character, devices[2].kind);
     try std.testing.expectEqual(@as(u32, 0), devices[2].mode);
-    try std.testing.expectEqual(Backend.Device.Kind.fifo, devices[3].kind);
+    try std.testing.expectEqual(libcontainer.Device.Kind.fifo, devices[3].kind);
     try std.testing.expectEqual(@as(u32, 0), devices[3].major);
     try std.testing.expectEqual(@as(u32, 0), devices[3].minor);
 }
@@ -217,7 +217,7 @@ test "linux configured devices override default paths and preserve other default
         try std.testing.expectEqualStrings(want.path, actual.path);
         try std.testing.expectEqual(want.major, actual.major);
         try std.testing.expectEqual(want.minor, actual.minor);
-        try std.testing.expectEqual(Backend.Device.Kind.character, actual.kind);
+        try std.testing.expectEqual(libcontainer.Device.Kind.character, actual.kind);
         try std.testing.expectEqual(@as(u32, 0o666), actual.mode);
         try std.testing.expect(!actual.required);
         try std.testing.expectEqual(@as(u32, 0), actual.uid);
@@ -226,14 +226,14 @@ test "linux configured devices override default paths and preserve other default
 }
 
 test "default device symlinks include ptmx only for a devpts mount" {
-    const expected = [_]Backend.Symlink{
+    const expected = [_]libcontainer.Symlink{
         .{ .path = "/dev/fd", .target = "/proc/self/fd" },
         .{ .path = "/dev/stdin", .target = "/proc/self/fd/0" },
         .{ .path = "/dev/stdout", .target = "/proc/self/fd/1" },
         .{ .path = "/dev/stderr", .target = "/proc/self/fd/2" },
         .{ .path = "/dev/ptmx", .target = "pts/ptmx" },
     };
-    for ([_][]const Backend.Mount{
+    for ([_][]const libcontainer.Mount{
         &.{},
         &.{.{ .destination = "/dev/pts", .source = "tmpfs", .type = "tmpfs", .flags = 0, .propagation = 0, .data = "" }},
         &.{.{ .destination = "/elsewhere", .source = "devpts", .type = "devpts", .flags = 0, .propagation = 0, .data = "" }},

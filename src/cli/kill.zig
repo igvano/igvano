@@ -1,13 +1,15 @@
 const std = @import("std");
 const oci = @import("igvano").oci;
 const libcontainer = @import("libcontainer");
-const Backend = libcontainer.Backend;
-const backendResult = @import("diagnostic.zig").backendResult;
+const ContainerInstance = @import("state.zig").ContainerInstance;
+const containerResult = @import("diagnostic.zig").containerResult;
+const ContainerOverride = @import("state.zig").ContainerOverride;
+const bindContainer = @import("state.zig").bindContainer;
 const Config = @import("args.zig").Config;
 const openContainerLock = @import("state.zig").openContainerLock;
 const lockContainer = @import("state.zig").lockContainer;
 const requireLinkedLock = @import("state.zig").requireLinkedLock;
-const stateHandle = @import("state.zig").stateHandle;
+const containerState = @import("state.zig").containerState;
 const readLiveState = @import("state.zig").readLiveState;
 
 fn parseSignal(value: ?[]const u8) !i32 {
@@ -34,7 +36,7 @@ fn parseSignal(value: ?[]const u8) !i32 {
     return @intCast(@intFromEnum(signal));
 }
 
-pub fn killContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, config: Config) !void {
+pub fn killContainer(allocator: std.mem.Allocator, io: std.Io, injected: ?ContainerOverride, config: Config) !void {
     const signal = try parseSignal(config.signal);
     const lock = try openContainerLock(allocator, config, false);
     defer if (lock) |file| file.close(io);
@@ -45,44 +47,47 @@ pub fn killContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend,
         // Signal a verified init or the saved cgroup during stuck start/create.
         std.debug.print("igvano: warning: container '{s}' is busy; signalling without the lock\n", .{config.id});
     }
-    var state = try readLiveState(allocator, io, backend, config, persist_recovery);
+    var state = try readLiveState(allocator, io, injected, config, persist_recovery);
     defer state.deinit();
+    var instance: ContainerInstance = undefined;
     if (!config.all or state.parsed.value.status != .stopped)
         oci.requireKill(state.parsed.value.status) catch return oci.validationError(error.ContainerNotRunning, "kill: container is not running", .{});
     if (config.all) {
-        if (state.handle == null)
-            state.handle = try stateHandle(allocator, io, config.root, state.parsed.value, false);
-        try backendResult(backend, backend.killAll(state.handle.?, signal));
+        if (state.container_state == null)
+            state.container_state = try containerState(allocator, io, config.root, state.parsed.value, false);
+        const container = bindContainer(&instance, injected, state.container_state.?);
+        try containerResult(container, container.killAll(signal));
     } else {
-        try backendResult(backend, backend.kill(state.handle.?, signal));
+        const container = bindContainer(&instance, injected, state.container_state.?);
+        try containerResult(container, container.kill(signal));
     }
 }
 
 test "kill reuses the handle loaded during the liveness check" {
-    const TestBackend = struct {
+    const overrideContainer = @import("tests/helpers.zig").overrideContainer;
+    const TestContainer = struct {
+        state: libcontainer.State = undefined,
         starttime_path: []const u8,
         cgroup_path: []const u8,
         killed: bool = false,
 
-        const vtable: Backend.VTable = .{ .create = unusedCreate, .alive = alive, .kill = kill, .killAll = kill, .delete = unusedDelete, .frozen = frozen };
+        const vtable: libcontainer.Container.VTable = .{ .alive = alive, .kill = kill, .killAll = kill, .delete = unusedDelete, .frozen = frozen };
 
-        fn unusedCreate(_: *anyopaque, _: Backend.CreateOptions) Backend.Error!Backend.Handle {
+        fn unusedDelete(_: *anyopaque) libcontainer.Error!void {
             return error.NotImplemented;
         }
-        fn unusedDelete(_: *anyopaque, _: Backend.Handle) Backend.Error!void {
-            return error.NotImplemented;
-        }
-        fn frozen(_: *anyopaque, _: Backend.Handle) Backend.Error!bool {
+        fn frozen(_: *anyopaque) libcontainer.Error!bool {
             return error.CgroupWriteFailed;
         }
-        fn alive(ptr: *anyopaque, _: Backend.Handle) Backend.Error!bool {
+        fn alive(ptr: *anyopaque) libcontainer.Error!bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             std.Io.Dir.cwd().deleteFile(std.testing.io, self.starttime_path) catch return error.LivenessFailed;
             std.Io.Dir.cwd().deleteFile(std.testing.io, self.cgroup_path) catch return error.LivenessFailed;
             return true;
         }
-        fn kill(ptr: *anyopaque, handle: Backend.Handle, signal: i32) Backend.Error!void {
+        fn kill(ptr: *anyopaque, signal: i32) libcontainer.Error!void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            const handle = self.state;
             if (!std.mem.eql(u8, handle.starttime, "12345") or signal != 15 or
                 !std.mem.eql(u8, handle.cgroup_path orelse return error.InvalidPath, "custom/from-state"))
                 return error.KillFailed;
@@ -106,9 +111,9 @@ test "kill reuses the handle loaded during the liveness check" {
     defer std.testing.allocator.free(path);
     const cgroup_path = try std.fs.path.join(std.testing.allocator, &.{ root, "example/cgroup" });
     defer std.testing.allocator.free(cgroup_path);
-    var implementation: TestBackend = .{ .starttime_path = path, .cgroup_path = cgroup_path };
-    const backend: Backend = .{ .ptr = &implementation, .vtable = &TestBackend.vtable };
-    try killContainer(std.testing.allocator, std.testing.io, backend, .{ .root = root, .subcommand = .kill, .id = "example" });
+    var implementation: TestContainer = .{ .starttime_path = path, .cgroup_path = cgroup_path };
+    const container: libcontainer.Container = .{ .ptr = &implementation, .vtable = &TestContainer.vtable };
+    try killContainer(std.testing.allocator, std.testing.io, overrideContainer(&implementation, container), .{ .root = root, .subcommand = .kill, .id = "example" });
     try std.testing.expect(implementation.killed);
 }
 

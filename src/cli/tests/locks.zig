@@ -1,8 +1,8 @@
 const std = @import("std");
+const overrideContainer = @import("helpers.zig").overrideContainer;
 const builtin = @import("builtin");
 const oci = @import("igvano").oci;
 const libcontainer = @import("libcontainer");
-const Backend = libcontainer.Backend;
 const Subcommand = @import("../args.zig").Subcommand;
 const Config = @import("../args.zig").Config;
 const openContainerLock = @import("../state.zig").openContainerLock;
@@ -13,7 +13,7 @@ const CreateContext = @import("../create.zig").CreateContext;
 const killContainer = @import("../kill.zig").killContainer;
 const deleteContainer = @import("../delete.zig").deleteContainer;
 const destroyContainer = @import("../delete.zig").destroyContainer;
-const LockTestBackend = @import("helpers.zig").LockTestBackend;
+const LockTestContainer = @import("helpers.zig").LockTestContainer;
 const LockTestProcess = @import("helpers.zig").LockTestProcess;
 const saveTestStarttime = @import("helpers.zig").saveTestStarttime;
 
@@ -135,9 +135,9 @@ test "linux kill delivers a signal while another process holds the container loc
     try saveTestStarttime(root, holder.pid);
     const watchdog = try std.Thread.spawn(.{}, LockTestProcess.releaseAfterTimeout, .{holder});
     defer watchdog.join();
-    var implementation: libcontainer.LinuxBackend = .{};
+
     // Recovery operations run in the parent; busy warnings must not print after fork.
-    try killContainer(std.testing.allocator, std.testing.io, implementation.backend(), .{
+    try killContainer(std.testing.allocator, std.testing.io, null, .{
         .root = root,
         .id = "example",
         .subcommand = .kill,
@@ -188,8 +188,8 @@ test "linux forced delete removes state while another process holds the containe
     var vtable = std.testing.io.vtable.*;
     vtable.dirRename = TestIo.rename;
     const io: std.Io = .{ .userdata = std.testing.io.userdata, .vtable = &vtable };
-    var implementation: LockTestBackend = .{};
-    try deleteContainer(std.testing.allocator, io, .{ .ptr = &implementation, .vtable = &LockTestBackend.vtable }, .{
+    var implementation: LockTestContainer = .{};
+    try deleteContainer(std.testing.allocator, io, overrideContainer(&implementation, .{ .ptr = &implementation, .vtable = &LockTestContainer.vtable }), .{
         .root = root,
         .id = "example",
         .subcommand = .delete,
@@ -295,13 +295,13 @@ test "linux busy owners preserve a recreated id after forced delete" {
         const replacement_json = try std.json.Stringify.valueAlloc(std.testing.allocator, replacement_spec, .{ .emit_null_optional_fields = false });
         defer std.testing.allocator.free(replacement_json);
         try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "replacement/config.json", .data = replacement_json });
-        var implementation: LockTestBackend = .{ .create_pid = 1234 };
-        const backend: Backend = .{ .ptr = &implementation, .vtable = &LockTestBackend.vtable };
+        var implementation: LockTestContainer = .{ .create_pid = 1234 };
+        const container: libcontainer.Container = .{ .ptr = &implementation, .vtable = &LockTestContainer.vtable };
         const config: Config = .{ .root = root, .id = "example", .subcommand = case.subcommand, .bundle = bundle };
         if (case.subcommand == .start)
-            try createContainer(std.testing.allocator, std.testing.io, backend, .{ .root = root, .id = "example", .subcommand = .create, .bundle = bundle });
+            try createContainer(std.testing.allocator, std.testing.io, overrideContainer(&implementation, container), .{ .root = root, .id = "example", .subcommand = .create, .bundle = bundle });
         implementation.fail_create = case.fail;
-        var owner = try LockTestProcess.commandWithBackend(config, case.failure, backend);
+        var owner = try LockTestProcess.commandWithContainer(config, case.failure, overrideContainer(&implementation, container));
         defer owner.deinit();
         const started = std.Io.Clock.awake.now(std.testing.io);
         while (true) {
@@ -312,9 +312,9 @@ test "linux busy owners preserve a recreated id after forced delete" {
                 return error.HookWaitTimeout;
             try std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake);
         }
-        try deleteContainer(std.testing.allocator, std.testing.io, backend, .{ .root = root, .id = "example", .subcommand = .delete, .force = true });
+        try deleteContainer(std.testing.allocator, std.testing.io, overrideContainer(&implementation, container), .{ .root = root, .id = "example", .subcommand = .delete, .force = true });
         implementation = .{ .create_pid = 5678 };
-        try createContainer(std.testing.allocator, std.testing.io, backend, .{ .root = root, .id = "example", .subcommand = .create, .bundle = replacement });
+        try createContainer(std.testing.allocator, std.testing.io, overrideContainer(&implementation, container), .{ .root = root, .id = "example", .subcommand = .create, .bundle = replacement });
         // A stale starter would consume the replacement's acknowledgement and overwrite its state.
         try tmp.dir.deleteFile(std.testing.io, "example/exec.fifo");
         try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "example/exec.fifo", .data = "\x01" });
@@ -352,10 +352,10 @@ test "unlinked owner lock prevents create callback writes and destruction" {
         .pid = 1234,
         .bundle = "/old",
     });
-    var implementation: LockTestBackend = .{};
-    const backend: Backend = .{ .ptr = &implementation, .vtable = &LockTestBackend.vtable };
+    var implementation: LockTestContainer = .{};
+    const container: libcontainer.Container = .{ .ptr = &implementation, .vtable = &LockTestContainer.vtable };
     const config: Config = .{ .root = root, .id = "example", .subcommand = .start };
-    var state = try readLiveState(std.testing.allocator, std.testing.io, backend, config, false);
+    var state = try readLiveState(std.testing.allocator, std.testing.io, overrideContainer(&implementation, container), config, false);
     defer state.deinit();
     try deleteStateDirectory(std.testing.io, state_dir);
     try tmp.dir.createDir(std.testing.io, "example", .default_dir);
@@ -376,8 +376,8 @@ test "unlinked owner lock prevents create callback writes and destruction" {
         .hooks = .{},
         .lock = lock,
     };
-    try std.testing.expectError(error.FileNotFound, context.ready(state.handle.?));
-    try std.testing.expectError(error.FileNotFound, destroyContainer(std.testing.allocator, std.testing.io, backend, config, &state, &lock, null));
+    try std.testing.expectError(error.FileNotFound, context.ready(state.container_state.?));
+    try std.testing.expectError(error.FileNotFound, destroyContainer(std.testing.allocator, std.testing.io, overrideContainer(&implementation, container), config, &state, &lock, null));
     const saved = try oci.loadState(std.testing.allocator, std.testing.io, root, "example");
     defer saved.deinit();
     try std.testing.expectEqual(oci.Status.created, saved.value.status);
@@ -435,7 +435,7 @@ test "linux early create failure removes state while holding the lock" {
         var state_removed = false;
 
         fn rename(userdata: ?*anyopaque, old_dir: std.Io.Dir, old_path: []const u8, new_dir: std.Io.Dir, new_path: []const u8) std.Io.Dir.RenameError!void {
-            // Fail after creating state.json, but before backend setup begins.
+            // Fail after creating state.json, but before container setup begins.
             if (std.mem.eql(u8, std.fs.path.basename(new_path), oci.hooks_file_name)) return error.AccessDenied;
             return std.testing.io.vtable.dirRename(userdata, old_dir, old_path, new_dir, new_path);
         }
@@ -474,11 +474,11 @@ test "linux early create failure removes state while holding the lock" {
     vtable.dirRename = TestIo.rename;
     vtable.dirOpenDir = TestIo.openDir;
     const io: std.Io = .{ .userdata = std.testing.io.userdata, .vtable = &vtable };
-    var implementation: LockTestBackend = .{};
-    try std.testing.expectError(error.AccessDenied, createContainer(std.testing.allocator, io, .{
+    var implementation: LockTestContainer = .{};
+    try std.testing.expectError(error.AccessDenied, createContainer(std.testing.allocator, io, overrideContainer(&implementation, .{
         .ptr = &implementation,
-        .vtable = &LockTestBackend.vtable,
-    }, .{ .root = root, .id = "example", .subcommand = .create, .bundle = bundle }));
+        .vtable = &LockTestContainer.vtable,
+    }), .{ .root = root, .id = "example", .subcommand = .create, .bundle = bundle }));
     try std.testing.expect(TestIo.checked);
     try std.testing.expect(TestIo.held);
     try std.testing.expect(TestIo.state_removed);
@@ -487,13 +487,14 @@ test "linux early create failure removes state while holding the lock" {
 
 test "linux create holds a private lock until backend setup finishes" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
-    const TestBackend = struct {
-        const vtable: Backend.VTable = .{ .create = create, .alive = LockTestBackend.alive, .kill = LockTestBackend.kill, .killAll = LockTestBackend.kill, .delete = LockTestBackend.delete };
-        fn create(_: *anyopaque, options: Backend.CreateOptions) Backend.Error!Backend.Handle {
+    const TestContainer = struct {
+        state: libcontainer.State = undefined,
+        const vtable: libcontainer.Container.VTable = .{ .alive = LockTestContainer.alive, .kill = LockTestContainer.kill, .killAll = LockTestContainer.kill, .delete = LockTestContainer.delete };
+        pub fn create(_: *anyopaque, options: libcontainer.CreateOptions) libcontainer.Error!libcontainer.State {
             var buffer: [std.fs.max_path_bytes]u8 = undefined;
             const path = std.fmt.bufPrintZ(&buffer, "{s}/lock", .{std.fs.path.dirname(options.exec_fifo).?}) catch return error.InvalidPath;
             if (!(LockTestProcess.isHeld(path) catch return error.CreateFailed)) return error.CreateFailed;
-            const handle: Backend.Handle = .{ .id = options.id, .pid = 1234, .starttime = "alive" };
+            const handle: libcontainer.State = .{ .id = options.id, .pid = 1234, .starttime = "alive" };
             if (options.on_create) |callback| try callback.run(callback.ptr, handle);
             return .{ .id = options.id, .pid = handle.pid, .starttime = try options.allocator.dupe(u8, handle.starttime) };
         }
@@ -511,8 +512,8 @@ test "linux create holds a private lock until backend setup finishes" {
     defer std.testing.allocator.free(root);
     const bundle = try std.fs.path.join(std.testing.allocator, &.{ root, "bundle" });
     defer std.testing.allocator.free(bundle);
-    var implementation: TestBackend = .{};
-    try createContainer(std.testing.allocator, std.testing.io, .{ .ptr = &implementation, .vtable = &TestBackend.vtable }, .{
+    var implementation: TestContainer = .{};
+    try createContainer(std.testing.allocator, std.testing.io, overrideContainer(&implementation, .{ .ptr = &implementation, .vtable = &TestContainer.vtable }), .{
         .root = root,
         .id = "example",
         .subcommand = .create,

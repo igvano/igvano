@@ -1,8 +1,8 @@
 const std = @import("std");
+const overrideContainer = @import("helpers.zig").overrideContainer;
 const builtin = @import("builtin");
 const oci = @import("igvano").oci;
 const libcontainer = @import("libcontainer");
-const Backend = libcontainer.Backend;
 const Subcommand = @import("../args.zig").Subcommand;
 const Config = @import("../args.zig").Config;
 const parseArgs = @import("../args.zig").parseArgs;
@@ -75,10 +75,9 @@ test "linux lifecycle waits for exec FIFO EOF and persists running then stopped"
         .bundle = bundle,
     });
     try saveTestStarttime(root, pid);
-    var implementation: libcontainer.LinuxBackend = .{};
-    const backend = implementation.backend();
+
     const config: Config = .{ .root = root, .subcommand = .start, .id = "example" };
-    try killContainer(std.testing.allocator, std.testing.io, backend, .{ .root = root, .subcommand = .kill, .id = "example", .signal = "0" });
+    try killContainer(std.testing.allocator, std.testing.io, null, .{ .root = root, .subcommand = .kill, .id = "example", .signal = "0" });
     const output_env = try std.fmt.allocPrint(std.testing.allocator, "OUT={s}/poststart-source", .{root});
     defer std.testing.allocator.free(output_env);
     const prestart_env = try std.fmt.allocPrint(std.testing.allocator, "PRESTART={s}", .{prestart_input});
@@ -106,7 +105,7 @@ test "linux lifecycle waits for exec FIFO EOF and persists running then stopped"
         \\{"ociVersion":"1.0.2","root":{"path":"/"},"process":{"args":["/bin/sh"],"cwd":"/","user":{"uid":0,"gid":0}},"hooks":{"prestart":[{"path":"/igvano-missing-hook"}],"poststart":[{"path":"/igvano-missing-hook"}]}}
         ,
     });
-    try startContainer(std.testing.allocator, std.testing.io, backend, config);
+    try startContainer(std.testing.allocator, std.testing.io, null, config);
     const input = try tmp.dir.readFileAlloc(std.testing.io, "prestart-input", std.testing.allocator, .limited(4096));
     defer std.testing.allocator.free(input);
     const hook_state = try std.json.parseFromSlice(oci.State, std.testing.allocator, input, .{});
@@ -120,9 +119,9 @@ test "linux lifecycle waits for exec FIFO EOF and persists running then stopped"
     const running = try oci.loadState(std.testing.allocator, std.testing.io, root, "example");
     defer running.deinit();
     try std.testing.expectEqual(oci.Status.running, running.value.status);
-    try std.testing.expectError(error.InvalidStatus, startContainer(std.testing.allocator, std.testing.io, backend, config));
-    try std.testing.expectError(error.InvalidStatus, deleteContainer(std.testing.allocator, std.testing.io, backend, config));
-    try killContainer(std.testing.allocator, std.testing.io, backend, .{ .root = root, .subcommand = .kill, .id = "example", .signal = "SIGKILL" });
+    try std.testing.expectError(error.InvalidStatus, startContainer(std.testing.allocator, std.testing.io, null, config));
+    try std.testing.expectError(error.InvalidStatus, deleteContainer(std.testing.allocator, std.testing.io, null, config));
+    try killContainer(std.testing.allocator, std.testing.io, null, .{ .root = root, .subcommand = .kill, .id = "example", .signal = "SIGKILL" });
     var status: if (builtin.link_libc) c_int else u32 = undefined;
     while (true) {
         switch (posix.errno(posix.system.waitpid(pid, &status, 0))) {
@@ -132,14 +131,14 @@ test "linux lifecycle waits for exec FIFO EOF and persists running then stopped"
         }
     }
     reaped = true;
-    const stopped = try readLiveState(std.testing.allocator, std.testing.io, backend, config, true);
+    const stopped = try readLiveState(std.testing.allocator, std.testing.io, null, config, true);
     defer stopped.deinit();
     try std.testing.expectEqual(oci.Status.stopped, stopped.parsed.value.status);
     const persisted = try oci.loadState(std.testing.allocator, std.testing.io, root, "example");
     defer persisted.deinit();
     try std.testing.expectEqual(oci.Status.stopped, persisted.value.status);
-    try std.testing.expectError(error.ContainerNotRunning, killContainer(std.testing.allocator, std.testing.io, backend, config));
-    try deleteContainer(std.testing.allocator, std.testing.io, backend, config);
+    try std.testing.expectError(error.ContainerNotRunning, killContainer(std.testing.allocator, std.testing.io, null, config));
+    try deleteContainer(std.testing.allocator, std.testing.io, null, config);
     try std.testing.expectError(error.FileNotFound, oci.loadState(std.testing.allocator, std.testing.io, root, "example"));
 }
 
@@ -178,8 +177,7 @@ test "linux kill all succeeds on stopped containers while plain kill fails" {
         }
     }
     reaped = true;
-    var implementation: libcontainer.LinuxBackend = .{};
-    const backend = implementation.backend();
+
     const all = try parseArgs(&.{ "igvano", "--root", root, "kill", "--all", "example", "9" });
     const plain = try parseArgs(&.{ "igvano", "--root", root, "kill", "example", "9" });
     for ([_]oci.Status{ .created, .running, .stopped }) |saved_status| {
@@ -189,24 +187,25 @@ test "linux kill all succeeds on stopped containers while plain kill fails" {
             .status = saved_status,
             .bundle = "/unused",
         });
-        try killContainer(std.testing.allocator, std.testing.io, backend, all);
-        try std.testing.expectError(error.ContainerNotRunning, killContainer(std.testing.allocator, std.testing.io, backend, plain));
+        try killContainer(std.testing.allocator, std.testing.io, null, all);
+        try std.testing.expectError(error.ContainerNotRunning, killContainer(std.testing.allocator, std.testing.io, null, plain));
     }
 }
 
 test "start uses saved process presence after bundle config changes" {
-    const TestBackend = struct {
-        const vtable: Backend.VTable = .{ .create = create, .alive = alive, .kill = kill, .killAll = kill, .delete = delete };
-        fn create(_: *anyopaque, _: Backend.CreateOptions) Backend.Error!Backend.Handle {
+    const TestContainer = struct {
+        state: libcontainer.State = undefined,
+        const vtable: libcontainer.Container.VTable = .{ .alive = alive, .kill = kill, .killAll = kill, .delete = delete };
+        pub fn create(_: *anyopaque, _: libcontainer.CreateOptions) libcontainer.Error!libcontainer.State {
             return error.NotImplemented;
         }
-        fn alive(_: *anyopaque, _: Backend.Handle) Backend.Error!bool {
+        fn alive(_: *anyopaque) libcontainer.Error!bool {
             return true;
         }
-        fn kill(_: *anyopaque, _: Backend.Handle, _: i32) Backend.Error!void {
+        fn kill(_: *anyopaque, _: i32) libcontainer.Error!void {
             return error.NotImplemented;
         }
-        fn delete(_: *anyopaque, _: Backend.Handle) Backend.Error!void {
+        fn delete(_: *anyopaque) libcontainer.Error!void {
             return error.NotImplemented;
         }
     };
@@ -231,8 +230,8 @@ test "start uses saved process presence after bundle config changes" {
         .{ .process = "x" ** 33, .json = "garbage", .failure = error.InvalidState },
         .{ .process = null, .json = "garbage", .failure = start_result },
     };
-    var implementation: TestBackend = .{};
-    const backend: Backend = .{ .ptr = &implementation, .vtable = &TestBackend.vtable };
+    var implementation: TestContainer = .{};
+    const container: libcontainer.Container = .{ .ptr = &implementation, .vtable = &TestContainer.vtable };
     const config: Config = .{ .root = root, .subcommand = .start, .id = "example" };
     for (cases) |case| {
         try tmp.dir.createDir(std.testing.io, "example", .default_dir);
@@ -250,9 +249,9 @@ test "start uses saved process presence after bundle config changes" {
         // A buffered acknowledgement exercises start without a real init process.
         try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "example/exec.fifo", .data = "\x01" });
         if (case.failure) |failure| {
-            try std.testing.expectError(failure, startContainer(std.testing.allocator, std.testing.io, backend, config));
+            try std.testing.expectError(failure, startContainer(std.testing.allocator, std.testing.io, overrideContainer(&implementation, container), config));
         } else {
-            try startContainer(std.testing.allocator, std.testing.io, backend, config);
+            try startContainer(std.testing.allocator, std.testing.io, overrideContainer(&implementation, container), config);
             const state = try oci.loadState(std.testing.allocator, std.testing.io, root, "example");
             defer state.deinit();
             try std.testing.expectEqual(oci.Status.running, state.value.status);
@@ -262,9 +261,10 @@ test "start uses saved process presence after bundle config changes" {
 
 test "linux start preserves process presence captured at create" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
-    const TestBackend = struct {
-        const vtable: Backend.VTable = .{ .create = create, .alive = alive, .kill = kill, .killAll = kill, .delete = delete };
-        fn create(_: *anyopaque, options: Backend.CreateOptions) Backend.Error!Backend.Handle {
+    const TestContainer = struct {
+        state: libcontainer.State = undefined,
+        const vtable: libcontainer.Container.VTable = .{ .alive = alive, .kill = kill, .killAll = kill, .delete = delete };
+        pub fn create(_: *anyopaque, options: libcontainer.CreateOptions) libcontainer.Error!libcontainer.State {
             if (options.on_create) |callback| try callback.run(callback.ptr, .{
                 .id = options.id,
                 .pid = 1234,
@@ -272,13 +272,13 @@ test "linux start preserves process presence captured at create" {
             });
             return .{ .id = options.id, .pid = 1234, .starttime = try options.allocator.dupe(u8, "12345") };
         }
-        fn alive(_: *anyopaque, _: Backend.Handle) Backend.Error!bool {
+        fn alive(_: *anyopaque) libcontainer.Error!bool {
             return true;
         }
-        fn kill(_: *anyopaque, _: Backend.Handle, _: i32) Backend.Error!void {
+        fn kill(_: *anyopaque, _: i32) libcontainer.Error!void {
             return error.NotImplemented;
         }
-        fn delete(_: *anyopaque, _: Backend.Handle) Backend.Error!void {
+        fn delete(_: *anyopaque) libcontainer.Error!void {
             return error.NotImplemented;
         }
     };
@@ -289,8 +289,8 @@ test "linux start preserves process presence captured at create" {
     defer std.testing.allocator.free(root);
     const bundle = try std.fs.path.join(std.testing.allocator, &.{ root, "bundle" });
     defer std.testing.allocator.free(bundle);
-    var implementation: TestBackend = .{};
-    const backend: Backend = .{ .ptr = &implementation, .vtable = &TestBackend.vtable };
+    var implementation: TestContainer = .{};
+    const container: libcontainer.Container = .{ .ptr = &implementation, .vtable = &TestContainer.vtable };
     for ([_]bool{ false, true }) |has_process| {
         const spec: oci.Spec = .{
             .ociVersion = "1.0.2",
@@ -301,7 +301,7 @@ test "linux start preserves process presence captured at create" {
         const json = try std.json.Stringify.valueAlloc(std.testing.allocator, spec, .{ .emit_null_optional_fields = false });
         defer std.testing.allocator.free(json);
         try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "bundle/config.json", .data = json });
-        try createContainer(std.testing.allocator, std.testing.io, backend, .{
+        try createContainer(std.testing.allocator, std.testing.io, overrideContainer(&implementation, container), .{
             .root = root,
             .subcommand = .create,
             .id = "example",
@@ -318,12 +318,12 @@ test "linux start preserves process presence captured at create" {
         try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "example/exec.fifo", .data = "\x01" });
         const config: Config = .{ .root = root, .subcommand = .start, .id = "example" };
         if (has_process) {
-            try startContainer(std.testing.allocator, std.testing.io, backend, config);
+            try startContainer(std.testing.allocator, std.testing.io, overrideContainer(&implementation, container), config);
             const state = try oci.loadState(std.testing.allocator, std.testing.io, root, "example");
             defer state.deinit();
             try std.testing.expectEqual(oci.Status.running, state.value.status);
         } else {
-            try std.testing.expectError(error.MissingProcess, startContainer(std.testing.allocator, std.testing.io, backend, config));
+            try std.testing.expectError(error.MissingProcess, startContainer(std.testing.allocator, std.testing.io, overrideContainer(&implementation, container), config));
         }
     }
 }
@@ -348,8 +348,7 @@ test "linux state kill and delete refresh stale creating created and running sta
     defer tmp.cleanup();
     const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
     defer std.testing.allocator.free(root);
-    var implementation: libcontainer.LinuxBackend = .{};
-    const backend = implementation.backend();
+
     for ([_]oci.Status{ .creating, .created, .running, .paused }) |status| {
         for ([_]Subcommand{ .state, .kill, .delete }) |subcommand| {
             try tmp.dir.createDirPath(std.testing.io, "example");
@@ -363,13 +362,13 @@ test "linux state kill and delete refresh stale creating created and running sta
             const config: Config = .{ .root = root, .subcommand = subcommand, .id = "example" };
             switch (subcommand) {
                 .state => {
-                    const state = try readLiveState(std.testing.allocator, std.testing.io, backend, config, true);
+                    const state = try readLiveState(std.testing.allocator, std.testing.io, null, config, true);
                     defer state.deinit();
                     try std.testing.expectEqual(oci.Status.stopped, state.parsed.value.status);
                 },
-                .kill => try std.testing.expectError(error.ContainerNotRunning, killContainer(std.testing.allocator, std.testing.io, backend, config)),
+                .kill => try std.testing.expectError(error.ContainerNotRunning, killContainer(std.testing.allocator, std.testing.io, null, config)),
                 .delete => {
-                    try deleteContainer(std.testing.allocator, std.testing.io, backend, config);
+                    try deleteContainer(std.testing.allocator, std.testing.io, null, config);
                     try std.testing.expectError(error.FileNotFound, oci.loadState(std.testing.allocator, std.testing.io, root, "example"));
                     continue;
                 },
@@ -384,25 +383,28 @@ test "linux state kill and delete refresh stale creating created and running sta
 
 test "creating state without a process identity becomes stopped and deletable" {
     defer oci.clearDiagnostic();
-    const TestBackend = struct {
-        const vtable: Backend.VTable = .{ .create = create, .alive = alive, .kill = kill, .killAll = kill, .delete = delete };
-        fn create(_: *anyopaque, _: Backend.CreateOptions) Backend.Error!Backend.Handle {
+    const TestContainer = struct {
+        state: libcontainer.State = undefined,
+        const vtable: libcontainer.Container.VTable = .{ .alive = alive, .kill = kill, .killAll = kill, .delete = delete };
+        pub fn create(_: *anyopaque, _: libcontainer.CreateOptions) libcontainer.Error!libcontainer.State {
             return error.NotImplemented;
         }
-        fn alive(_: *anyopaque, handle: Backend.Handle) Backend.Error!bool {
+        fn alive(ptr: *anyopaque) libcontainer.Error!bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const handle = self.state;
             return std.mem.eql(u8, handle.starttime, "alive");
         }
-        fn kill(_: *anyopaque, _: Backend.Handle, _: i32) Backend.Error!void {
+        fn kill(_: *anyopaque, _: i32) libcontainer.Error!void {
             return error.NotImplemented;
         }
-        fn delete(_: *anyopaque, _: Backend.Handle) Backend.Error!void {}
+        fn delete(_: *anyopaque) libcontainer.Error!void {}
     };
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
     defer std.testing.allocator.free(root);
-    var implementation: TestBackend = .{};
-    const backend: Backend = .{ .ptr = &implementation, .vtable = &TestBackend.vtable };
+    var implementation: TestContainer = .{};
+    const container: libcontainer.Container = .{ .ptr = &implementation, .vtable = &TestContainer.vtable };
     for ([_]?i32{ null, 1234 }) |pid| {
         try tmp.dir.createDir(std.testing.io, "example", .default_dir);
         try oci.saveState(std.testing.allocator, std.testing.io, root, .{
@@ -412,11 +414,11 @@ test "creating state without a process identity becomes stopped and deletable" {
             .bundle = "/bundle",
         });
         const config: Config = .{ .root = root, .id = "example", .subcommand = .delete };
-        const state = try readLiveState(std.testing.allocator, std.testing.io, backend, config, true);
+        const state = try readLiveState(std.testing.allocator, std.testing.io, overrideContainer(&implementation, container), config, true);
         defer state.deinit();
         try std.testing.expectEqual(oci.Status.stopped, state.parsed.value.status);
         try std.testing.expect(oci.diagnostic() == null);
-        try deleteContainer(std.testing.allocator, std.testing.io, backend, config);
+        try deleteContainer(std.testing.allocator, std.testing.io, overrideContainer(&implementation, container), config);
         try std.testing.expectError(error.FileNotFound, tmp.dir.openDir(std.testing.io, "example", .{}));
     }
     try tmp.dir.createDir(std.testing.io, "example", .default_dir);
@@ -427,7 +429,7 @@ test "creating state without a process identity becomes stopped and deletable" {
         .pid = 1234,
         .bundle = "/bundle",
     });
-    const state = try readLiveState(std.testing.allocator, std.testing.io, backend, .{
+    const state = try readLiveState(std.testing.allocator, std.testing.io, overrideContainer(&implementation, container), .{
         .root = root,
         .id = "example",
         .subcommand = .state,

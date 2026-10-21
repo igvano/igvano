@@ -3,7 +3,7 @@
 // Copyright (C) 2020 Aleksa Sarai <cyphar@cyphar.com>
 // Copyright (C) 2020 SUSE LLC
 const std = @import("std");
-pub const Rule = @import("root.zig").Backend.Resources.DeviceRule;
+pub const Rule = @import("root.zig").Resources.DeviceRule;
 pub const Error = std.mem.Allocator.Error || error{ InvalidConfig, CannotPunchHole };
 
 pub fn accessMask(access: []const u8) error{InvalidConfig}!u3 {

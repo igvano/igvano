@@ -1,7 +1,7 @@
 const std = @import("std");
 const linux = std.os.linux;
 const posix = std.posix;
-const Backend = @import("../root.zig").Backend;
+const libcontainer = @import("../root.zig");
 const writeAll = @import("syscall.zig").writeAll;
 
 // Borrowed diagnostic detail for this thread; no allocation after fork.
@@ -38,7 +38,7 @@ pub fn reportDiagnostic(comptime fmt: []const u8, args: anytype) void {
     }
 }
 
-pub fn diagnostic(_: *anyopaque) ?[]const u8 {
+pub fn diagnostic() ?[]const u8 {
     return if (last_diagnostic_len == 0) null else last_diagnostic[0..last_diagnostic_len];
 }
 
@@ -50,7 +50,7 @@ pub const CreateResponse = extern struct {
     message: [512]u8 = @splat(0),
     message_len: u32 = 0,
 
-    pub fn failureError(self: *const CreateResponse) ?Backend.Error {
+    pub fn failureError(self: *const CreateResponse) ?libcontainer.Error {
         if (self.failure == 0) return null;
         last_diagnostic_len = @min(self.message_len, last_diagnostic.len);
         @memcpy(last_diagnostic[0..last_diagnostic_len], self.message[0..last_diagnostic_len]);
@@ -62,7 +62,7 @@ pub fn childError(message: []const u8, err: anyerror) void {
     reportDiagnostic("{s}{s}", .{ message, @errorName(err) });
 }
 
-pub fn failCreate(fd: posix.fd_t, err: Backend.Error) noreturn {
+pub fn failCreate(fd: posix.fd_t, err: libcontainer.Error) noreturn {
     var response: CreateResponse = .{ .failure = @intFromError(err), .message_len = @intCast(last_diagnostic_len) };
     @memcpy(response.message[0..last_diagnostic_len], last_diagnostic[0..last_diagnostic_len]);
     _ = writeAll(fd, std.mem.asBytes(&response));

@@ -1,7 +1,8 @@
 const std = @import("std");
+const withState = @import("helpers.zig").withState;
 const builtin = @import("builtin");
 const libcontainer = @import("libcontainer");
-const Backend = libcontainer.Backend;
+const ContainerInstance = @import("../state.zig").ContainerInstance;
 const makeExecFifo = @import("../create.zig").makeExecFifo;
 const waitForStart = @import("../start.zig").waitForStart;
 const saveTestStarttime = @import("helpers.zig").saveTestStarttime;
@@ -9,23 +10,21 @@ const saveTestStarttime = @import("helpers.zig").saveTestStarttime;
 test "linux start drains buffered acknowledgements and exec failures after init exits" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const linux = std.os.linux;
-    const TestBackend = struct {
+    const TestContainer = struct {
+        state: libcontainer.State = undefined,
         writer: ?std.posix.fd_t,
         bytes: []const u8,
         opened: bool = false,
 
-        const vtable: Backend.VTable = .{ .create = unusedCreate, .alive = alive, .kill = unusedKill, .killAll = unusedKill, .delete = unusedDelete };
+        const vtable: libcontainer.Container.VTable = .{ .alive = alive, .kill = unusedKill, .killAll = unusedKill, .delete = unusedDelete };
 
-        fn unusedCreate(_: *anyopaque, _: Backend.CreateOptions) Backend.Error!Backend.Handle {
+        fn unusedKill(_: *anyopaque, _: i32) libcontainer.Error!void {
             return error.NotImplemented;
         }
-        fn unusedKill(_: *anyopaque, _: Backend.Handle, _: i32) Backend.Error!void {
+        fn unusedDelete(_: *anyopaque) libcontainer.Error!void {
             return error.NotImplemented;
         }
-        fn unusedDelete(_: *anyopaque, _: Backend.Handle) Backend.Error!void {
-            return error.NotImplemented;
-        }
-        fn alive(ptr: *anyopaque, _: Backend.Handle) Backend.Error!bool {
+        fn alive(ptr: *anyopaque) libcontainer.Error!bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (!self.opened) {
                 self.opened = true;
@@ -50,15 +49,15 @@ test "linux start drains buffered acknowledgements and exec failures after init 
         defer std.testing.allocator.free(fifo_z);
         const opened = linux.open(fifo_z, .{ .ACCMODE = .RDWR, .NONBLOCK = true, .CLOEXEC = true }, 0);
         if (linux.errno(opened) != .SUCCESS) return error.OpenFailed;
-        var implementation: TestBackend = .{ .writer = @intCast(opened), .bytes = bytes };
+        var implementation: TestContainer = .{ .writer = @intCast(opened), .bytes = bytes };
         defer if (implementation.writer) |writer| {
             _ = linux.close(writer);
         };
-        const result = waitForStart(std.testing.allocator, std.testing.io, .{ .ptr = &implementation, .vtable = &TestBackend.vtable }, .{
+        const result = waitForStart(std.testing.allocator, std.testing.io, withState(&implementation, .{ .ptr = &implementation, .vtable = &TestContainer.vtable }, .{
             .id = "example",
             .pid = 1234,
             .starttime = "12345",
-        }, fifo);
+        }), fifo);
         if (bytes.len == 1) {
             try result;
         } else {
@@ -101,12 +100,15 @@ test "linux start waits for FIFO close after acknowledgement" {
     try saveTestStarttime(root, pid);
     const starttime = try tmp.dir.readFileAlloc(std.testing.io, "example/starttime", std.testing.allocator, .limited(64));
     defer std.testing.allocator.free(starttime);
-    var implementation: libcontainer.LinuxBackend = .{};
+
     const started = std.Io.Clock.awake.now(std.testing.io);
-    try waitForStart(std.testing.allocator, std.testing.io, implementation.backend(), .{
-        .id = "example",
-        .pid = pid,
-        .starttime = starttime,
-    }, fifo);
+    try (wait: {
+        var instance = ContainerInstance.load(.{
+            .id = "example",
+            .pid = pid,
+            .starttime = starttime,
+        });
+        break :wait waitForStart(std.testing.allocator, std.testing.io, instance.container(), fifo);
+    });
     try std.testing.expect(started.untilNow(std.testing.io, .awake).nanoseconds >= std.Io.Duration.fromMilliseconds(200).nanoseconds);
 }

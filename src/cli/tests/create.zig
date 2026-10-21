@@ -1,27 +1,28 @@
 const std = @import("std");
+const overrideContainer = @import("helpers.zig").overrideContainer;
 const builtin = @import("builtin");
 const oci = @import("igvano").oci;
 const libcontainer = @import("libcontainer");
-const Backend = libcontainer.Backend;
 const Config = @import("../args.zig").Config;
 const loadDeviceNodes = @import("../state.zig").loadDeviceNodes;
 const loadRootfsMount = @import("../state.zig").loadRootfsMount;
 const createContainer = @import("../create.zig").createContainer;
 
 test "create uses private state directories and preserves existing root permissions" {
-    const TestBackend = struct {
+    const TestContainer = struct {
+        state: libcontainer.State = undefined,
         state_mode: ?std.posix.mode_t = null,
         configured: bool = false,
-        const vtable: Backend.VTable = .{ .create = create, .alive = alive, .kill = kill, .killAll = kill, .delete = delete };
+        const vtable: libcontainer.Container.VTable = .{ .alive = alive, .kill = kill, .killAll = kill, .delete = delete };
 
-        fn create(ptr: *anyopaque, options: Backend.CreateOptions) Backend.Error!Backend.Handle {
+        pub fn create(ptr: *anyopaque, options: libcontainer.CreateOptions) libcontainer.Error!libcontainer.State {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             const state_dir = std.fs.path.dirname(options.exec_fifo) orelse return error.InvalidPath;
             const stat = std.Io.Dir.cwd().statFile(std.testing.io, state_dir, .{}) catch return error.InvalidPath;
             // Inspect the real directory before setup failure rolls it back.
             self.state_mode = stat.permissions.toMode() & 0o7777;
             if (self.configured) {
-                std.testing.expectEqualDeep(@as(?Backend.Process, .{
+                std.testing.expectEqualDeep(@as(?libcontainer.Process, .{
                     .args = &.{"/bin/sh"},
                     .env = &.{"PATH=/bin"},
                     .cwd = "/work",
@@ -30,34 +31,34 @@ test "create uses private state directories and preserves existing root permissi
                     .additional_gids = &.{42},
                     .no_new_privileges = true,
                 }), options.process) catch return error.InvalidConfig;
-                std.testing.expectEqualDeep(@as([]const Backend.Namespace, &.{
+                std.testing.expectEqualDeep(@as([]const libcontainer.Namespace, &.{
                     .{ .kind = .pid },    .{ .kind = .network, .path = "/proc/1234/ns/net" },
                     .{ .kind = .mount },  .{ .kind = .ipc },
                     .{ .kind = .uts },    .{ .kind = .user },
                     .{ .kind = .cgroup }, .{ .kind = .time },
                 }), options.namespaces) catch return error.InvalidConfig;
-                std.testing.expectEqualDeep(@as([]const Backend.IDMapping, &.{.{ .container_id = 0, .host_id = 100000, .size = 65536 }}), options.uid_mappings) catch return error.InvalidConfig;
-                std.testing.expectEqualDeep(@as([]const Backend.IDMapping, &.{.{ .container_id = 0, .host_id = 200000, .size = 65536 }}), options.gid_mappings) catch return error.InvalidConfig;
+                std.testing.expectEqualDeep(@as([]const libcontainer.IDMapping, &.{.{ .container_id = 0, .host_id = 100000, .size = 65536 }}), options.uid_mappings) catch return error.InvalidConfig;
+                std.testing.expectEqualDeep(@as([]const libcontainer.IDMapping, &.{.{ .container_id = 0, .host_id = 200000, .size = 65536 }}), options.gid_mappings) catch return error.InvalidConfig;
                 std.testing.expectEqualStrings("container", options.hostname orelse return error.InvalidConfig) catch return error.InvalidConfig;
                 if (!options.readonly_rootfs) return error.InvalidConfig;
             } else {
                 if (options.process != null or options.uid_mappings.len != 0 or options.gid_mappings.len != 0 or
                     options.hostname != null or options.readonly_rootfs)
                     return error.InvalidConfig;
-                std.testing.expectEqualDeep(@as([]const Backend.Namespace, &.{.{ .kind = .mount }}), options.namespaces) catch return error.InvalidConfig;
+                std.testing.expectEqualDeep(@as([]const libcontainer.Namespace, &.{.{ .kind = .mount }}), options.namespaces) catch return error.InvalidConfig;
             }
             const device_nodes = loadDeviceNodes(std.testing.allocator, std.testing.io, std.fs.path.dirname(state_dir).?, options.id) catch return error.InvalidConfig;
             defer oci.freeDevices(std.testing.allocator, device_nodes);
             std.testing.expectEqualDeep(options.devices, device_nodes) catch return error.InvalidConfig;
             return error.NotImplemented;
         }
-        fn alive(_: *anyopaque, _: Backend.Handle) Backend.Error!bool {
+        fn alive(_: *anyopaque) libcontainer.Error!bool {
             return error.NotImplemented;
         }
-        fn kill(_: *anyopaque, _: Backend.Handle, _: i32) Backend.Error!void {
+        fn kill(_: *anyopaque, _: i32) libcontainer.Error!void {
             return error.NotImplemented;
         }
-        fn delete(_: *anyopaque, _: Backend.Handle) Backend.Error!void {
+        fn delete(_: *anyopaque) libcontainer.Error!void {
             return error.NotImplemented;
         }
     };
@@ -79,11 +80,11 @@ test "create uses private state directories and preserves existing root permissi
     for ([_][]const u8{ "new/containers", "existing" }) |root_name| {
         const root = try std.fs.path.join(std.testing.allocator, &.{ base, root_name });
         defer std.testing.allocator.free(root);
-        var implementation: TestBackend = .{};
-        try std.testing.expectError(error.NotImplemented, createContainer(std.testing.allocator, std.testing.io, .{
+        var implementation: TestContainer = .{};
+        try std.testing.expectError(error.NotImplemented, createContainer(std.testing.allocator, std.testing.io, overrideContainer(&implementation, .{
             .ptr = &implementation,
-            .vtable = &TestBackend.vtable,
-        }, .{ .root = root, .subcommand = .create, .id = "example", .bundle = bundle }));
+            .vtable = &TestContainer.vtable,
+        }), .{ .root = root, .subcommand = .create, .id = "example", .bundle = bundle }));
         if (comptime builtin.os.tag == .linux)
             try std.testing.expectEqual(@as(?std.posix.mode_t, 0o700), implementation.state_mode);
         const stat = try tmp.dir.statFile(std.testing.io, root_name, .{});
@@ -100,11 +101,11 @@ test "create uses private state directories and preserves existing root permissi
     });
     const configured_root = try std.fs.path.join(std.testing.allocator, &.{ base, "configured" });
     defer std.testing.allocator.free(configured_root);
-    var configured_backend: TestBackend = .{ .configured = true };
-    try std.testing.expectError(error.NotImplemented, createContainer(std.testing.allocator, std.testing.io, .{
+    var configured_backend: TestContainer = .{ .configured = true };
+    try std.testing.expectError(error.NotImplemented, createContainer(std.testing.allocator, std.testing.io, overrideContainer(&configured_backend, .{
         .ptr = &configured_backend,
-        .vtable = &TestBackend.vtable,
-    }, .{ .root = configured_root, .subcommand = .create, .id = "example", .bundle = bundle }));
+        .vtable = &TestContainer.vtable,
+    }), .{ .root = configured_root, .subcommand = .create, .id = "example", .bundle = bundle }));
     if (comptime builtin.os.tag == .linux)
         try std.testing.expectEqual(@as(?std.posix.mode_t, 0o700), configured_backend.state_mode);
 }
@@ -128,8 +129,8 @@ test "create rejects a duplicate id without changing existing state" {
     defer std.testing.allocator.free(root);
     const bundle = try std.fs.path.join(std.testing.allocator, &.{ base, "bundle" });
     defer std.testing.allocator.free(bundle);
-    var implementation: libcontainer.LinuxBackend = .{};
-    try std.testing.expectError(error.ContainerExists, createContainer(std.testing.allocator, std.testing.io, implementation.backend(), .{
+
+    try std.testing.expectError(error.ContainerExists, createContainer(std.testing.allocator, std.testing.io, null, .{
         .root = root,
         .subcommand = .create,
         .id = "example",
@@ -150,8 +151,8 @@ test "create rejects a missing bundle before creating the state directory" {
     defer std.testing.allocator.free(base);
     const bundle = try std.fs.path.join(std.testing.allocator, &.{ base, "missing" });
     defer std.testing.allocator.free(bundle);
-    var implementation: libcontainer.LinuxBackend = .{};
-    try std.testing.expectError(error.FileNotFound, createContainer(std.testing.allocator, std.testing.io, implementation.backend(), .{
+
+    try std.testing.expectError(error.FileNotFound, createContainer(std.testing.allocator, std.testing.io, null, .{
         .root = base,
         .subcommand = .create,
         .id = "example",
@@ -174,8 +175,8 @@ test "create rejects propagation without mount isolation before creating runtime
     defer std.testing.allocator.free(root);
     const bundle = try std.fs.path.join(std.testing.allocator, &.{ root, "bundle" });
     defer std.testing.allocator.free(bundle);
-    var implementation: libcontainer.LinuxBackend = .{};
-    try std.testing.expectError(error.InvalidConfig, createContainer(std.testing.allocator, std.testing.io, implementation.backend(), .{
+
+    try std.testing.expectError(error.InvalidConfig, createContainer(std.testing.allocator, std.testing.io, null, .{
         .root = root,
         .subcommand = .create,
         .id = "example",
@@ -211,8 +212,8 @@ test "create rejects invalid process settings before creating runtime state" {
         );
         defer std.testing.allocator.free(json);
         try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "bundle/config.json", .data = json });
-        var implementation: libcontainer.LinuxBackend = .{};
-        try std.testing.expectError(case.expected, createContainer(std.testing.allocator, std.testing.io, implementation.backend(), .{
+
+        try std.testing.expectError(case.expected, createContainer(std.testing.allocator, std.testing.io, null, .{
             .root = root,
             .subcommand = .create,
             .id = "example",
@@ -236,8 +237,8 @@ test "create rejects invalid devices before creating runtime state" {
     defer std.testing.allocator.free(root);
     const bundle = try std.fs.path.join(std.testing.allocator, &.{ root, "bundle" });
     defer std.testing.allocator.free(bundle);
-    var implementation: libcontainer.LinuxBackend = .{};
-    try std.testing.expectError(error.InvalidConfig, createContainer(std.testing.allocator, std.testing.io, implementation.backend(), .{
+
+    try std.testing.expectError(error.InvalidConfig, createContainer(std.testing.allocator, std.testing.io, null, .{
         .root = root,
         .subcommand = .create,
         .id = "example",
@@ -260,10 +261,10 @@ test "create removes its new state directory when setup fails" {
     defer std.testing.allocator.free(root);
     const bundle = try std.fs.path.join(std.testing.allocator, &.{ root, "bundle" });
     defer std.testing.allocator.free(bundle);
-    var implementation: libcontainer.LinuxBackend = .{};
+
     try std.testing.expectError(
         if (builtin.os.tag == .linux) error.InvalidConfig else error.NotImplemented,
-        createContainer(std.testing.allocator, std.testing.io, implementation.backend(), .{
+        createContainer(std.testing.allocator, std.testing.io, null, .{
             .root = root,
             .subcommand = .create,
             .id = "example",
@@ -275,22 +276,22 @@ test "create removes its new state directory when setup fails" {
 
 test "create with inherited mount isolation persists backend resources and rolls back a failed pid file" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
-    const TestBackend = struct {
+    const TestContainer = struct {
+        state: libcontainer.State = undefined,
         rootfs: [std.fs.max_path_bytes]u8 = undefined,
         rootfs_len: usize = 0,
         mounts_checked: bool = false,
         killed: bool = false,
         deleted: bool = false,
 
-        const vtable: Backend.VTable = .{
-            .create = create,
+        const vtable: libcontainer.Container.VTable = .{
             .alive = alive,
             .kill = kill,
             .killAll = kill,
             .delete = delete,
         };
 
-        fn create(ptr: *anyopaque, options: Backend.CreateOptions) Backend.Error!Backend.Handle {
+        pub fn create(ptr: *anyopaque, options: libcontainer.CreateOptions) libcontainer.Error!libcontainer.State {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.rootfs_len = options.rootfs.len;
             @memcpy(self.rootfs[0..self.rootfs_len], options.rootfs);
@@ -304,8 +305,8 @@ test "create with inherited mount isolation persists backend resources and rolls
                 return error.InvalidConfig;
             const mappings = bind.mappings orelse return error.InvalidConfig;
             if (mappings.uid.len != 1 or mappings.gid.len != 1 or mappings.recursive or
-                !std.meta.eql(mappings.uid[0], Backend.IDMapping{ .container_id = 1000, .host_id = 0, .size = 1 }) or
-                !std.meta.eql(mappings.gid[0], Backend.IDMapping{ .container_id = 2000, .host_id = 0, .size = 1 }))
+                !std.meta.eql(mappings.uid[0], libcontainer.IDMapping{ .container_id = 1000, .host_id = 0, .size = 1 }) or
+                !std.meta.eql(mappings.gid[0], libcontainer.IDMapping{ .container_id = 2000, .host_id = 0, .size = 1 }))
                 return error.InvalidConfig;
             const proc = options.mounts[1];
             if (!std.mem.eql(u8, proc.destination, "/proc") or
@@ -318,20 +319,20 @@ test "create with inherited mount isolation persists backend resources and rolls
                 options.resources.pids == null or options.resources.pids.?.limit != 5)
                 return error.InvalidConfig;
             const caps = options.capabilities orelse return error.InvalidConfig;
-            if (!std.meta.eql(caps, Backend.Capabilities{
+            if (!std.meta.eql(caps, libcontainer.Capabilities{
                 .bounding = 1 | (@as(u64, 1) << 39),
                 .effective = 1,
                 .permitted = 1,
                 .inheritable = 1,
                 .ambient = 1,
             })) return error.InvalidConfig;
-            if (options.rlimits.len != 1 or !std.meta.eql(options.rlimits[0], Backend.Rlimit{
+            if (options.rlimits.len != 1 or !std.meta.eql(options.rlimits[0], libcontainer.Rlimit{
                 .resource = .NOFILE,
                 .hard = 1024,
                 .soft = 512,
             })) return error.InvalidConfig;
             if (options.oom_score_adj != 100) return error.InvalidConfig;
-            std.testing.expectEqualDeep(@as(?Backend.Process, .{
+            std.testing.expectEqualDeep(@as(?libcontainer.Process, .{
                 .args = &.{"/bin/sh"},
                 .cwd = "/",
                 .uid = 1000,
@@ -366,8 +367,9 @@ test "create with inherited mount isolation persists backend resources and rolls
             };
         }
 
-        fn delete(ptr: *anyopaque, handle: Backend.Handle) Backend.Error!void {
+        fn delete(ptr: *anyopaque) libcontainer.Error!void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            const handle = self.state;
             if (!std.mem.eql(u8, handle.cgroup_path orelse return error.InvalidPath, "custom/test"))
                 return error.InvalidPath;
             if (!std.mem.eql(u8, handle.rootfs_mount orelse return error.InvalidPath, self.rootfs[0..self.rootfs_len]))
@@ -376,11 +378,12 @@ test "create with inherited mount isolation persists backend resources and rolls
             self.deleted = true;
         }
 
-        fn alive(_: *anyopaque, _: Backend.Handle) Backend.Error!bool {
+        fn alive(_: *anyopaque) libcontainer.Error!bool {
             return true;
         }
-        fn kill(ptr: *anyopaque, handle: Backend.Handle, signal: i32) Backend.Error!void {
+        fn kill(ptr: *anyopaque, signal: i32) libcontainer.Error!void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            const handle = self.state;
             if (handle.pid != 1234 or signal != 9) return error.CreateFailed;
             self.killed = true;
         }
@@ -400,10 +403,10 @@ test "create with inherited mount isolation persists backend resources and rolls
     defer std.testing.allocator.free(bundle);
     const pid_file = try std.fs.path.join(std.testing.allocator, &.{ root, "init.pid" });
     defer std.testing.allocator.free(pid_file);
-    var implementation: TestBackend = .{};
-    const backend: Backend = .{ .ptr = &implementation, .vtable = &TestBackend.vtable };
+    var implementation: TestContainer = .{};
+    const container: libcontainer.Container = .{ .ptr = &implementation, .vtable = &TestContainer.vtable };
     var config: Config = .{ .root = root, .subcommand = .create, .id = "example", .bundle = bundle, .pid_file = pid_file };
-    try createContainer(std.testing.allocator, std.testing.io, backend, config);
+    try createContainer(std.testing.allocator, std.testing.io, overrideContainer(&implementation, container), config);
 
     const json = try tmp.dir.readFileAlloc(std.testing.io, "example/state.json", std.testing.allocator, .limited(1024));
     defer std.testing.allocator.free(json);
@@ -443,7 +446,7 @@ test "create with inherited mount isolation persists backend resources and rolls
     const bad_pid_file = try std.fs.path.join(std.testing.allocator, &.{ root, "missing", "init.pid" });
     defer std.testing.allocator.free(bad_pid_file);
     config.id = "other";
-    try std.testing.expectError(error.InvalidConfig, createContainer(std.testing.allocator, std.testing.io, backend, config));
+    try std.testing.expectError(error.InvalidConfig, createContainer(std.testing.allocator, std.testing.io, overrideContainer(&implementation, container), config));
     try std.testing.expect(std.mem.indexOf(u8, oci.diagnostic().?, "already used by live container 'example'") != null);
     try std.testing.expect(!implementation.killed);
     try std.testing.expect(!implementation.deleted);
@@ -458,7 +461,7 @@ test "create with inherited mount isolation persists backend resources and rolls
     defer std.testing.allocator.free(private_config);
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "bundle/config.json", .data = private_config });
     config.pid_file = bad_pid_file;
-    try std.testing.expectError(error.FileNotFound, createContainer(std.testing.allocator, std.testing.io, backend, config));
+    try std.testing.expectError(error.FileNotFound, createContainer(std.testing.allocator, std.testing.io, overrideContainer(&implementation, container), config));
     try std.testing.expect(implementation.killed);
     try std.testing.expect(implementation.deleted);
     try std.testing.expectError(error.FileNotFound, tmp.dir.openDir(std.testing.io, "other", .{}));

@@ -2,9 +2,11 @@ const std = @import("std");
 const builtin = @import("builtin");
 const oci = @import("igvano").oci;
 const libcontainer = @import("libcontainer");
-const Backend = libcontainer.Backend;
+const ContainerInstance = @import("state.zig").ContainerInstance;
 const attached = @import("../attached.zig");
-const backendResult = @import("diagnostic.zig").backendResult;
+const containerResult = @import("diagnostic.zig").containerResult;
+const ContainerOverride = @import("state.zig").ContainerOverride;
+const bindContainer = @import("state.zig").bindContainer;
 const Config = @import("args.zig").Config;
 const parseArgs = @import("args.zig").parseArgs;
 const optionValue = @import("args.zig").optionValue;
@@ -61,7 +63,7 @@ fn replaceExecEnv(allocator: std.mem.Allocator, env: *std.ArrayList([]const u8),
     try env.append(allocator, value);
 }
 
-pub fn execContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend, config: Config) !u8 {
+pub fn execContainer(allocator: std.mem.Allocator, io: std.Io, injected: ?ContainerOverride, config: Config) !u8 {
     if (comptime builtin.os.tag != .linux) return error.NotImplemented;
     const linux = std.os.linux;
     if (!config.detach) try reserveStdio();
@@ -71,8 +73,10 @@ pub fn execContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend,
     if (locked) {
         if (lock) |file| try requireLinkedLock(io, file);
     }
-    const state = try readLiveState(allocator, io, backend, config, locked);
+    const state = try readLiveState(allocator, io, injected, config, locked);
     defer state.deinit();
+    var instance: ContainerInstance = undefined;
+    const container = if (state.container_state) |value| bindContainer(&instance, injected, value) else null;
     if (state.parsed.value.status != .created and state.parsed.value.status != .running) return oci.validationError(error.InvalidStatus, "exec: requires created or running state", .{});
 
     var arena: std.heap.ArenaAllocator = .init(allocator);
@@ -82,7 +86,7 @@ pub fn execContainer(allocator: std.mem.Allocator, io: std.Io, backend: Backend,
     defer if (options.console_fds) |fds| for (fds) |fd| {
         _ = linux.close(fd);
     };
-    return runExec(allocator, io, backend, config, state.handle.?, options, &lock, locked);
+    return runExec(allocator, io, container.?, config, options, &lock, locked);
 }
 
 fn reserveStdio() !void {
@@ -107,7 +111,7 @@ fn reserveStdio() !void {
     }
 }
 
-fn prepareExecOptions(process_allocator: std.mem.Allocator, io: std.Io, state: LiveState, config: Config) !Backend.ExecOptions {
+fn prepareExecOptions(process_allocator: std.mem.Allocator, io: std.Io, state: LiveState, config: Config) !libcontainer.ExecOptions {
     const saved_bundle = try std.fs.path.join(process_allocator, &.{ config.root, config.id });
     // Legacy containers did not snapshot config.json at create.
     const saved_spec = try loadExecSpec(process_allocator, io, saved_bundle, state.parsed.value.bundle, config.process_file != null);
@@ -122,7 +126,7 @@ fn prepareExecOptions(process_allocator: std.mem.Allocator, io: std.Io, state: L
         break :seccomp settings.seccomp;
     };
     options.seccomp = try oci.prepareSeccomp(process_allocator, seccomp);
-    options.cgroup_path = state.handle.?.cgroup_path orelse return oci.validationError(error.InvalidState, "exec: saved cgroup path is missing", .{});
+    options.cgroup_path = state.container_state.?.cgroup_path orelse return oci.validationError(error.InvalidState, "exec: saved cgroup path is missing", .{});
     options.console_fds = if (process.terminal orelse false) try libcontainer.console.socketpair() else null;
     return options;
 }
@@ -183,13 +187,13 @@ fn restoreExecSubreaper(was_subreaper: u32) void {
     _ = linux.prctl(@intFromEnum(linux.PR.SET_CHILD_SUBREAPER), was_subreaper, 0, 0, 0);
 }
 
-fn runExec(allocator: std.mem.Allocator, io: std.Io, backend: Backend, config: Config, handle: Backend.Handle, options: Backend.ExecOptions, lock: *?std.Io.File, locked: bool) !u8 {
+fn runExec(allocator: std.mem.Allocator, io: std.Io, container: libcontainer.Container, config: Config, options: libcontainer.ExecOptions, lock: *?std.Io.File, locked: bool) !u8 {
     const linux = std.os.linux;
     const was_subreaper = if (!config.detach) try enableExecSubreaper() else 0;
     defer if (!config.detach) restoreExecSubreaper(was_subreaper);
     var signals: ?attached.Signals = if (!config.detach) try attached.Signals.init() else null;
     defer if (signals) |*handler| handler.deinit();
-    const pid = try backendResult(backend, backend.exec(handle, options));
+    const pid = try containerResult(container, container.exec(options));
     var reaped = false;
     errdefer if (!reaped) {
         _ = linux.kill(pid, .KILL);

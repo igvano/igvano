@@ -199,7 +199,7 @@ fn reap(pid: i32, exit_status: *?u8, reaped: *bool) !void {
 /// waitpid collects pid, including when subsequent console draining fails.
 pub fn wait(pid: i32, reaped: *bool, signals: *Signals, controller: ?fd_t, input: fd_t, output: fd_t) !u8 {
     if (comptime builtin.os.tag != .linux) return error.NotImplemented;
-    // Raw mode and the first resize deliberately follow backend.exec, matching runc.
+    // Raw mode and the first resize deliberately follow container.exec, matching runc.
     const original = if (controller != null) try makeRaw(input) else null;
     defer restoreTerminal(input, original);
     const controller_flags = if (controller) |fd| try nonblocking(fd) else null;

@@ -1,5 +1,5 @@
 const std = @import("std");
-const Backend = @import("libcontainer").Backend;
+const libcontainer = @import("libcontainer");
 const recordDiagnostic = @import("diagnostic.zig").recordDiagnostic;
 const invalidConfig = @import("diagnostic.zig").invalidConfig;
 const diagnosticContext = @import("diagnostic.zig").diagnosticContext;
@@ -30,9 +30,9 @@ pub fn resolveCgroupPath(allocator: std.mem.Allocator, configured: ?[]const u8, 
 
 /// Translate and validate OCI resources without selecting a cgroup hierarchy.
 /// Arrays are caller-owned; strings are borrowed from the parsed spec.
-pub fn cgroupResources(allocator: std.mem.Allocator, configured: ?Spec.Resources) !Backend.Resources {
+pub fn cgroupResources(allocator: std.mem.Allocator, configured: ?Spec.Resources) !libcontainer.Resources {
     const settings = configured orelse return .{};
-    var resources: Backend.Resources = .{};
+    var resources: libcontainer.Resources = .{};
     errdefer freeCgroupResources(allocator, resources);
     if (settings.memory) |value| resources.memory = try resourceMemory(value);
     if (settings.cpu) |value| resources.cpu = try resourceCpu(value);
@@ -45,7 +45,7 @@ pub fn cgroupResources(allocator: std.mem.Allocator, configured: ?Spec.Resources
     if (settings.network) |network| {
         resources.network = .{ .class_id = network.classID };
         const priorities = network.priorities orelse &.{};
-        const translated = try allocator.alloc(Backend.Resources.Priority, priorities.len);
+        const translated = try allocator.alloc(libcontainer.Resources.Priority, priorities.len);
         resources.network.?.priorities = translated;
         for (priorities, translated) |entry, *priority|
             priority.* = .{ .name = entry.name, .priority = entry.priority };
@@ -55,7 +55,7 @@ pub fn cgroupResources(allocator: std.mem.Allocator, configured: ?Spec.Resources
     return resources;
 }
 
-fn resourceMemory(memory: Spec.Resources.Memory) !Backend.Resources.Memory {
+fn resourceMemory(memory: Spec.Resources.Memory) !libcontainer.Resources.Memory {
     inline for (.{ "limit", "reservation", "swap", "kernel", "kernelTCP" }) |field|
         try validateResourceLimit(@field(memory, field), "linux.resources.memory." ++ field);
     return .{
@@ -69,7 +69,7 @@ fn resourceMemory(memory: Spec.Resources.Memory) !Backend.Resources.Memory {
     };
 }
 
-fn resourceCpu(cpu: Spec.Resources.Cpu) !Backend.Resources.Cpu {
+fn resourceCpu(cpu: Spec.Resources.Cpu) !libcontainer.Resources.Cpu {
     try validateResourceLimit(cpu.quota, "linux.resources.cpu.quota");
     try validateResourceLimit(cpu.realtimeRuntime, "linux.resources.cpu.realtimeRuntime");
     if (cpu.shares) |shares|
@@ -85,12 +85,12 @@ fn resourceCpu(cpu: Spec.Resources.Cpu) !Backend.Resources.Cpu {
     };
 }
 
-fn prepareBlockResources(allocator: std.mem.Allocator, resources: *Backend.Resources, block: Spec.Resources.BlockIO) !void {
+fn prepareBlockResources(allocator: std.mem.Allocator, resources: *libcontainer.Resources, block: Spec.Resources.BlockIO) !void {
     try validateResourceWeight(block.weight, "linux.resources.blockIO.weight");
     try validateResourceWeight(block.leafWeight, "linux.resources.blockIO.leafWeight");
     resources.block_io = .{ .weight = block.weight, .leaf_weight = block.leafWeight };
     const weights = block.weightDevice orelse &.{};
-    const translated = try allocator.alloc(Backend.Resources.WeightDevice, weights.len);
+    const translated = try allocator.alloc(libcontainer.Resources.WeightDevice, weights.len);
     resources.block_io.?.weight_device = translated;
     for (weights, translated, 0..) |entry, *device, i| {
         if (entry.major < 0 or entry.minor < 0) return invalidConfig("linux.resources.blockIO.weightDevice[{d}]: major/minor must be nonnegative", .{i});
@@ -109,8 +109,8 @@ fn prepareBlockResources(allocator: std.mem.Allocator, resources: *Backend.Resou
     resources.block_io.?.throttle_write_iops = try resourceThrottleDevices(allocator, block.throttleWriteIOPSDevice, "throttleWriteIOPSDevice");
 }
 
-fn prepareUnifiedResources(allocator: std.mem.Allocator, resources: *Backend.Resources, unified: std.json.ArrayHashMap([]const u8)) !void {
-    const translated = try allocator.alloc(Backend.Resources.Unified, unified.map.count());
+fn prepareUnifiedResources(allocator: std.mem.Allocator, resources: *libcontainer.Resources, unified: std.json.ArrayHashMap([]const u8)) !void {
+    const translated = try allocator.alloc(libcontainer.Resources.Unified, unified.map.count());
     resources.unified = translated;
     for (unified.map.keys(), unified.map.values(), translated) |key, value, *entry| {
         if (key.len == 0 or std.mem.indexOfAny(u8, key, "/\x00") != null or
@@ -119,9 +119,9 @@ fn prepareUnifiedResources(allocator: std.mem.Allocator, resources: *Backend.Res
     }
 }
 
-fn prepareHugepageResources(allocator: std.mem.Allocator, resources: *Backend.Resources, configured: ?[]const Spec.Resources.HugepageLimit) !void {
+fn prepareHugepageResources(allocator: std.mem.Allocator, resources: *libcontainer.Resources, configured: ?[]const Spec.Resources.HugepageLimit) !void {
     const hugepages = configured orelse &.{};
-    const translated_pages = try allocator.alloc(Backend.Resources.HugepageLimit, hugepages.len);
+    const translated_pages = try allocator.alloc(libcontainer.Resources.HugepageLimit, hugepages.len);
     resources.hugepage_limits = translated_pages;
     for (hugepages, translated_pages, 0..) |entry, *page, i| {
         if (entry.pageSize.len == 0) return invalidConfig("linux.resources.hugepageLimits[{d}].pageSize: must not be empty", .{i});
@@ -129,12 +129,12 @@ fn prepareHugepageResources(allocator: std.mem.Allocator, resources: *Backend.Re
     }
 }
 
-fn resourceDeviceRules(allocator: std.mem.Allocator, configured: ?[]const Spec.Resources.DeviceRule) ![]Backend.Resources.DeviceRule {
+fn resourceDeviceRules(allocator: std.mem.Allocator, configured: ?[]const Spec.Resources.DeviceRule) ![]libcontainer.Resources.DeviceRule {
     const devices = configured orelse &.{};
-    const translated = try allocator.alloc(Backend.Resources.DeviceRule, devices.len);
+    const translated = try allocator.alloc(libcontainer.Resources.DeviceRule, devices.len);
     errdefer allocator.free(translated);
     for (devices, translated, 0..) |entry, *device, i| {
-        const kind: @FieldType(Backend.Resources.DeviceRule, "kind") = if (std.mem.eql(u8, entry.type, "a"))
+        const kind: @FieldType(libcontainer.Resources.DeviceRule, "kind") = if (std.mem.eql(u8, entry.type, "a"))
             .all
         else if (std.mem.eql(u8, entry.type, "b"))
             .block
@@ -167,9 +167,9 @@ fn validateResourceWeight(value: ?u16, comptime field: []const u8) error{Invalid
         if (weight != 0 and (weight < 10 or weight > 1000)) return invalidConfig(field ++ ": expected 0 or 10..1000", .{});
 }
 
-fn resourceThrottleDevices(allocator: std.mem.Allocator, configured: ?[]const Spec.Resources.ThrottleDevice, comptime field: []const u8) ![]Backend.Resources.ThrottleDevice {
+fn resourceThrottleDevices(allocator: std.mem.Allocator, configured: ?[]const Spec.Resources.ThrottleDevice, comptime field: []const u8) ![]libcontainer.Resources.ThrottleDevice {
     const entries = configured orelse &.{};
-    const devices = try allocator.alloc(Backend.Resources.ThrottleDevice, entries.len);
+    const devices = try allocator.alloc(libcontainer.Resources.ThrottleDevice, entries.len);
     errdefer allocator.free(devices);
     for (entries, devices, 0..) |entry, *device, i| {
         if (entry.major < 0 or entry.minor < 0) return invalidConfig("linux.resources.blockIO." ++ field ++ "[{d}]: major/minor must be nonnegative", .{i});
@@ -178,7 +178,7 @@ fn resourceThrottleDevices(allocator: std.mem.Allocator, configured: ?[]const Sp
     return devices;
 }
 
-pub fn freeCgroupResources(allocator: std.mem.Allocator, resources: Backend.Resources) void {
+pub fn freeCgroupResources(allocator: std.mem.Allocator, resources: libcontainer.Resources) void {
     if (resources.block_io) |block| {
         allocator.free(block.weight_device);
         allocator.free(block.throttle_read_bps);
@@ -241,7 +241,7 @@ test "OCI resources retain typed limits without hierarchy mapping" {
     const resources = try cgroupResources(std.testing.allocator, parsed.value.resources);
     defer freeCgroupResources(std.testing.allocator, resources);
     try std.testing.expectEqual(@as(?i64, 67108864), resources.memory.?.limit);
-    try std.testing.expectEqualDeep(Backend.Resources.Cpu{ .quota = 50000, .period = 100000, .shares = 1024 }, resources.cpu.?);
+    try std.testing.expectEqualDeep(libcontainer.Resources.Cpu{ .quota = 50000, .period = 100000, .shares = 1024 }, resources.cpu.?);
     try std.testing.expectEqual(@as(?i64, 32), resources.pids.?.limit);
 }
 
@@ -292,7 +292,7 @@ test "cgroup resource validation rejects invalid signed limits and cpu shares" {
 }
 
 test "cgroup resources validate device types access and wildcard numbers" {
-    for ([_][]const u8{ "a", "b", "c" }, [_]@FieldType(Backend.Resources.DeviceRule, "kind"){ .all, .block, .char }) |kind, expected| {
+    for ([_][]const u8{ "a", "b", "c" }, [_]@FieldType(libcontainer.Resources.DeviceRule, "kind"){ .all, .block, .char }) |kind, expected| {
         const resources = try cgroupResources(std.testing.allocator, .{ .devices = &.{
             .{ .allow = true, .type = kind, .major = -1, .minor = -1, .access = "mrw" },
         } });
@@ -384,7 +384,7 @@ test "resource files preserve omitted fields and validate device rules through c
     try std.testing.expect(resources.memory == null and resources.pids == null);
     try std.testing.expectEqual(@as(?u64, 512), resources.cpu.?.shares);
     try std.testing.expect(resources.cpu.?.quota == null and resources.cpu.?.period == null);
-    try std.testing.expectEqualDeep(Backend.Resources.DeviceRule{
+    try std.testing.expectEqualDeep(libcontainer.Resources.DeviceRule{
         .allow = true,
         .kind = .char,
         .major = 1,

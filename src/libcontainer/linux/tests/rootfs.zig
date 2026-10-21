@@ -2,7 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 const posix = std.posix;
-const Backend = @import("../../root.zig").Backend;
+const libcontainer = @import("../../root.zig");
 const hooks = @import("../../hooks.zig");
 const PreparedMount = @import("../mount.zig").PreparedMount;
 const checkResult = @import("../syscall.zig").checkResult;
@@ -21,7 +21,7 @@ const requireTestMountNamespace = @import("helpers.zig").requireTestMountNamespa
 const requireTestUniqueMountIds = @import("helpers.zig").requireTestUniqueMountIds;
 const console = @import("../console.zig").console;
 const PreparedDevice = @import("../device_nodes.zig").PreparedDevice;
-const LinuxBackend = @import("../../linux.zig").LinuxBackend;
+const LinuxContainer = @import("../../linux.zig").Container;
 
 test "linux rootfs console setup precedes restrictions and readonly without a dev tmpfs" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
@@ -55,10 +55,8 @@ test "linux rootfs cleanup preserves replacement self-binds and mounts from anot
 }
 
 fn testReplacementRootfsMount(rootfs: [:0]const u8) !void {
-    var implementation: LinuxBackend = .{};
-    const backend = implementation.backend();
     try checkResult(linux.mount(rootfs, rootfs, null, linux.MS.BIND | linux.MS.REC, 0));
-    const handle: Backend.Handle = .{
+    const handle: libcontainer.State = .{
         .id = "replacement",
         .pid = 0,
         .starttime = "",
@@ -77,26 +75,41 @@ fn testReplacementRootfsMount(rootfs: [:0]const u8) !void {
     defer closeFd(fd);
     const replacement_id = try mountId(fd);
     try std.testing.expect(handle.rootfs_mount_id.? != replacement_id);
-    try backend.delete(handle);
+    try (delete: {
+        var instance = LinuxContainer.load(handle);
+        break :delete instance.container().delete();
+    });
     const current_fd = try openPath(linux.AT.FDCWD, rootfs, .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true });
     defer closeFd(current_fd);
     try std.testing.expectEqual(replacement_id, try mountId(current_fd));
     var reboot_handle = handle;
     reboot_handle.rootfs_mount_id = replacement_id;
     reboot_handle.rootfs_mount_boot_id.?[0] ^= 1;
-    try backend.delete(reboot_handle);
+    try (delete: {
+        var instance = LinuxContainer.load(reboot_handle);
+        break :delete instance.container().delete();
+    });
     var legacy_handle = handle;
     legacy_handle.rootfs_mount_id = replacement_id;
     legacy_handle.rootfs_mount_boot_id = null;
-    try backend.delete(legacy_handle);
+    try (delete: {
+        var instance = LinuxContainer.load(legacy_handle);
+        break :delete instance.container().delete();
+    });
     var stat: linux.Statx = undefined;
     try checkResult(linux.statx(linux.AT.FDCWD, rootfs, 0, .{ .MNT_ID_UNIQUE = true }, &stat));
     try std.testing.expectEqual(replacement_id, stat.mnt_id);
     var replacement_handle = handle;
     replacement_handle.rootfs_mount_id = replacement_id;
-    try backend.delete(replacement_handle);
+    try (delete: {
+        var instance = LinuxContainer.load(replacement_handle);
+        break :delete instance.container().delete();
+    });
     try expectNoRootfsMount(rootfs);
-    try backend.delete(replacement_handle);
+    try (delete: {
+        var instance = LinuxContainer.load(replacement_handle);
+        break :delete instance.container().delete();
+    });
 }
 
 test "linux rootfs console setup uses move mount without procfs" {
@@ -126,7 +139,7 @@ fn testRootfsConsole(readonly: bool, mount_proc: bool) !void {
         .{ .destination = "/dev/pts", .source = "devpts", .type = "devpts", .flags = linux.MS.NOSUID | linux.MS.NOEXEC, .propagation = 0, .data = "newinstance,ptmxmode=666,mode=620" },
         .{ .destination = "/proc", .source = "proc", .type = "proc", .flags = 0, .propagation = 0, .data = "" },
     };
-    const symlinks = [_]Backend.Symlink{.{ .path = "/dev/ptmx", .target = "pts/ptmx" }};
+    const symlinks = [_]libcontainer.Symlink{.{ .path = "/dev/ptmx", .target = "pts/ptmx" }};
     const sockets = try console.socketpair();
     const go = try makePipe();
     defer for (go) |fd| closeFd(fd);
@@ -263,7 +276,7 @@ test "linux rootfs setup applies ordered mounts detaches the host root and enfor
         .{ .path = "/dev/null", .mode = linux.S.IFCHR | 0o666, .dev = 0x103 },
         .{ .path = "/run/pipe", .mode = linux.S.IFIFO | 0o640, .dev = 0 },
     };
-    const symlinks: []const Backend.Symlink = &.{
+    const symlinks: []const libcontainer.Symlink = &.{
         .{ .path = "/dev/fd", .target = "/proc/self/fd" },
         .{ .path = "/dev/stdin", .target = "/proc/self/fd/0" },
         .{ .path = "/dev/stdout", .target = "/proc/self/fd/1" },

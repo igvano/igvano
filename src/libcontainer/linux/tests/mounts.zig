@@ -1,7 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const linux = std.os.linux;
-const Backend = @import("../../root.zig").Backend;
+const libcontainer = @import("../../root.zig");
 const PreparedMount = @import("../mount.zig").PreparedMount;
 const mountDestination = @import("../mount.zig").mountDestination;
 const remountFlags = @import("../mount.zig").remountFlags;
@@ -103,8 +103,8 @@ test "linux accessible user namespace binds retain locked host mount restriction
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     if (linux.geteuid() != 0) return error.SkipZigTest;
     try requireTestMountNamespace();
-    const ranges: []const Backend.IDMapping = &.{.{ .container_id = 0, .host_id = 100000, .size = 10 }};
-    const mappings: Backend.MountMappings = .{ .uid = ranges, .gid = ranges };
+    const ranges: []const libcontainer.IDMapping = &.{.{ .container_id = 0, .host_id = 100000, .size = 10 }};
+    const mappings: libcontainer.MountMappings = .{ .uid = ranges, .gid = ranges };
     const userns = createMountUserNamespace(std.testing.allocator, mappings) catch |err| switch (err) {
         error.PermissionDenied, error.Unsupported => return error.SkipZigTest,
         else => return err,

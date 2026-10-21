@@ -1,23 +1,24 @@
 const std = @import("std");
+const overrideContainer = @import("helpers.zig").overrideContainer;
 const oci = @import("igvano").oci;
 const libcontainer = @import("libcontainer");
-const Backend = libcontainer.Backend;
 const Config = @import("../args.zig").Config;
 const deleteContainer = @import("../delete.zig").deleteContainer;
 
 test "delete requires stopped containers unless forced and waits after SIGKILL" {
-    const TestBackend = struct {
+    const TestContainer = struct {
+        state: libcontainer.State = undefined,
         is_alive: bool,
         fail_freezer: bool,
         deleted: bool = false,
         signal: ?i32 = null,
         polls_after_kill: usize = 0,
-        const vtable: Backend.VTable = .{ .create = create, .alive = alive, .kill = kill, .killAll = kill, .delete = delete, .frozen = frozen };
+        const vtable: libcontainer.Container.VTable = .{ .alive = alive, .kill = kill, .killAll = kill, .delete = delete, .frozen = frozen };
 
-        fn create(_: *anyopaque, _: Backend.CreateOptions) Backend.Error!Backend.Handle {
+        pub fn create(_: *anyopaque, _: libcontainer.CreateOptions) libcontainer.Error!libcontainer.State {
             return error.NotImplemented;
         }
-        fn alive(ptr: *anyopaque, _: Backend.Handle) Backend.Error!bool {
+        fn alive(ptr: *anyopaque) libcontainer.Error!bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.signal != null) {
                 self.polls_after_kill += 1;
@@ -25,16 +26,16 @@ test "delete requires stopped containers unless forced and waits after SIGKILL" 
             }
             return self.is_alive;
         }
-        fn kill(ptr: *anyopaque, _: Backend.Handle, signal: i32) Backend.Error!void {
+        fn kill(ptr: *anyopaque, signal: i32) libcontainer.Error!void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.signal = signal;
         }
-        fn frozen(ptr: *anyopaque, _: Backend.Handle) Backend.Error!bool {
+        fn frozen(ptr: *anyopaque) libcontainer.Error!bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.fail_freezer) return error.CgroupWriteFailed;
             return false;
         }
-        fn delete(ptr: *anyopaque, _: Backend.Handle) Backend.Error!void {
+        fn delete(ptr: *anyopaque) libcontainer.Error!void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.deleted = true;
         }
@@ -55,12 +56,12 @@ test "delete requires stopped containers unless forced and waits after SIGKILL" 
                     .status = status,
                     .bundle = "/bundle",
                 });
-                var implementation: TestBackend = .{ .is_alive = is_alive, .fail_freezer = force };
-                const backend: Backend = .{ .ptr = &implementation, .vtable = &TestBackend.vtable };
+                var implementation: TestContainer = .{ .is_alive = is_alive, .fail_freezer = force };
+                const container: libcontainer.Container = .{ .ptr = &implementation, .vtable = &TestContainer.vtable };
                 if (!force and is_alive and status != .stopped) {
                     const before = try tmp.dir.readFileAlloc(std.testing.io, "example/state.json", std.testing.allocator, .limited(4096));
                     defer std.testing.allocator.free(before);
-                    try std.testing.expectError(error.InvalidStatus, deleteContainer(std.testing.allocator, std.testing.io, backend, config));
+                    try std.testing.expectError(error.InvalidStatus, deleteContainer(std.testing.allocator, std.testing.io, overrideContainer(&implementation, container), config));
                     try std.testing.expect(!implementation.deleted);
                     try std.testing.expect(implementation.signal == null);
                     const after = try tmp.dir.readFileAlloc(std.testing.io, "example/state.json", std.testing.allocator, .limited(4096));
@@ -71,7 +72,7 @@ test "delete requires stopped containers unless forced and waits after SIGKILL" 
                     try std.testing.expectEqualStrings("12345", starttime);
                     try tmp.dir.deleteTree(std.testing.io, "example");
                 } else {
-                    try deleteContainer(std.testing.allocator, std.testing.io, backend, config);
+                    try deleteContainer(std.testing.allocator, std.testing.io, overrideContainer(&implementation, container), config);
                     try std.testing.expect(implementation.deleted);
                     if (force and is_alive and status != .stopped) {
                         try std.testing.expectEqual(@as(?i32, 9), implementation.signal);
@@ -87,22 +88,24 @@ test "delete requires stopped containers unless forced and waits after SIGKILL" 
 }
 
 test "delete uses persisted cgroup and rootfs mounts and preserves state on backend failure" {
-    const TestBackend = struct {
+    const TestContainer = struct {
+        state: libcontainer.State = undefined,
         fail_delete: bool = true,
         deleted: bool = false,
-        const vtable: Backend.VTable = .{ .create = create, .alive = alive, .kill = kill, .killAll = kill, .delete = delete };
+        const vtable: libcontainer.Container.VTable = .{ .alive = alive, .kill = kill, .killAll = kill, .delete = delete };
 
-        fn create(_: *anyopaque, _: Backend.CreateOptions) Backend.Error!Backend.Handle {
+        pub fn create(_: *anyopaque, _: libcontainer.CreateOptions) libcontainer.Error!libcontainer.State {
             return error.NotImplemented;
         }
-        fn alive(_: *anyopaque, _: Backend.Handle) Backend.Error!bool {
+        fn alive(_: *anyopaque) libcontainer.Error!bool {
             return error.NotImplemented;
         }
-        fn kill(_: *anyopaque, _: Backend.Handle, _: i32) Backend.Error!void {
+        fn kill(_: *anyopaque, _: i32) libcontainer.Error!void {
             return error.NotImplemented;
         }
-        fn delete(ptr: *anyopaque, handle: Backend.Handle) Backend.Error!void {
+        fn delete(ptr: *anyopaque) libcontainer.Error!void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            const handle = self.state;
             if (!std.mem.eql(u8, handle.cgroup_path orelse return error.InvalidPath, "custom/persisted"))
                 return error.InvalidPath;
             if (!std.mem.eql(u8, handle.rootfs_mount orelse return error.InvalidPath, "/bundle/rootfs"))
@@ -127,33 +130,35 @@ test "delete uses persisted cgroup and rootfs mounts and preserves state on back
         .sub_path = "example/rootfs_mount",
         .data = "{\"path\":\"/bundle/rootfs\",\"mount_id_unique\":12345,\"boot_id\":\"00000000-0000-0000-0000-000000000000\"}",
     });
-    var implementation: TestBackend = .{};
-    const backend: Backend = .{ .ptr = &implementation, .vtable = &TestBackend.vtable };
+    var implementation: TestContainer = .{};
+    const container: libcontainer.Container = .{ .ptr = &implementation, .vtable = &TestContainer.vtable };
     const config: Config = .{ .root = root, .subcommand = .delete, .id = "example" };
-    try std.testing.expectError(error.CgroupDeleteFailed, deleteContainer(std.testing.allocator, std.testing.io, backend, config));
+    try std.testing.expectError(error.CgroupDeleteFailed, deleteContainer(std.testing.allocator, std.testing.io, overrideContainer(&implementation, container), config));
     const state = try oci.loadState(std.testing.allocator, std.testing.io, root, "example");
     state.deinit();
     implementation.fail_delete = false;
-    try deleteContainer(std.testing.allocator, std.testing.io, backend, config);
+    try deleteContainer(std.testing.allocator, std.testing.io, overrideContainer(&implementation, container), config);
     try std.testing.expect(implementation.deleted);
     try std.testing.expectError(error.FileNotFound, tmp.dir.openDir(std.testing.io, "example", .{}));
 }
 
 test "forced deletion recovers corrupt and unreadable cgroup drivers" {
-    const TestBackend = struct {
+    const TestContainer = struct {
+        state: libcontainer.State = undefined,
         stopped_scope: bool = false,
         cleaned: bool = false,
         systemd_cleanup: bool = false,
-        const vtable: Backend.VTable = .{ .create = create, .alive = alive, .kill = kill, .killAll = kill, .delete = delete };
-        fn create(_: *anyopaque, _: Backend.CreateOptions) Backend.Error!Backend.Handle {
+        const vtable: libcontainer.Container.VTable = .{ .alive = alive, .kill = kill, .killAll = kill, .delete = delete };
+        pub fn create(_: *anyopaque, _: libcontainer.CreateOptions) libcontainer.Error!libcontainer.State {
             return error.NotImplemented;
         }
-        fn alive(_: *anyopaque, _: Backend.Handle) Backend.Error!bool {
+        fn alive(_: *anyopaque) libcontainer.Error!bool {
             return false;
         }
-        fn kill(_: *anyopaque, _: Backend.Handle, _: i32) Backend.Error!void {}
-        fn delete(ptr: *anyopaque, handle: Backend.Handle) Backend.Error!void {
+        fn kill(_: *anyopaque, _: i32) libcontainer.Error!void {}
+        fn delete(ptr: *anyopaque) libcontainer.Error!void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            const handle = self.state;
             if (handle.systemd) {
                 self.stopped_scope = true;
                 return error.CgroupWriteFailed;
@@ -182,15 +187,15 @@ test "forced deletion recovers corrupt and unreadable cgroup drivers" {
                     .status = status,
                     .bundle = "/bundle",
                 });
-                var implementation: TestBackend = .{};
-                const backend: Backend = .{ .ptr = &implementation, .vtable = &TestBackend.vtable };
+                var implementation: TestContainer = .{};
+                const container: libcontainer.Container = .{ .ptr = &implementation, .vtable = &TestContainer.vtable };
                 var config: Config = .{ .root = root, .id = "example", .subcommand = .delete };
                 if (!unreadable) {
-                    try std.testing.expectError(error.InvalidState, deleteContainer(std.testing.allocator, std.testing.io, backend, config));
+                    try std.testing.expectError(error.InvalidState, deleteContainer(std.testing.allocator, std.testing.io, overrideContainer(&implementation, container), config));
                     try std.testing.expect(!implementation.cleaned);
                 }
                 config.force = true;
-                try deleteContainer(std.testing.allocator, std.testing.io, backend, config);
+                try deleteContainer(std.testing.allocator, std.testing.io, overrideContainer(&implementation, container), config);
                 try std.testing.expect(implementation.cleaned);
                 try std.testing.expect(!implementation.stopped_scope);
                 try std.testing.expect(!implementation.systemd_cleanup);
@@ -210,9 +215,9 @@ test "forced deletion recovers corrupt and unreadable cgroup drivers" {
         .status = .stopped,
         .bundle = "/bundle",
     });
-    var implementation: TestBackend = .{};
-    const backend: Backend = .{ .ptr = &implementation, .vtable = &TestBackend.vtable };
-    try deleteContainer(std.testing.allocator, std.testing.io, backend, .{
+    var implementation: TestContainer = .{};
+    const container: libcontainer.Container = .{ .ptr = &implementation, .vtable = &TestContainer.vtable };
+    try deleteContainer(std.testing.allocator, std.testing.io, overrideContainer(&implementation, container), .{
         .root = root,
         .id = "example",
         .subcommand = .delete,

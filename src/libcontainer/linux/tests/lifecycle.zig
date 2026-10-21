@@ -2,7 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 const posix = std.posix;
-const Backend = @import("../../root.zig").Backend;
+const libcontainer = @import("../../root.zig");
 const diagnostics = @import("../diagnostic.zig");
 const checkResult = @import("../syscall.zig").checkResult;
 const forkProcess = @import("../syscall.zig").forkProcess;
@@ -18,42 +18,43 @@ const removeCgroup = @import("../cgroup.zig").removeCgroup;
 const requireTestMountNamespace = @import("helpers.zig").requireTestMountNamespace;
 const readProcStat = @import("../proc.zig").readProcStat;
 const applyProcess = @import("../process.zig").applyProcess;
-const LinuxBackend = @import("../../linux.zig").LinuxBackend;
+const LinuxContainer = @import("../../linux.zig").Container;
+const expectCreateError = @import("helpers.zig").expectCreateError;
 
 test "linux update requires a persisted cgroup path" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
-    var implementation: LinuxBackend = .{};
-    const backend = implementation.backend();
-    try std.testing.expectError(error.Unsupported, backend.update(.{
+    var update_instance = LinuxContainer.load(.{
         .id = "example",
         .pid = 1,
         .starttime = "1",
-    }, .{ .memory = .{ .limit = 67108864 } }));
-    try std.testing.expect(std.mem.indexOf(u8, backend.diagnostic().?, "no cgroup") != null);
+    });
+    const update_container = update_instance.container();
+    try std.testing.expectError(error.Unsupported, update_container.update(.{ .memory = .{ .limit = 67108864 } }));
+    try std.testing.expect(std.mem.indexOf(u8, libcontainer.linux.diagnostic().?, "no cgroup") != null);
 }
 
 test "linux backend is unavailable on other platforms" {
     if (comptime builtin.os.tag == .linux) return error.SkipZigTest;
-    const handle: Backend.Handle = .{ .id = "example", .pid = 1234, .starttime = "12345" };
-    var implementation: LinuxBackend = .{};
-    const backend = implementation.backend();
+    const handle: libcontainer.State = .{ .id = "example", .pid = 1234, .starttime = "12345" };
+    var handle_instance = LinuxContainer.load(handle);
+    const handle_container = handle_instance.container();
     if (comptime builtin.os.tag != .linux) {
-        try std.testing.expectError(error.NotImplemented, backend.create(.{
+        try expectCreateError(error.NotImplemented, .{
             .allocator = std.testing.allocator,
             .id = "example",
             .rootfs = "/tmp/bundle/rootfs",
             .exec_fifo = "/tmp/containers/example/exec.fifo",
             .process = .{ .args = &.{"/bin/sh"}, .cwd = "/", .uid = 0, .gid = 0 },
-        }));
+        });
     }
-    try std.testing.expectError(error.NotImplemented, backend.alive(handle));
-    try std.testing.expectError(error.NotImplemented, backend.kill(handle, 15));
-    try std.testing.expectError(error.NotImplemented, backend.killAll(handle, 15));
-    try std.testing.expectError(error.NotImplemented, backend.pids(handle, std.testing.allocator));
-    try std.testing.expectError(error.NotImplemented, backend.freeze(handle));
-    try std.testing.expectError(error.NotImplemented, backend.thaw(handle));
-    try std.testing.expectError(error.NotImplemented, backend.frozen(handle));
-    try std.testing.expectError(error.NotImplemented, backend.delete(handle));
+    try std.testing.expectError(error.NotImplemented, handle_container.alive());
+    try std.testing.expectError(error.NotImplemented, handle_container.kill(15));
+    try std.testing.expectError(error.NotImplemented, handle_container.killAll(15));
+    try std.testing.expectError(error.NotImplemented, handle_container.pids(std.testing.allocator));
+    try std.testing.expectError(error.NotImplemented, handle_container.freeze());
+    try std.testing.expectError(error.NotImplemented, handle_container.thaw());
+    try std.testing.expectError(error.NotImplemented, handle_container.frozen());
+    try std.testing.expectError(error.NotImplemented, handle_container.delete());
 }
 
 test "linux liveness and signaling work with a handle loaded by a new backend" {
@@ -73,44 +74,50 @@ test "linux liveness and signaling work with a handle loaded by a new backend" {
         _ = linux.kill(pid, .KILL);
         _ = waitChild(pid) catch {};
     };
-    var implementation: LinuxBackend = .{};
-    const backend = implementation.backend();
     var stat_buffer: [4096]u8 = undefined;
     const stat = try readProcStat(pid, &stat_buffer);
-    const handle: Backend.Handle = .{ .id = "persisted", .pid = pid, .starttime = stat.starttime };
-    try std.testing.expect(try backend.alive(handle));
-    const reused: Backend.Handle = .{ .id = "persisted", .pid = pid, .starttime = "mismatched" };
-    try std.testing.expect(!try backend.alive(reused));
-    const reused_pids = try backend.pids(reused, std.testing.allocator);
+    const handle: libcontainer.State = .{ .id = "persisted", .pid = pid, .starttime = stat.starttime };
+    var handle_instance = LinuxContainer.load(handle);
+    const handle_container = handle_instance.container();
+    try std.testing.expect(try handle_container.alive());
+    const reused: libcontainer.State = .{ .id = "persisted", .pid = pid, .starttime = "mismatched" };
+    var reused_instance = LinuxContainer.load(reused);
+    const reused_container = reused_instance.container();
+    try std.testing.expect(!try reused_container.alive());
+    const reused_pids = try reused_container.pids(std.testing.allocator);
     defer std.testing.allocator.free(reused_pids);
     try std.testing.expectEqual(@as(usize, 0), reused_pids.len);
-    const pids = try backend.pids(handle, std.testing.allocator);
+    const pids = try handle_container.pids(std.testing.allocator);
     defer std.testing.allocator.free(pids);
     try std.testing.expectEqualSlices(i32, &.{pid}, pids);
-    try std.testing.expect(!try backend.frozen(handle));
-    try std.testing.expectError(error.Unsupported, backend.freeze(handle));
-    try std.testing.expect(std.mem.indexOf(u8, backend.diagnostic().?, "no cgroup freezer") != null);
-    try std.testing.expectError(error.Unsupported, backend.thaw(handle));
-    try std.testing.expectError(error.ProcessNotFound, backend.kill(reused, 9));
-    try backend.killAll(reused, 9);
-    try std.testing.expect(try backend.alive(handle));
-    try backend.kill(handle, 0);
-    try backend.killAll(handle, 0);
-    try std.testing.expectError(error.InvalidProcess, backend.kill(.{ .id = "invalid", .pid = 0, .starttime = "" }, 9));
-    try std.testing.expectError(error.InvalidProcess, backend.killAll(.{ .id = "invalid", .pid = 0, .starttime = "" }, 9));
-    try std.testing.expectError(error.InvalidProcess, backend.alive(.{ .id = "invalid", .pid = -1, .starttime = "" }));
-    try std.testing.expectError(error.KillFailed, backend.kill(handle, 65));
-    try std.testing.expectError(error.KillFailed, backend.killAll(handle, 65));
-    try backend.killAll(handle, 9);
+    try std.testing.expect(!try handle_container.frozen());
+    try std.testing.expectError(error.Unsupported, handle_container.freeze());
+    try std.testing.expect(std.mem.indexOf(u8, libcontainer.linux.diagnostic().?, "no cgroup freezer") != null);
+    try std.testing.expectError(error.Unsupported, handle_container.thaw());
+    try std.testing.expectError(error.ProcessNotFound, reused_container.kill(9));
+    try reused_container.killAll(9);
+    try std.testing.expect(try handle_container.alive());
+    try handle_container.kill(0);
+    try handle_container.killAll(0);
+    var invalid_instance = LinuxContainer.load(.{ .id = "invalid", .pid = 0, .starttime = "" });
+    const invalid_container = invalid_instance.container();
+    try std.testing.expectError(error.InvalidProcess, invalid_container.kill(9));
+    try std.testing.expectError(error.InvalidProcess, invalid_container.killAll(9));
+    var negative_pid_instance = LinuxContainer.load(.{ .id = "invalid", .pid = -1, .starttime = "" });
+    const negative_pid_container = negative_pid_instance.container();
+    try std.testing.expectError(error.InvalidProcess, negative_pid_container.alive());
+    try std.testing.expectError(error.KillFailed, handle_container.kill(65));
+    try std.testing.expectError(error.KillFailed, handle_container.killAll(65));
+    try handle_container.killAll(9);
     _ = try waitChild(pid);
     reaped = true;
-    try std.testing.expect(!try backend.alive(handle));
-    const stopped_pids = try backend.pids(handle, std.testing.allocator);
+    try std.testing.expect(!try handle_container.alive());
+    const stopped_pids = try handle_container.pids(std.testing.allocator);
     defer std.testing.allocator.free(stopped_pids);
     try std.testing.expectEqual(@as(usize, 0), stopped_pids.len);
-    try std.testing.expectError(error.ProcessNotFound, backend.kill(handle, 15));
-    try backend.killAll(handle, 15);
-    try backend.delete(handle);
+    try std.testing.expectError(error.ProcessNotFound, handle_container.kill(15));
+    try handle_container.killAll(15);
+    try handle_container.delete();
 }
 
 test "linux liveness rejects an unreaped zombie even though kill zero succeeds" {
@@ -127,63 +134,58 @@ test "linux liveness rejects an unreaped zombie even though kill zero succeeds" 
         }
     }
     try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.kill(pid, @enumFromInt(0))));
-    var implementation: LinuxBackend = .{};
-    const backend = implementation.backend();
     var buffer: [4096]u8 = undefined;
     const stat = try readProcStat(pid, &buffer);
-    const handle: Backend.Handle = .{ .id = "zombie", .pid = pid, .starttime = stat.starttime };
-    try std.testing.expect(!try backend.alive(handle));
-    try std.testing.expectError(error.ProcessNotFound, backend.kill(handle, 15));
+    const handle: libcontainer.State = .{ .id = "zombie", .pid = pid, .starttime = stat.starttime };
+    var handle_instance = LinuxContainer.load(handle);
+    const handle_container = handle_instance.container();
+    try std.testing.expect(!try handle_container.alive());
+    try std.testing.expectError(error.ProcessNotFound, handle_container.kill(15));
 }
 
 test "linux create rejects hostname without UTS isolation and terminals without a console" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
-    var implementation: LinuxBackend = .{};
-    const backend = implementation.backend();
-    var options: Backend.CreateOptions = .{
+    var options: libcontainer.CreateOptions = .{
         .allocator = std.testing.allocator,
         .id = "example",
         .rootfs = "/",
         .exec_fifo = "/dev/null",
         .hostname = "must-not-change-the-host",
     };
-    try std.testing.expectError(error.InvalidConfig, backend.create(options));
+    try expectCreateError(error.InvalidConfig, options);
     options.hostname = null;
     options.process = .{ .args = &.{"/bin/sh"}, .cwd = "/", .terminal = true, .uid = 0, .gid = 0 };
-    try std.testing.expectError(error.InvalidConfig, backend.create(options));
+    try expectCreateError(error.InvalidConfig, options);
 }
 
 test "linux create rejects propagation without mount isolation before acquiring resources" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
-    var implementation: LinuxBackend = .{};
-    try std.testing.expectError(error.InvalidConfig, implementation.backend().create(.{
+    try expectCreateError(error.InvalidConfig, .{
         .allocator = std.testing.allocator,
         .id = "example",
         .rootfs = "/",
         .exec_fifo = "/dev/null",
         .rootfs_propagation = linux.MS.PRIVATE | linux.MS.REC,
-    }));
+    });
 }
 
 test "linux inherited mount namespace rejects the runtime root before any mount" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
-    var implementation: LinuxBackend = .{};
     for ([_][]const u8{ "/", "/./", "/proc/self/root" }) |rootfs| {
-        try std.testing.expectError(error.InvalidConfig, implementation.backend().create(.{
+        try expectCreateError(error.InvalidConfig, .{
             .allocator = std.testing.allocator,
             .id = "example",
             .rootfs = rootfs,
             .exec_fifo = "/dev/null",
             // An invalid cgroup path prevents mount setup if this guard regresses.
             .cgroup_path = "",
-        }));
+        });
     }
 }
 
 test "linux create rejects joining the runtime's own mount namespace" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
-    var implementation: LinuxBackend = .{};
-    try std.testing.expectError(error.InvalidConfig, implementation.backend().create(.{
+    try expectCreateError(error.InvalidConfig, .{
         .allocator = std.testing.allocator,
         .id = "example",
         .rootfs = "/",
@@ -191,7 +193,7 @@ test "linux create rejects joining the runtime's own mount namespace" {
         .namespaces = &.{.{ .kind = .mount, .path = "/proc/self/ns/mnt" }},
         // An invalid cgroup path prevents mount setup if the guard regresses.
         .cgroup_path = "",
-    }));
+    });
 }
 
 test "linux create rejects relative process cwd" {
@@ -204,19 +206,18 @@ test "linux create rejects relative process cwd" {
     defer std.testing.allocator.free(rootfs);
     // These paths exist under rootfs, so existence alone cannot validate cwd.
     for ([_][]const u8{ "rootfs", ".", "" }) |cwd| {
-        var implementation: LinuxBackend = .{};
-        const backend = implementation.backend();
-        const result = backend.create(.{
+        var result = LinuxContainer.create(.{
             .allocator = std.testing.allocator,
             .id = "example",
             .rootfs = rootfs,
             .exec_fifo = "/dev/null",
             .process = .{ .args = &.{"/bin/sh"}, .cwd = cwd, .uid = 0, .gid = 0 },
         });
-        if (result) |handle| {
-            defer std.testing.allocator.free(handle.starttime);
+        if (result) |*instance| {
+            defer instance.deinit(std.testing.allocator);
+            const container = instance.container();
             // Clean up if a regression incorrectly creates an init.
-            backend.kill(handle, 9) catch {};
+            container.kill(9) catch {};
         } else |_| {}
         try std.testing.expectError(
             if (builtin.os.tag == .linux) error.InvalidProcess else error.NotImplemented,
@@ -226,13 +227,11 @@ test "linux create rejects relative process cwd" {
 }
 
 test "linux create rejects empty process args" {
-    var implementation: LinuxBackend = .{};
-    const backend = implementation.backend();
     const cgroup_path = try std.fmt.allocPrint(std.testing.allocator, "igvano/example-{d}", .{
         if (comptime builtin.os.tag == .linux) linux.getpid() else 0,
     });
     defer std.testing.allocator.free(cgroup_path);
-    const result = backend.create(.{
+    var result = LinuxContainer.create(.{
         .allocator = std.testing.allocator,
         .id = "example",
         .rootfs = "/",
@@ -240,9 +239,10 @@ test "linux create rejects empty process args" {
         .process = .{ .args = &.{}, .cwd = "/", .uid = 0, .gid = 0 },
         .cgroup_path = cgroup_path,
     });
-    if (result) |handle| {
-        defer std.testing.allocator.free(handle.starttime);
-        backend.kill(handle, 9) catch {};
+    if (result) |*instance| {
+        defer instance.deinit(std.testing.allocator);
+        const container = instance.container();
+        container.kill(9) catch {};
     } else |_| {}
     try std.testing.expectError(
         if (builtin.os.tag == .linux) error.InvalidProcess else error.NotImplemented,
@@ -267,13 +267,11 @@ test "linux create rejects a cwd missing from the resolved rootfs" {
     const rootfs = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, base, std.testing.allocator);
     defer std.testing.allocator.free(rootfs);
     // /proc exists on the Linux host, but not inside this empty rootfs.
-    var implementation: LinuxBackend = .{};
-    const backend = implementation.backend();
     const cgroup_path = try std.fmt.allocPrint(std.testing.allocator, "igvano/example-{d}", .{
         if (comptime builtin.os.tag == .linux) linux.getpid() else 0,
     });
     defer std.testing.allocator.free(cgroup_path);
-    const result = backend.create(.{
+    var result = LinuxContainer.create(.{
         .allocator = std.testing.allocator,
         .id = "example",
         .rootfs = rootfs,
@@ -282,10 +280,11 @@ test "linux create rejects a cwd missing from the resolved rootfs" {
         .process = .{ .args = &.{ "/bin/sleep", "1000" }, .cwd = "/proc", .uid = 0, .gid = 0 },
         .cgroup_path = cgroup_path,
     });
-    if (result) |handle| {
-        defer std.testing.allocator.free(handle.starttime);
+    if (result) |*instance| {
+        defer instance.deinit(std.testing.allocator);
+        const container = instance.container();
         // Clean up if a regression incorrectly creates an init.
-        backend.kill(handle, 9) catch {};
+        container.kill(9) catch {};
     } else |_| {}
     try std.testing.expectError(
         if (builtin.os.tag == .linux) error.CreateFailed else error.NotImplemented,
@@ -295,14 +294,13 @@ test "linux create rejects a cwd missing from the resolved rootfs" {
 
 test "linux create reports the frontend ambient capability validation error" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
-    var implementation: LinuxBackend = .{};
-    try std.testing.expectError(error.AmbientCapabilitiesRequirePermittedAndInheritable, implementation.backend().create(.{
+    try expectCreateError(error.AmbientCapabilitiesRequirePermittedAndInheritable, .{
         .allocator = std.testing.allocator,
         .id = "example",
         .rootfs = "/",
         .exec_fifo = "/dev/null",
         .capabilities = .{ .ambient = 1 },
-    }));
+    });
 }
 
 test "linux init reopens its root-owned pinned FIFO only for writing after dropping uid" {
@@ -390,8 +388,7 @@ test "linux create reports child setup failures without leaving an init" {
     const fifo_z = try std.testing.allocator.dupeZ(u8, fifo);
     defer std.testing.allocator.free(fifo_z);
     try checkResult(linux.mknod(fifo_z, linux.S.IFIFO | 0o600, 0));
-    var implementation: LinuxBackend = .{};
-    var options: Backend.CreateOptions = .{
+    var options: libcontainer.CreateOptions = .{
         .allocator = std.testing.allocator,
         .id = "example",
         .rootfs = "/",
@@ -400,17 +397,17 @@ test "linux create reports child setup failures without leaving an init" {
         .process = .{ .args = &.{"/bin/sh"}, .cwd = missing_cwd, .uid = 0, .gid = 0 },
         .cgroup_path = cgroup_path,
     };
-    try std.testing.expectError(error.CreateFailed, implementation.backend().create(options));
+    try expectCreateError(error.CreateFailed, options);
     try std.testing.expectEqual(@as(?posix.fd_t, null), try walkCgroup(cgroup_root.fd, cgroup_path, false, &.{}));
     options.process.?.cwd = "/";
     // Linux rejects NOFILE above fs.nr_open even with CAP_SYS_RESOURCE.
     options.rlimits = &.{.{ .resource = .NOFILE, .hard = std.math.maxInt(u64), .soft = 0 }};
-    try std.testing.expectError(error.CreateFailed, implementation.backend().create(options));
+    try expectCreateError(error.CreateFailed, options);
     try std.testing.expectEqual(@as(?posix.fd_t, null), try walkCgroup(cgroup_root.fd, cgroup_path, false, &.{}));
     options.rlimits = &.{};
     for ([_]i32{ 1001, -1001 }) |value| {
         options.oom_score_adj = value;
-        try std.testing.expectError(error.CreateFailed, implementation.backend().create(options));
+        try expectCreateError(error.CreateFailed, options);
         try std.testing.expectEqual(@as(?posix.fd_t, null), try walkCgroup(cgroup_root.fd, cgroup_path, false, &.{}));
     }
     options.oom_score_adj = null;
@@ -425,10 +422,10 @@ test "linux create reports child setup failures without leaving an init" {
     });
     for ([_][]const u8{ "igvano-no-such-binary", "/igvano-no-such-binary", "/", "/no-execute" }) |arg0| {
         options.process.?.args = &.{arg0};
-        try std.testing.expectError(error.ExecFailed, implementation.backend().create(options));
+        try expectCreateError(error.ExecFailed, options);
         const expected = try std.fmt.allocPrint(std.testing.allocator, "exec: \"{s}\": executable file not found in $PATH", .{arg0});
         defer std.testing.allocator.free(expected);
-        try std.testing.expectEqualStrings(expected, implementation.backend().diagnostic().?);
+        try std.testing.expectEqualStrings(expected, libcontainer.linux.diagnostic().?);
         try std.testing.expectEqual(@as(?posix.fd_t, null), try walkCgroup(cgroup_root.fd, cgroup_path, false, &.{}));
     }
 }
@@ -453,11 +450,11 @@ test "linux create retains the init child's rootfs diagnostic" {
     const fifo = try std.fmt.allocPrintSentinel(allocator, "{s}/exec.fifo", .{absolute}, 0);
     defer allocator.free(fifo);
     try checkResult(linux.mknod(fifo, linux.S.IFIFO | 0o600, 0));
-    var implementation: LinuxBackend = .{};
-    const backend = implementation.backend();
     defer diagnostics.last_diagnostic_len = 0;
-    defer backend.delete(.{ .id = "diagnostic", .pid = 0, .starttime = "", .cgroup_path = cgroup_path }) catch {};
-    var options: Backend.CreateOptions = .{
+    var cleanup_instance = LinuxContainer.load(.{ .id = "diagnostic", .pid = 0, .starttime = "", .cgroup_path = cgroup_path });
+    const cleanup_container = cleanup_instance.container();
+    defer cleanup_container.delete() catch {};
+    var options: libcontainer.CreateOptions = .{
         .allocator = allocator,
         .id = "diagnostic",
         .rootfs = rootfs,
@@ -473,17 +470,17 @@ test "linux create retains the init child's rootfs diagnostic" {
             .data = "",
         }},
     };
-    try std.testing.expectError(error.CreateFailed, backend.create(options));
+    try expectCreateError(error.CreateFailed, options);
     try std.testing.expectEqualStrings(
         "cannot prepare rootfs: mount /proc (igvano-missing-filesystem): CreateFailed",
-        backend.diagnostic().?,
+        libcontainer.linux.diagnostic().?,
     );
     // Hooks run after the first ready response; failure must survive cleanup
     // after the runtime has already received the init's PID.
     options.mounts = &.{};
     options.create_hooks = &.{.{ .path = "/igvano-missing-create-hook" }};
-    try std.testing.expectError(error.HookFailed, backend.create(options));
-    try std.testing.expectEqualStrings("error running hook #0: exit status 1, stdout: , stderr: ", backend.diagnostic().?);
+    try expectCreateError(error.HookFailed, options);
+    try std.testing.expectEqualStrings("error running hook #0: exit status 1, stdout: , stderr: ", libcontainer.linux.diagnostic().?);
 }
 
 test "linux create accepts a prepared executable or process-less rootfs and returns a live blocked init" {
@@ -529,7 +526,7 @@ test "linux create accepts a prepared executable or process-less rootfs and retu
         pid: i32 = 0,
         fail: bool = false,
 
-        fn run(ptr: *anyopaque, handle: Backend.Handle) Backend.Error!void {
+        fn run(ptr: *anyopaque, handle: libcontainer.State) libcontainer.Error!void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.pid = handle.pid;
             if (linux.errno(linux.access(self.child_marker, linux.F_OK)) != .NOENT)
@@ -539,15 +536,13 @@ test "linux create accepts a prepared executable or process-less rootfs and retu
             defer closeFd(fd);
         }
     };
-    const processes = [_]?Backend.Process{
+    const processes = [_]?libcontainer.Process{
         .{ .args = &.{"/init"}, .cwd = "/", .uid = 0, .gid = 0 },
         null,
     };
     for (processes) |process| {
-        var implementation: LinuxBackend = .{};
-        const backend = implementation.backend();
         var callback: Callback = .{ .parent_marker = parent_marker, .child_marker = child_marker, .fail = true };
-        const options: Backend.CreateOptions = .{
+        const options: libcontainer.CreateOptions = .{
             .allocator = std.testing.allocator,
             .id = "example",
             .rootfs = rootfs,
@@ -570,16 +565,18 @@ test "linux create accepts a prepared executable or process-less rootfs and retu
                 .timeout_seconds = 2,
             }},
         };
-        try std.testing.expectError(error.HookFailed, backend.create(options));
+        try expectCreateError(error.HookFailed, options);
         try std.testing.expectEqual(linux.E.SRCH, linux.errno(linux.kill(callback.pid, @enumFromInt(0))));
         try std.testing.expectEqual(@as(?posix.fd_t, null), try walkCgroup(cgroup_root.fd, cgroup_path, false, &.{}));
         try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, "child-hook", .{}));
         callback.fail = false;
-        const handle = try backend.create(options);
-        defer std.testing.allocator.free(handle.starttime);
+        var handle_instance = try LinuxContainer.create(options);
+        defer handle_instance.deinit(options.allocator);
+        const handle = handle_instance.state;
+        const handle_container = handle_instance.container();
         defer {
-            backend.kill(handle, 9) catch {};
-            backend.delete(handle) catch {};
+            handle_container.kill(9) catch {};
+            handle_container.delete() catch {};
         }
         try std.testing.expect(handle.pid > 0);
         try std.testing.expectEqual(handle.pid, callback.pid);
@@ -590,7 +587,7 @@ test "linux create accepts a prepared executable or process-less rootfs and retu
         try tmp.dir.deleteFile(std.testing.io, "child-hook");
         try std.testing.expectEqualStrings("example", handle.id);
         try std.testing.expect(handle.starttime.len != 0);
-        try std.testing.expect(try backend.alive(handle));
+        try std.testing.expect(try handle_container.alive());
         const null_device = try tmp.dir.statFile(std.testing.io, "rootfs/dev/null", .{});
         try std.testing.expectEqual(std.Io.File.Kind.character_device, null_device.kind);
         try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.kill(handle.pid, @enumFromInt(0))));
@@ -614,8 +611,8 @@ test "linux create accepts a prepared executable or process-less rootfs and retu
             }
             try std.testing.expectEqual(@as(u32, 0), try waitChild(checker));
         }
-        try backend.kill(handle, 9);
-        try backend.delete(handle);
-        try backend.delete(handle);
+        try handle_container.kill(9);
+        try handle_container.delete();
+        try handle_container.delete();
     }
 }

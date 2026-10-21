@@ -2,8 +2,8 @@ const std = @import("std");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 const posix = std.posix;
-const Backend = @import("../root.zig").Backend;
-const Resources = Backend.Resources;
+const libcontainer = @import("../root.zig");
+const Resources = libcontainer.Resources;
 const DeviceEmulator = @import("../devices.zig").Emulator;
 const diagnostics = @import("diagnostic.zig");
 const v2DeviceRules = @import("devices.zig").v2DeviceRules;
@@ -45,7 +45,7 @@ pub const V1Write = struct {
 };
 
 /// Controller and fallback names are static; the caller owns name and value.
-fn appendV1Write(allocator: std.mem.Allocator, writes: *std.ArrayList(V1Write), controller: []const u8, name: []const u8, value: []u8, fallback: ?[]const u8, optional: bool) Backend.Error!void {
+fn appendV1Write(allocator: std.mem.Allocator, writes: *std.ArrayList(V1Write), controller: []const u8, name: []const u8, value: []u8, fallback: ?[]const u8, optional: bool) libcontainer.Error!void {
     errdefer allocator.free(value);
     const owned_name = try allocator.dupe(u8, name);
     errdefer allocator.free(owned_name);
@@ -60,14 +60,14 @@ pub fn freeV1Writes(allocator: std.mem.Allocator, writes: []const V1Write) void 
     allocator.free(writes);
 }
 
-fn v1Limit(allocator: std.mem.Allocator, limit: i64) Backend.Error![]u8 {
+fn v1Limit(allocator: std.mem.Allocator, limit: i64) libcontainer.Error![]u8 {
     if (limit < -1) return error.InvalidConfig;
     return std.fmt.allocPrint(allocator, "{d}", .{limit});
 }
 
 /// Pure legacy resource mapping; devices use the emulator's transition separately.
 /// Memory/memsw order is finalized by the writer after reading the current limit.
-pub fn v1Writes(allocator: std.mem.Allocator, resources: Resources) Backend.Error![]V1Write {
+pub fn v1Writes(allocator: std.mem.Allocator, resources: Resources) libcontainer.Error![]V1Write {
     if (resources.unified.len != 0) return error.InvalidConfig;
     var policy = try deviceEmulator(allocator, resources.devices);
     defer policy.deinit(allocator);
@@ -86,7 +86,7 @@ pub fn v1Writes(allocator: std.mem.Allocator, resources: Resources) Backend.Erro
     return writes.toOwnedSlice(allocator);
 }
 
-fn appendV1MemoryWrites(allocator: std.mem.Allocator, writes: *std.ArrayList(V1Write), memory: Resources.Memory) Backend.Error!void {
+fn appendV1MemoryWrites(allocator: std.mem.Allocator, writes: *std.ArrayList(V1Write), memory: Resources.Memory) libcontainer.Error!void {
     inline for (.{
         .{ "limit", "memory.limit_in_bytes" },
         .{ "reservation", "memory.soft_limit_in_bytes" },
@@ -109,7 +109,7 @@ fn appendV1MemoryWrites(allocator: std.mem.Allocator, writes: *std.ArrayList(V1W
         (memory.limit.? == -1 or memory.swap.? < memory.limit.?)) return error.InvalidConfig;
 }
 
-fn appendV1CpuWrites(allocator: std.mem.Allocator, writes: *std.ArrayList(V1Write), cpu: Resources.Cpu) Backend.Error!void {
+fn appendV1CpuWrites(allocator: std.mem.Allocator, writes: *std.ArrayList(V1Write), cpu: Resources.Cpu) libcontainer.Error!void {
     if (cpu.shares) |value| {
         _ = try cpuWeight(value);
         if (value != 0)
@@ -133,14 +133,14 @@ fn appendV1CpuWrites(allocator: std.mem.Allocator, writes: *std.ArrayList(V1Writ
         try appendV1Write(allocator, writes, "cpuset", "cpuset.mems", try allocator.dupe(u8, value), null, false);
 }
 
-fn appendV1PidsWrites(allocator: std.mem.Allocator, writes: *std.ArrayList(V1Write), pids: Resources.Pids) Backend.Error!void {
+fn appendV1PidsWrites(allocator: std.mem.Allocator, writes: *std.ArrayList(V1Write), pids: Resources.Pids) libcontainer.Error!void {
     if (pids.limit) |value| {
         if (value != 0)
             try appendV1Write(allocator, writes, "pids", "pids.max", try cgroupLimit(allocator, value), null, false);
     }
 }
 
-fn appendV1BlockIOWrites(allocator: std.mem.Allocator, writes: *std.ArrayList(V1Write), block: Resources.BlockIO) Backend.Error!void {
+fn appendV1BlockIOWrites(allocator: std.mem.Allocator, writes: *std.ArrayList(V1Write), block: Resources.BlockIO) libcontainer.Error!void {
     inline for (.{ .{ "weight", "blkio.weight", @as(?[]const u8, "blkio.bfq.weight"), false }, .{ "leaf_weight", "blkio.leaf_weight", @as(?[]const u8, null), true } }) |field| {
         if (@field(block, field[0])) |value| {
             _ = try ioWeight(value);
@@ -162,7 +162,7 @@ fn appendV1BlockIOWrites(allocator: std.mem.Allocator, writes: *std.ArrayList(V1
     }
 }
 
-fn appendV1DeviceWeightWrites(allocator: std.mem.Allocator, writes: *std.ArrayList(V1Write), device: Resources.WeightDevice) Backend.Error!void {
+fn appendV1DeviceWeightWrites(allocator: std.mem.Allocator, writes: *std.ArrayList(V1Write), device: Resources.WeightDevice) libcontainer.Error!void {
     if (device.major < 0 or device.minor < 0) return error.InvalidConfig;
     inline for (.{ .{ "weight", "blkio.weight_device", @as(?[]const u8, "blkio.bfq.weight_device"), false }, .{ "leaf_weight", "blkio.leaf_weight_device", @as(?[]const u8, null), true } }) |field| {
         if (@field(device, field[0])) |value| {
@@ -173,7 +173,7 @@ fn appendV1DeviceWeightWrites(allocator: std.mem.Allocator, writes: *std.ArrayLi
     }
 }
 
-fn appendV1HugepageWrites(allocator: std.mem.Allocator, writes: *std.ArrayList(V1Write), pages: []const Resources.HugepageLimit) Backend.Error!void {
+fn appendV1HugepageWrites(allocator: std.mem.Allocator, writes: *std.ArrayList(V1Write), pages: []const Resources.HugepageLimit) libcontainer.Error!void {
     for (pages) |page| {
         if (page.page_size.len == 0 or std.mem.indexOfAny(u8, page.page_size, "/\x00") != null) return error.InvalidConfig;
         const name = try std.fmt.allocPrint(allocator, "hugetlb.{s}.limit_in_bytes", .{page.page_size});
@@ -182,7 +182,7 @@ fn appendV1HugepageWrites(allocator: std.mem.Allocator, writes: *std.ArrayList(V
     }
 }
 
-fn appendV1NetworkWrites(allocator: std.mem.Allocator, writes: *std.ArrayList(V1Write), network: Resources.Network) Backend.Error!void {
+fn appendV1NetworkWrites(allocator: std.mem.Allocator, writes: *std.ArrayList(V1Write), network: Resources.Network) libcontainer.Error!void {
     if (network.class_id) |value|
         try appendV1Write(allocator, writes, "net_cls", "net_cls.classid", try std.fmt.allocPrint(allocator, "{d}", .{value}), null, false);
     for (network.priorities) |priority| {
@@ -191,7 +191,7 @@ fn appendV1NetworkWrites(allocator: std.mem.Allocator, writes: *std.ArrayList(V1
     }
 }
 
-fn appendV1DeviceRule(allocator: std.mem.Allocator, writes: *std.ArrayList(V1Write), rule: Resources.DeviceRule) Backend.Error!void {
+fn appendV1DeviceRule(allocator: std.mem.Allocator, writes: *std.ArrayList(V1Write), rule: Resources.DeviceRule) libcontainer.Error!void {
     if (rule.access.len == 0) return error.InvalidConfig;
     for (rule.access) |access| {
         if (std.mem.indexOfScalar(u8, "rwm", access) == null) return error.InvalidConfig;
@@ -208,7 +208,7 @@ fn appendV1DeviceRule(allocator: std.mem.Allocator, writes: *std.ArrayList(V1Wri
     try appendV1Write(allocator, writes, "devices", if (rule.allow) "devices.allow" else "devices.deny", try std.fmt.allocPrint(allocator, "{c} {s}:{s} {s}", .{ kind, major, minor, rule.access }), null, false);
 }
 
-pub fn v1DeviceNumber(buffer: []u8, value: i64) Backend.Error![]const u8 {
+pub fn v1DeviceNumber(buffer: []u8, value: i64) libcontainer.Error![]const u8 {
     if (value == -1) return "*";
     if (value < 0) return error.InvalidConfig;
     return std.fmt.bufPrint(buffer, "{d}", .{value}) catch return error.InvalidConfig;
@@ -292,11 +292,11 @@ fn freeV1Hierarchy(allocator: std.mem.Allocator, hierarchy: V1Hierarchy) void {
 }
 
 /// The fs driver ignores named hierarchies; systemd also owns name=systemd.
-pub fn v1Hierarchies(allocator: std.mem.Allocator, text: []const u8) Backend.Error![]V1Hierarchy {
+pub fn v1Hierarchies(allocator: std.mem.Allocator, text: []const u8) libcontainer.Error![]V1Hierarchy {
     return v1HierarchiesForDriver(allocator, text, false);
 }
 
-fn v1HierarchiesForDriver(allocator: std.mem.Allocator, text: []const u8, systemd: bool) Backend.Error![]V1Hierarchy {
+fn v1HierarchiesForDriver(allocator: std.mem.Allocator, text: []const u8, systemd: bool) libcontainer.Error![]V1Hierarchy {
     var result: std.ArrayList(V1Hierarchy) = .empty;
     defer result.deinit(allocator);
     errdefer for (result.items) |hierarchy| freeV1Hierarchy(allocator, hierarchy);
@@ -314,7 +314,7 @@ fn v1HierarchiesForDriver(allocator: std.mem.Allocator, text: []const u8, system
     return result.toOwnedSlice(allocator);
 }
 
-fn parseV1Hierarchy(allocator: std.mem.Allocator, line: []const u8, systemd: bool) Backend.Error!?V1Hierarchy {
+fn parseV1Hierarchy(allocator: std.mem.Allocator, line: []const u8, systemd: bool) libcontainer.Error!?V1Hierarchy {
     const separator = std.mem.indexOf(u8, line, " - ") orelse return error.CreateFailed;
     var fields = std.mem.tokenizeScalar(u8, line[separator + 3 ..], ' ');
     if (!std.mem.eql(u8, fields.next() orelse return error.CreateFailed, "cgroup")) return null;
@@ -568,7 +568,7 @@ test "v1 mapping and hierarchy discovery release partial allocations" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, AllocationTest.run, .{});
 }
 
-pub fn openV1Hierarchies(allocator: std.mem.Allocator, systemd: bool) Backend.Error![]V1Hierarchy {
+pub fn openV1Hierarchies(allocator: std.mem.Allocator, systemd: bool) libcontainer.Error![]V1Hierarchy {
     const text = try readMountinfo(allocator);
     defer allocator.free(text);
     const hierarchies = try v1HierarchiesForDriver(allocator, text, systemd);
@@ -587,7 +587,7 @@ pub fn openV1Hierarchies(allocator: std.mem.Allocator, systemd: bool) Backend.Er
     return hierarchies;
 }
 
-fn seedV1Cpuset(allocator: std.mem.Allocator, parent: posix.fd_t, child: posix.fd_t, path: []const u8) Backend.Error!void {
+fn seedV1Cpuset(allocator: std.mem.Allocator, parent: posix.fd_t, child: posix.fd_t, path: []const u8) libcontainer.Error!void {
     for ([_][:0]const u8{ "cpuset.cpus", "cpuset.mems" }) |name| {
         const existing = try readCgroupFile(allocator, child, name);
         defer allocator.free(existing);
@@ -599,7 +599,7 @@ fn seedV1Cpuset(allocator: std.mem.Allocator, parent: posix.fd_t, child: posix.f
 }
 
 /// Seed each newly created cpuset directory before descending into its child.
-pub fn walkV1Cgroup(allocator: std.mem.Allocator, root: posix.fd_t, mount_root: []const u8, path: []const u8, create: bool, cpuset: bool) Backend.Error!?posix.fd_t {
+pub fn walkV1Cgroup(allocator: std.mem.Allocator, root: posix.fd_t, mount_root: []const u8, path: []const u8, create: bool, cpuset: bool) libcontainer.Error!?posix.fd_t {
     try validateCgroupPath(path);
     var current = try openPath(root, ".", .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true });
     errdefer closeFd(current);
@@ -650,7 +650,7 @@ fn tryV1Write(dir: posix.fd_t, filename: []const u8, value: []const u8) linux.E 
     }
 }
 
-pub fn writeV1Resource(dir: posix.fd_t, write: V1Write, path: []const u8, kmem_warned: *bool) Backend.Error!void {
+pub fn writeV1Resource(dir: posix.fd_t, write: V1Write, path: []const u8, kmem_warned: *bool) libcontainer.Error!void {
     var name = write.name;
     var err = tryV1Write(dir, name, write.value);
     if (err == .NOENT) {
@@ -673,7 +673,7 @@ pub fn writeV1Resource(dir: posix.fd_t, write: V1Write, path: []const u8, kmem_w
     return error.CgroupWriteFailed;
 }
 
-fn requiredV1Controller(controller: []const u8, resources: Resources, devices: []const Backend.Device) bool {
+fn requiredV1Controller(controller: []const u8, resources: Resources, devices: []const libcontainer.Device) bool {
     if (std.mem.eql(u8, controller, "memory") or std.mem.eql(u8, controller, "pids")) return true;
     if (std.mem.eql(u8, controller, "devices")) {
         if (resources.devices.len != 0) return true;
@@ -685,7 +685,7 @@ fn requiredV1Controller(controller: []const u8, resources: Resources, devices: [
 }
 
 // Null devices selects update: leave an omitted ruleset alone.
-pub fn applyV1Writes(allocator: std.mem.Allocator, hierarchies: []const V1Hierarchy, writes: []const V1Write, resources: Resources, devices: ?[]const Backend.Device, path: []const u8, create: bool) Backend.Error!void {
+pub fn applyV1Writes(allocator: std.mem.Allocator, hierarchies: []const V1Hierarchy, writes: []const V1Write, resources: Resources, devices: ?[]const libcontainer.Device, path: []const u8, create: bool) libcontainer.Error!void {
     const has_devices = devices != null or resources.devices.len != 0;
     const nodes = devices orelse &.{};
     const configured = if (has_devices) try v2DeviceRules(allocator, resources.devices, nodes) else &.{};
@@ -702,7 +702,7 @@ pub fn applyV1Writes(allocator: std.mem.Allocator, hierarchies: []const V1Hierar
     }
 }
 
-fn checkV1DeviceController(hierarchies: []const V1Hierarchy, resources: Resources, nodes: []const Backend.Device) Backend.Error!void {
+fn checkV1DeviceController(hierarchies: []const V1Hierarchy, resources: Resources, nodes: []const libcontainer.Device) libcontainer.Error!void {
     if (hasV1Controller(hierarchies, "devices")) return;
     if (requiredV1Controller("devices", resources, nodes)) {
         reportDiagnostic("cgroup v1 controller devices is required but not mounted", .{});
@@ -711,7 +711,7 @@ fn checkV1DeviceController(hierarchies: []const V1Hierarchy, resources: Resource
     std.debug.print("igvano: warning: cgroup v1 controller devices is not mounted; ignoring\n", .{});
 }
 
-fn checkV1WriteControllers(hierarchies: []const V1Hierarchy, writes: []const V1Write, resources: Resources, nodes: []const Backend.Device) Backend.Error!void {
+fn checkV1WriteControllers(hierarchies: []const V1Hierarchy, writes: []const V1Write, resources: Resources, nodes: []const libcontainer.Device) libcontainer.Error!void {
     // Warn once per missing controller, including controllers with many writes.
     for (writes, 0..) |write, index| {
         if (hasV1Controller(hierarchies, write.controller)) continue;
@@ -736,7 +736,7 @@ const V1MemoryWriteOrder = struct {
     swap_first: ?usize = null,
 };
 
-fn v1MemoryWriteOrder(allocator: std.mem.Allocator, hierarchy: V1Hierarchy, writes: []const V1Write, resources: Resources) Backend.Error!V1MemoryWriteOrder {
+fn v1MemoryWriteOrder(allocator: std.mem.Allocator, hierarchy: V1Hierarchy, writes: []const V1Write, resources: Resources) libcontainer.Error!V1MemoryWriteOrder {
     if (!hierarchy.has("memory")) return .{};
     var swap_first: ?usize = null;
     var limit_write: ?usize = null;
@@ -754,7 +754,7 @@ fn v1MemoryWriteOrder(allocator: std.mem.Allocator, hierarchy: V1Hierarchy, writ
     return .{ .limit = limit_write, .swap_first = swap_first };
 }
 
-fn applyV1HierarchyWrites(allocator: std.mem.Allocator, hierarchy: V1Hierarchy, writes: []const V1Write, resources: Resources, path: []const u8, kmem_warned: *bool) Backend.Error!void {
+fn applyV1HierarchyWrites(allocator: std.mem.Allocator, hierarchy: V1Hierarchy, writes: []const V1Write, resources: Resources, path: []const u8, kmem_warned: *bool) libcontainer.Error!void {
     const order = try v1MemoryWriteOrder(allocator, hierarchy, writes, resources);
     for (writes, 0..) |write, index| {
         if (!hierarchy.has(write.controller)) continue;
@@ -766,7 +766,7 @@ fn applyV1HierarchyWrites(allocator: std.mem.Allocator, hierarchy: V1Hierarchy, 
     }
 }
 
-fn applyV1DeviceWrites(allocator: std.mem.Allocator, dir: posix.fd_t, target: DeviceEmulator, path: []const u8, create: bool, kmem_warned: *bool) Backend.Error!void {
+fn applyV1DeviceWrites(allocator: std.mem.Allocator, dir: posix.fd_t, target: DeviceEmulator, path: []const u8, create: bool, kmem_warned: *bool) libcontainer.Error!void {
     const list = try readCgroupFile(allocator, dir, "devices.list");
     defer allocator.free(list);
     var current = try deviceEmulatorFromList(allocator, list);
@@ -803,7 +803,7 @@ fn applyV1DeviceWrites(allocator: std.mem.Allocator, dir: posix.fd_t, target: De
     }
 }
 
-pub fn killV1Members(dir: posix.fd_t, freezer: ?posix.fd_t, signal: i32, mount_root: []const u8, path: []const u8, controller: ?[]const u8) Backend.Error!void {
+pub fn killV1Members(dir: posix.fd_t, freezer: ?posix.fd_t, signal: i32, mount_root: []const u8, path: []const u8, controller: ?[]const u8) libcontainer.Error!void {
     const allocator = std.heap.page_allocator;
     if (signal < 0 or signal >= linux.NSIG) return error.KillFailed;
     const was_frozen = if (freezer) |fd| try cgroupFrozen(fd, .legacy) else false;
@@ -831,12 +831,12 @@ fn thawV1Quietly(fd: posix.fd_t, path: []const u8) void {
     diagnostics.last_diagnostic_len = saved_len;
 }
 
-fn freezeV1Members(fd: posix.fd_t, path: []const u8) Backend.Error!void {
+fn freezeV1Members(fd: posix.fd_t, path: []const u8) libcontainer.Error!void {
     try writeCgroupFile(fd, "freezer.state", "FROZEN", path);
     if (!try waitFrozen(fd, .legacy, true, 50)) thawV1Quietly(fd, path);
 }
 
-fn signalV1Member(pid: i32, signal: i32, mount_root: []const u8, path: []const u8, controller: ?[]const u8) Backend.Error!bool {
+fn signalV1Member(pid: i32, signal: i32, mount_root: []const u8, path: []const u8, controller: ?[]const u8) libcontainer.Error!bool {
     const pidfd = openPidfd(pid) catch |err| switch (err) {
         error.ProcessNotFound => return false,
         else => return err,
@@ -855,7 +855,7 @@ fn signalV1Member(pid: i32, signal: i32, mount_root: []const u8, path: []const u
     return true;
 }
 
-fn verifyV1MembersEmpty(allocator: std.mem.Allocator, dir: posix.fd_t, members: *std.ArrayList(i32), mount_root: []const u8, path: []const u8, controller: ?[]const u8) Backend.Error!void {
+fn verifyV1MembersEmpty(allocator: std.mem.Allocator, dir: posix.fd_t, members: *std.ArrayList(i32), mount_root: []const u8, path: []const u8, controller: ?[]const u8) libcontainer.Error!void {
     // Members may have exited or moved after enumeration. Verify that the
     // subtree is still populated before reporting an unverifiable policy.
     // V1 cannot detect members hidden by our PID namespace; only v2's
@@ -872,9 +872,9 @@ fn verifyV1MembersEmpty(allocator: std.mem.Allocator, dir: posix.fd_t, members: 
     }
 }
 
-pub fn removeV1Cgroups(hierarchies: []const V1Hierarchy, path: []const u8) Backend.Error!void {
+pub fn removeV1Cgroups(hierarchies: []const V1Hierarchy, path: []const u8) libcontainer.Error!void {
     var freezer: ?posix.fd_t = null;
-    var failure: ?Backend.Error = null;
+    var failure: ?libcontainer.Error = null;
     for (hierarchies) |hierarchy| {
         if (hierarchy.has("freezer")) freezer = hierarchy.leaf;
     }
@@ -890,13 +890,13 @@ pub fn removeV1Cgroups(hierarchies: []const V1Hierarchy, path: []const u8) Backe
     if (failure) |err| return err;
 }
 
-fn removeV1Hierarchy(hierarchy: V1Hierarchy, path: []const u8, freezer: ?posix.fd_t) Backend.Error!void {
+fn removeV1Hierarchy(hierarchy: V1Hierarchy, path: []const u8, freezer: ?posix.fd_t) libcontainer.Error!void {
     const fd = hierarchy.leaf orelse return;
     try removeV1Cgroup(hierarchy.root.?, hierarchy.mount_root, path, fd, freezer, hierarchy.controllers[0]);
 }
 
 /// Only remove our leaf, checking identity against the pinned fd on every retry.
-pub fn removeV1Cgroup(root: posix.fd_t, mount_root: []const u8, path: []const u8, owned_fd: posix.fd_t, freezer: ?posix.fd_t, controller: ?[]const u8) Backend.Error!void {
+pub fn removeV1Cgroup(root: posix.fd_t, mount_root: []const u8, path: []const u8, owned_fd: posix.fd_t, freezer: ?posix.fd_t, controller: ?[]const u8) libcontainer.Error!void {
     try validateCgroupPath(path);
     const parent = if (std.fs.path.dirname(path)) |parent_path|
         (try walkCgroup(root, parent_path, false, &.{})) orelse return
@@ -936,7 +936,7 @@ pub fn removeV1Cgroup(root: posix.fd_t, mount_root: []const u8, path: []const u8
     return error.CgroupDeleteFailed;
 }
 
-fn v1CgroupIdentityMatches(owned: linux.Statx, leaf: posix.fd_t) Backend.Error!bool {
+fn v1CgroupIdentityMatches(owned: linux.Statx, leaf: posix.fd_t) libcontainer.Error!bool {
     var current: linux.Statx = undefined;
     try checkResult(linux.statx(leaf, "", linux.AT.EMPTY_PATH, .{ .INO = true }, &current));
     if (!owned.mask.INO or !current.mask.INO) return error.CgroupDeleteFailed;

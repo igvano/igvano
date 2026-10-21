@@ -2,7 +2,6 @@ const std = @import("std");
 const builtin = @import("builtin");
 const oci = @import("igvano").oci;
 const libcontainer = @import("libcontainer");
-const Backend = libcontainer.Backend;
 const Config = @import("../args.zig").Config;
 const lockContainer = @import("../state.zig").lockContainer;
 const createContainer = @import("../create.zig").createContainer;
@@ -62,8 +61,7 @@ pub fn execTestCommand(config: Config, stdout: ?std.posix.fd_t) !u8 {
             if (linux.errno(linux.dup2(fd, 1)) != .SUCCESS) linux.exit_group(1);
         }
         var threaded: std.Io.Threaded = .init_single_threaded;
-        var implementation: libcontainer.LinuxBackend = .{};
-        const status = execContainer(std.heap.page_allocator, threaded.io(), implementation.backend(), config) catch linux.exit_group(1);
+        const status = execContainer(std.heap.page_allocator, threaded.io(), null, config) catch linux.exit_group(1);
         linux.exit_group(status);
     }
     return waitExec(child);
@@ -99,29 +97,45 @@ pub fn waitTestExec(io: std.Io, pid: i32) !u8 {
     return error.Timeout;
 }
 
-pub const LockTestBackend = struct {
+pub fn overrideContainer(implementation: anytype, container: libcontainer.Container) @import("../state.zig").ContainerOverride {
+    const Implementation = @typeInfo(@TypeOf(implementation)).pointer.child;
+    return .{
+        .container = container,
+        .state = &implementation.state,
+        .create = if (@hasDecl(Implementation, "create")) Implementation.create else null,
+    };
+}
+
+pub fn withState(implementation: anytype, container: libcontainer.Container, state: libcontainer.State) libcontainer.Container {
+    implementation.state = state;
+    return container;
+}
+
+pub const LockTestContainer = struct {
+    state: libcontainer.State = undefined,
     create_pid: ?i32 = null,
     fail_create: bool = false,
     killed: bool = false,
     detail: ?[]const u8 = null,
 
-    pub const vtable: Backend.VTable = .{ .create = create, .alive = alive, .kill = kill, .killAll = kill, .delete = delete, .diagnostic = diagnostic };
-    fn create(ptr: *anyopaque, options: Backend.CreateOptions) Backend.Error!Backend.Handle {
+    pub const vtable: libcontainer.Container.VTable = .{ .alive = alive, .kill = kill, .killAll = kill, .delete = delete, .diagnostic = diagnostic };
+    pub fn create(ptr: *anyopaque, options: libcontainer.CreateOptions) libcontainer.Error!libcontainer.State {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        const handle: Backend.Handle = .{ .id = options.id, .pid = self.create_pid orelse return error.NotImplemented, .starttime = "alive" };
+        const handle: libcontainer.State = .{ .id = options.id, .pid = self.create_pid orelse return error.NotImplemented, .starttime = "alive" };
         if (options.on_create) |callback| try callback.run(callback.ptr, handle);
         if (self.fail_create) return error.CreateFailed;
         return .{ .id = options.id, .pid = handle.pid, .starttime = try options.allocator.dupe(u8, handle.starttime) };
     }
-    pub fn alive(ptr: *anyopaque, handle: Backend.Handle) Backend.Error!bool {
+    pub fn alive(ptr: *anyopaque) libcontainer.Error!bool {
         const self: *@This() = @ptrCast(@alignCast(ptr));
+        const handle = self.state;
         return !self.killed and std.mem.eql(u8, handle.starttime, "alive");
     }
-    pub fn kill(ptr: *anyopaque, _: Backend.Handle, _: i32) Backend.Error!void {
+    pub fn kill(ptr: *anyopaque, _: i32) libcontainer.Error!void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         self.killed = true;
     }
-    pub fn delete(_: *anyopaque, _: Backend.Handle) Backend.Error!void {}
+    pub fn delete(_: *anyopaque) libcontainer.Error!void {}
     fn diagnostic(ptr: *anyopaque) ?[]const u8 {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         return self.detail;
@@ -190,11 +204,11 @@ pub const LockTestProcess = struct {
     }
 
     pub fn command(config: Config, expected_error: ?anyerror) !LockTestProcess {
-        var implementation: LockTestBackend = .{};
-        return commandWithBackend(config, expected_error, .{ .ptr = &implementation, .vtable = &LockTestBackend.vtable });
+        var implementation: LockTestContainer = .{};
+        return commandWithContainer(config, expected_error, overrideContainer(&implementation, .{ .ptr = &implementation, .vtable = &LockTestContainer.vtable }));
     }
 
-    pub fn commandWithBackend(config: Config, expected_error: ?anyerror, backend: Backend) !LockTestProcess {
+    pub fn commandWithContainer(config: Config, expected_error: ?anyerror, container: ?@import("../state.zig").ContainerOverride) !LockTestProcess {
         const linux = std.os.linux;
         const sockets = try libcontainer.console.socketpair();
         const result = linux.fork();
@@ -212,10 +226,10 @@ pub const LockTestProcess = struct {
             var threaded: std.Io.Threaded = .init_single_threaded;
             const io = threaded.io();
             const operation = switch (config.subcommand) {
-                .state => stateContainer(std.heap.page_allocator, io, backend, config),
-                .create => createContainer(std.heap.page_allocator, io, backend, config),
-                .start => startContainer(std.heap.page_allocator, io, backend, config),
-                .delete => deleteContainer(std.heap.page_allocator, io, backend, config),
+                .state => stateContainer(std.heap.page_allocator, io, container, config),
+                .create => createContainer(std.heap.page_allocator, io, container, config),
+                .start => startContainer(std.heap.page_allocator, io, container, config),
+                .delete => deleteContainer(std.heap.page_allocator, io, container, config),
                 .features, .ps, .pause, .@"resume", .kill, .update, .exec => unreachable,
             };
             if (operation) |_| {

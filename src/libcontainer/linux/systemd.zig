@@ -1,6 +1,6 @@
 const std = @import("std");
-const Backend = @import("../root.zig").Backend;
-const Resources = Backend.Resources;
+const libcontainer = @import("../root.zig");
+const Resources = libcontainer.Resources;
 const dbus = @import("../dbus.zig");
 const diagnostics = @import("diagnostic.zig");
 const v2DeviceRules = @import("devices.zig").v2DeviceRules;
@@ -148,7 +148,7 @@ test "systemd properties use hierarchy-specific limits and round CPU quotas up" 
         try std.testing.expectError(error.InvalidConfig, systemdCpuSet(arena.allocator(), invalid));
 }
 
-pub fn systemdFailure(client: *const dbus.Client, operation: []const u8, err: dbus.Error) Backend.Error {
+pub fn systemdFailure(client: *const dbus.Client, operation: []const u8, err: dbus.Error) libcontainer.Error {
     if (err == error.OutOfMemory) return error.OutOfMemory;
     const detail = client.diagnostic();
     reportDiagnostic("{s}: {s}", .{ operation, if (detail.len != 0) detail else @errorName(err) });
@@ -172,7 +172,7 @@ fn freeSystemdValue(allocator: std.mem.Allocator, value: dbus.Value) void {
     }
 }
 
-fn setSystemdProperty(allocator: std.mem.Allocator, properties: *std.ArrayList(dbus.Property), property: dbus.Property) Backend.Error!void {
+fn setSystemdProperty(allocator: std.mem.Allocator, properties: *std.ArrayList(dbus.Property), property: dbus.Property) libcontainer.Error!void {
     errdefer freeSystemdValue(allocator, property.value);
     for (properties.items) |*existing| {
         if (!std.mem.eql(u8, existing.name, property.name)) continue;
@@ -183,7 +183,7 @@ fn setSystemdProperty(allocator: std.mem.Allocator, properties: *std.ArrayList(d
     try properties.append(allocator, property);
 }
 
-fn systemdCpuSet(allocator: std.mem.Allocator, cpus: []const u8) Backend.Error![]u8 {
+fn systemdCpuSet(allocator: std.mem.Allocator, cpus: []const u8) libcontainer.Error![]u8 {
     var bits: std.ArrayList(u8) = .empty;
     errdefer bits.deinit(allocator);
     if (cpus.len == 0) return bits.toOwnedSlice(allocator);
@@ -200,7 +200,7 @@ fn systemdCpuSet(allocator: std.mem.Allocator, cpus: []const u8) Backend.Error![
     return bits.toOwnedSlice(allocator);
 }
 
-fn systemdQuota(allocator: std.mem.Allocator, properties: *std.ArrayList(dbus.Property), quota: i64, configured_period: u64) Backend.Error!void {
+fn systemdQuota(allocator: std.mem.Allocator, properties: *std.ArrayList(dbus.Property), quota: i64, configured_period: u64) libcontainer.Error!void {
     if (quota < -1) return error.InvalidConfig;
     const period = if (configured_period == 0) 100000 else configured_period;
     if (configured_period != 0)
@@ -215,7 +215,7 @@ fn systemdQuota(allocator: std.mem.Allocator, properties: *std.ArrayList(dbus.Pr
     try setSystemdProperty(allocator, properties, .{ .name = "CPUQuotaPerSecUSec", .value = .{ .uint64 = per_sec } });
 }
 
-fn systemdNumber(value: []const u8) Backend.Error!u64 {
+fn systemdNumber(value: []const u8) libcontainer.Error!u64 {
     const trimmed = std.mem.trim(u8, value, " \t\r\n");
     if (std.mem.eql(u8, trimmed, "max")) return std.math.maxInt(u64);
     return std.fmt.parseInt(u64, trimmed, 10) catch error.InvalidConfig;
@@ -224,7 +224,7 @@ fn systemdNumber(value: []const u8) Backend.Error!u64 {
 /// systemd cannot express deny-lists or wildcard-major/concrete-minor rules.
 /// Deny-lists use a temporary strict policy; wildcard-major rules are skipped.
 /// The caller then applies exact cgroupfs rules.
-fn systemdDeviceAllows(allocator: std.mem.Allocator, rules: []const Resources.DeviceRule) Backend.Error![][2][]const u8 {
+fn systemdDeviceAllows(allocator: std.mem.Allocator, rules: []const Resources.DeviceRule) libcontainer.Error![][2][]const u8 {
     var policy = try deviceEmulator(allocator, rules);
     defer policy.deinit(allocator);
     if (policy.default_allow and !policy.isAllowAll()) return error.Unsupported;
@@ -260,7 +260,7 @@ fn systemdDeviceAllows(allocator: std.mem.Allocator, rules: []const Resources.De
 
 /// Convert the same values used by cgroupfs, so swap conversion and unified
 /// overrides cannot diverge from the kernel writes. Unknown files stay on fs.
-pub fn systemdProperties(allocator: std.mem.Allocator, resources: Resources, mode: CgroupMode, device_rules: []const Resources.DeviceRule) Backend.Error![]dbus.Property {
+pub fn systemdProperties(allocator: std.mem.Allocator, resources: Resources, mode: CgroupMode, device_rules: []const Resources.DeviceRule) libcontainer.Error![]dbus.Property {
     var properties: std.ArrayList(dbus.Property) = .empty;
     errdefer {
         for (properties.items) |property| freeSystemdValue(allocator, property.value);
@@ -279,13 +279,13 @@ pub fn systemdProperties(allocator: std.mem.Allocator, resources: Resources, mod
     return properties.toOwnedSlice(allocator);
 }
 
-fn setSystemdUnifiedProperties(allocator: std.mem.Allocator, properties: *std.ArrayList(dbus.Property), resources: Resources) Backend.Error!void {
+fn setSystemdUnifiedProperties(allocator: std.mem.Allocator, properties: *std.ArrayList(dbus.Property), resources: Resources) libcontainer.Error!void {
     const writes = try v2Writes(allocator, resources);
     defer freeWrites(allocator, writes);
     for (writes) |write| try setSystemdUnifiedProperty(allocator, properties, write);
 }
 
-fn setSystemdUnifiedProperty(allocator: std.mem.Allocator, properties: *std.ArrayList(dbus.Property), write: Write) Backend.Error!void {
+fn setSystemdUnifiedProperty(allocator: std.mem.Allocator, properties: *std.ArrayList(dbus.Property), write: Write) libcontainer.Error!void {
     if (std.mem.eql(u8, write.name, "cpu.max")) {
         try setSystemdCpuMax(allocator, properties, write.value);
         return;
@@ -311,7 +311,7 @@ fn setSystemdUnifiedProperty(allocator: std.mem.Allocator, properties: *std.Arra
     }
 }
 
-fn setSystemdCpuMax(allocator: std.mem.Allocator, properties: *std.ArrayList(dbus.Property), value: []const u8) Backend.Error!void {
+fn setSystemdCpuMax(allocator: std.mem.Allocator, properties: *std.ArrayList(dbus.Property), value: []const u8) libcontainer.Error!void {
     var fields = std.mem.tokenizeAny(u8, value, " \t\r\n");
     const quota_text = fields.next() orelse return error.InvalidConfig;
     const quota: i64 = if (std.mem.eql(u8, quota_text, "max")) -1 else std.fmt.parseInt(i64, quota_text, 10) catch return error.InvalidConfig;
@@ -320,13 +320,13 @@ fn setSystemdCpuMax(allocator: std.mem.Allocator, properties: *std.ArrayList(dbu
     try systemdQuota(allocator, properties, quota, period);
 }
 
-fn setSystemdMemoryProperties(allocator: std.mem.Allocator, properties: *std.ArrayList(dbus.Property), memory: Resources.Memory) Backend.Error!void {
+fn setSystemdMemoryProperties(allocator: std.mem.Allocator, properties: *std.ArrayList(dbus.Property), memory: Resources.Memory) libcontainer.Error!void {
     if (memory.limit) |limit| {
         if (limit != 0) try setSystemdProperty(allocator, properties, .{ .name = "MemoryLimit", .value = .{ .uint64 = @bitCast(limit) } });
     }
 }
 
-fn setSystemdCpuProperties(allocator: std.mem.Allocator, properties: *std.ArrayList(dbus.Property), cpu: Resources.Cpu) Backend.Error!void {
+fn setSystemdCpuProperties(allocator: std.mem.Allocator, properties: *std.ArrayList(dbus.Property), cpu: Resources.Cpu) libcontainer.Error!void {
     if (cpu.shares) |shares| if (shares != 0) {
         _ = try cpuWeight(shares);
         try setSystemdProperty(allocator, properties, .{ .name = "CPUShares", .value = .{ .uint64 = shares } });
@@ -338,19 +338,19 @@ fn setSystemdCpuProperties(allocator: std.mem.Allocator, properties: *std.ArrayL
     }
 }
 
-fn setSystemdPidsProperties(allocator: std.mem.Allocator, properties: *std.ArrayList(dbus.Property), pids: Resources.Pids) Backend.Error!void {
+fn setSystemdPidsProperties(allocator: std.mem.Allocator, properties: *std.ArrayList(dbus.Property), pids: Resources.Pids) libcontainer.Error!void {
     if (pids.limit) |limit| {
         if (limit != 0) try setSystemdProperty(allocator, properties, .{ .name = "TasksMax", .value = .{ .uint64 = @bitCast(limit) } });
     }
 }
 
-fn setSystemdBlockIOProperties(allocator: std.mem.Allocator, properties: *std.ArrayList(dbus.Property), block: Resources.BlockIO) Backend.Error!void {
+fn setSystemdBlockIOProperties(allocator: std.mem.Allocator, properties: *std.ArrayList(dbus.Property), block: Resources.BlockIO) libcontainer.Error!void {
     if (block.weight) |weight| {
         if (weight != 0) try setSystemdProperty(allocator, properties, .{ .name = "BlockIOWeight", .value = .{ .uint64 = weight } });
     }
 }
 
-fn appendSystemdDeviceProperties(allocator: std.mem.Allocator, properties: *std.ArrayList(dbus.Property), device_rules: []const Resources.DeviceRule) Backend.Error!void {
+fn appendSystemdDeviceProperties(allocator: std.mem.Allocator, properties: *std.ArrayList(dbus.Property), device_rules: []const Resources.DeviceRule) libcontainer.Error!void {
     // As in runc, deny-lists temporarily use a strict deny-all policy.
     // The v1 manager then applies the exact policy.
     const allows = systemdDeviceAllows(allocator, device_rules) catch |err| switch (err) {
@@ -371,7 +371,7 @@ fn appendSystemdDeviceProperties(allocator: std.mem.Allocator, properties: *std.
     try properties.append(allocator, .{ .name = "DeviceAllow", .value = .{ .string_pairs = allows } });
 }
 
-pub fn setSystemdResources(allocator: std.mem.Allocator, handle: Backend.Handle, resources: Resources, mode: CgroupMode, omit_inferred_memory_limit: bool, device_rules: []const Resources.DeviceRule) Backend.Error!void {
+pub fn setSystemdResources(allocator: std.mem.Allocator, handle: libcontainer.State, resources: Resources, mode: CgroupMode, omit_inferred_memory_limit: bool, device_rules: []const Resources.DeviceRule) libcontainer.Error!void {
     if (!handle.systemd) return;
     const path = handle.cgroup_path orelse return error.InvalidPath;
     const properties = try systemdProperties(allocator, resources, mode, device_rules);
@@ -391,7 +391,7 @@ pub fn setSystemdResources(allocator: std.mem.Allocator, handle: Backend.Handle,
     client.setProperties(std.fs.path.basename(path), requested_properties) catch |err| return systemdFailure(&client, "update systemd scope", err);
 }
 
-pub fn stopSystemdScope(allocator: std.mem.Allocator, unit: []const u8) Backend.Error!void {
+pub fn stopSystemdScope(allocator: std.mem.Allocator, unit: []const u8) libcontainer.Error!void {
     var client = dbus.Client.init(allocator);
     defer client.deinit();
     client.connect() catch |err| return systemdFailure(&client, "stop systemd scope", err);

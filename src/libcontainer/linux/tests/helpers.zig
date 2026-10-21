@@ -2,7 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 const posix = std.posix;
-const Backend = @import("../../root.zig").Backend;
+const libcontainer = @import("../../root.zig");
 const queryDevicePrograms = @import("../devices.zig").queryDevicePrograms;
 const OPEN_TREE_CLONE = @import("../mount.zig").OPEN_TREE_CLONE;
 const OPEN_TREE_CLOEXEC = @import("../mount.zig").OPEN_TREE_CLOEXEC;
@@ -33,7 +33,16 @@ const statMount = @import("../rootfs.zig").statMount;
 const RootfsStep = @import("../rootfs.zig").RootfsStep;
 const startMountSourceHelper = @import("../mount_sources.zig").startMountSourceHelper;
 const receiveMountSources = @import("../mount_sources.zig").receiveMountSources;
-const LinuxBackend = @import("../../linux.zig").LinuxBackend;
+const LinuxContainer = @import("../../linux.zig").Container;
+
+pub fn expectCreateError(expected: anyerror, options: libcontainer.CreateOptions) !void {
+    var instance = LinuxContainer.create(options) catch |err| return std.testing.expectEqual(expected, err);
+    defer instance.deinit(options.allocator);
+    const container = instance.container();
+    container.kill(9) catch {};
+    container.delete() catch {};
+    return error.TestUnexpectedError;
+}
 
 pub fn cleanupV1TestHierarchies(hierarchies: []const V1Hierarchy, path: []const u8) void {
     removeV1Cgroups(hierarchies, path) catch {};
@@ -145,8 +154,8 @@ pub fn testIDMappedBindOwnership(base: []const u8, cgroup_path: []const u8) !voi
         const container_uid: u32 = if (with_userns) 100000 else 0;
         try checkResult(linux.chown(rootfs, container_uid, container_uid));
         try checkResult(linux.chown(source, source_uid, source_uid));
-        const container_mapping: []const Backend.IDMapping = &.{.{ .container_id = 0, .host_id = 100000, .size = 1 }};
-        var options: Backend.CreateOptions = .{
+        const container_mapping: []const libcontainer.IDMapping = &.{.{ .container_id = 0, .host_id = 100000, .size = 1 }};
+        var options: libcontainer.CreateOptions = .{
             .allocator = allocator,
             .id = suffix,
             .rootfs = rootfs,
@@ -162,7 +171,7 @@ pub fn testIDMappedBindOwnership(base: []const u8, cgroup_path: []const u8) !voi
         var joined_fd: ?posix.fd_t = null;
         defer if (joined_fd) |fd| closeFd(fd);
         if (joined) {
-            const ranges: []const Backend.IDMapping = &.{.{ .container_id = 0, .host_id = 100000, .size = 1 }};
+            const ranges: []const libcontainer.IDMapping = &.{.{ .container_id = 0, .host_id = 100000, .size = 1 }};
             const fd = try createMountUserNamespace(allocator, .{ .uid = ranges, .gid = ranges });
             joined_fd = fd;
             const path = try std.fmt.allocPrintSentinel(allocator, "/proc/self/fd/{d}", .{fd}, 0);
@@ -174,15 +183,13 @@ pub fn testIDMappedBindOwnership(base: []const u8, cgroup_path: []const u8) !voi
         }
         // The mount map translates filesystem IDs to kernel IDs. Thus 0:100000
         // exposes a host-root-owned tree as root in a 0:100000 container.
-        const mapping: []const Backend.IDMapping = &.{.{ .container_id = source_uid, .host_id = container_uid, .size = 1 }};
-        const mappings: Backend.MountMappings = if (joined) .{
+        const mapping: []const libcontainer.IDMapping = &.{.{ .container_id = source_uid, .host_id = container_uid, .size = 1 }};
+        const mappings: libcontainer.MountMappings = if (joined) .{
             .userns_path = options.namespaces[0].path,
         } else .{
             .uid = mapping,
             .gid = mapping,
         };
-        var implementation: LinuxBackend = .{};
-        const backend = implementation.backend();
         options.mounts = &.{.{
             .destination = "/data",
             .source = source,
@@ -192,10 +199,13 @@ pub fn testIDMappedBindOwnership(base: []const u8, cgroup_path: []const u8) !voi
             .data = "",
             .mappings = mappings,
         }};
-        const handle = try backend.create(options);
+        var handle_instance = try LinuxContainer.create(options);
+        defer handle_instance.deinit(options.allocator);
+        const handle = handle_instance.state;
+        const handle_container = handle_instance.container();
         defer {
-            backend.kill(handle, 9) catch {};
-            backend.delete(handle) catch {};
+            handle_container.kill(9) catch {};
+            handle_container.delete() catch {};
         }
         const proc_root = try std.fmt.allocPrintSentinel(allocator, "/proc/{d}/root", .{handle.pid}, 0);
         const root_fd = try openPath(linux.AT.FDCWD, proc_root, .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true });
@@ -237,7 +247,7 @@ pub fn testIDMappedBindOwnership(base: []const u8, cgroup_path: []const u8) !voi
 /// Probe on tmpfs in an isolated mount namespace so unsupported kernels skip
 /// without hiding failures on the actual bind source's filesystem.
 pub fn requireTestIDMappedMounts(path: [:0]const u8) !void {
-    const mapping: []const Backend.IDMapping = &.{.{ .container_id = 0, .host_id = 100000, .size = 1 }};
+    const mapping: []const libcontainer.IDMapping = &.{.{ .container_id = 0, .host_id = 100000, .size = 1 }};
     const userns = createMountUserNamespace(std.testing.allocator, .{ .uid = mapping, .gid = mapping }) catch |err| switch (err) {
         error.PermissionDenied, error.Unsupported => return error.SkipZigTest,
         else => return err,
@@ -268,8 +278,8 @@ pub fn testPrivateUserNamespaceBindLocks(idmapped: bool) !void {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     if (linux.geteuid() != 0) return error.SkipZigTest;
     try requireTestMountNamespace();
-    const ranges: []const Backend.IDMapping = &.{.{ .container_id = 0, .host_id = 100000, .size = 10 }};
-    const mappings: Backend.MountMappings = .{ .uid = ranges, .gid = ranges };
+    const ranges: []const libcontainer.IDMapping = &.{.{ .container_id = 0, .host_id = 100000, .size = 10 }};
+    const mappings: libcontainer.MountMappings = .{ .uid = ranges, .gid = ranges };
     const userns = createMountUserNamespace(std.testing.allocator, mappings) catch |err| switch (err) {
         error.PermissionDenied, error.Unsupported => return error.SkipZigTest,
         else => return err,

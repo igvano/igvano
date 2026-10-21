@@ -2,8 +2,8 @@ const std = @import("std");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 const posix = std.posix;
-const Backend = @import("../root.zig").Backend;
-const Resources = Backend.Resources;
+const libcontainer = @import("../root.zig");
+const Resources = libcontainer.Resources;
 const diagnostics = @import("diagnostic.zig");
 const v2DeviceRules = @import("devices.zig").v2DeviceRules;
 const applyV2DeviceFilter = @import("devices.zig").applyV2DeviceFilter;
@@ -44,12 +44,12 @@ const kill = @import("proc.zig").kill;
 const setSystemdResources = @import("systemd.zig").setSystemdResources;
 const stopSystemdScope = @import("systemd.zig").stopSystemdScope;
 
-pub fn killAll(ptr: *anyopaque, handle: Backend.Handle, signal: i32) Backend.Error!void {
+pub fn killAll(handle: libcontainer.State, signal: i32) libcontainer.Error!void {
     diagnostics.last_diagnostic_len = 0;
     if (comptime builtin.os.tag == .linux) {
         if (signal < 0 or signal >= linux.NSIG) return error.KillFailed;
         const path = handle.cgroup_path orelse {
-            kill(ptr, handle, signal) catch |err| switch (err) {
+            kill(handle, signal) catch |err| switch (err) {
                 error.ProcessNotFound => {},
                 else => return err,
             };
@@ -66,7 +66,7 @@ pub fn killAll(ptr: *anyopaque, handle: Backend.Handle, signal: i32) Backend.Err
     }
 }
 
-fn killAllV1(allocator: std.mem.Allocator, handle: Backend.Handle, path: []const u8, signal: i32) Backend.Error!void {
+fn killAllV1(allocator: std.mem.Allocator, handle: libcontainer.State, path: []const u8, signal: i32) libcontainer.Error!void {
     const hierarchies = try openV1Hierarchies(allocator, handle.systemd);
     defer freeV1Hierarchies(allocator, hierarchies);
     var members: ?posix.fd_t = null;
@@ -92,7 +92,7 @@ fn killAllV1(allocator: std.mem.Allocator, handle: Backend.Handle, path: []const
     if (members) |fd| try killV1Members(fd, freezer, signal, member_mount_root, path, member_controller);
 }
 
-fn killAllV2(allocator: std.mem.Allocator, root: posix.fd_t, path: []const u8, signal: i32) Backend.Error!void {
+fn killAllV2(allocator: std.mem.Allocator, root: posix.fd_t, path: []const u8, signal: i32) libcontainer.Error!void {
     const cgroup = (try walkCgroup(root, path, false, &.{})) orelse return;
     defer closeFd(cgroup);
     if (signal == @intFromEnum(linux.SIG.KILL) and try writeCgroupKill(cgroup, path)) return;
@@ -111,7 +111,7 @@ fn killAllV2(allocator: std.mem.Allocator, root: posix.fd_t, path: []const u8, s
     try killV2Members(cgroup, signal, mount_root, path);
 }
 
-fn writeCgroupKill(cgroup: posix.fd_t, path: []const u8) Backend.Error!bool {
+fn writeCgroupKill(cgroup: posix.fd_t, path: []const u8) libcontainer.Error!bool {
     while (true) {
         const opened = linux.openat(cgroup, "cgroup.kill", .{ .ACCMODE = .WRONLY, .NOFOLLOW = true, .CLOEXEC = true }, 0);
         switch (linux.errno(opened)) {
@@ -128,7 +128,7 @@ fn writeCgroupKill(cgroup: posix.fd_t, path: []const u8) Backend.Error!bool {
     return false;
 }
 
-pub fn update(_: *anyopaque, handle: Backend.Handle, resources: Resources) Backend.Error!void {
+pub fn update(handle: libcontainer.State, resources: Resources) libcontainer.Error!void {
     diagnostics.last_diagnostic_len = 0;
     if (comptime builtin.os.tag != .linux) return error.NotImplemented;
     const path = handle.cgroup_path orelse {
@@ -143,7 +143,7 @@ pub fn update(_: *anyopaque, handle: Backend.Handle, resources: Resources) Backe
     return updateV2(allocator, root.fd, handle, resources, path);
 }
 
-fn updateV1(allocator: std.mem.Allocator, handle: Backend.Handle, resources: Resources, path: []const u8) Backend.Error!void {
+fn updateV1(allocator: std.mem.Allocator, handle: libcontainer.State, resources: Resources, path: []const u8) libcontainer.Error!void {
     if (resources.unified.len != 0) {
         reportDiagnostic("unified resources require cgroup v2", .{});
         return error.InvalidConfig;
@@ -169,7 +169,7 @@ fn partialCpuLimit(cpu: Resources.Cpu) bool {
     return (cpu.quota != null or cpu.period != null) and (cpu.quota == null or cpu.period == null);
 }
 
-fn completeV1Cpu(allocator: std.mem.Allocator, hierarchies: []const V1Hierarchy, requested: *Resources) Backend.Error!void {
+fn completeV1Cpu(allocator: std.mem.Allocator, hierarchies: []const V1Hierarchy, requested: *Resources) libcontainer.Error!void {
     const cpu = requested.cpu orelse return;
     if (!partialCpuLimit(cpu)) return;
     for (hierarchies) |hierarchy| {
@@ -188,7 +188,7 @@ fn completeV1Cpu(allocator: std.mem.Allocator, hierarchies: []const V1Hierarchy,
     }
 }
 
-fn updateV2(allocator: std.mem.Allocator, root: posix.fd_t, handle: Backend.Handle, resources: Resources, path: []const u8) Backend.Error!void {
+fn updateV2(allocator: std.mem.Allocator, root: posix.fd_t, handle: libcontainer.State, resources: Resources, path: []const u8) libcontainer.Error!void {
     var requested = resources;
     const inferred_memory_limit = try inferV2MemoryLimit(allocator, root, path, &requested);
     var writes = try v2Writes(allocator, requested);
@@ -214,7 +214,7 @@ fn updateV2(allocator: std.mem.Allocator, root: posix.fd_t, handle: Backend.Hand
     }
 }
 
-fn inferV2MemoryLimit(allocator: std.mem.Allocator, root: posix.fd_t, path: []const u8, requested: *Resources) Backend.Error!bool {
+fn inferV2MemoryLimit(allocator: std.mem.Allocator, root: posix.fd_t, path: []const u8, requested: *Resources) libcontainer.Error!bool {
     const memory = requested.memory orelse return false;
     if (memory.limit != null or (memory.swap orelse 0) <= 0) return false;
     const existing = (try walkCgroup(root, path, false, &.{.{ .name = "memory.max", .value = "" }})) orelse return error.ProcessNotFound;
@@ -229,7 +229,7 @@ fn inferV2MemoryLimit(allocator: std.mem.Allocator, root: posix.fd_t, path: []co
     return true;
 }
 
-fn completeV2Cpu(allocator: std.mem.Allocator, cgroup: posix.fd_t, requested: *Resources) Backend.Error!bool {
+fn completeV2Cpu(allocator: std.mem.Allocator, cgroup: posix.fd_t, requested: *Resources) libcontainer.Error!bool {
     const cpu = requested.cpu orelse return false;
     if (!partialCpuLimit(cpu)) return false;
     // cpu.max combines two fields; preserve the omitted half.
@@ -254,7 +254,7 @@ fn unifiedHasMemoryLimit(entries: []const Resources.Unified) bool {
     return false;
 }
 
-fn writeV2Resources(cgroup: posix.fd_t, writes: []const Write, path: []const u8, inferred_memory_limit: bool) Backend.Error!void {
+fn writeV2Resources(cgroup: posix.fd_t, writes: []const Write, path: []const u8, inferred_memory_limit: bool) libcontainer.Error!void {
     var skip_memory_limit = inferred_memory_limit;
     for (writes) |write| {
         // The current limit was needed only to convert total swap.
@@ -266,11 +266,11 @@ fn writeV2Resources(cgroup: posix.fd_t, writes: []const Write, path: []const u8,
     }
 }
 
-pub fn pids(ptr: *anyopaque, handle: Backend.Handle, allocator: std.mem.Allocator) Backend.Error![]i32 {
+pub fn pids(handle: libcontainer.State, allocator: std.mem.Allocator) libcontainer.Error![]i32 {
     diagnostics.last_diagnostic_len = 0;
     if (comptime builtin.os.tag != .linux) return error.NotImplemented;
     const path = handle.cgroup_path orelse {
-        return allocator.dupe(i32, if (try alive(ptr, handle)) &.{handle.pid} else &.{});
+        return allocator.dupe(i32, if (try alive(handle)) &.{handle.pid} else &.{});
     };
     try validateCgroupPath(path);
     var result: std.ArrayList(i32) = .empty;
@@ -288,7 +288,7 @@ pub fn pids(ptr: *anyopaque, handle: Backend.Handle, allocator: std.mem.Allocato
     return result.toOwnedSlice(allocator);
 }
 
-fn openV1Members(allocator: std.mem.Allocator, systemd: bool, path: []const u8) Backend.Error!?posix.fd_t {
+fn openV1Members(allocator: std.mem.Allocator, systemd: bool, path: []const u8) libcontainer.Error!?posix.fd_t {
     const hierarchies = try openV1Hierarchies(allocator, systemd);
     defer freeV1Hierarchies(allocator, hierarchies);
     for ([_]?[]const u8{ "freezer", "pids", null }) |controller| {
@@ -303,15 +303,15 @@ fn openV1Members(allocator: std.mem.Allocator, systemd: bool, path: []const u8) 
     return null;
 }
 
-pub fn freeze(_: *anyopaque, handle: Backend.Handle) Backend.Error!void {
+pub fn freeze(handle: libcontainer.State) libcontainer.Error!void {
     return setFrozen(handle, true);
 }
 
-pub fn thaw(_: *anyopaque, handle: Backend.Handle) Backend.Error!void {
+pub fn thaw(handle: libcontainer.State) libcontainer.Error!void {
     return setFrozen(handle, false);
 }
 
-pub fn frozen(_: *anyopaque, handle: Backend.Handle) Backend.Error!bool {
+pub fn frozen(handle: libcontainer.State) libcontainer.Error!bool {
     diagnostics.last_diagnostic_len = 0;
     if (comptime builtin.os.tag != .linux) return error.NotImplemented;
     const cgroup = (try openFreezerCgroup(handle)) orelse return false;
@@ -319,20 +319,20 @@ pub fn frozen(_: *anyopaque, handle: Backend.Handle) Backend.Error!bool {
     return cgroupFrozen(cgroup.fd, cgroup.mode);
 }
 
-pub fn delete(ptr: *anyopaque, handle: Backend.Handle) Backend.Error!void {
+pub fn delete(handle: libcontainer.State) libcontainer.Error!void {
     diagnostics.last_diagnostic_len = 0;
     if (comptime builtin.os.tag != .linux) return error.NotImplemented;
-    if (handle.cgroup_path) |path| try deleteContainerCgroup(ptr, handle, path);
+    if (handle.cgroup_path) |path| try deleteContainerCgroup(handle, path);
     try detachContainerRootfs(handle);
 }
 
-fn deleteContainerCgroup(ptr: *anyopaque, handle: Backend.Handle, path: []const u8) Backend.Error!void {
+fn deleteContainerCgroup(handle: libcontainer.State, path: []const u8) libcontainer.Error!void {
     try validateCgroupPath(path);
     if (handle.systemd) {
         // Namespace init ignores the scope's default SIGTERM. Drain
         // members first, as fs deletion does, so StopUnit completes
         // within the job deadline even when descendants remain.
-        try killAll(ptr, handle, @intFromEnum(linux.SIG.KILL));
+        try killAll(handle, @intFromEnum(linux.SIG.KILL));
         try stopSystemdScope(std.heap.page_allocator, std.fs.path.basename(path));
     }
     const root = try openCgroupRoot();
@@ -355,7 +355,7 @@ fn deleteContainerCgroup(ptr: *anyopaque, handle: Backend.Handle, path: []const 
     try removeCgroup(root.fd, path);
 }
 
-fn detachContainerRootfs(handle: Backend.Handle) Backend.Error!void {
+fn detachContainerRootfs(handle: libcontainer.State) libcontainer.Error!void {
     // Cgroup removal waits for all members to exit before mounts detach.
     if (handle.rootfs_mount) |path| {
         // Old state has no ownership identity, so preserve its mounts.

@@ -2,7 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 const posix = std.posix;
-const Backend = @import("../../root.zig").Backend;
+const libcontainer = @import("../../root.zig");
 const seccomp = @import("../../seccomp.zig");
 const diagnostics = @import("../diagnostic.zig");
 const checkResult = @import("../syscall.zig").checkResult;
@@ -31,7 +31,7 @@ const readProcStat = @import("../proc.zig").readProcStat;
 const readProcFileAt = @import("../proc.zig").readProcFileAt;
 const openPidfd = @import("../proc.zig").openPidfd;
 const signalPid = @import("../proc.zig").signalPid;
-const LinuxBackend = @import("../../linux.zig").LinuxBackend;
+const LinuxContainer = @import("../../linux.zig").Container;
 
 test "linux v1 ignores missing deprecated kmem files but requires other memory files" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
@@ -121,10 +121,10 @@ test "linux pidfds signal the held process and cgroup checks reject stale member
     const stat = try readProcStat(children[1], &buffer);
     const starttime = try std.testing.allocator.dupe(u8, stat.starttime);
     defer std.testing.allocator.free(starttime);
-    var implementation: LinuxBackend = .{};
-    const backend = implementation.backend();
-    const handle: Backend.Handle = .{ .id = "survivor", .pid = children[1], .starttime = starttime };
-    try std.testing.expect(try backend.alive(handle));
+    const handle: libcontainer.State = .{ .id = "survivor", .pid = children[1], .starttime = starttime };
+    var handle_instance = LinuxContainer.load(handle);
+    const handle_container = handle_instance.container();
+    try std.testing.expect(try handle_container.alive());
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const members = try std.fmt.allocPrint(std.testing.allocator, "{d}\n", .{children[1]});
@@ -132,7 +132,7 @@ test "linux pidfds signal the held process and cgroup checks reject stale member
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "cgroup.procs", .data = members });
     defer diagnostics.last_diagnostic_len = 0;
     try std.testing.expectError(error.KillFailed, killV1Members(tmp.dir.handle, null, 9, "/", "igvano/unrelated", null));
-    try std.testing.expect(try backend.alive(handle));
+    try std.testing.expect(try handle_container.alive());
 }
 
 test "linux pidfd_open denied by seccomp falls back to kill" {
@@ -152,8 +152,9 @@ test "linux pidfd_open denied by seccomp falls back to kill" {
             if (pidfd != null) linux.exit_group(4);
             var buffer: [4096]u8 = undefined;
             const stat = readProcStat(linux.getpid(), &buffer) catch linux.exit_group(5);
-            var implementation: LinuxBackend = .{};
-            implementation.backend().kill(.{ .id = "pidfd-denied", .pid = linux.getpid(), .starttime = stat.starttime }, 0) catch linux.exit_group(6);
+            var self_instance = LinuxContainer.load(.{ .id = "pidfd-denied", .pid = linux.getpid(), .starttime = stat.starttime });
+            const self_container = self_instance.container();
+            self_container.kill(0) catch linux.exit_group(6);
             linux.exit_group(0);
         }
         try std.testing.expectEqual(@as(u32, 0), try waitChild(pid));
@@ -235,8 +236,6 @@ test "linux kill all signals every cgroup member and plain SIGKILL thaws paused 
         errdefer closeFd(fd);
         try nested.append(allocator, fd);
     }
-    var implementation: LinuxBackend = .{};
-    const backend = implementation.backend();
     for ([_]struct { signal: i32, paused: bool, all: bool = true }{
         .{ .signal = 9, .paused = false },
         .{ .signal = 15, .paused = false },
@@ -258,7 +257,9 @@ test "linux kill all signals every cgroup member and plain SIGKILL thaws paused 
         defer if (writer) |fd| closeFd(fd);
         var children = [_]i32{ 0, 0 };
         defer {
-            if (case.paused) backend.thaw(.{ .id = "kill-all", .pid = 0, .starttime = "", .cgroup_path = path }) catch {};
+            var cleanup_instance = LinuxContainer.load(.{ .id = "kill-all", .pid = 0, .starttime = "", .cgroup_path = path });
+            const cleanup_container = cleanup_instance.container();
+            if (case.paused) cleanup_container.thaw() catch {};
             for (children) |pid| {
                 if (pid > 0) {
                     _ = linux.kill(pid, .KILL);
@@ -291,24 +292,26 @@ test "linux kill all signals every cgroup member and plain SIGKILL thaws paused 
         try std.testing.expectEqualSlices(u8, &.{ 1, 1 }, &bytes);
         var buffer: [4096]u8 = undefined;
         const stat = try readProcStat(children[0], &buffer);
-        const handle: Backend.Handle = .{ .id = "kill-all", .pid = children[0], .starttime = stat.starttime, .cgroup_path = path };
-        const subtree_pids = try backend.pids(handle, allocator);
+        const handle: libcontainer.State = .{ .id = "kill-all", .pid = children[0], .starttime = stat.starttime, .cgroup_path = path };
+        var handle_instance = LinuxContainer.load(handle);
+        const handle_container = handle_instance.container();
+        const subtree_pids = try handle_container.pids(allocator);
         defer allocator.free(subtree_pids);
         for (children) |pid| try std.testing.expect(std.mem.indexOfScalar(i32, subtree_pids, pid) != null);
-        try backend.killAll(handle, 0);
-        try std.testing.expect(try backend.alive(handle));
+        try handle_container.killAll(0);
+        try std.testing.expect(try handle_container.alive());
         if (signal == 15) {
             // Init can exit while another member remains in its cgroup.
-            try backend.kill(handle, 9);
+            try handle_container.kill(9);
             const status = try waitChild(children[0]);
             children[0] = 0;
             try std.testing.expectEqual(@as(u32, 9), status);
         }
-        if (case.paused) try backend.freeze(handle);
+        if (case.paused) try handle_container.freeze();
         if (case.all) {
-            try backend.killAll(handle, signal);
+            try handle_container.killAll(signal);
         } else {
-            try backend.kill(handle, signal);
+            try handle_container.kill(signal);
             try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.kill(children[1], @enumFromInt(0))));
         }
         const stays_frozen = case.paused and (root.mode == .unified or signal != 9);
@@ -318,7 +321,7 @@ test "linux kill all signals every cgroup member and plain SIGKILL thaws paused 
             defer allocator.free(requested);
             try std.testing.expectEqualStrings("1", std.mem.trim(u8, requested, " \t\n"));
         } else {
-            try std.testing.expectEqual(stays_frozen, try backend.frozen(handle));
+            try std.testing.expectEqual(stays_frozen, try handle_container.frozen());
         }
         // Finish SIGKILL exits before thawing so the kernel has updated
         // the subtree's freezer counters.
@@ -329,8 +332,8 @@ test "linux kill all signals every cgroup member and plain SIGKILL thaws paused 
                 try std.testing.expectEqual(@as(u32, 9), status);
             }
         }
-        if (stays_frozen) try backend.thaw(handle);
-        if (!case.all) try backend.killAll(handle, signal);
+        if (stays_frozen) try handle_container.thaw();
+        if (!case.all) try handle_container.killAll(signal);
         if (cgroup) |fd| {
             const thawed = try readCgroupFile(allocator, fd, "cgroup.freeze");
             defer allocator.free(thawed);
@@ -352,9 +355,11 @@ test "linux kill all signals every cgroup member and plain SIGKILL thaws paused 
         const members = try readCgroupFile(allocator, cgroup orelse hierarchies[0].leaf.?, "cgroup.procs");
         defer allocator.free(members);
         try std.testing.expectEqualStrings("", std.mem.trim(u8, members, " \t\n"));
-        try backend.killAll(handle, signal);
+        try handle_container.killAll(signal);
     }
-    const handle: Backend.Handle = .{ .id = "kill-all", .pid = 0, .starttime = "", .cgroup_path = path };
-    try backend.delete(handle);
-    try backend.killAll(handle, 9);
+    const handle: libcontainer.State = .{ .id = "kill-all", .pid = 0, .starttime = "", .cgroup_path = path };
+    var handle_instance = LinuxContainer.load(handle);
+    const handle_container = handle_instance.container();
+    try handle_container.delete();
+    try handle_container.killAll(9);
 }

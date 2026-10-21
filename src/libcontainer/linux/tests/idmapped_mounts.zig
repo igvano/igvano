@@ -1,7 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const linux = std.os.linux;
-const Backend = @import("../../root.zig").Backend;
+const libcontainer = @import("../../root.zig");
 const PreparedMount = @import("../mount.zig").PreparedMount;
 const applyMount = @import("../mount.zig").applyMount;
 const checkResult = @import("../syscall.zig").checkResult;
@@ -69,7 +69,7 @@ test "linux idmapped binds isolate shared source propagation recursively" {
     const source = try std.fmt.allocPrintSentinel(allocator, "{s}/source", .{absolute}, 0);
     const rootfs = try std.fmt.allocPrintSentinel(allocator, "{s}/rootfs", .{absolute}, 0);
     try requireTestIDMappedMounts(source);
-    const mapping: []const Backend.IDMapping = &.{.{ .container_id = 0, .host_id = 100000, .size = 1 }};
+    const mapping: []const libcontainer.IDMapping = &.{.{ .container_id = 0, .host_id = 100000, .size = 1 }};
     const userns = try createMountUserNamespace(allocator, .{ .uid = mapping, .gid = mapping });
     defer closeFd(userns);
     for ([_]bool{ false, true }) |recursive_bind| {
@@ -174,7 +174,7 @@ test "linux rbind clones submounts and ridmap alone maps them recursively" {
     const marker = try std.fmt.allocPrintSentinel(allocator, "{s}/source/sub/marker", .{absolute}, 0);
     const rootfs = try std.fmt.allocPrintSentinel(allocator, "{s}/rootfs", .{absolute}, 0);
     try requireTestIDMappedMounts(source);
-    const mapping: []const Backend.IDMapping = &.{.{ .container_id = 0, .host_id = 100000, .size = 1 }};
+    const mapping: []const libcontainer.IDMapping = &.{.{ .container_id = 0, .host_id = 100000, .size = 1 }};
     const userns = try createMountUserNamespace(allocator, .{ .uid = mapping, .gid = mapping });
     defer closeFd(userns);
     for ([_]bool{ false, true }) |recursive| {

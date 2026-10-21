@@ -2,7 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 const posix = std.posix;
-const Backend = @import("../root.zig").Backend;
+const libcontainer = @import("../root.zig");
 const diagnostics = @import("diagnostic.zig");
 const pathString = @import("syscall.zig").pathString;
 const checkResult = @import("syscall.zig").checkResult;
@@ -29,7 +29,7 @@ pub const MountAttr = extern struct {
 
 /// EPERM fallback preserves flags even in an inherited user namespace.
 /// Strict atime is implicit in statfs; never combine incompatible atime modes.
-pub fn lockedMountFlags(requested: u32, fs_flags: usize) Backend.Error!u32 {
+pub fn lockedMountFlags(requested: u32, fs_flags: usize) libcontainer.Error!u32 {
     const ms = linux.MS;
     const common = ms.RDONLY | ms.NOSUID | ms.NODEV | ms.NOEXEC | ms.NODIRATIME;
     const atime_mask = ms.NOATIME | ms.RELATIME | ms.STRICTATIME;
@@ -73,7 +73,7 @@ test "locked atime modes are inherited only when absent and conflicts are reject
 }
 
 /// Legacy cgroup mounts are expanded during parent-side mount preparation.
-pub fn cgroupMountType(mount_type: []const u8, host_fs_type: usize) Backend.Error![]const u8 {
+pub fn cgroupMountType(mount_type: []const u8, host_fs_type: usize) libcontainer.Error![]const u8 {
     if (!std.mem.eql(u8, mount_type, "cgroup") and !std.mem.eql(u8, mount_type, "cgroup2")) return mount_type;
     if (host_fs_type != 0x63677270) {
         if (std.mem.eql(u8, mount_type, "cgroup2")) {
@@ -86,7 +86,7 @@ pub fn cgroupMountType(mount_type: []const u8, host_fs_type: usize) Backend.Erro
 }
 
 /// Strings and symlinks are owned by the caller's preparation arena.
-pub fn prepareMounts(allocator: std.mem.Allocator, mounts: []const Backend.Mount, host_fs_type: usize, hierarchies: []const V1Hierarchy, cgroup_path: []const u8) Backend.Error![]PreparedMount {
+pub fn prepareMounts(allocator: std.mem.Allocator, mounts: []const libcontainer.Mount, host_fs_type: usize, hierarchies: []const V1Hierarchy, cgroup_path: []const u8) libcontainer.Error![]PreparedMount {
     var prepared: std.ArrayList(PreparedMount) = .empty;
     defer prepared.deinit(allocator);
     for (mounts) |mount| {
@@ -113,7 +113,7 @@ pub fn prepareMounts(allocator: std.mem.Allocator, mounts: []const Backend.Mount
     return prepared.toOwnedSlice(allocator);
 }
 
-fn validateMountMappings(mount: Backend.Mount) Backend.Error!void {
+fn validateMountMappings(mount: libcontainer.Mount) libcontainer.Error!void {
     const mappings = mount.mappings orelse return;
     if (mount.flags & linux.MS.BIND == 0) {
         reportDiagnostic("idmapped mount '{s}' must be a bind mount", .{mount.destination});
@@ -130,7 +130,7 @@ fn validateMountMappings(mount: Backend.Mount) Backend.Error!void {
     }
 }
 
-fn prepareV1CgroupMount(allocator: std.mem.Allocator, prepared: *std.ArrayList(PreparedMount), mount: Backend.Mount, hierarchies: []const V1Hierarchy, cgroup_path: []const u8) Backend.Error!void {
+fn prepareV1CgroupMount(allocator: std.mem.Allocator, prepared: *std.ArrayList(PreparedMount), mount: libcontainer.Mount, hierarchies: []const V1Hierarchy, cgroup_path: []const u8) libcontainer.Error!void {
     const destination = try pathString(allocator, mount.destination);
     try prepared.append(allocator, .{
         .destination = destination,
@@ -140,7 +140,7 @@ fn prepareV1CgroupMount(allocator: std.mem.Allocator, prepared: *std.ArrayList(P
         .propagation = mount.propagation,
         .data = "mode=755",
     });
-    var symlinks: std.ArrayList(Backend.Symlink) = .empty;
+    var symlinks: std.ArrayList(libcontainer.Symlink) = .empty;
     defer symlinks.deinit(allocator);
     // ponytail: bind the leaf even with a cgroup namespace; runc mounts
     // cgroupfs with subsystem options there. Use that if needed.
@@ -193,8 +193,8 @@ test "mount preparation rejects invalid idmapped bind configurations" {
     defer diagnostics.last_diagnostic_len = 0;
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
-    const mapping: []const Backend.IDMapping = &.{.{ .container_id = 0, .host_id = 1000, .size = 1 }};
-    for ([_]Backend.MountMappings{
+    const mapping: []const libcontainer.IDMapping = &.{.{ .container_id = 0, .host_id = 1000, .size = 1 }};
+    for ([_]libcontainer.MountMappings{
         .{ .uid = mapping },
         .{ .gid = mapping },
         .{},
@@ -280,7 +280,7 @@ pub fn needsSetupDev(mounts: anytype) bool {
     return setup;
 }
 
-pub fn validateDeviceMounts(mounts: []const Backend.Mount, devices: []const Backend.Device) Backend.Error!void {
+pub fn validateDeviceMounts(mounts: []const libcontainer.Mount, devices: []const libcontainer.Device) libcontainer.Error!void {
     if (needsSetupDev(mounts)) return;
     for (devices) |device| {
         if (device.required) return error.Unsupported;
@@ -288,19 +288,19 @@ pub fn validateDeviceMounts(mounts: []const Backend.Mount, devices: []const Back
 }
 
 test "bind-mounted dev skips defaults and rejects explicit devices" {
-    const bind: Backend.Mount = .{ .destination = "/dev", .source = "/dev", .type = null, .flags = linux.MS.BIND, .propagation = 0, .data = "" };
-    const tmpfs: Backend.Mount = .{ .destination = "/dev", .source = "tmpfs", .type = "tmpfs", .flags = 0, .propagation = 0, .data = "" };
-    const cases = [_]struct { mounts: []const Backend.Mount, setup: bool }{
+    const bind: libcontainer.Mount = .{ .destination = "/dev", .source = "/dev", .type = null, .flags = linux.MS.BIND, .propagation = 0, .data = "" };
+    const tmpfs: libcontainer.Mount = .{ .destination = "/dev", .source = "tmpfs", .type = "tmpfs", .flags = 0, .propagation = 0, .data = "" };
+    const cases = [_]struct { mounts: []const libcontainer.Mount, setup: bool }{
         .{ .mounts = &.{}, .setup = true },
         .{ .mounts = &.{bind}, .setup = false },
         .{ .mounts = &.{ tmpfs, bind }, .setup = false },
         .{ .mounts = &.{ bind, tmpfs }, .setup = true },
     };
-    const defaults = [_]Backend.Device{.{ .path = "/dev/null", .kind = .character, .major = 1, .minor = 3, .required = false }};
+    const defaults = [_]libcontainer.Device{.{ .path = "/dev/null", .kind = .character, .major = 1, .minor = 3, .required = false }};
     for (cases) |case| {
         try std.testing.expectEqual(case.setup, needsSetupDev(case.mounts));
         try validateDeviceMounts(case.mounts, &defaults);
-        const explicit = [_]Backend.Device{.{ .path = "/dev/custom", .kind = .fifo }};
+        const explicit = [_]libcontainer.Device{.{ .path = "/dev/custom", .kind = .fifo }};
         if (case.setup)
             try validateDeviceMounts(case.mounts, &explicit)
         else
@@ -316,19 +316,19 @@ pub const PreparedMount = struct {
     propagation: u32,
     data: [:0]const u8,
     recursive_readonly: ?bool = null,
-    mappings: ?Backend.MountMappings = null,
+    mappings: ?libcontainer.MountMappings = null,
     /// O_PATH source opened with host credentials in init's mount namespace.
     source_fd: ?posix.fd_t = null,
     /// Detached idmapped tree cloned from init's locked mount namespace.
     mount_fd: ?posix.fd_t = null,
     userns_fd: ?posix.fd_t = null,
     /// Created after this mount, before a following tmpfs readonly remount.
-    symlinks: []const Backend.Symlink = &.{},
+    symlinks: []const libcontainer.Symlink = &.{},
 };
 
 /// Walk beneath a pinned root, rejecting symlinks in every component. Mounting
 /// through the returned fd also avoids a destination swap between lookup/mount.
-pub fn mountDestination(root_fd: posix.fd_t, destination: []const u8, is_file: bool, create: bool) Backend.Error!posix.fd_t {
+pub fn mountDestination(root_fd: posix.fd_t, destination: []const u8, is_file: bool, create: bool) libcontainer.Error!posix.fd_t {
     var current = try openPath(root_fd, ".", .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true });
     errdefer closeFd(current);
     var components = std.mem.tokenizeScalar(u8, destination, '/');
@@ -361,7 +361,7 @@ pub fn mountDestination(root_fd: posix.fd_t, destination: []const u8, is_file: b
     }
 }
 
-fn openMountFile(dir: posix.fd_t, name: [:0]const u8, create: bool) Backend.Error!posix.fd_t {
+fn openMountFile(dir: posix.fd_t, name: [:0]const u8, create: bool) libcontainer.Error!posix.fd_t {
     if (create) {
         const created = linux.openat(dir, name, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .NOFOLLOW = true, .CLOEXEC = true }, 0o644);
         switch (linux.errno(created)) {
@@ -377,7 +377,7 @@ fn openMountFile(dir: posix.fd_t, name: [:0]const u8, create: bool) Backend.Erro
     return fd;
 }
 
-pub fn remountFlags(target_fd: posix.fd_t, requested: u32) Backend.Error!u32 {
+pub fn remountFlags(target_fd: posix.fd_t, requested: u32) libcontainer.Error!u32 {
     if (comptime builtin.os.tag == .linux) {
         // s390x uses u32 for metadata words and native words for counters.
         const Word = if (builtin.cpu.arch == .s390x) u32 else usize;
@@ -403,7 +403,7 @@ pub fn remountFlags(target_fd: posix.fd_t, requested: u32) Backend.Error!u32 {
     }
 }
 
-pub fn bindRemount(target_fd: posix.fd_t, target: [*:0]const u8, requested: u32) Backend.Error!void {
+pub fn bindRemount(target_fd: posix.fd_t, target: [*:0]const u8, requested: u32) libcontainer.Error!void {
     const result = linux.mount(null, target, null, requested, 0);
     if (linux.errno(result) != .PERM) return checkResult(result);
     // Retry locked flags on EPERM, including in an inherited user namespace.
@@ -412,7 +412,7 @@ pub fn bindRemount(target_fd: posix.fd_t, target: [*:0]const u8, requested: u32)
     try checkResult(linux.mount(null, target, null, flags, 0));
 }
 
-pub fn applyMount(rootfs: [:0]const u8, root_fd: posix.fd_t, mount: PreparedMount, private_mount_namespace: bool, rootfs_propagation: u32, step: *RootfsStep) Backend.Error!void {
+pub fn applyMount(rootfs: [:0]const u8, root_fd: posix.fd_t, mount: PreparedMount, private_mount_namespace: bool, rootfs_propagation: u32, step: *RootfsStep) libcontainer.Error!void {
     const ms = linux.MS;
     const bind = mount.flags & ms.BIND != 0;
     step.* = .{ .operation = "open bind source", .source = mount.source, .path = mount.destination };
@@ -449,7 +449,7 @@ pub fn applyMount(rootfs: [:0]const u8, root_fd: posix.fd_t, mount: PreparedMoun
     try applyMountAttributes(mount, target_fd, step);
 }
 
-fn attachMount(mount: PreparedMount, source: ?[*:0]const u8, target_fd: posix.fd_t, step: *RootfsStep) Backend.Error!void {
+fn attachMount(mount: PreparedMount, source: ?[*:0]const u8, target_fd: posix.fd_t, step: *RootfsStep) libcontainer.Error!void {
     const ms = linux.MS;
     const bind = mount.flags & ms.BIND != 0;
     var target_buffer: [64]u8 = undefined;
@@ -476,7 +476,7 @@ fn attachMount(mount: PreparedMount, source: ?[*:0]const u8, target_fd: posix.fd
     }
 }
 
-fn isolateBindMount(mount: PreparedMount, target_fd: posix.fd_t, private_mount_namespace: bool, rootfs_propagation: u32, step: *RootfsStep) Backend.Error!void {
+fn isolateBindMount(mount: PreparedMount, target_fd: posix.fd_t, private_mount_namespace: bool, rootfs_propagation: u32, step: *RootfsStep) libcontainer.Error!void {
     const ms = linux.MS;
     const bind = mount.flags & ms.BIND != 0;
     var target_buffer: [64]u8 = undefined;
@@ -496,7 +496,7 @@ fn isolateBindMount(mount: PreparedMount, target_fd: posix.fd_t, private_mount_n
     }
 }
 
-fn applyMountAttributes(mount: PreparedMount, target_fd: posix.fd_t, step: *RootfsStep) Backend.Error!void {
+fn applyMountAttributes(mount: PreparedMount, target_fd: posix.fd_t, step: *RootfsStep) libcontainer.Error!void {
     const ms = linux.MS;
     var target_buffer: [64]u8 = undefined;
     if (mount.flags & ms.BIND != 0 and mount.flags & ~@as(u32, ms.BIND | ms.REC) != 0) {

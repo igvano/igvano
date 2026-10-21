@@ -1,8 +1,8 @@
 const std = @import("std");
+const overrideContainer = @import("helpers.zig").overrideContainer;
 const builtin = @import("builtin");
 const oci = @import("igvano").oci;
 const libcontainer = @import("libcontainer");
-const Backend = libcontainer.Backend;
 const readLiveState = @import("../state.zig").readLiveState;
 const createContainer = @import("../create.zig").createContainer;
 const CreateContext = @import("../create.zig").CreateContext;
@@ -58,31 +58,32 @@ test "linux create callback runs only createRuntime with creating state" {
 
 test "linux failed create runs poststop after removing runtime state" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
-    const TestBackend = struct {
+    const TestContainer = struct {
+        state: libcontainer.State = undefined,
         killed: bool = false,
         deleted: bool = false,
         fail_create: bool = false,
-        const vtable: Backend.VTable = .{ .create = create, .alive = alive, .kill = kill, .killAll = kill, .delete = delete };
-        fn create(ptr: *anyopaque, options: Backend.CreateOptions) Backend.Error!Backend.Handle {
+        const vtable: libcontainer.Container.VTable = .{ .alive = alive, .kill = kill, .killAll = kill, .delete = delete };
+        pub fn create(ptr: *anyopaque, options: libcontainer.CreateOptions) libcontainer.Error!libcontainer.State {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.fail_create) return error.HookFailed;
-            const handle: Backend.Handle = .{ .id = options.id, .pid = 1234, .starttime = "12345" };
+            const handle: libcontainer.State = .{ .id = options.id, .pid = 1234, .starttime = "12345" };
             if (options.on_create) |callback| callback.run(callback.ptr, handle) catch |err| {
-                // A backend owns cleanup when its parent callback aborts create.
-                try kill(ptr, handle, 9);
-                try delete(ptr, handle);
+                // A container owns cleanup when its parent callback aborts create.
+                try kill(ptr, 9);
+                try delete(ptr);
                 return err;
             };
             return .{ .id = options.id, .pid = handle.pid, .starttime = try options.allocator.dupe(u8, handle.starttime) };
         }
-        fn alive(_: *anyopaque, _: Backend.Handle) Backend.Error!bool {
+        fn alive(_: *anyopaque) libcontainer.Error!bool {
             return true;
         }
-        fn kill(ptr: *anyopaque, _: Backend.Handle, _: i32) Backend.Error!void {
+        fn kill(ptr: *anyopaque, _: i32) libcontainer.Error!void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.killed = true;
         }
-        fn delete(ptr: *anyopaque, _: Backend.Handle) Backend.Error!void {
+        fn delete(ptr: *anyopaque) libcontainer.Error!void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.deleted = true;
         }
@@ -124,11 +125,11 @@ test "linux failed create runs poststop after removing runtime state" {
     const bundle = try std.fs.path.join(std.testing.allocator, &.{ base, "bundle" });
     defer std.testing.allocator.free(bundle);
     for ([_]bool{ false, true }) |fail_create| {
-        var implementation: TestBackend = .{ .fail_create = fail_create };
-        try std.testing.expectError(error.HookFailed, createContainer(std.testing.allocator, std.testing.io, .{
+        var implementation: TestContainer = .{ .fail_create = fail_create };
+        try std.testing.expectError(error.HookFailed, createContainer(std.testing.allocator, std.testing.io, overrideContainer(&implementation, .{
             .ptr = &implementation,
-            .vtable = &TestBackend.vtable,
-        }, .{ .root = base, .subcommand = .create, .id = "example", .bundle = bundle }));
+            .vtable = &TestContainer.vtable,
+        }), .{ .root = base, .subcommand = .create, .id = "example", .bundle = bundle }));
         try std.testing.expectEqual(!fail_create, implementation.killed and implementation.deleted);
         try std.testing.expectError(error.FileNotFound, tmp.dir.openDir(std.testing.io, "example", .{}));
         const input = try tmp.dir.readFileAlloc(std.testing.io, "poststop-input", std.testing.allocator, .limited(4096));
@@ -144,18 +145,21 @@ test "linux failed create runs poststop after removing runtime state" {
 
 test "linux poststop runs after stopped-container deletion despite a missing bundle and earlier hook failure" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
-    const TestBackend = struct {
-        const vtable: Backend.VTable = .{ .create = create, .alive = alive, .kill = kill, .killAll = kill, .delete = delete };
-        fn create(_: *anyopaque, _: Backend.CreateOptions) Backend.Error!Backend.Handle {
+    const TestContainer = struct {
+        state: libcontainer.State = undefined,
+        const vtable: libcontainer.Container.VTable = .{ .alive = alive, .kill = kill, .killAll = kill, .delete = delete };
+        pub fn create(_: *anyopaque, _: libcontainer.CreateOptions) libcontainer.Error!libcontainer.State {
             return error.NotImplemented;
         }
-        fn alive(_: *anyopaque, _: Backend.Handle) Backend.Error!bool {
+        fn alive(_: *anyopaque) libcontainer.Error!bool {
             return false;
         }
-        fn kill(_: *anyopaque, _: Backend.Handle, _: i32) Backend.Error!void {
+        fn kill(_: *anyopaque, _: i32) libcontainer.Error!void {
             return error.NotImplemented;
         }
-        fn delete(_: *anyopaque, handle: Backend.Handle) Backend.Error!void {
+        fn delete(ptr: *anyopaque) libcontainer.Error!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const handle = self.state;
             if (handle.pid != 1234) return error.InvalidProcess;
         }
     };
@@ -189,11 +193,11 @@ test "linux poststop runs after stopped-container deletion despite a missing bun
         .status = .stopped,
         .bundle = "/igvano-missing-bundle",
     });
-    var implementation: TestBackend = .{};
-    try deleteContainer(std.testing.allocator, std.testing.io, .{
+    var implementation: TestContainer = .{};
+    try deleteContainer(std.testing.allocator, std.testing.io, overrideContainer(&implementation, .{
         .ptr = &implementation,
-        .vtable = &TestBackend.vtable,
-    }, .{ .root = root, .id = "example", .subcommand = .delete });
+        .vtable = &TestContainer.vtable,
+    }), .{ .root = root, .id = "example", .subcommand = .delete });
     const input = try tmp.dir.readFileAlloc(std.testing.io, "hook-state", std.testing.allocator, .limited(4096));
     defer std.testing.allocator.free(input);
     const state = try std.json.parseFromSlice(oci.State, std.testing.allocator, input, .{});
@@ -280,8 +284,8 @@ test "linux prestart receives created state before init unblocks and poststart r
     const json = try std.json.Stringify.valueAlloc(std.testing.allocator, configured, .{ .emit_null_optional_fields = false });
     defer std.testing.allocator.free(json);
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "example/hooks.json", .data = json });
-    var implementation: libcontainer.LinuxBackend = .{};
-    try startContainer(std.testing.allocator, std.testing.io, implementation.backend(), .{
+
+    try startContainer(std.testing.allocator, std.testing.io, null, .{
         .root = root,
         .id = "example",
         .subcommand = .start,
@@ -303,29 +307,31 @@ test "linux prestart receives created state before init unblocks and poststart r
 }
 
 test "prestart failure kills init and destroys runtime state" {
-    const TestBackend = struct {
+    const TestContainer = struct {
+        state: libcontainer.State = undefined,
         checks: usize = 0,
         killed: bool = false,
         signal: ?i32 = null,
         deleted: bool = false,
-        const vtable: Backend.VTable = .{ .create = create, .alive = alive, .kill = kill, .killAll = kill, .delete = delete };
-        fn create(_: *anyopaque, _: Backend.CreateOptions) Backend.Error!Backend.Handle {
+        const vtable: libcontainer.Container.VTable = .{ .alive = alive, .kill = kill, .killAll = kill, .delete = delete };
+        pub fn create(_: *anyopaque, _: libcontainer.CreateOptions) libcontainer.Error!libcontainer.State {
             return error.NotImplemented;
         }
-        fn alive(ptr: *anyopaque, _: Backend.Handle) Backend.Error!bool {
+        fn alive(ptr: *anyopaque) libcontainer.Error!bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.checks += 1;
             return !self.killed;
         }
-        fn kill(ptr: *anyopaque, _: Backend.Handle, signal: i32) Backend.Error!void {
+        fn kill(ptr: *anyopaque, signal: i32) libcontainer.Error!void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.killed = true;
             self.signal = signal;
             // A cleanup error must not replace the hook failure.
             return error.KillFailed;
         }
-        fn delete(ptr: *anyopaque, handle: Backend.Handle) Backend.Error!void {
+        fn delete(ptr: *anyopaque) libcontainer.Error!void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            const handle = self.state;
             if (!self.killed or handle.pid != 1234 or
                 !std.mem.eql(u8, handle.cgroup_path orelse return error.InvalidPath, "custom/persisted"))
                 return error.CgroupDeleteFailed;
@@ -376,12 +382,12 @@ test "prestart failure kills init and destroys runtime state" {
         const json = try std.json.Stringify.valueAlloc(std.testing.allocator, configured, .{ .emit_null_optional_fields = false });
         defer std.testing.allocator.free(json);
         try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "example/hooks.json", .data = json });
-        var implementation: TestBackend = .{};
-        const backend: Backend = .{
+        var implementation: TestContainer = .{};
+        const container: libcontainer.Container = .{
             .ptr = &implementation,
-            .vtable = &TestBackend.vtable,
+            .vtable = &TestContainer.vtable,
         };
-        try std.testing.expectError(case.failure, startContainer(std.testing.allocator, std.testing.io, backend, .{
+        try std.testing.expectError(case.failure, startContainer(std.testing.allocator, std.testing.io, overrideContainer(&implementation, container), .{
             .root = root,
             .id = "example",
             .subcommand = .start,
@@ -390,7 +396,7 @@ test "prestart failure kills init and destroys runtime state" {
         try std.testing.expectEqual(@as(?i32, 9), implementation.signal);
         try std.testing.expect(implementation.deleted);
         try std.testing.expectError(error.FileNotFound, tmp.dir.openDir(std.testing.io, "example", .{}));
-        try std.testing.expectError(error.FileNotFound, readLiveState(std.testing.allocator, std.testing.io, backend, .{
+        try std.testing.expectError(error.FileNotFound, readLiveState(std.testing.allocator, std.testing.io, overrideContainer(&implementation, container), .{
             .root = root,
             .id = "example",
             .subcommand = .state,

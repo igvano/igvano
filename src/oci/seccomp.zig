@@ -1,11 +1,11 @@
 const std = @import("std");
-const Backend = @import("libcontainer").Backend;
+const libcontainer = @import("libcontainer");
 const invalidConfig = @import("diagnostic.zig").invalidConfig;
 const Spec = @import("spec.zig").Spec;
 
-pub fn prepareSeccomp(allocator: std.mem.Allocator, configured: ?Spec.Seccomp) !?Backend.seccomp.Config {
+pub fn prepareSeccomp(allocator: std.mem.Allocator, configured: ?Spec.Seccomp) !?libcontainer.seccomp.Config {
     const config = configured orelse return null;
-    const seccomp = Backend.seccomp;
+    const seccomp = libcontainer.seccomp;
     if (config.listenerPath != null)
         return seccompInvalid("seccomp notify is not supported", .{});
     const default_action = try seccompAction(config.defaultAction);
@@ -43,8 +43,8 @@ fn seccompFlags(configured: ?[]const []const u8) !u32 {
     return flags;
 }
 
-fn appendSeccompArches(allocator: std.mem.Allocator, arches: *std.ArrayList(Backend.seccomp.Arch), configured: ?[]const []const u8) !void {
-    const seccomp = Backend.seccomp;
+fn appendSeccompArches(allocator: std.mem.Allocator, arches: *std.ArrayList(libcontainer.seccomp.Arch), configured: ?[]const []const u8) !void {
+    const seccomp = libcontainer.seccomp;
     // Like seccomp_init, retain the native ABI when additional ABIs are named.
     try arches.append(allocator, seccomp.Arch.native() orelse
         return seccompInvalid("seccomp is unsupported on this architecture", .{}));
@@ -57,7 +57,7 @@ fn appendSeccompArches(allocator: std.mem.Allocator, arches: *std.ArrayList(Back
     }
 }
 
-fn appendSeccompSyscall(allocator: std.mem.Allocator, rules: *std.ArrayList(Backend.seccomp.Rule), args: *std.ArrayList(Backend.seccomp.Arg), arches: []const Backend.seccomp.Arch, syscall: Spec.Seccomp.Syscall) !void {
+fn appendSeccompSyscall(allocator: std.mem.Allocator, rules: *std.ArrayList(libcontainer.seccomp.Rule), args: *std.ArrayList(libcontainer.seccomp.Arg), arches: []const libcontainer.seccomp.Arch, syscall: Spec.Seccomp.Syscall) !void {
     const action = try seccompAction(syscall.action);
     if (syscall.errnoRet != null and action != .errno and action != .trace)
         return seccompInvalid("seccomp errnoRet is not supported by {s}", .{syscall.action});
@@ -66,7 +66,7 @@ fn appendSeccompSyscall(allocator: std.mem.Allocator, rules: *std.ArrayList(Back
     try appendSeccompRules(allocator, rules, arches, syscall.names, action, errno_ret, args.items, repeated_index);
 }
 
-fn prepareSeccompArgs(allocator: std.mem.Allocator, args: *std.ArrayList(Backend.seccomp.Arg), configured: ?[]const Spec.Seccomp.Arg) !bool {
+fn prepareSeccompArgs(allocator: std.mem.Allocator, args: *std.ArrayList(libcontainer.seccomp.Arg), configured: ?[]const Spec.Seccomp.Arg) !bool {
     args.clearRetainingCapacity();
     var indices: [6]bool = @splat(false);
     var repeated_index = false;
@@ -85,8 +85,8 @@ fn prepareSeccompArgs(allocator: std.mem.Allocator, args: *std.ArrayList(Backend
     return repeated_index;
 }
 
-fn appendSeccompRules(allocator: std.mem.Allocator, rules: *std.ArrayList(Backend.seccomp.Rule), arches: []const Backend.seccomp.Arch, names: []const []const u8, action: Backend.seccomp.Action, errno_ret: ?u16, args: []const Backend.seccomp.Arg, repeated_index: bool) !void {
-    const seccomp = Backend.seccomp;
+fn appendSeccompRules(allocator: std.mem.Allocator, rules: *std.ArrayList(libcontainer.seccomp.Rule), arches: []const libcontainer.seccomp.Arch, names: []const []const u8, action: libcontainer.seccomp.Action, errno_ret: ?u16, args: []const libcontainer.seccomp.Arg, repeated_index: bool) !void {
+    const seccomp = libcontainer.seccomp;
     for (arches) |arch| for (names) |name| {
         const number = seccompSyscall(arch, name) orelse continue;
         // runc/libseccomp split every condition into an OR rule if any index repeats.
@@ -99,7 +99,7 @@ fn appendSeccompRules(allocator: std.mem.Allocator, rules: *std.ArrayList(Backen
     };
 }
 
-pub fn freeSeccomp(allocator: std.mem.Allocator, config: ?Backend.seccomp.Config) void {
+pub fn freeSeccomp(allocator: std.mem.Allocator, config: ?libcontainer.seccomp.Config) void {
     const value = config orelse return;
     for (value.rules) |rule| allocator.free(rule.args);
     allocator.free(value.rules);
@@ -110,7 +110,7 @@ fn seccompInvalid(comptime fmt: []const u8, args: anytype) error{InvalidConfig} 
     return invalidConfig("linux.seccomp: " ++ fmt, args);
 }
 
-fn seccompAction(name: []const u8) error{InvalidConfig}!Backend.seccomp.Action {
+fn seccompAction(name: []const u8) error{InvalidConfig}!libcontainer.seccomp.Action {
     if (std.mem.eql(u8, name, "SCMP_ACT_NOTIFY"))
         return seccompInvalid("seccomp notify is not supported", .{});
     return seccomp_actions.get(name) orelse seccompInvalid("unknown seccomp action: {s}", .{name});
@@ -123,15 +123,15 @@ fn seccompErrno(value: ?u32) error{InvalidConfig}!?u16 {
     return @intCast(number);
 }
 
-pub const seccomp_actions = std.StaticStringMap(Backend.seccomp.Action).initComptime(.{
+pub const seccomp_actions = std.StaticStringMap(libcontainer.seccomp.Action).initComptime(.{
     .{ "SCMP_ACT_KILL", .kill_thread },          .{ "SCMP_ACT_KILL_THREAD", .kill_thread },
     .{ "SCMP_ACT_KILL_PROCESS", .kill_process }, .{ "SCMP_ACT_TRAP", .trap },
     .{ "SCMP_ACT_ERRNO", .errno },               .{ "SCMP_ACT_TRACE", .trace },
     .{ "SCMP_ACT_LOG", .log },                   .{ "SCMP_ACT_ALLOW", .allow },
 });
 
-pub const seccomp_arches = std.StaticStringMap(?Backend.seccomp.Arch).initComptime(.{
-    .{ "SCMP_ARCH_NATIVE", Backend.seccomp.Arch.native() },
+pub const seccomp_arches = std.StaticStringMap(?libcontainer.seccomp.Arch).initComptime(.{
+    .{ "SCMP_ARCH_NATIVE", libcontainer.seccomp.Arch.native() },
     .{ "SCMP_ARCH_X86_64", .x86_64 },
     .{ "SCMP_ARCH_X86", .x86 },
     .{ "SCMP_ARCH_AARCH64", .aarch64 },
@@ -157,7 +157,7 @@ pub const seccomp_arches = std.StaticStringMap(?Backend.seccomp.Arch).initCompti
     .{ "SCMP_ARCH_SHEB", null },
 });
 
-pub const seccomp_ops = std.StaticStringMap(Backend.seccomp.Op).initComptime(.{
+pub const seccomp_ops = std.StaticStringMap(libcontainer.seccomp.Op).initComptime(.{
     .{ "SCMP_CMP_EQ", .eq },               .{ "SCMP_CMP_NE", .ne }, .{ "SCMP_CMP_LT", .lt },
     .{ "SCMP_CMP_LE", .le },               .{ "SCMP_CMP_GT", .gt }, .{ "SCMP_CMP_GE", .ge },
     .{ "SCMP_CMP_MASKED_EQ", .masked_eq },
@@ -222,7 +222,7 @@ const seccomp_syscalls_arm = syscallMap(std.os.linux.syscalls.Arm, &.{
     .{ "sync_file_range2", "sync_file_range" },
 });
 
-fn seccompSyscall(arch: Backend.seccomp.Arch, name: []const u8) ?u32 {
+fn seccompSyscall(arch: libcontainer.seccomp.Arch, name: []const u8) ?u32 {
     return switch (arch) {
         .x86_64 => seccomp_syscalls_x64.get(name),
         .x32 => seccomp_syscalls_x32.get(name),
@@ -233,7 +233,7 @@ fn seccompSyscall(arch: Backend.seccomp.Arch, name: []const u8) ?u32 {
 }
 
 test "seccomp syscall lookup uses ABI-specific OCI names" {
-    const cases = [_]struct { arch: Backend.seccomp.Arch, name: []const u8, number: ?u32 }{
+    const cases = [_]struct { arch: libcontainer.seccomp.Arch, name: []const u8, number: ?u32 }{
         .{ .arch = .x86_64, .name = "newfstatat", .number = 262 },
         .{ .arch = .x32, .name = "newfstatat", .number = 0x40000000 + 262 },
         .{ .arch = .x32, .name = "execve", .number = 0x40000000 + 520 },
@@ -269,7 +269,7 @@ test "seccomp syscall lookup uses ABI-specific OCI names" {
     };
     for (cases) |case|
         try std.testing.expectEqual(case.number, seccompSyscall(case.arch, case.name));
-    for ([_]Backend.seccomp.Arch{ .x86_64, .x32, .x86, .aarch64, .arm }) |arch|
+    for ([_]libcontainer.seccomp.Arch{ .x86_64, .x32, .x86, .aarch64, .arm }) |arch|
         try std.testing.expectEqual(@as(?u32, null), seccompSyscall(arch, "riscv_hwprobe"));
 }
 
@@ -292,7 +292,7 @@ test "seccomp translation resolves syscall numbers per ABI and skips unknown nam
     for (translated.rules) |rule| {
         try std.testing.expectEqual(@as(u64, 4294967296), rule.args[0].value);
         try std.testing.expectEqual(@as(u64, 1), rule.args[0].value_two);
-        try std.testing.expectEqual(Backend.seccomp.Op.masked_eq, rule.args[0].op);
+        try std.testing.expectEqual(libcontainer.seccomp.Op.masked_eq, rule.args[0].op);
         switch (rule.arch) {
             .x86_64 => {
                 try std.testing.expectEqual(@as(u32, 83), rule.number);
@@ -342,11 +342,11 @@ test "seccomp rejects unsupported or unknown schema values even for unknown sysc
     try std.testing.expect((try prepareSeccomp(arena.allocator(), .{
         .defaultAction = "SCMP_ACT_ALLOW",
         .architectures = &.{"SCMP_ARCH_X32"},
-    })).?.architectures.len == if (Backend.seccomp.Arch.native() == .x32) @as(usize, 1) else 2);
+    })).?.architectures.len == if (libcontainer.seccomp.Arch.native() == .x32) @as(usize, 1) else 2);
 }
 
 test "seccomp repeated argument indices deny personality alternatives" {
-    const seccomp = Backend.seccomp;
+    const seccomp = libcontainer.seccomp;
     const testing = @import("libcontainer").testing.seccomp;
     // A repeated index makes every condition an alternative, including index 1.
     // Distinct indices in the second syscall still form a conjunction.
@@ -405,14 +405,14 @@ test "seccomp accepts all spec architecture names and ignores unimplemented ABIs
             .syscalls = &.{.{ .names = &.{"personality"}, .action = "SCMP_ACT_ERRNO" }},
         })).?;
         defer freeSeccomp(std.testing.allocator, config);
-        const native = Backend.seccomp.Arch.native().?;
-        const program = try Backend.seccomp.compile(std.testing.allocator, config, native);
+        const native = libcontainer.seccomp.Arch.native().?;
+        const program = try libcontainer.seccomp.compile(std.testing.allocator, config, native);
         defer std.testing.allocator.free(program.filters);
         if (std.mem.eql(u8, name, "SCMP_ARCH_NATIVE") or
             (!std.mem.eql(u8, name, "SCMP_ARCH_X86") and !std.mem.eql(u8, name, "SCMP_ARCH_X86_64") and
                 !std.mem.eql(u8, name, "SCMP_ARCH_X32") and
                 !std.mem.eql(u8, name, "SCMP_ARCH_ARM") and !std.mem.eql(u8, name, "SCMP_ARCH_AARCH64")))
-            try std.testing.expectEqualSlices(Backend.seccomp.Arch, &.{native}, config.architectures);
+            try std.testing.expectEqualSlices(libcontainer.seccomp.Arch, &.{native}, config.architectures);
     }
 }
 

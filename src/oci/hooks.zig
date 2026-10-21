@@ -1,5 +1,5 @@
 const std = @import("std");
-const Backend = @import("libcontainer").Backend;
+const libcontainer = @import("libcontainer");
 const invalidConfig = @import("diagnostic.zig").invalidConfig;
 const Spec = @import("spec.zig").Spec;
 
@@ -19,9 +19,9 @@ pub fn validateHooks(configured: ?Spec.Hooks) error{InvalidConfig}!void {
 }
 
 /// Translate OCI hook entries; all slices are borrowed from the parsed spec.
-pub fn prepareHooks(allocator: std.mem.Allocator, configured: ?[]const Spec.Hook) ![]Backend.Hook {
+pub fn prepareHooks(allocator: std.mem.Allocator, configured: ?[]const Spec.Hook) ![]libcontainer.Hook {
     const entries = configured orelse &.{};
-    const hooks = try allocator.alloc(Backend.Hook, entries.len);
+    const hooks = try allocator.alloc(libcontainer.Hook, entries.len);
     for (entries, hooks) |entry, *hook| hook.* = .{
         .path = entry.path,
         .args = entry.args orelse &.{},

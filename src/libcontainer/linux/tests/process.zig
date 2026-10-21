@@ -2,7 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 const posix = std.posix;
-const Backend = @import("../../root.zig").Backend;
+const libcontainer = @import("../../root.zig");
 const seccomp = @import("../../seccomp.zig");
 const diagnostics = @import("../diagnostic.zig");
 const checkResult = @import("../syscall.zig").checkResult;
@@ -32,7 +32,7 @@ test "linux capability preparation skips bits unsupported by the running kernel"
     if (linux.errno(linux.prctl(@intFromEnum(linux.PR.CAPBSET_READ), 63, 0, 0, 0)) != .INVAL)
         return error.SkipZigTest;
     const future = @as(u64, 1) << 63;
-    try std.testing.expectEqual(Backend.Capabilities{
+    try std.testing.expectEqual(libcontainer.Capabilities{
         .bounding = 1,
         .effective = 1,
         .permitted = 1,
@@ -113,7 +113,7 @@ test "linux init rejects missing directory and non-executable args before create
     const rootfs_z = try std.testing.allocator.dupeZ(u8, rootfs);
     defer std.testing.allocator.free(rootfs_z);
     for ([_][*:0]const u8{ "igvano-no-such-binary", "/igvano-no-such-binary", "/directory", "/no-execute" }) |arg0| {
-        const process: Backend.Process = .{ .args = &.{std.mem.span(arg0)}, .cwd = "/", .uid = 0, .gid = 0 };
+        const process: libcontainer.Process = .{ .args = &.{std.mem.span(arg0)}, .cwd = "/", .uid = 0, .gid = 0 };
         const argv = [_:null]?[*:0]const u8{arg0};
         const envp = [_:null]?[*:0]const u8{"PATH=/bin:/usr/bin"};
         const ready = try makePipe();
@@ -143,7 +143,7 @@ test "linux init rejects missing directory and non-executable args before create
 test "linux init applies uid gid and optional supplementary groups before exec" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     if (linux.geteuid() != 0) return error.SkipZigTest;
-    const cases = [_]struct { process: Backend.Process, expected: []const u8 }{
+    const cases = [_]struct { process: libcontainer.Process, expected: []const u8 }{
         .{ .process = .{ .args = &.{ "sh", "-c", "id -u; id -g; id -G" }, .cwd = "/", .uid = 1000, .gid = 1000 }, .expected = "1000\n1000\n1000\n" },
         .{ .process = .{ .args = &.{ "sh", "-c", "id -u; id -g; id -G" }, .cwd = "/", .uid = 1000, .gid = 1000, .additional_gids = &.{} }, .expected = "1000\n1000\n1000\n" },
         .{ .process = .{ .args = &.{ "sh", "-c", "id -u; id -g; id -G" }, .cwd = "/", .uid = 1000, .gid = 1000, .additional_gids = &.{ 1001, 1002 } }, .expected = "1000\n1000\n1000 1001 1002\n" },
@@ -236,7 +236,7 @@ test "linux init exits nonzero instead of exec for out of range oomScoreAdj" {
 
 test "linux init exits nonzero instead of exec when it cannot apply process user" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
-    const process: Backend.Process = .{ .args = &.{ "/bin/sh", "-c", "exit 0" }, .cwd = "/", .uid = 0, .gid = 0 };
+    const process: libcontainer.Process = .{ .args = &.{ "/bin/sh", "-c", "exit 0" }, .cwd = "/", .uid = 0, .gid = 0 };
     const argv = [_:null]?[*:0]const u8{ "/bin/sh", "-c", "exit 0" };
     const envp = [_:null]?[*:0]const u8{};
     const ready = try makePipe();
@@ -262,7 +262,7 @@ test "linux init marks inherited descriptors CLOEXEC and sets noNewPrivileges" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     if (linux.geteuid() != 0) return error.SkipZigTest;
     const command = "test ! -e /proc/self/fd/200 && grep -q '^NoNewPrivs:[[:space:]]*1$' /proc/self/status";
-    const process: Backend.Process = .{
+    const process: libcontainer.Process = .{
         .args = &.{ "/bin/sh", "-c", command },
         .cwd = "/",
         .uid = 0,
@@ -339,7 +339,7 @@ test "linux process settings apply rlimits without changing inherited capabiliti
     try checkResult(linux.getrlimit(.NOFILE, &original));
     const hard = @min(original.max, 1024);
     const soft = @min(hard, 512);
-    const process: Backend.Process = .{
+    const process: libcontainer.Process = .{
         .args = &.{"/bin/true"},
         .cwd = "/",
         .uid = linux.geteuid(),
@@ -374,7 +374,7 @@ test "linux process settings retain configured capabilities across nonzero uid a
     if (linux.prctl(@intFromEnum(linux.PR.CAPBSET_READ), linux.CAP.CHOWN, 0, 0, 0) != 1)
         return error.SkipZigTest;
     const command = "test \"$(id -u)\" = 1000 && grep -q '^CapAmb:[[:space:]]*0000000000000001$' /proc/self/status";
-    const process: Backend.Process = .{
+    const process: libcontainer.Process = .{
         .args = &.{ "/bin/sh", "-c", command },
         .cwd = "/",
         .uid = 1000,

@@ -1,5 +1,5 @@
 const std = @import("std");
-const Backend = @import("libcontainer").Backend;
+const libcontainer = @import("libcontainer");
 const invalidConfig = @import("diagnostic.zig").invalidConfig;
 const Spec = @import("spec.zig").Spec;
 const requireCreate = @import("validate.zig").requireCreate;
@@ -59,9 +59,9 @@ pub fn validateSysctls(config: Spec.Linux) error{InvalidConfig}!void {
 }
 
 /// The frontend validated namespace ownership; the backend receives only writes.
-pub fn prepareSysctls(allocator: std.mem.Allocator, config: Spec.Linux) ![]Backend.Sysctl {
-    const configured = config.sysctl orelse return allocator.alloc(Backend.Sysctl, 0);
-    const entries = try allocator.alloc(Backend.Sysctl, configured.map.count());
+pub fn prepareSysctls(allocator: std.mem.Allocator, config: Spec.Linux) ![]libcontainer.Sysctl {
+    const configured = config.sysctl orelse return allocator.alloc(libcontainer.Sysctl, 0);
+    const entries = try allocator.alloc(libcontainer.Sysctl, configured.map.count());
     var iterator = configured.map.iterator();
     var index: usize = 0;
     while (iterator.next()) |entry| : (index += 1)
