@@ -162,6 +162,26 @@ igvano is also checked with containerd v2.2's integration suite
 [cri-tools](https://github.com/kubernetes-sigs/cri-tools)' `critest` through
 containerd's CRI plugin. On both cgroup v1 and v2 the results match runc's.
 
+### Kubernetes (kind)
+
+`hack/kind.sh` builds igvano for the Docker host's architecture and creates a
+kind cluster with an igvano RuntimeClass. It checks a two-replica
+`nginx:alpine` Deployment's readiness probes, exec, logs and pod replacement,
+plus a one-shot BusyBox pod checking its mounted service-account token.
+Docker, kind, kubectl and Nix must be on `PATH`.
+
+```sh
+hack/kind.sh
+KIND_CGROUP_DRIVER=cgroupfs hack/kind.sh
+```
+
+The default driver is systemd; the cgroupfs variant configures both kubelet
+and every containerd runtime to use cgroupfs. `KIND_NODE_IMAGE` defaults to
+`kindest/node:v1.34.0`, and `KIND_CLUSTER` defaults to `igvano-kind` (an
+existing cluster with that name is refused). Failures print pod and containerd
+diagnostics. The cluster is deleted on exit; set `KEEP_CLUSTER=1` to retain it
+and use `kind export kubeconfig --name <cluster>` to inspect it.
+
 ## Layout
 
 - `src/main.zig` — CLI entry point: dispatch and error reporting (stderr, `--log`)

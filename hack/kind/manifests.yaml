@@ -1,0 +1,31 @@
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: igvano
+handler: igvano
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: nginx
+  template:
+    metadata:
+      labels:
+        app: nginx
+    spec:
+      runtimeClassName: igvano
+      # Keep the default service-account token mount: Alpine's /var/run is a symlink.
+      containers:
+        - name: nginx
+          image: nginx:alpine
+          ports:
+            - containerPort: 80
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 80

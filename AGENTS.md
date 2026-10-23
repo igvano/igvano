@@ -51,6 +51,7 @@ macOS skips every Linux-gated test, so a passing `zig build test` is not enough 
 - arm64 cgroup v1 and v2, systemd, AppArmor: the same binaries built for `aarch64-linux-musl`, run as root in the Lima VMs (one pure cgroup v1, one cgroup v2).
 - Conformance: `hack/conformance.sh` (cgroup v2, Colima) and `CONFORMANCE_VM=<vm> hack/conformance.sh` (cgroup v1), from a checkout under `$HOME`. Gate per suite: no previously clean suite may gain failures; known runtime-tools/kernel failures are labelled.
 - containerd: v2.2 `integration/client` suite and `critest` via the CRI plugin, compared with runc on the same host.
+- Kubernetes (kind): `hack/kind.sh` (systemd driver) and `KIND_CGROUP_DRIVER=cgroupfs hack/kind.sh` (cgroupfs driver for kubelet and all containerd runtimes). Requires Docker, kind, kubectl and Nix; builds for the Docker host architecture. Checks nginx readiness/exec/logs/pod replacement and the default service-account token mount. `KIND_CLUSTER` defaults to `igvano-kind` (must not already exist), `KIND_NODE_IMAGE` to `kindest/node:v1.34.0`; `KEEP_CLUSTER=1` retains the cluster, otherwise the exit trap tears it down after failure diagnostics.
 
 Gotchas:
 - Nix flakes ignore untracked files — `git add` new files before `nix develop` or the build won't see them.
