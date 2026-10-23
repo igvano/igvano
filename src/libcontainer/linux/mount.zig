@@ -10,6 +10,8 @@ const closeFd = @import("syscall.zig").closeFd;
 const openPath = @import("syscall.zig").openPath;
 const fileType = @import("syscall.zig").fileType;
 const fdPath = @import("syscall.zig").fdPath;
+const OpenHow = @import("syscall.zig").OpenHow;
+const RESOLVE_NO_MAGICLINKS = @import("syscall.zig").RESOLVE_NO_MAGICLINKS;
 const reportDiagnostic = @import("diagnostic.zig").reportDiagnostic;
 const V1Hierarchy = @import("cgroup_v1.zig").V1Hierarchy;
 const v1Hierarchies = @import("cgroup_v1.zig").v1Hierarchies;
@@ -17,6 +19,7 @@ const RootfsStep = @import("rootfs.zig").RootfsStep;
 
 const ST_NOATIME: usize = 1024;
 const ST_RELATIME: usize = 4096; // Unlike MS_RELATIME.
+const RESOLVE_IN_ROOT: u64 = 0x10;
 pub const OPEN_TREE_CLONE: u32 = 1;
 pub const OPEN_TREE_CLOEXEC: u32 = 1 << @bitOffsetOf(linux.O, "CLOEXEC");
 pub const MOUNT_ATTR_IDMAP: u64 = 0x00100000;
@@ -326,10 +329,13 @@ pub const PreparedMount = struct {
     symlinks: []const libcontainer.Symlink = &.{},
 };
 
-/// Walk beneath a pinned root, rejecting symlinks in every component. Mounting
-/// through the returned fd also avoids a destination swap between lookup/mount.
+/// Follow symlinks within a pinned root, including absolute targets and ".."
+/// in symlink contents. Mount through the returned fd to avoid destination swaps.
 pub fn mountDestination(root_fd: posix.fd_t, destination: []const u8, is_file: bool, create: bool) libcontainer.Error!posix.fd_t {
-    var current = try openPath(root_fd, ".", .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true });
+    if (std.mem.indexOfScalar(u8, destination, 0) != null) return error.InvalidPath;
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path = std.fmt.bufPrintZ(&path_buffer, "{s}", .{destination}) catch return error.InvalidPath;
+    var current = try openMountPath(root_fd, ".", false);
     errdefer closeFd(current);
     var components = std.mem.tokenizeScalar(u8, destination, '/');
     var component = components.next() orelse {
@@ -340,10 +346,13 @@ pub fn mountDestination(root_fd: posix.fd_t, destination: []const u8, is_file: b
         // Frontend paths are normalized; reject traversal from library callers too.
         if (std.mem.eql(u8, component, "..") or std.mem.eql(u8, component, ".")) return error.InvalidPath;
         const next = components.next();
+        const end = @intFromPtr(component.ptr) - @intFromPtr(destination.ptr) + component.len;
+        path_buffer[end] = 0;
+        defer path_buffer[end] = if (end < destination.len) destination[end] else 0;
         var buffer: [256]u8 = undefined;
         const name = std.fmt.bufPrintZ(&buffer, "{s}", .{component}) catch return error.InvalidPath;
         if (next == null and is_file) {
-            const fd = try openMountFile(current, name, create);
+            const fd = try openMountFile(root_fd, current, name, path.ptr, create);
             closeFd(current);
             return fd;
         }
@@ -354,14 +363,42 @@ pub fn mountDestination(root_fd: posix.fd_t, destination: []const u8, is_file: b
                 else => try checkResult(created),
             }
         }
-        const fd = try openPath(current, name, .{ .PATH = true, .DIRECTORY = true, .NOFOLLOW = true, .CLOEXEC = true });
+        // Resolve the whole prefix from root_fd, never from current: an absolute
+        // symlink (or ".." in its target) must be scoped to the container root.
+        // Reopening also confines a component swapped to a symlink after mkdir.
+        const fd = try openMountPath(root_fd, path.ptr, false);
         closeFd(current);
         current = fd;
         component = next orelse return current;
     }
 }
 
-fn openMountFile(dir: posix.fd_t, name: [:0]const u8, create: bool) libcontainer.Error!posix.fd_t {
+const mount_destination_retry_failure = "resolve mount destination (openat2 EAGAIN after 32 attempts)";
+
+fn openMountPath(root_fd: posix.fd_t, path: [*:0]const u8, is_file: bool) libcontainer.Error!posix.fd_t {
+    const flags: linux.O = .{ .PATH = true, .DIRECTORY = !is_file, .CLOEXEC = true };
+    const how: OpenHow = .{
+        .flags = @as(u32, @bitCast(flags)),
+        .resolve = RESOLVE_IN_ROOT | RESOLVE_NO_MAGICLINKS,
+    };
+    // Scoped ".." lookups can race with mount or rename changes elsewhere.
+    for (0..32) |_| {
+        const result = linux.syscall4(.openat2, @intCast(root_fd), @intFromPtr(path), @intFromPtr(&how), @sizeOf(OpenHow));
+        switch (linux.errno(result)) {
+            .AGAIN => continue,
+            .NOSYS, .@"2BIG" => {
+                reportDiagnostic("openat2 with RESOLVE_IN_ROOT is required for mount destinations (Linux 5.6+): {s}", .{@tagName(linux.errno(result))});
+                return error.Unsupported;
+            },
+            else => try checkResult(result),
+        }
+        return @intCast(result);
+    }
+    reportDiagnostic(mount_destination_retry_failure, .{});
+    return error.SystemResources;
+}
+
+fn openMountFile(root_fd: posix.fd_t, dir: posix.fd_t, name: [:0]const u8, path: [*:0]const u8, create: bool) libcontainer.Error!posix.fd_t {
     if (create) {
         const created = linux.openat(dir, name, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .NOFOLLOW = true, .CLOEXEC = true }, 0o644);
         switch (linux.errno(created)) {
@@ -370,11 +407,21 @@ fn openMountFile(dir: posix.fd_t, name: [:0]const u8, create: bool) libcontainer
             else => try checkResult(created),
         }
     }
-    const fd = try openPath(dir, name, .{ .PATH = true, .NOFOLLOW = true, .CLOEXEC = true });
+    const fd = try openMountPath(root_fd, path, true);
     errdefer closeFd(fd);
     const kind = try fileType(fd);
-    if (kind == linux.S.IFLNK or kind == linux.S.IFDIR) return error.InvalidPath;
+    if (kind == linux.S.IFDIR) return error.InvalidPath;
     return fd;
+}
+
+fn mountDestinationStep(root_fd: posix.fd_t, destination: []const u8, is_file: bool, create: bool, step: *RootfsStep) libcontainer.Error!posix.fd_t {
+    return mountDestination(root_fd, destination, is_file, create) catch |err| {
+        // setupRootfs replaces the thread-local diagnostic with this step.
+        if (err == error.Unsupported) step.operation = "resolve mount destination (openat2 is required)";
+        if (err == error.SystemResources and std.mem.eql(u8, diagnostics.diagnostic() orelse "", mount_destination_retry_failure))
+            step.operation = mount_destination_retry_failure;
+        return err;
+    };
 }
 
 pub fn remountFlags(target_fd: posix.fd_t, requested: u32) libcontainer.Error!u32 {
@@ -426,7 +473,7 @@ pub fn applyMount(rootfs: [:0]const u8, root_fd: posix.fd_t, mount: PreparedMoun
     step.operation = "stat bind source";
     const is_file = if (source_fd) |fd| try fileType(fd) != linux.S.IFDIR else false;
     step.* = .{ .operation = "prepare mount destination", .path = mount.destination };
-    var target_fd = try mountDestination(root_fd, mount.destination, is_file, true);
+    var target_fd = try mountDestinationStep(root_fd, mount.destination, is_file, true, step);
     defer closeFd(target_fd);
     var source_buffer: [64]u8 = undefined;
     const source: ?[*:0]const u8 = if (source_fd) |fd|
@@ -437,12 +484,12 @@ pub fn applyMount(rootfs: [:0]const u8, root_fd: posix.fd_t, mount: PreparedMoun
         null;
     try attachMount(mount, source, target_fd, step);
     // The original fd pins the covered mount. Reopen to address the new mount
-    // for remount and propagation changes, still without following symlinks.
+    // for remount and propagation changes, with symlinks still scoped to rootfs.
     step.operation = "open mounted destination";
     const mounted_fd = if (std.mem.eql(u8, mount.destination, "/"))
         try openPath(linux.AT.FDCWD, rootfs, .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true })
     else
-        try mountDestination(root_fd, mount.destination, is_file, false);
+        try mountDestinationStep(root_fd, mount.destination, is_file, false, step);
     closeFd(target_fd);
     target_fd = mounted_fd;
     try isolateBindMount(mount, target_fd, private_mount_namespace, rootfs_propagation, step);
