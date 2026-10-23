@@ -95,7 +95,8 @@ Note: Nix flakes only see files tracked by git — `git add` new files before
 Other Zig projects can depend on the standalone `libcontainer` module:
 fetch with `zig fetch --save git+https://github.com/igvano/igvano`, then import
 `b.dependency("igvano", .{ .target = target, .optimize = optimize }).module("libcontainer")`.
-See [examples/consumer](examples/consumer) for a complete build and usage example.
+See [src/libcontainer/README.md](src/libcontainer/README.md) for the API and caller contract,
+and [examples/consumer](examples/consumer) for a complete build and usage example.
 
 ## Test
 
