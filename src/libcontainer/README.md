@@ -76,6 +76,65 @@ the FIFO `O_RDONLY` and read it until EOF, polling `container.alive()` so a dead
 leave you blocked. `waitForStart` in [`src/cli/start.zig`](../cli/start.zig) is the reference
 implementation, including timeouts.
 
+## How create works
+
+`create` uses a double fork, as runc's `nsexec` does. The calling process (*parent*) prepares
+everything before the first fork, because the forked processes must not allocate.
+*Bootstrap* (child1) joins the cgroup and the namespaces, then forks *init* (child2). Init
+becomes PID 1 in the new PID namespace. The processes coordinate over pipes, and each step
+reports a failure, with its diagnostic, back to the parent.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant P as parent<br/>(caller of create)
+    participant B as bootstrap<br/>(child1)
+    participant I as init<br/>(child2)
+    participant S as starter<br/>(caller, later)
+
+    Note over P: validate options, then prepare everything before forking:<br/>cgroup dirs or systemd connection, mount sources, devices,<br/>seccomp BPF, argv/env, hook input
+    P->>B: fork
+    Note over B: PR_SET_DUMPABLE 0<br/>join cgroup (cgroup.procs)<br/>set oom_score_adj<br/>setns joined namespaces<br/>unshare(NEWUSER, NEWPID, NEWNS, ...)
+    B->>I: fork (PID 1 in the new PID ns)
+    B->>I: init's host PID (for hook state)
+
+    opt user namespace or systemd
+        B-->>P: init PID
+        Note over P: systemd: adopt init into a transient scope<br/>userns: write uid_map / gid_map
+        P->>I: maps ready
+        Note over I: setuid/setgid 0 in the userns<br/>unshare(NEWCGROUP) if systemd
+    end
+
+    Note over I: receive id-mapped mount sources<br/>sethostname<br/>set propagation, bind rootfs onto itself<br/>apply configured mounts
+    I-->>B: mounts ready
+    Note over B: read /proc/PID/stat starttime of init<br/>(init is still its child, so the PID can't be reused)
+    B-->>P: init pid + starttime
+    Note over P: on_create(State)<br/>igvano saves state.json<br/>and runs createRuntime hooks
+    P->>I: go
+    Note over I: createContainer hooks (mount ns, before pivot_root)<br/>create /dev nodes and symlinks<br/>pivot_root, console<br/>sysctls, masked/readonly paths, readonly root
+    Note over I: chdir, AppArmor, close inherited fds<br/>rlimits, seccomp (if NNP=false)<br/>drop capabilities, setgid/setuid<br/>resolve executable
+    I-->>B: initialized
+    B-->>P: initialized
+    B->>B: exit, so init is reparented to the subreaper or PID 1
+    Note over P: reap bootstrap<br/>return State { pid, starttime, cgroup, ... }
+    Note over I: blocks in open(exec_fifo, O_WRONLY)
+
+    rect rgba(127,127,127,0.1)
+    Note over S,I: start (a separate call, e.g. igvano start)
+    S->>I: open(exec_fifo, O_RDONLY) unblocks init
+    Note over I: startContainer hooks
+    I-->>S: ack byte 1 (0 on hook failure)
+    Note over I: seccomp (if NNP=true)<br/>execve(process)
+    I-->>S: EOF: the CLOEXEC writer closed at exec
+    end
+```
+
+Failure handling: when any step fails, the failing process writes the error and its
+diagnostic to its pipe and exits. The parent then kills init if it was already reported,
+reaps bootstrap, and cleans up: it stops the systemd scope, kills and removes the cgroup,
+and detaches the rootfs self-bind. It then returns the error, with
+the reason available from `linux.diagnostic()`.
+
 ## Caller contract
 
 - **Privileges.** You need root, or a user namespace with `uid_mappings`/`gid_mappings`. You
