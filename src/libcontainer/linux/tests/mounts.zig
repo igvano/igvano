@@ -187,7 +187,10 @@ fn testCreateDanglingMount(destination: [:0]const u8, link: []const u8, target: 
     const cgroup_path = try std.fmt.allocPrint(std.testing.allocator, "igvano-dangling-mount-{d}", .{linux.getpid()});
     defer std.testing.allocator.free(cgroup_path);
     if (cgroup_root.mode == .unified) {
-        const probe = (walkCgroup(cgroup_root.fd, cgroup_path, true, &.{}) catch return error.SkipZigTest).?;
+        const probe = (walkCgroup(cgroup_root.fd, cgroup_path, true, &.{}) catch |err| switch (err) {
+            error.PermissionDenied, error.Unsupported => return error.SkipZigTest,
+            else => return err,
+        }).?;
         closeFd(probe);
         try removeCgroup(cgroup_root.fd, cgroup_path);
     }

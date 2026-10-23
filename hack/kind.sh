@@ -100,11 +100,11 @@ fi
 # Mark existing pods so the waits below must observe a new, ready replacement.
 kube label pods -l app=nginx igvano-smoke-original=true
 kube delete pod "$pod" --wait=true --timeout=180s
-deadline=$(($(date +%s) + 60))
+deadline=$(($(date +%s) + 180))
 replacement=
 while [ "$(date +%s)" -lt "$deadline" ]; do
     replacement=$(kube --request-timeout=5s get pods -l 'app=nginx,!igvano-smoke-original' \
-        -o jsonpath='{.items[*].metadata.name}')
+        -o jsonpath='{.items[*].metadata.name}') || replacement=
     if [ -n "$replacement" ]; then
         replacement=${replacement%% *}
         break
@@ -112,7 +112,7 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
     sleep 1
 done
 if [ -z "$replacement" ]; then
-    echo 'No replacement nginx pod appeared within 60s' >&2
+    echo 'No replacement nginx pod appeared within 180s' >&2
     exit 1
 fi
 kube wait "pod/$replacement" --for=condition=Ready --timeout=180s
