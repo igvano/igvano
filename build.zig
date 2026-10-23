@@ -41,6 +41,18 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(exe);
 
+    const consumer = b.addExecutable(.{
+        .name = "libcontainer-consumer",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/consumer/src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "libcontainer", .module = libcontainer }},
+        }),
+    });
+    const examples_step = b.step("examples", "Compile library consumer examples");
+    examples_step.dependOn(&consumer.step);
+
     const libcontainer_tests = b.addTest(.{ .root_module = libcontainer });
     const library_tests = b.addTest(.{ .root_module = library });
     const probe = b.addExecutable(.{
@@ -61,7 +73,8 @@ pub fn build(b: *std.Build) void {
     };
     probe_path.path.addStepDependencies(&probe_path.step);
     run_exe_tests.step.dependOn(&probe_path.step);
-    const test_step = b.step("test", "Run library and executable tests");
+    const test_step = b.step("test", "Run library and executable tests and compile examples");
+    test_step.dependOn(examples_step);
     test_step.dependOn(&b.addRunArtifact(libcontainer_tests).step);
     test_step.dependOn(&b.addRunArtifact(library_tests).step);
     test_step.dependOn(&run_exe_tests.step);

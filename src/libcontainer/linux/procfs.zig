@@ -11,6 +11,7 @@ const RESOLVE_BENEATH = @import("syscall.zig").RESOLVE_BENEATH;
 const OpenHow = @import("syscall.zig").OpenHow;
 const openat2 = @import("syscall.zig").openat2;
 const statfsType = @import("syscall.zig").statfsType;
+const PROC_SUPER_MAGIC = @import("syscall.zig").PROC_SUPER_MAGIC;
 const checkResult = @import("syscall.zig").checkResult;
 const closeFd = @import("syscall.zig").closeFd;
 const readAll = @import("syscall.zig").readAll;
@@ -40,7 +41,7 @@ pub const Procfs = struct {
     pub fn fallback(fd: posix.fd_t) libcontainer.Error!Procfs {
         var fs: [32]usize = undefined;
         try checkResult(linux.syscall2(.fstatfs, @intCast(fd), @intFromPtr(&fs)));
-        if (statfsType(&fs) != 0x9fa0) {
+        if (statfsType(&fs) != PROC_SUPER_MAGIC) {
             reportDiagnostic("unsafe fallback /proc: requires the root of a procfs mount", .{});
             return error.MissingProcfs;
         }

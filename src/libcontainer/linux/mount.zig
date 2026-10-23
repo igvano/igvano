@@ -16,6 +16,7 @@ const RESOLVE_IN_ROOT = @import("syscall.zig").RESOLVE_IN_ROOT;
 const RESOLVE_NO_MAGICLINKS = @import("syscall.zig").RESOLVE_NO_MAGICLINKS;
 const RESOLVE_NO_SYMLINKS = @import("syscall.zig").RESOLVE_NO_SYMLINKS;
 const statfsType = @import("syscall.zig").statfsType;
+const PROC_SUPER_MAGIC = @import("syscall.zig").PROC_SUPER_MAGIC;
 const reportDiagnostic = @import("diagnostic.zig").reportDiagnostic;
 const V1Hierarchy = @import("cgroup_v1.zig").V1Hierarchy;
 const v1Hierarchies = @import("cgroup_v1.zig").v1Hierarchies;
@@ -402,12 +403,7 @@ fn findMountPath(root_fd: posix.fd_t, path: [*:0]const u8, is_file: bool, nofoll
         .flags = @as(u32, @bitCast(flags)),
         .resolve = RESOLVE_IN_ROOT | RESOLVE_NO_MAGICLINKS | (if (nofollow) RESOLVE_NO_SYMLINKS else @as(u64, 0)),
     };
-    const result = openat2(root_fd, path, how) catch |err| {
-        if (err == error.ResolveRetryExhausted) {
-            reportDiagnostic(mount_destination_retry_failure, .{});
-        }
-        return err;
-    };
+    const result = try openat2(root_fd, path, how);
     switch (linux.errno(result)) {
         .NOENT => return null,
         .LOOP => return invalidMountPath("symlink loop or forbidden symlink"),
@@ -449,6 +445,7 @@ const MissingMountPath = struct {
     prefix: [linux.PATH_MAX]u8 = undefined,
     prefix_len: usize = 0,
     expansions: usize = 0,
+    created: bool = false,
 
     fn next(self: *MissingMountPath, name_buffer: []u8) libcontainer.Error!?[:0]u8 {
         const remaining = std.mem.trimStart(u8, self.pending[0..self.pending_len], "/");
@@ -486,7 +483,7 @@ const MissingMountPath = struct {
         try checkResult(linux.syscall2(.fstatfs, @intCast(link_fd), @intFromPtr(&fs)));
         // O_PATH|O_NOFOLLOW can pin a magic link even with NO_MAGICLINKS.
         // Do not reinterpret procfs links as ordinary lexical symlink targets.
-        if (statfsType(&fs) == 0x9fa0) return invalidMountPath("procfs symlink in dangling destination");
+        if (statfsType(&fs) == PROC_SUPER_MAGIC) return invalidMountPath("procfs symlink in dangling destination");
         var target: [linux.PATH_MAX]u8 = undefined;
         const read = linux.readlinkat(link_fd, "", &target, target.len);
         try checkResult(read);
@@ -517,13 +514,14 @@ fn createMissingMountDestination(root_fd: posix.fd_t, destination: [:0]const u8,
     while (try path.next(&name_buffer)) |name| {
         if (std.mem.eql(u8, name, ".")) continue;
         if (std.mem.eql(u8, name, "..")) {
+            if (path.created) return invalidMountPath("'..' after a missing component");
             path.parent();
             try reopenMountParent(root_fd, &current, &path);
             continue;
         }
         const parent_len = path.prefix_len;
         try path.append(name);
-        const fd = try missingMountComponent(root_fd, current, path.path(), name, is_file and path.pending_len == 0);
+        const fd = try missingMountComponent(root_fd, current, &path, name, is_file and path.pending_len == 0);
         defer closeFd(fd);
         if (try fileType(fd) == linux.S.IFLNK) {
             path.prefix_len = parent_len;
@@ -543,12 +541,21 @@ fn reopenMountParent(root_fd: posix.fd_t, current: *posix.fd_t, path: *MissingMo
     current.* = fd;
 }
 
-fn missingMountComponent(root_fd: posix.fd_t, parent: posix.fd_t, path: [:0]const u8, name: [:0]const u8, is_file: bool) libcontainer.Error!posix.fd_t {
-    if (try findMountPath(root_fd, path.ptr, true, true)) |fd| return fd;
+fn missingMountComponent(root_fd: posix.fd_t, parent: posix.fd_t, path: *MissingMountPath, name: [:0]const u8, is_file: bool) libcontainer.Error!posix.fd_t {
+    const prefix = path.path();
+    if (try findMountPath(root_fd, prefix.ptr, true, true)) |fd| return fd;
+    // Like securejoin's MkdirAll, reject traversal in the unresolved remainder
+    // before creating anything the kernel could not originally walk through.
+    var remaining = std.mem.tokenizeScalar(u8, path.pending[0..path.pending_len], '/');
+    while (remaining.next()) |component| {
+        if (std.mem.eql(u8, component, ".."))
+            return invalidMountPath("'..' after a missing component");
+    }
+    path.created = true;
     try createMountComponent(parent, name, is_file);
     // EXCL/NOFOLLOW and mkdirat cannot follow a swapped final symlink. Reopen
     // from root without following any prefix swapped after the inspection.
-    return (try findMountPath(root_fd, path.ptr, true, true)) orelse return missingMountPath(path.ptr);
+    return (try findMountPath(root_fd, prefix.ptr, true, true)) orelse return missingMountPath(prefix.ptr);
 }
 
 fn mountDestinationStep(root_fd: posix.fd_t, destination: []const u8, is_file: bool, create: bool, step: *RootfsStep) libcontainer.Error!posix.fd_t {

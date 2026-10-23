@@ -168,7 +168,9 @@ containerd's CRI plugin. On both cgroup v1 and v2 the results match runc's.
 kind cluster with an igvano RuntimeClass. It checks a two-replica
 `nginx:alpine` Deployment's readiness probes, exec, logs and pod replacement,
 plus a one-shot BusyBox pod checking its mounted service-account token.
-Docker, kind, kubectl and Nix must be on `PATH`.
+Docker, kind >= 0.30, kubectl and Nix must be on `PATH`. Use kubectl within one
+minor version of the node's Kubernetes version (1.33–1.35 for the default 1.34
+node). Pod replacement uses a bounded poll and does not need `wait --for=create`.
 
 ```sh
 hack/kind.sh
@@ -179,8 +181,9 @@ The default driver is systemd; the cgroupfs variant configures both kubelet
 and every containerd runtime to use cgroupfs. `KIND_NODE_IMAGE` defaults to
 `kindest/node:v1.34.0`, and `KIND_CLUSTER` defaults to `igvano-kind` (an
 existing cluster with that name is refused). Failures print pod and containerd
-diagnostics. The cluster is deleted on exit; set `KEEP_CLUSTER=1` to retain it
-and use `kind export kubeconfig --name <cluster>` to inspect it.
+diagnostics. The cluster and built node image are deleted on exit; set
+`KEEP_CLUSTER=1` to retain them and use `kind export kubeconfig --name <cluster>`
+to inspect it.
 
 ## Layout
 

@@ -5,6 +5,7 @@ const posix = std.posix;
 const libcontainer = @import("../root.zig");
 const reportDiagnostic = @import("diagnostic.zig").reportDiagnostic;
 
+pub const PROC_SUPER_MAGIC: usize = 0x9fa0;
 pub const RESOLVE_NO_XDEV: u64 = 0x01;
 pub const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
 pub const RESOLVE_NO_SYMLINKS: u64 = 0x04;
@@ -29,13 +30,13 @@ test "statfs type excludes the adjacent block size on s390x" {
     var fs: [32]usize = @splat(0);
     if (comptime builtin.cpu.arch == .s390x) {
         const words: *[64]u32 = @ptrCast(&fs);
-        words[0] = 0x9fa0;
+        words[0] = @intCast(PROC_SUPER_MAGIC);
         words[1] = 4096;
     } else {
-        fs[0] = 0x9fa0;
+        fs[0] = PROC_SUPER_MAGIC;
         fs[1] = 4096;
     }
-    try std.testing.expectEqual(@as(usize, 0x9fa0), statfsType(&fs));
+    try std.testing.expectEqual(PROC_SUPER_MAGIC, statfsType(&fs));
 }
 
 pub fn processString(allocator: std.mem.Allocator, value: []const u8) libcontainer.Error![:0]u8 {

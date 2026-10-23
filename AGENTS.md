@@ -42,8 +42,10 @@ nix develop -c zig test --dep igvano --dep libcontainer -Mroot=src/main.zig \
   --dep libcontainer -Migvano=src/lib.zig -Mlibcontainer=src/libcontainer/root.zig   # CLI tests directly
 ```
 
-`examples/consumer` checks the public library as an external dependency, separately
-from root tests: `cd examples/consumer && nix develop ../.. -c zig build`, then
+`zig build test` also compiles `examples/consumer` against the in-tree
+`libcontainer` module; `zig build examples` compiles it without running tests or
+installing it. The example's own build checks the public library as an external
+dependency: `cd examples/consumer && nix develop ../.. -c zig build`, then
 `nix develop ../.. -c zig build -Dtarget=x86_64-linux-musl` for the Linux check.
 
 macOS skips every Linux-gated test, so a passing `zig build test` is not enough for Linux implementation changes. Linux checks (see README "Test"):
@@ -51,7 +53,7 @@ macOS skips every Linux-gated test, so a passing `zig build test` is not enough 
 - arm64 cgroup v1 and v2, systemd, AppArmor: the same binaries built for `aarch64-linux-musl`, run as root in the Lima VMs (one pure cgroup v1, one cgroup v2).
 - Conformance: `hack/conformance.sh` (cgroup v2, Colima) and `CONFORMANCE_VM=<vm> hack/conformance.sh` (cgroup v1), from a checkout under `$HOME`. Gate per suite: no previously clean suite may gain failures; known runtime-tools/kernel failures are labelled.
 - containerd: v2.2 `integration/client` suite and `critest` via the CRI plugin, compared with runc on the same host.
-- Kubernetes (kind): `hack/kind.sh` (systemd driver) and `KIND_CGROUP_DRIVER=cgroupfs hack/kind.sh` (cgroupfs driver for kubelet and all containerd runtimes). Requires Docker, kind, kubectl and Nix; builds for the Docker host architecture. Checks nginx readiness/exec/logs/pod replacement and the default service-account token mount. `KIND_CLUSTER` defaults to `igvano-kind` (must not already exist), `KIND_NODE_IMAGE` to `kindest/node:v1.34.0`; `KEEP_CLUSTER=1` retains the cluster, otherwise the exit trap tears it down after failure diagnostics.
+- Kubernetes (kind): `hack/kind.sh` (systemd driver) and `KIND_CGROUP_DRIVER=cgroupfs hack/kind.sh` (cgroupfs driver for kubelet and all containerd runtimes). Requires Docker, kind >= 0.30, kubectl within one minor version of the node's Kubernetes version (1.33–1.35 for the default 1.34 node), and Nix; builds for the Docker host architecture. Pod replacement uses a bounded poll without `kubectl wait --for=create`. Checks nginx readiness/exec/logs/pod replacement and the default service-account token mount. `KIND_CLUSTER` defaults to `igvano-kind` (must not already exist), `KIND_NODE_IMAGE` to `kindest/node:v1.34.0`; `KEEP_CLUSTER=1` retains the cluster and built node image, otherwise the exit trap removes both after failure diagnostics.
 
 Gotchas:
 - Nix flakes ignore untracked files — `git add` new files before `nix develop` or the build won't see them.

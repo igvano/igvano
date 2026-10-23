@@ -1,5 +1,6 @@
 #!/bin/sh
-# Requires Docker, kind, kubectl and Nix. Run from any directory.
+# Requires Docker, kind >= 0.30, kubectl 1.33-1.35 for the default node, and Nix.
+# Run from any directory.
 # KIND_CGROUP_DRIVER=systemd|cgroupfs; KIND_CLUSTER=igvano-kind.
 # KIND_NODE_IMAGE=kindest/node:v1.34.0; KEEP_CLUSTER=1 skips teardown.
 set -eu
@@ -53,6 +54,9 @@ cleanup() {
             }
         fi
     fi
+    if [ "${KEEP_CLUSTER:-0}" != 1 ] && [ -s "$work/image-id" ]; then
+        docker image rm "$(cat "$work/image-id")" >/dev/null 2>&1 || true
+    fi
     rm -rf "$work" || { [ "$status" -ne 0 ] || status=1; }
     exit "$status"
 }
@@ -96,8 +100,22 @@ fi
 # Mark existing pods so the waits below must observe a new, ready replacement.
 kube label pods -l app=nginx igvano-smoke-original=true
 kube delete pod "$pod" --wait=true --timeout=180s
-kube wait pods -l 'app=nginx,!igvano-smoke-original' --for=create --timeout=180s
-kube wait pods -l 'app=nginx,!igvano-smoke-original' --for=condition=Ready --timeout=180s
+deadline=$(($(date +%s) + 60))
+replacement=
+while [ "$(date +%s)" -lt "$deadline" ]; do
+    replacement=$(kube --request-timeout=5s get pods -l 'app=nginx,!igvano-smoke-original' \
+        -o jsonpath='{.items[*].metadata.name}')
+    if [ -n "$replacement" ]; then
+        replacement=${replacement%% *}
+        break
+    fi
+    sleep 1
+done
+if [ -z "$replacement" ]; then
+    echo 'No replacement nginx pod appeared within 60s' >&2
+    exit 1
+fi
+kube wait "pod/$replacement" --for=condition=Ready --timeout=180s
 kube wait deployment/nginx --for=condition=Available --timeout=180s
 kube apply -f - <<'EOF'
 apiVersion: v1

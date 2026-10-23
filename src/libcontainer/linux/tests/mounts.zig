@@ -122,6 +122,7 @@ test "linux mount destinations reject procfs magic links" {
 
 test "linux dangling mount destinations reject procfs links during expansion" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    try requireTestMountNamespace();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(std.testing.io, "rootfs/proc");
@@ -132,7 +133,7 @@ test "linux dangling mount destinations reject procfs links during expansion" {
     const host_root = try openPath(linux.AT.FDCWD, "/", .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true });
     defer closeFd(host_root);
     var target_buffer: [128]u8 = undefined;
-    const target = try std.fmt.bufPrint(&target_buffer, "/missing/../proc/self/fd/{d}", .{host_root});
+    const target = try std.fmt.bufPrint(&target_buffer, "/proc/self/igvano-missing-{d}", .{linux.getpid()});
     try tmp.dir.symLink(std.testing.io, target, "rootfs/entry", .{});
     const pid = try forkProcess();
     if (pid == 0) {
@@ -145,7 +146,8 @@ test "linux dangling mount destinations reject procfs links during expansion" {
             closeFd(fd);
             linux.exit_group(4);
         } else |err| {
-            if (err != error.InvalidPath or diagnostics.diagnostic() == null) linux.exit_group(5);
+            const diagnostic = diagnostics.diagnostic() orelse linux.exit_group(5);
+            if (err != error.InvalidPath or std.mem.indexOf(u8, diagnostic, "procfs") == null) linux.exit_group(5);
         }
         if (linux.errno(linux.openat(root_fd, "escaped", .{ .PATH = true, .NOFOLLOW = true, .CLOEXEC = true }, 0)) != .NOENT)
             linux.exit_group(6);
@@ -179,12 +181,16 @@ test "linux create dangling mount targets clamp parent traversal and absolute ro
 
 fn testCreateDanglingMount(destination: [:0]const u8, link: []const u8, target: []const u8, resolved: [:0]const u8, is_file: bool) !void {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
-    // These regressions must execute on the wrapper's privileged Linux host.
-    // Treat missing privileges or cgroup support as failures, rather than skips.
-    const cgroup_root = try openCgroupRoot();
+    try requireTestMountNamespace();
+    const cgroup_root = openCgroupRoot() catch return error.SkipZigTest;
     defer closeFd(cgroup_root.fd);
     const cgroup_path = try std.fmt.allocPrint(std.testing.allocator, "igvano-dangling-mount-{d}", .{linux.getpid()});
     defer std.testing.allocator.free(cgroup_path);
+    if (cgroup_root.mode == .unified) {
+        const probe = (walkCgroup(cgroup_root.fd, cgroup_path, true, &.{}) catch return error.SkipZigTest).?;
+        closeFd(probe);
+        try removeCgroup(cgroup_root.fd, cgroup_path);
+    }
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(std.testing.io, "rootfs/etc");
@@ -307,6 +313,29 @@ test "linux dangling mount destinations resolve relative targets after symlinked
     try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, "rootfs/missing", .{}));
     try std.testing.expectError(error.InvalidPath, mountDestination(root_fd, "/alias/link/../bad", false, true));
     try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, "rootfs/nested/missing/child/bad", .{}));
+}
+
+test "linux dangling mount destinations reject parent traversal after missing components" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    defer diagnostics.last_diagnostic_len = 0;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "rootfs", .default_dir);
+    try tmp.dir.symLink(std.testing.io, "/missing/../proc", "rootfs/entry", .{});
+    const rootfs = try std.fmt.allocPrintSentinel(std.testing.allocator, ".zig-cache/tmp/{s}/rootfs", .{tmp.sub_path}, 0);
+    defer std.testing.allocator.free(rootfs);
+    const root_fd = try openPath(linux.AT.FDCWD, rootfs, .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true });
+    defer closeFd(root_fd);
+    diagnostics.last_diagnostic_len = 0;
+    if (mountDestination(root_fd, "/entry", false, true)) |fd| {
+        closeFd(fd);
+        return error.TestUnexpectedResult;
+    } else |err| {
+        try std.testing.expectEqual(error.InvalidPath, err);
+    }
+    try std.testing.expect(diagnostics.diagnostic() != null);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, "rootfs/missing", .{}));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, "rootfs/proc", .{}));
 }
 
 test "linux dangling mount destinations bound symlink loops and expanded paths" {
