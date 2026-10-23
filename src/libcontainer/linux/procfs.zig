@@ -9,6 +9,7 @@ const RESOLVE_NO_MAGICLINKS = @import("syscall.zig").RESOLVE_NO_MAGICLINKS;
 const RESOLVE_NO_SYMLINKS = @import("syscall.zig").RESOLVE_NO_SYMLINKS;
 const RESOLVE_BENEATH = @import("syscall.zig").RESOLVE_BENEATH;
 const OpenHow = @import("syscall.zig").OpenHow;
+const openat2 = @import("syscall.zig").openat2;
 const statfsType = @import("syscall.zig").statfsType;
 const checkResult = @import("syscall.zig").checkResult;
 const closeFd = @import("syscall.zig").closeFd;
@@ -60,7 +61,7 @@ pub const Procfs = struct {
             .resolve = RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS |
                 (if (self.mount_id != null) RESOLVE_NO_XDEV else RESOLVE_NO_SYMLINKS),
         };
-        const opened = linux.syscall4(.openat2, @intCast(self.fd), @intFromPtr(path.ptr), @intFromPtr(&how), @sizeOf(OpenHow));
+        const opened = try openat2(self.fd, path.ptr, how);
         switch (linux.errno(opened)) {
             .SUCCESS => {},
             .NOENT => return null,

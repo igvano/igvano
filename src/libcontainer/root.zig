@@ -292,6 +292,7 @@ pub const Error = error{
     InvalidPath,
     PermissionDenied,
     SystemResources,
+    ResolveRetryExhausted,
     CreateFailed,
     ExecFailed,
     KillFailed,

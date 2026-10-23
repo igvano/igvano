@@ -11,6 +11,7 @@ const PreparedMount = @import("mount.zig").PreparedMount;
 const RESOLVE_NO_MAGICLINKS = @import("syscall.zig").RESOLVE_NO_MAGICLINKS;
 const RESOLVE_NO_SYMLINKS = @import("syscall.zig").RESOLVE_NO_SYMLINKS;
 const OpenHow = @import("syscall.zig").OpenHow;
+const openat2 = @import("syscall.zig").openat2;
 const pathString = @import("syscall.zig").pathString;
 const checkResult = @import("syscall.zig").checkResult;
 const forkProcess = @import("syscall.zig").forkProcess;
@@ -86,7 +87,7 @@ pub fn sendMountSources(mounts: []const PreparedMount, socket: posix.fd_t) libco
             .flags = @as(u32, @bitCast(linux.O{ .PATH = true, .CLOEXEC = true })),
             .resolve = RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS,
         };
-        const opened = linux.syscall4(.openat2, @bitCast(@as(isize, linux.AT.FDCWD)), @intFromPtr(source.ptr), @intFromPtr(&how), @sizeOf(OpenHow));
+        const opened = try openat2(linux.AT.FDCWD, source.ptr, how);
         if (linux.errno(opened) == .LOOP) {
             step.operation = "";
             reportDiagnostic("bind source {s} contains a symlink; symlinks are not allowed when joining a mount namespace", .{source});

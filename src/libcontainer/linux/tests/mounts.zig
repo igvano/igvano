@@ -27,7 +27,7 @@ const startMountSourceHelper = @import("../mount_sources.zig").startMountSourceH
 const receiveMountSources = @import("../mount_sources.zig").receiveMountSources;
 const createDevice = @import("../device_nodes.zig").createDevice;
 
-test "linux mount destinations reject symlinks without creating host paths" {
+test "linux mount destinations confine symlinks to rootfs without creating host paths" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -120,12 +120,236 @@ test "linux mount destinations reject procfs magic links" {
     } else |_| {}
 }
 
+test "linux dangling mount destinations reject procfs links during expansion" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "rootfs/proc");
+    const rootfs = try std.fmt.allocPrintSentinel(std.testing.allocator, ".zig-cache/tmp/{s}/rootfs", .{tmp.sub_path}, 0);
+    defer std.testing.allocator.free(rootfs);
+    const proc = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/proc", .{rootfs}, 0);
+    defer std.testing.allocator.free(proc);
+    const host_root = try openPath(linux.AT.FDCWD, "/", .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true });
+    defer closeFd(host_root);
+    var target_buffer: [128]u8 = undefined;
+    const target = try std.fmt.bufPrint(&target_buffer, "/missing/../proc/self/fd/{d}", .{host_root});
+    try tmp.dir.symLink(std.testing.io, target, "rootfs/entry", .{});
+    const pid = try forkProcess();
+    if (pid == 0) {
+        checkResult(linux.unshare(linux.CLONE.NEWNS)) catch linux.exit_group(1);
+        checkResult(linux.mount(null, "/", null, linux.MS.PRIVATE | linux.MS.REC, 0)) catch linux.exit_group(2);
+        checkResult(linux.mount("/proc", proc, null, linux.MS.BIND, 0)) catch linux.exit_group(3);
+        // A fd opened before unshare pins the old mount and cannot see this proc bind.
+        const root_fd = openPath(linux.AT.FDCWD, rootfs, .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true }) catch linux.exit_group(8);
+        if (mountDestination(root_fd, "/entry/escaped", false, true)) |fd| {
+            closeFd(fd);
+            linux.exit_group(4);
+        } else |err| {
+            if (err != error.InvalidPath or diagnostics.diagnostic() == null) linux.exit_group(5);
+        }
+        if (linux.errno(linux.openat(root_fd, "escaped", .{ .PATH = true, .NOFOLLOW = true, .CLOEXEC = true }, 0)) != .NOENT)
+            linux.exit_group(6);
+        if (linux.errno(linux.openat(host_root, "escaped", .{ .PATH = true, .NOFOLLOW = true, .CLOEXEC = true }, 0)) != .NOENT)
+            linux.exit_group(7);
+        linux.exit_group(0);
+    }
+    try std.testing.expectEqual(@as(u32, 0), try waitChild(pid));
+}
+
 test "linux create bind mounts through var run symlink" {
     try testCreateSymlinkMount(false);
 }
 
 test "linux create confines absolute mount destination symlinks to rootfs" {
     try testCreateSymlinkMount(true);
+}
+
+test "linux create file bind follows dangling resolv conf symlink" {
+    try testCreateDanglingMount("/etc/resolv.conf", "etc/resolv.conf", "/run/systemd/resolve/stub-resolv.conf", "/run/systemd/resolve/stub-resolv.conf", true);
+}
+
+test "linux create directory bind follows dangling var run symlink" {
+    try testCreateDanglingMount("/var/run/secrets/x", "var/run", "/run", "/run/secrets/x", false);
+}
+
+test "linux create dangling mount targets clamp parent traversal and absolute root" {
+    try testCreateDanglingMount("/entry/item", "entry", "../../../../host-escape", "/host-escape/item", false);
+    try testCreateDanglingMount("/entry/missing/item", "entry", "/", "/missing/item", false);
+}
+
+fn testCreateDanglingMount(destination: [:0]const u8, link: []const u8, target: []const u8, resolved: [:0]const u8, is_file: bool) !void {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    // These regressions must execute on the wrapper's privileged Linux host.
+    // Treat missing privileges or cgroup support as failures, rather than skips.
+    const cgroup_root = try openCgroupRoot();
+    defer closeFd(cgroup_root.fd);
+    const cgroup_path = try std.fmt.allocPrint(std.testing.allocator, "igvano-dangling-mount-{d}", .{linux.getpid()});
+    defer std.testing.allocator.free(cgroup_path);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "rootfs/etc");
+    try tmp.dir.createDir(std.testing.io, "rootfs/var", .default_dir);
+    try tmp.dir.createDir(std.testing.io, "source", .default_dir);
+    const contents = "bound through a dangling symlink";
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "source/item", .data = contents });
+    const link_path = try std.fmt.allocPrint(std.testing.allocator, "rootfs/{s}", .{link});
+    defer std.testing.allocator.free(link_path);
+    try tmp.dir.symLink(std.testing.io, target, link_path, .{});
+    const base = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer std.testing.allocator.free(base);
+    const absolute = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, base, std.testing.allocator);
+    defer std.testing.allocator.free(absolute);
+    const rootfs = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/rootfs", .{absolute}, 0);
+    defer std.testing.allocator.free(rootfs);
+    const source = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/source{s}", .{ absolute, if (is_file) "/item" else "" }, 0);
+    defer std.testing.allocator.free(source);
+    const fifo = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/exec.fifo", .{absolute}, 0);
+    defer std.testing.allocator.free(fifo);
+    try checkResult(linux.mknod(fifo, linux.S.IFIFO | 0o600, 0));
+    const host_root = try openPath(linux.AT.FDCWD, "/", .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true });
+    defer closeFd(host_root);
+    var missing_buffer: [128]u8 = undefined;
+    const missing = try std.fmt.bufPrintZ(&missing_buffer, "{s}/igvano-missing-{d}", .{ destination, linux.getpid() });
+    // Pin the host root before joining init's namespace, then check both
+    // fixtures which would create host paths if resolution were unconfined.
+    const host_path: ?[:0]const u8 = if (std.mem.startsWith(u8, resolved, "/host-escape/"))
+        "host-escape/item"
+    else if (std.mem.eql(u8, target, "/"))
+        "missing/item"
+    else
+        null;
+    if (host_path) |path| try expectMissingMountHostPath(host_root, path);
+    var instance = try LinuxContainer.create(.{
+        .allocator = std.testing.allocator,
+        .id = "dangling-mount",
+        .rootfs = rootfs,
+        .exec_fifo = fifo,
+        .namespaces = &.{.{ .kind = .mount }},
+        .cgroup_path = cgroup_path,
+        .mounts = &.{.{
+            .destination = destination,
+            .source = source,
+            .type = null,
+            .flags = linux.MS.BIND | linux.MS.RDONLY,
+            .propagation = 0,
+            .data = "",
+        }},
+    });
+    defer instance.deinit(std.testing.allocator);
+    const container = instance.container();
+    defer {
+        container.kill(9) catch {};
+        container.delete() catch {};
+    }
+    try std.testing.expect(try container.alive());
+    const created = try std.fmt.allocPrint(std.testing.allocator, "rootfs{s}", .{resolved});
+    defer std.testing.allocator.free(created);
+    try std.testing.expectEqual(if (is_file) std.Io.File.Kind.file else .directory, (try tmp.dir.statFile(std.testing.io, created, .{})).kind);
+    const namespace_path = try std.fmt.allocPrintSentinel(std.testing.allocator, "/proc/{d}/ns/mnt", .{instance.state.pid}, 0);
+    defer std.testing.allocator.free(namespace_path);
+    const namespace = try openPath(linux.AT.FDCWD, namespace_path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true });
+    defer closeFd(namespace);
+    const root_path = try std.fmt.allocPrintSentinel(std.testing.allocator, "/proc/{d}/root", .{instance.state.pid}, 0);
+    defer std.testing.allocator.free(root_path);
+    const root_fd = try openPath(linux.AT.FDCWD, root_path, .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true });
+    defer closeFd(root_fd);
+    const resolved_item = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}{s}", .{ resolved, if (is_file) "" else "/item" }, 0);
+    defer std.testing.allocator.free(resolved_item);
+    const destination_item = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}{s}", .{ destination, if (is_file) "" else "/item" }, 0);
+    defer std.testing.allocator.free(destination_item);
+    const pid = try forkProcess();
+    if (pid == 0) {
+        checkResult(linux.setns(namespace, linux.CLONE.NEWNS)) catch linux.exit_group(1);
+        if (host_path) |path| {
+            if (linux.errno(linux.openat(host_root, path, .{ .PATH = true, .NOFOLLOW = true, .CLOEXEC = true }, 0)) != .NOENT)
+                linux.exit_group(2);
+        }
+        checkResult(linux.fchdir(root_fd)) catch linux.exit_group(3);
+        checkResult(linux.chroot(".")) catch linux.exit_group(4);
+        checkResult(linux.chdir("/")) catch linux.exit_group(5);
+        for ([_][:0]const u8{ resolved_item, destination_item }) |path| {
+            const fd = openPath(linux.AT.FDCWD, path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }) catch linux.exit_group(6);
+            var buffer: [contents.len]u8 = undefined;
+            if (!readAll(fd, &buffer) or !std.mem.eql(u8, &buffer, contents)) linux.exit_group(7);
+            closeFd(fd);
+            // Verify an actual readonly bind mount, not merely a created path.
+            if (linux.errno(linux.open(path, .{ .ACCMODE = .WRONLY, .CLOEXEC = true }, 0)) != .ROFS) linux.exit_group(8);
+        }
+        if (!is_file and linux.errno(linux.open(missing, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .CLOEXEC = true }, 0o600)) != .ROFS)
+            linux.exit_group(9);
+        linux.exit_group(0);
+    }
+    try std.testing.expectEqual(@as(u32, 0), try waitChild(pid));
+}
+
+fn expectMissingMountHostPath(fd: std.posix.fd_t, path: [:0]const u8) !void {
+    const result = linux.openat(fd, path, .{ .PATH = true, .NOFOLLOW = true, .CLOEXEC = true }, 0);
+    if (linux.errno(result) == .SUCCESS) closeFd(@intCast(result));
+    try std.testing.expectEqual(linux.E.NOENT, linux.errno(result));
+}
+
+test "linux dangling mount destinations resolve relative targets after symlinked parents" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "rootfs/nested/parent");
+    try tmp.dir.symLink(std.testing.io, "/nested/parent", "rootfs/alias", .{});
+    try tmp.dir.symLink(std.testing.io, "../missing/./child", "rootfs/nested/parent/link", .{});
+    const rootfs = try std.fmt.allocPrintSentinel(std.testing.allocator, ".zig-cache/tmp/{s}/rootfs", .{tmp.sub_path}, 0);
+    defer std.testing.allocator.free(rootfs);
+    const root_fd = try openPath(linux.AT.FDCWD, rootfs, .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true });
+    defer closeFd(root_fd);
+    try std.testing.expectError(error.CreateFailed, mountDestination(root_fd, "/alias/link/file", true, false));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, "rootfs/nested/missing", .{}));
+    const fd = try mountDestination(root_fd, "/alias/link/file", true, true);
+    closeFd(fd);
+    try std.testing.expectEqual(std.Io.File.Kind.file, (try tmp.dir.statFile(std.testing.io, "rootfs/nested/missing/child/file", .{})).kind);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, "rootfs/missing", .{}));
+    try std.testing.expectError(error.InvalidPath, mountDestination(root_fd, "/alias/link/../bad", false, true));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, "rootfs/nested/missing/child/bad", .{}));
+}
+
+test "linux dangling mount destinations bound symlink loops and expanded paths" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    defer diagnostics.last_diagnostic_len = 0;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "rootfs", .default_dir);
+    try tmp.dir.symLink(std.testing.io, "b", "rootfs/a", .{});
+    try tmp.dir.symLink(std.testing.io, "a", "rootfs/b", .{});
+    // Each expansion remains within PATH_MAX, but their combined path does not.
+    const long_target = ("component/" ** 230) ++ "tail";
+    try tmp.dir.symLink(std.testing.io, long_target, "rootfs/long", .{});
+    const rootfs = try std.fmt.allocPrintSentinel(std.testing.allocator, ".zig-cache/tmp/{s}/rootfs", .{tmp.sub_path}, 0);
+    defer std.testing.allocator.free(rootfs);
+    const root_fd = try openPath(linux.AT.FDCWD, rootfs, .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true });
+    defer closeFd(root_fd);
+    try std.testing.expectError(error.InvalidPath, mountDestination(root_fd, "/a/missing", false, true));
+    try std.testing.expect(diagnostics.diagnostic() != null);
+    const overflow = "/long/" ++ ("suffix/" ** 300) ++ "file";
+    try std.testing.expectError(error.InvalidPath, mountDestination(root_fd, overflow, true, true));
+    try std.testing.expect(diagnostics.diagnostic() != null);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, "rootfs/component", .{}));
+    var too_long: [linux.PATH_MAX]u8 = @splat('x');
+    try std.testing.expectError(error.InvalidPath, mountDestination(root_fd, &too_long, false, true));
+    try std.testing.expect(diagnostics.diagnostic() != null);
+    // A dangling chain of exactly forty expansions is allowed.
+    for (0..41) |i| {
+        var link_buffer: [64]u8 = undefined;
+        var target_buffer: [64]u8 = undefined;
+        const chain_link = try std.fmt.bufPrint(&link_buffer, "rootfs/chain-{d}", .{i});
+        const chain_target = if (i == 40) "missing" else try std.fmt.bufPrint(&target_buffer, "chain-{d}", .{i + 1});
+        try tmp.dir.symLink(std.testing.io, chain_target, chain_link, .{});
+    }
+    try tmp.dir.symLink(std.testing.io, "absent/../chain-1", "rootfs/over-limit", .{});
+    try std.testing.expectError(error.InvalidPath, mountDestination(root_fd, "/over-limit", false, true));
+    try std.testing.expect(diagnostics.diagnostic() != null);
+    try std.testing.expectError(error.InvalidPath, mountDestination(root_fd, "/chain-0", false, true));
+    try std.testing.expect(diagnostics.diagnostic() != null);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, "rootfs/missing", .{}));
+    const fd = try mountDestination(root_fd, "/chain-1", false, true);
+    closeFd(fd);
+    try std.testing.expectEqual(std.Io.File.Kind.directory, (try tmp.dir.statFile(std.testing.io, "rootfs/missing", .{})).kind);
 }
 
 fn testCreateSymlinkMount(absolute_symlink: bool) !void {
@@ -297,7 +521,7 @@ test "linux mount destinations report exhausted openat2 EAGAIN retries" {
             closeFd(fd);
             linux.exit_group(4);
         } else |err| {
-            if (err != error.SystemResources) linux.exit_group(5);
+            if (err != error.ResolveRetryExhausted) linux.exit_group(5);
             const message = diagnostics.diagnostic() orelse linux.exit_group(6);
             if (std.mem.indexOf(u8, message, "EAGAIN after 32 attempts") == null) linux.exit_group(7);
         }
@@ -312,7 +536,7 @@ test "linux mount destinations report exhausted openat2 EAGAIN retries" {
         }, true, linux.MS.PRIVATE | linux.MS.REC, &step)) {
             linux.exit_group(8);
         } else |err| {
-            if (err != error.SystemResources) linux.exit_group(9);
+            if (err != error.ResolveRetryExhausted) linux.exit_group(9);
             step.report(err);
             const message = diagnostics.diagnostic() orelse linux.exit_group(10);
             if (std.mem.indexOf(u8, message, "EAGAIN after 32 attempts") == null) linux.exit_group(11);

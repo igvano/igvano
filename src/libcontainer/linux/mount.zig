@@ -11,7 +11,11 @@ const openPath = @import("syscall.zig").openPath;
 const fileType = @import("syscall.zig").fileType;
 const fdPath = @import("syscall.zig").fdPath;
 const OpenHow = @import("syscall.zig").OpenHow;
+const openat2 = @import("syscall.zig").openat2;
+const RESOLVE_IN_ROOT = @import("syscall.zig").RESOLVE_IN_ROOT;
 const RESOLVE_NO_MAGICLINKS = @import("syscall.zig").RESOLVE_NO_MAGICLINKS;
+const RESOLVE_NO_SYMLINKS = @import("syscall.zig").RESOLVE_NO_SYMLINKS;
+const statfsType = @import("syscall.zig").statfsType;
 const reportDiagnostic = @import("diagnostic.zig").reportDiagnostic;
 const V1Hierarchy = @import("cgroup_v1.zig").V1Hierarchy;
 const v1Hierarchies = @import("cgroup_v1.zig").v1Hierarchies;
@@ -19,7 +23,6 @@ const RootfsStep = @import("rootfs.zig").RootfsStep;
 
 const ST_NOATIME: usize = 1024;
 const ST_RELATIME: usize = 4096; // Unlike MS_RELATIME.
-const RESOLVE_IN_ROOT: u64 = 0x10;
 pub const OPEN_TREE_CLONE: u32 = 1;
 pub const OPEN_TREE_CLOEXEC: u32 = 1 << @bitOffsetOf(linux.O, "CLOEXEC");
 pub const MOUNT_ATTR_IDMAP: u64 = 0x00100000;
@@ -332,93 +335,227 @@ pub const PreparedMount = struct {
 /// Follow symlinks within a pinned root, including absolute targets and ".."
 /// in symlink contents. Mount through the returned fd to avoid destination swaps.
 pub fn mountDestination(root_fd: posix.fd_t, destination: []const u8, is_file: bool, create: bool) libcontainer.Error!posix.fd_t {
-    if (std.mem.indexOfScalar(u8, destination, 0) != null) return error.InvalidPath;
-    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const path = std.fmt.bufPrintZ(&path_buffer, "{s}", .{destination}) catch return error.InvalidPath;
-    var current = try openMountPath(root_fd, ".", false);
-    errdefer closeFd(current);
+    var path_buffer: [linux.PATH_MAX]u8 = undefined;
+    const path = try mountDestinationPath(&path_buffer, destination);
     var components = std.mem.tokenizeScalar(u8, destination, '/');
     var component = components.next() orelse {
-        if (is_file) return error.InvalidPath;
-        return current;
+        if (is_file) return invalidMountPath("file destination resolves to root");
+        return openMountPath(root_fd, ".", false);
     };
+    var current = try openMountPath(root_fd, ".", false);
+    defer closeFd(current);
     while (true) {
-        // Frontend paths are normalized; reject traversal from library callers too.
-        if (std.mem.eql(u8, component, "..") or std.mem.eql(u8, component, ".")) return error.InvalidPath;
         const next = components.next();
+        const final_file = next == null and is_file;
         const end = @intFromPtr(component.ptr) - @intFromPtr(destination.ptr) + component.len;
         path_buffer[end] = 0;
         defer path_buffer[end] = if (end < destination.len) destination[end] else 0;
         var buffer: [256]u8 = undefined;
-        const name = std.fmt.bufPrintZ(&buffer, "{s}", .{component}) catch return error.InvalidPath;
-        if (next == null and is_file) {
-            const fd = try openMountFile(root_fd, current, name, path.ptr, create);
-            closeFd(current);
-            return fd;
-        }
-        if (create) {
-            const created = linux.mkdirat(current, name, 0o755);
-            switch (linux.errno(created)) {
-                .SUCCESS, .EXIST => {},
-                else => try checkResult(created),
-            }
-        }
+        const name = std.fmt.bufPrintZ(&buffer, "{s}", .{component}) catch return invalidMountPath("component exceeds NAME_MAX");
+        if (create) try createMountComponent(current, name, final_file);
         // Resolve the whole prefix from root_fd, never from current: an absolute
         // symlink (or ".." in its target) must be scoped to the container root.
         // Reopening also confines a component swapped to a symlink after mkdir.
-        const fd = try openMountPath(root_fd, path.ptr, false);
+        const fd = (try findMountPath(root_fd, path.ptr, final_file, false)) orelse {
+            if (!create) return missingMountPath(path.ptr);
+            // Restore the full destination before replaying the dangling prefix.
+            path_buffer[end] = if (end < destination.len) destination[end] else 0;
+            return createMissingMountDestination(root_fd, path, is_file);
+        };
+        if (next == null) return verifyMountDestination(fd, is_file);
         closeFd(current);
         current = fd;
-        component = next orelse return current;
+        component = next.?;
     }
+}
+
+fn invalidMountPath(reason: []const u8) libcontainer.Error {
+    reportDiagnostic("invalid mount destination: {s}", .{reason});
+    return error.InvalidPath;
+}
+
+fn missingMountPath(path: [*:0]const u8) libcontainer.Error {
+    reportDiagnostic("cannot resolve mount destination '{s}': NOENT", .{std.mem.span(path)});
+    return error.CreateFailed;
+}
+
+fn mountDestinationPath(buffer: []u8, destination: []const u8) libcontainer.Error![:0]u8 {
+    if (std.mem.indexOfScalar(u8, destination, 0) != null) return invalidMountPath("embedded NUL");
+    var components = std.mem.tokenizeScalar(u8, destination, '/');
+    while (components.next()) |component| {
+        // Only symlink contents may contain traversal, never caller input.
+        if (std.mem.eql(u8, component, "..") or std.mem.eql(u8, component, "."))
+            return invalidMountPath("original path contains '.' or '..'");
+    }
+    return std.fmt.bufPrintZ(buffer, "{s}", .{destination}) catch return invalidMountPath("path exceeds Linux PATH_MAX");
 }
 
 const mount_destination_retry_failure = "resolve mount destination (openat2 EAGAIN after 32 attempts)";
 
 fn openMountPath(root_fd: posix.fd_t, path: [*:0]const u8, is_file: bool) libcontainer.Error!posix.fd_t {
-    const flags: linux.O = .{ .PATH = true, .DIRECTORY = !is_file, .CLOEXEC = true };
-    const how: OpenHow = .{
-        .flags = @as(u32, @bitCast(flags)),
-        .resolve = RESOLVE_IN_ROOT | RESOLVE_NO_MAGICLINKS,
-    };
-    // Scoped ".." lookups can race with mount or rename changes elsewhere.
-    for (0..32) |_| {
-        const result = linux.syscall4(.openat2, @intCast(root_fd), @intFromPtr(path), @intFromPtr(&how), @sizeOf(OpenHow));
-        switch (linux.errno(result)) {
-            .AGAIN => continue,
-            .NOSYS, .@"2BIG" => {
-                reportDiagnostic("openat2 with RESOLVE_IN_ROOT is required for mount destinations (Linux 5.6+): {s}", .{@tagName(linux.errno(result))});
-                return error.Unsupported;
-            },
-            else => try checkResult(result),
-        }
-        return @intCast(result);
-    }
-    reportDiagnostic(mount_destination_retry_failure, .{});
-    return error.SystemResources;
+    return (try findMountPath(root_fd, path, is_file, false)) orelse return missingMountPath(path);
 }
 
-fn openMountFile(root_fd: posix.fd_t, dir: posix.fd_t, name: [:0]const u8, path: [*:0]const u8, create: bool) libcontainer.Error!posix.fd_t {
-    if (create) {
+fn findMountPath(root_fd: posix.fd_t, path: [*:0]const u8, is_file: bool, nofollow: bool) libcontainer.Error!?posix.fd_t {
+    const flags: linux.O = .{ .PATH = true, .DIRECTORY = !is_file, .NOFOLLOW = nofollow, .CLOEXEC = true };
+    const how: OpenHow = .{
+        .flags = @as(u32, @bitCast(flags)),
+        .resolve = RESOLVE_IN_ROOT | RESOLVE_NO_MAGICLINKS | (if (nofollow) RESOLVE_NO_SYMLINKS else @as(u64, 0)),
+    };
+    const result = openat2(root_fd, path, how) catch |err| {
+        if (err == error.ResolveRetryExhausted) {
+            reportDiagnostic(mount_destination_retry_failure, .{});
+        }
+        return err;
+    };
+    switch (linux.errno(result)) {
+        .NOENT => return null,
+        .LOOP => return invalidMountPath("symlink loop or forbidden symlink"),
+        .NAMETOOLONG => return invalidMountPath("path exceeds Linux PATH_MAX or NAME_MAX"),
+        else => try checkResult(result),
+    }
+    return @intCast(result);
+}
+
+fn createMountComponent(dir: posix.fd_t, name: [:0]const u8, is_file: bool) libcontainer.Error!void {
+    if (is_file) {
         const created = linux.openat(dir, name, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .NOFOLLOW = true, .CLOEXEC = true }, 0o644);
         switch (linux.errno(created)) {
             .SUCCESS => closeFd(@intCast(created)),
             .EXIST => {},
             else => try checkResult(created),
         }
+        return;
     }
-    const fd = try openMountPath(root_fd, path, true);
+    const created = linux.mkdirat(dir, name, 0o755);
+    switch (linux.errno(created)) {
+        .SUCCESS, .EXIST => {},
+        else => try checkResult(created),
+    }
+}
+
+fn verifyMountDestination(fd: posix.fd_t, is_file: bool) libcontainer.Error!posix.fd_t {
     errdefer closeFd(fd);
     const kind = try fileType(fd);
-    if (kind == linux.S.IFDIR) return error.InvalidPath;
+    if (is_file and kind == linux.S.IFDIR) return invalidMountPath("file destination is a directory");
+    if (!is_file and kind != linux.S.IFDIR) return invalidMountPath("directory destination is not a directory");
     return fd;
+}
+
+/// Lexical state for the ENOENT fallback; buffers include space for the NUL.
+const MissingMountPath = struct {
+    pending: [linux.PATH_MAX]u8 = undefined,
+    pending_len: usize,
+    prefix: [linux.PATH_MAX]u8 = undefined,
+    prefix_len: usize = 0,
+    expansions: usize = 0,
+
+    fn next(self: *MissingMountPath, name_buffer: []u8) libcontainer.Error!?[:0]u8 {
+        const remaining = std.mem.trimStart(u8, self.pending[0..self.pending_len], "/");
+        if (remaining.len == 0) return null;
+        const end = std.mem.indexOfScalar(u8, remaining, '/') orelse remaining.len;
+        const name = std.fmt.bufPrintZ(name_buffer, "{s}", .{remaining[0..end]}) catch return invalidMountPath("component exceeds NAME_MAX");
+        const rest = std.mem.trimStart(u8, remaining[end..], "/");
+        std.mem.copyForwards(u8, &self.pending, rest);
+        self.pending_len = rest.len;
+        return name;
+    }
+
+    fn path(self: *MissingMountPath) [:0]const u8 {
+        self.prefix[self.prefix_len] = 0;
+        return if (self.prefix_len == 0) "." else self.prefix[0..self.prefix_len :0];
+    }
+
+    fn append(self: *MissingMountPath, name: []const u8) libcontainer.Error!void {
+        const len = self.prefix_len + 1 + name.len;
+        if (len >= linux.PATH_MAX) return invalidMountPath("expanded path exceeds Linux PATH_MAX");
+        self.prefix[self.prefix_len] = '/';
+        @memcpy(self.prefix[self.prefix_len + 1 .. len], name);
+        self.prefix_len = len;
+    }
+
+    fn parent(self: *MissingMountPath) void {
+        // Never open ".." against a directory fd: it could leave the root.
+        self.prefix_len = std.mem.lastIndexOfScalar(u8, self.prefix[0..self.prefix_len], '/') orelse 0;
+    }
+
+    fn expand(self: *MissingMountPath, link_fd: posix.fd_t) libcontainer.Error!bool {
+        if (self.expansions == 40) return invalidMountPath("more than 40 symlink expansions");
+        self.expansions += 1;
+        var fs: [32]usize = undefined;
+        try checkResult(linux.syscall2(.fstatfs, @intCast(link_fd), @intFromPtr(&fs)));
+        // O_PATH|O_NOFOLLOW can pin a magic link even with NO_MAGICLINKS.
+        // Do not reinterpret procfs links as ordinary lexical symlink targets.
+        if (statfsType(&fs) == 0x9fa0) return invalidMountPath("procfs symlink in dangling destination");
+        var target: [linux.PATH_MAX]u8 = undefined;
+        const read = linux.readlinkat(link_fd, "", &target, target.len);
+        try checkResult(read);
+        if (read == 0 or read == target.len) return invalidMountPath("symlink target exceeds Linux PATH_MAX");
+        const absolute = target[0] == '/';
+        const base_len = if (absolute) 0 else self.prefix_len + 1;
+        const separator: usize = if (self.pending_len == 0) 0 else 1;
+        const len = read + separator + self.pending_len;
+        if (base_len + len >= linux.PATH_MAX) return invalidMountPath("expanded path exceeds Linux PATH_MAX");
+        std.mem.copyBackwards(u8, self.pending[read + separator .. len], self.pending[0..self.pending_len]);
+        @memcpy(self.pending[0..read], target[0..read]);
+        if (separator != 0) self.pending[read] = '/';
+        self.pending_len = len;
+        if (absolute) self.prefix_len = 0;
+        return absolute;
+    }
+};
+
+fn createMissingMountDestination(root_fd: posix.fd_t, destination: [:0]const u8, is_file: bool) libcontainer.Error!posix.fd_t {
+    var path: MissingMountPath = .{ .pending_len = destination.len };
+    @memcpy(path.pending[0..destination.len], destination);
+    var current = try openMountPath(root_fd, ".", false);
+    defer closeFd(current);
+    var name_buffer: [256]u8 = undefined;
+    // Replay the existing prefix without following links to learn its lexical
+    // position (a parent may itself be an alias). Continue creating from the
+    // deepest existing confined directory, with only canonical prefixes.
+    while (try path.next(&name_buffer)) |name| {
+        if (std.mem.eql(u8, name, ".")) continue;
+        if (std.mem.eql(u8, name, "..")) {
+            path.parent();
+            try reopenMountParent(root_fd, &current, &path);
+            continue;
+        }
+        const parent_len = path.prefix_len;
+        try path.append(name);
+        const fd = try missingMountComponent(root_fd, current, path.path(), name, is_file and path.pending_len == 0);
+        defer closeFd(fd);
+        if (try fileType(fd) == linux.S.IFLNK) {
+            path.prefix_len = parent_len;
+            if (try path.expand(fd)) try reopenMountParent(root_fd, &current, &path);
+            continue;
+        }
+        if (path.pending_len != 0) try reopenMountParent(root_fd, &current, &path);
+    }
+    // Resolve the original destination once more, including aliases and mount
+    // changes, and mount through this pinned fd rather than a lexical pathname.
+    return verifyMountDestination(try openMountPath(root_fd, destination.ptr, is_file), is_file);
+}
+
+fn reopenMountParent(root_fd: posix.fd_t, current: *posix.fd_t, path: *MissingMountPath) libcontainer.Error!void {
+    const fd = (try findMountPath(root_fd, path.path().ptr, false, true)) orelse return missingMountPath(path.path().ptr);
+    closeFd(current.*);
+    current.* = fd;
+}
+
+fn missingMountComponent(root_fd: posix.fd_t, parent: posix.fd_t, path: [:0]const u8, name: [:0]const u8, is_file: bool) libcontainer.Error!posix.fd_t {
+    if (try findMountPath(root_fd, path.ptr, true, true)) |fd| return fd;
+    try createMountComponent(parent, name, is_file);
+    // EXCL/NOFOLLOW and mkdirat cannot follow a swapped final symlink. Reopen
+    // from root without following any prefix swapped after the inspection.
+    return (try findMountPath(root_fd, path.ptr, true, true)) orelse return missingMountPath(path.ptr);
 }
 
 fn mountDestinationStep(root_fd: posix.fd_t, destination: []const u8, is_file: bool, create: bool, step: *RootfsStep) libcontainer.Error!posix.fd_t {
     return mountDestination(root_fd, destination, is_file, create) catch |err| {
         // setupRootfs replaces the thread-local diagnostic with this step.
         if (err == error.Unsupported) step.operation = "resolve mount destination (openat2 is required)";
-        if (err == error.SystemResources and std.mem.eql(u8, diagnostics.diagnostic() orelse "", mount_destination_retry_failure))
+        if (err == error.ResolveRetryExhausted)
             step.operation = mount_destination_retry_failure;
         return err;
     };

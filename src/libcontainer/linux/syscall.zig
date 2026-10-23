@@ -3,11 +3,13 @@ const builtin = @import("builtin");
 const linux = std.os.linux;
 const posix = std.posix;
 const libcontainer = @import("../root.zig");
+const reportDiagnostic = @import("diagnostic.zig").reportDiagnostic;
 
 pub const RESOLVE_NO_XDEV: u64 = 0x01;
 pub const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
 pub const RESOLVE_NO_SYMLINKS: u64 = 0x04;
 pub const RESOLVE_BENEATH: u64 = 0x08;
+pub const RESOLVE_IN_ROOT: u64 = 0x10;
 pub const OpenHow = extern struct {
     flags: u64,
     mode: u64 = 0,
@@ -140,9 +142,28 @@ pub fn openPath(dir_fd: posix.fd_t, path: [*:0]const u8, flags: linux.O) libcont
 
 fn openResolved(dir_fd: posix.fd_t, path: [*:0]const u8, flags: linux.O, resolve: u64) libcontainer.Error!posix.fd_t {
     const how: OpenHow = .{ .flags = @as(u32, @bitCast(flags)), .resolve = resolve };
-    const result = linux.syscall4(.openat2, @bitCast(@as(isize, dir_fd)), @intFromPtr(path), @intFromPtr(&how), @sizeOf(OpenHow));
+    const result = try openat2(dir_fd, path, how);
     try checkResult(result);
     return @intCast(result);
+}
+
+/// Preserve ordinary errno values for callers with path-specific semantics.
+/// Never fall back to openat when the kernel cannot enforce resolve flags.
+pub fn openat2(dir_fd: posix.fd_t, path: [*:0]const u8, how: OpenHow) libcontainer.Error!usize {
+    // Scoped lookups can race with mount or rename changes elsewhere.
+    for (0..32) |_| {
+        const result = linux.syscall4(.openat2, @bitCast(@as(isize, dir_fd)), @intFromPtr(path), @intFromPtr(&how), @sizeOf(OpenHow));
+        switch (linux.errno(result)) {
+            .AGAIN => continue,
+            .NOSYS, .@"2BIG" => {
+                reportDiagnostic("openat2 is required for confined path resolution (Linux 5.6+): {s}", .{@tagName(linux.errno(result))});
+                return error.Unsupported;
+            },
+            else => return result,
+        }
+    }
+    reportDiagnostic("resolve confined path (openat2 EAGAIN after 32 attempts)", .{});
+    return error.ResolveRetryExhausted;
 }
 
 pub fn fileType(fd: posix.fd_t) libcontainer.Error!u16 {
