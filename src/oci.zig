@@ -53,7 +53,7 @@ pub const validateMountDestination = @import("oci/mounts.zig").validateMountDest
 pub const resolveMountDestination = @import("oci/mounts.zig").resolveMountDestination;
 pub const validateIDMappings = @import("oci/mounts.zig").validateIDMappings;
 pub const mountMappings = @import("oci/mounts.zig").mountMappings;
-pub const backendIDMappings = @import("oci/mounts.zig").backendIDMappings;
+pub const containerIDMappings = @import("oci/mounts.zig").containerIDMappings;
 
 pub const capability_names = @import("oci/process.zig").capability_names;
 pub const capabilityNumber = @import("oci/process.zig").capabilityNumber;

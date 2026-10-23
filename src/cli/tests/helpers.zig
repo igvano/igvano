@@ -178,7 +178,7 @@ pub const LockTestProcess = struct {
         const linux = std.os.linux;
         const path_z = try std.testing.allocator.dupeZ(u8, path);
         defer std.testing.allocator.free(path_z);
-        const sockets = try libcontainer.console.socketpair();
+        const sockets = try libcontainer.linux.console.socketpair();
         const result = linux.fork();
         if (linux.errno(result) != .SUCCESS) {
             for (sockets) |fd| _ = linux.close(fd);
@@ -210,7 +210,7 @@ pub const LockTestProcess = struct {
 
     pub fn commandWithContainer(config: Config, expected_error: ?anyerror, container: ?@import("../state.zig").ContainerOverride) !LockTestProcess {
         const linux = std.os.linux;
-        const sockets = try libcontainer.console.socketpair();
+        const sockets = try libcontainer.linux.console.socketpair();
         const result = linux.fork();
         if (linux.errno(result) != .SUCCESS) {
             for (sockets) |fd| _ = linux.close(fd);

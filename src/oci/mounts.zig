@@ -212,16 +212,16 @@ fn inheritMountMappings(config: *MountMappingConfig, settings: Spec.Linux) void 
     }
 }
 
-/// Translate to backend-owned types; the caller owns both mapping slices.
+/// Translate to libcontainer types; the caller owns both mapping slices.
 pub fn mountMappings(allocator: std.mem.Allocator, mount: Spec.Mount, settings: Spec.Linux) !?libcontainer.MountMappings {
     const config = (try mountMappingConfig(mount, settings)) orelse return null;
-    const uid = try backendIDMappings(allocator, config.uid);
+    const uid = try containerIDMappings(allocator, config.uid);
     errdefer allocator.free(uid);
-    const gid = try backendIDMappings(allocator, config.gid);
+    const gid = try containerIDMappings(allocator, config.gid);
     return .{ .uid = uid, .gid = gid, .userns_path = config.userns_path, .recursive = config.recursive };
 }
 
-pub fn backendIDMappings(allocator: std.mem.Allocator, mappings: []const Spec.IDMapping) ![]libcontainer.IDMapping {
+pub fn containerIDMappings(allocator: std.mem.Allocator, mappings: []const Spec.IDMapping) ![]libcontainer.IDMapping {
     const result = try allocator.alloc(libcontainer.IDMapping, mappings.len);
     for (mappings, result) |mapping, *converted| converted.* = .{
         .container_id = mapping.containerID,

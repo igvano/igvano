@@ -1,11 +1,34 @@
+//! A runc-style libcontainer for Zig, using Linux namespaces and cgroups.
+//! Linux-only at runtime; it compiles elsewhere, where operations return
+//! NotImplemented and Linux tests skip. Callers need root or a user namespace
+//! and a writable cgroup hierarchy or systemd.
+//!
+//! ```zig
+//! var instance = try libcontainer.linux.Container.create(options);
+//! defer instance.deinit(options.allocator);
+//! const container = instance.container();
+//! _ = try container.alive();
+//! // Persist instance.state, then borrow the restored state:
+//! var restored = libcontainer.linux.Container.load(state);
+//! defer restored.deinit(options.allocator); // Borrowed state: no-op.
+//! _ = try restored.container().alive();
+//! ```
+//!
+//! All option strings and slices are borrowed. Keep state-referenced data alive
+//! while using the instance. State is caller-persisted; its strings are borrowed
+//! except starttime allocated by create and freed by deinit with the same allocator.
+//! load borrows all state; adopt transfers ownership of an allocated starttime.
+//! Interface handles borrow their instance, which must remain at a stable address.
+//! Diagnostics are thread-local borrowed slices: copy them immediately after a
+//! failed call, before another container operation or cleanup overwrites them.
+//! create forks; keep caller-owned descriptors CLOEXEC-safe, including passed
+//! descriptors as documented on CreateOptions.
+
 const std = @import("std");
 const builtin = @import("builtin");
 
 pub const linux = @import("linux.zig");
-pub const apparmorEnabled = @import("linux.zig").apparmorEnabled;
-pub const console = @import("linux.zig").console;
 pub const hooks = @import("hooks.zig");
-pub const systemdCgroupMatches = @import("linux.zig").systemdCgroupMatches;
 
 pub const testing = if (builtin.is_test) struct {
     pub const seccomp = @import("test/seccomp.zig");
@@ -14,6 +37,8 @@ pub const testing = if (builtin.is_test) struct {
 pub const seccomp = @import("seccomp.zig");
 
 /// Strings and slices are borrowed; the caller owns their memory.
+/// create forks: caller-owned descriptors must be CLOEXEC to avoid leaking
+/// into init or hooks. Passed console_fds follow the contract below.
 pub const CreateOptions = struct {
     allocator: std.mem.Allocator,
     id: []const u8,
@@ -236,7 +261,7 @@ pub const MountMappings = struct {
 };
 
 /// The id is borrowed. create() allocates starttime with the supplied allocator;
-/// loaded handles borrow starttime from the frontend.
+/// loaded handles borrow starttime from the caller.
 pub const State = struct {
     id: []const u8,
     pid: i32,
@@ -337,43 +362,52 @@ pub const Container = struct {
         return self.vtable.exec(self.ptr, options);
     }
 
+    /// Checks whether init is alive and its saved process identity still matches.
     pub fn alive(self: Container) Error!bool {
         return self.vtable.alive(self.ptr);
     }
 
+    /// Signals init after validating its saved process identity.
     pub fn kill(self: Container, signal: i32) Error!void {
         return self.vtable.kill(self.ptr, signal);
     }
 
+    /// Signals every cgroup member, including descendants, even after init exits.
     pub fn killAll(self: Container, signal: i32) Error!void {
         return self.vtable.killAll(self.ptr, signal);
     }
 
+    /// Applies resource limits to the container's cgroup.
     pub fn update(self: Container, resources: Resources) Error!void {
         return self.vtable.update(self.ptr, resources);
     }
 
+    /// Returns host PIDs, including descendant cgroups; free with allocator.
     pub fn pids(self: Container, allocator: std.mem.Allocator) Error![]i32 {
         return self.vtable.pids(self.ptr, allocator);
     }
 
+    /// Freezes the container's cgroup and waits for the requested state.
     pub fn freeze(self: Container) Error!void {
         return self.vtable.freeze(self.ptr);
     }
 
+    /// Thaws the container's cgroup and waits for the requested state.
     pub fn thaw(self: Container) Error!void {
         return self.vtable.thaw(self.ptr);
     }
 
+    /// Reports whether the container's cgroup is frozen.
     pub fn frozen(self: Container) Error!bool {
         return self.vtable.frozen(self.ptr);
     }
 
+    /// Removes the stopped container's resources; instance memory remains owned.
     pub fn delete(self: Container) Error!void {
         return self.vtable.delete(self.ptr);
     }
 
-    /// Human-readable detail for the most recent failed operation.
+    /// Borrowed detail for the most recent failed operation; copy before cleanup.
     pub fn diagnostic(self: Container) ?[]const u8 {
         return self.vtable.diagnostic(self.ptr);
     }

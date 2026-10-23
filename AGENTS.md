@@ -42,6 +42,10 @@ nix develop -c zig test --dep igvano --dep libcontainer -Mroot=src/main.zig \
   --dep libcontainer -Migvano=src/lib.zig -Mlibcontainer=src/libcontainer/root.zig   # CLI tests directly
 ```
 
+`examples/consumer` checks the public library as an external dependency, separately
+from root tests: `cd examples/consumer && nix develop ../.. -c zig build`, then
+`nix develop ../.. -c zig build -Dtarget=x86_64-linux-musl` for the Linux check.
+
 macOS skips every Linux-gated test, so a passing `zig build test` is not enough for Linux implementation changes. Linux checks (see README "Test"):
 - x86_64 cgroup v2: cross-compile the libcontainer/lib/main test binaries for `x86_64-linux-musl` (`--test-no-exec`) and run them as root in privileged `debian:bookworm-slim` (install `procps`) from a container-local directory. The main tests need `IGVANO_SECCOMP_PROBE` pointing at `src/test/seccomp-probe.zig` built for the same target.
 - arm64 cgroup v1 and v2, systemd, AppArmor: the same binaries built for `aarch64-linux-musl`, run as root in the Lima VMs (one pure cgroup v1, one cgroup v2).

@@ -12,7 +12,7 @@ pub const runtime_oci_version = "1.0.2";
 pub const oci_version_min = "1.0.0";
 pub const oci_version_max = "1.2.1";
 
-/// Parsed config.json values needed by a namespace backend.
+/// Parsed config.json values translated by the frontend for libcontainer.
 pub const Spec = struct {
     ociVersion: []const u8,
     root: Root,

@@ -1,15 +1,11 @@
 const std = @import("std");
 const libcontainer = @import("root.zig");
 
-pub const reportDiagnostic = @import("linux/diagnostic.zig").reportDiagnostic;
-pub const lockedMountFlags = @import("linux/mount.zig").lockedMountFlags;
-pub const cgroupMountType = @import("linux/mount.zig").cgroupMountType;
-pub const namespaceFlags = @import("linux/namespaces.zig").namespaceFlags;
-pub const closeExecFrom = @import("linux/process.zig").closeExecFrom;
 pub const console = @import("linux/console.zig").console;
 pub const apparmorEnabled = @import("linux/procfs.zig").apparmorEnabled;
 pub const systemdCgroupMatches = @import("linux/systemd.zig").systemdCgroupMatches;
 
+/// Borrowed thread-local failure detail; copy immediately before another operation.
 pub fn diagnostic() ?[]const u8 {
     return @import("linux/diagnostic.zig").diagnostic();
 }
@@ -29,12 +25,19 @@ pub const Container = struct {
         return .{ .state = state };
     }
 
-    /// Frees the starttime owned by created instances, using the same allocator.
+    /// Takes ownership of state.starttime; all other fields remain borrowed.
+    /// Call deinit with the allocator that allocated starttime.
+    pub fn adopt(state: libcontainer.State) Container {
+        return .{ .state = state, .owned = true };
+    }
+
+    /// Frees starttime owned by created or adopted instances, using the same allocator.
     /// Does nothing for loaded instances.
     pub fn deinit(self: *Container, allocator: std.mem.Allocator) void {
         if (self.owned) allocator.free(self.state.starttime);
     }
 
+    /// Borrows this instance as an interface; keep it alive at a stable address.
     pub fn container(self: *Container) libcontainer.Container {
         return .{ .ptr = self, .vtable = &vtable };
     }

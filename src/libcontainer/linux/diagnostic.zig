@@ -5,7 +5,7 @@ const libcontainer = @import("../root.zig");
 const writeAll = @import("syscall.zig").writeAll;
 
 // Borrowed diagnostic detail for this thread; no allocation after fork.
-// ponytail: One backend per thread; use per-instance storage if a thread hosts several.
+// ponytail: one container operation at a time per thread; copy detail before the next.
 pub threadlocal var last_diagnostic: [512]u8 = @splat(0);
 pub threadlocal var last_diagnostic_len: usize = 0;
 

@@ -27,7 +27,7 @@ pub fn bindContainer(instance: *ContainerInstance, injected: ?ContainerOverride,
 pub fn createInstance(instance: *ContainerInstance, injected: ?ContainerOverride, options: libcontainer.CreateOptions) libcontainer.Error!libcontainer.Container {
     if (injected) |override| {
         const create = override.create orelse return error.NotImplemented;
-        instance.* = .{ .state = try create(override.container.ptr, options), .owned = true };
+        instance.* = ContainerInstance.adopt(try create(override.container.ptr, options));
         override.state.* = instance.state;
         return override.container;
     }
@@ -294,7 +294,7 @@ fn inferCleanupSystemdDriver(allocator: std.mem.Allocator, io: std.Io, root: []c
     defer if (saved_spec) |spec| spec.deinit();
     const configured = if (saved_spec) |spec| if (spec.value.linux) |settings| settings.cgroupsPath else null else null;
     if (!try systemdUnitMatchesContainer(allocator, unit, id, configured)) return false;
-    return libcontainer.systemdCgroupMatches(allocator, unit, path) catch |query_err| {
+    return libcontainer.linux.systemdCgroupMatches(allocator, unit, path) catch |query_err| {
         if (query_err == error.OutOfMemory) return query_err;
         return false;
     };

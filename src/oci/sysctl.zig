@@ -58,7 +58,7 @@ pub fn validateSysctls(config: Spec.Linux) error{InvalidConfig}!void {
     }
 }
 
-/// The frontend validated namespace ownership; the backend receives only writes.
+/// The frontend validated namespace ownership; libcontainer receives only writes.
 pub fn prepareSysctls(allocator: std.mem.Allocator, config: Spec.Linux) ![]libcontainer.Sysctl {
     const configured = config.sysctl orelse return allocator.alloc(libcontainer.Sysctl, 0);
     const entries = try allocator.alloc(libcontainer.Sysctl, configured.map.count());

@@ -92,6 +92,11 @@ Without Nix, install the Zig version named in `build.zig.zon` from
 Note: Nix flakes only see files tracked by git — `git add` new files before
 `nix develop` or the build won't find them.
 
+Other Zig projects can depend on the standalone `libcontainer` module:
+fetch with `zig fetch --save git+https://github.com/igvano/igvano`, then import
+`b.dependency("igvano", .{ .target = target, .optimize = optimize }).module("libcontainer")`.
+See [examples/consumer](examples/consumer) for a complete build and usage example.
+
 ## Test
 
 Pre-commit hooks run through [prek](https://github.com/j178/prek): `zig fmt --check`, and `cccc` enforcing the `cccc.toml` complexity limits (cognitive 25, cyclomatic 15 per function; `tests/` and `test/` exempt) on the staged files and on all of `src/`. Both tools come from the devShell. With a global `core.hooksPath` (e.g. a corporate hook that chains to local hooks), put `exec nix develop -c prek run --hook-stage pre-commit` in `.git/hooks/pre-commit` instead of `prek install`.

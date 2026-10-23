@@ -101,13 +101,13 @@ test "create uses private state directories and preserves existing root permissi
     });
     const configured_root = try std.fs.path.join(std.testing.allocator, &.{ base, "configured" });
     defer std.testing.allocator.free(configured_root);
-    var configured_backend: TestContainer = .{ .configured = true };
-    try std.testing.expectError(error.NotImplemented, createContainer(std.testing.allocator, std.testing.io, overrideContainer(&configured_backend, .{
-        .ptr = &configured_backend,
+    var configured_container: TestContainer = .{ .configured = true };
+    try std.testing.expectError(error.NotImplemented, createContainer(std.testing.allocator, std.testing.io, overrideContainer(&configured_container, .{
+        .ptr = &configured_container,
         .vtable = &TestContainer.vtable,
     }), .{ .root = configured_root, .subcommand = .create, .id = "example", .bundle = bundle }));
     if (comptime builtin.os.tag == .linux)
-        try std.testing.expectEqual(@as(?std.posix.mode_t, 0o700), configured_backend.state_mode);
+        try std.testing.expectEqual(@as(?std.posix.mode_t, 0o700), configured_container.state_mode);
 }
 
 test "create rejects a duplicate id without changing existing state" {

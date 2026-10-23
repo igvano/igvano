@@ -176,7 +176,7 @@ test "linux procfs writes bypass bind overmounts and the fallback fails closed" 
                 .{ .destination = "/proc", .source = "proc", .type = "proc", .flags = 0, .propagation = 0, .data = "" },
                 .{ .destination = "/proc/sys/kernel/hostname", .source = source, .type = null, .flags = linux.MS.BIND, .propagation = 0, .data = "" },
             };
-            // Prepared mounts are the parsed backend config; install the
+            // Prepared mounts are the translated container config; install the
             // attack exactly as a configured bind, then write after pivot_root.
             setupRootfs(rootfs, &mounts, &.{}, &.{}, false, .{}) catch linux.exit_group(3);
             const root = openPath(linux.AT.FDCWD, "/proc", .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true }) catch linux.exit_group(4);

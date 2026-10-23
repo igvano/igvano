@@ -32,7 +32,7 @@ pub fn createContainer(allocator: std.mem.Allocator, io: std.Io, injected: ?Cont
     try oci.requireCreate(parsed.value);
     const process_options = try prepareCreateProcess(allocator, parsed.value.process, config.console_socket != null);
     defer if (process_options) |options| allocator.free(options.rlimits);
-    const console_fds = if (config.console_socket != null) try libcontainer.console.socketpair() else null;
+    const console_fds = if (config.console_socket != null) try libcontainer.linux.console.socketpair() else null;
     defer closeConsoleFds(console_fds);
     const rootfs = try oci.resolveRootfs(allocator, bundle, parsed.value.root.path);
     defer allocator.free(rootfs);
@@ -153,8 +153,8 @@ fn applyCreateSpec(allocator: std.mem.Allocator, options: *libcontainer.CreateOp
     const settings: oci.Spec.Linux = spec.linux orelse .{};
     options.process = if (spec.process) |process| oci.processConfig(process) else null;
     options.namespaces = try prepareCreateNamespaces(allocator, settings.namespaces);
-    options.uid_mappings = try oci.backendIDMappings(allocator, settings.uidMappings orelse &.{});
-    options.gid_mappings = try oci.backendIDMappings(allocator, settings.gidMappings orelse &.{});
+    options.uid_mappings = try oci.containerIDMappings(allocator, settings.uidMappings orelse &.{});
+    options.gid_mappings = try oci.containerIDMappings(allocator, settings.gidMappings orelse &.{});
     options.hostname = spec.hostname;
     options.readonly_rootfs = spec.root.readonly;
 }
@@ -240,7 +240,7 @@ fn createPreparedContainer(allocator: std.mem.Allocator, mount_allocator: std.me
 }
 
 fn createdContainer(detail: ?[]const u8, created: libcontainer.Error!libcontainer.Container, failure: ?anyerror) !libcontainer.Container {
-    return diagnostics.createResult(detail, created) catch |err| {
+    return diagnostics.resultWithDetail(detail, created) catch |err| {
         if (failure) |reason| {
             diagnostics.last_container_detail = null;
             return reason;
@@ -309,13 +309,13 @@ fn persistCreatingState(allocator: std.mem.Allocator, io: std.Io, root: []const 
 
 fn reportCreateConsole(console_fds: ?[2]std.posix.fd_t, console_socket: ?[]const u8) !void {
     if (console_fds) |fds| {
-        const controller = try libcontainer.console.receiveFd(fds[0]);
+        const controller = try libcontainer.linux.console.receiveFd(fds[0]);
         defer _ = std.os.linux.close(controller);
         // Connect after fork so the blocked init cannot keep this connection
         // alive after create closes its copy.
         const peer = try connectConsoleSocket(console_socket.?);
         defer _ = std.os.linux.close(peer);
-        try libcontainer.console.sendFd(peer, controller);
+        try libcontainer.linux.console.sendFd(peer, controller);
     }
 }
 

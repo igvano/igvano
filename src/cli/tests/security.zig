@@ -155,7 +155,7 @@ fn testSeccompLifecycle(base: []const u8) !void {
 
 test "linux AppArmor confines init and exec with inherited and explicit profiles" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
-    if (!libcontainer.apparmorEnabled()) return error.SkipZigTest;
+    if (!libcontainer.linux.apparmorEnabled()) return error.SkipZigTest;
     if (std.os.linux.prctl(@intFromEnum(std.os.linux.PR.GET_NO_NEW_PRIVS), 0, 0, 0, 0) != 0)
         return error.SkipZigTest;
     try runIsolatedSecurityTest(testAppArmorLifecycle);

@@ -8,11 +8,11 @@ pub var last_container_detail: ?[]const u8 = null;
 pub fn containerResult(container: libcontainer.Container, result: anytype) @TypeOf(result) {
     last_container_detail = null;
     return result catch |err| {
-        return createResult(container.diagnostic(), @as(@TypeOf(result), err));
+        return resultWithDetail(container.diagnostic(), @as(@TypeOf(result), err));
     };
 }
 
-pub fn createResult(detail: ?[]const u8, result: anytype) @TypeOf(result) {
+pub fn resultWithDetail(detail: ?[]const u8, result: anytype) @TypeOf(result) {
     last_container_detail = null;
     return result catch |err| {
         if (detail) |message| {

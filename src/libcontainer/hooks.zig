@@ -1,7 +1,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const linux = std.os.linux;
-const reportDiagnostic = @import("linux.zig").reportDiagnostic;
+const reportDiagnostic = @import("linux/diagnostic.zig").reportDiagnostic;
+const closeExecFrom = @import("linux/process.zig").closeExecFrom;
 
 /// Execution settings, already validated and translated by the frontend.
 pub const Hook = struct {
@@ -172,7 +173,7 @@ fn writeHookState(input: std.posix.fd_t, state: []const u8) Error!void {
 fn execHook(hook: Prepared, input: std.posix.fd_t, output: std.posix.fd_t, errors: std.posix.fd_t, sweep: bool) noreturn {
     for ([_]std.posix.fd_t{ input, output, errors }, 0..) |fd, target|
         if (linux.errno(linux.dup2(fd, @intCast(target))) != .SUCCESS) linux.exit_group(1);
-    if (sweep) @import("linux.zig").closeExecFrom(3, null) catch linux.exit_group(1);
+    if (sweep) closeExecFrom(3, null) catch linux.exit_group(1);
     _ = linux.execve(hook.path, hook.argv.ptr, hook.envp.ptr);
     linux.exit_group(1);
 }

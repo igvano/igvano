@@ -127,7 +127,7 @@ fn prepareExecOptions(process_allocator: std.mem.Allocator, io: std.Io, state: L
     };
     options.seccomp = try oci.prepareSeccomp(process_allocator, seccomp);
     options.cgroup_path = state.container_state.?.cgroup_path orelse return oci.validationError(error.InvalidState, "exec: saved cgroup path is missing", .{});
-    options.console_fds = if (process.terminal orelse false) try libcontainer.console.socketpair() else null;
+    options.console_fds = if (process.terminal orelse false) try libcontainer.linux.console.socketpair() else null;
     return options;
 }
 
@@ -222,11 +222,11 @@ fn receiveExecConsole(console_fds: ?[2]std.posix.fd_t, console_socket: ?[]const 
         _ = linux.close(fd);
     };
     if (console_fds) |fds| {
-        controller = try libcontainer.console.receiveFd(fds[0]);
+        controller = try libcontainer.linux.console.receiveFd(fds[0]);
         if (console_socket) |path| {
             const peer = try connectConsoleSocket(path);
             defer _ = linux.close(peer);
-            try libcontainer.console.sendFd(peer, controller.?);
+            try libcontainer.linux.console.sendFd(peer, controller.?);
             _ = linux.close(controller.?);
             controller = null;
         }

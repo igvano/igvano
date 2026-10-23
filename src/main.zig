@@ -283,7 +283,7 @@ test "backend error detail survives cleanup overwriting the borrowed buffer" {
         .exec_fifo = "/runtime/example/exec.fifo",
     });
     const message = createDiagnostic(overrideContainer(&implementation, container));
-    try std.testing.expectError(error.NotImplemented, diagnostics.createResult(message, created));
+    try std.testing.expectError(error.NotImplemented, diagnostics.resultWithDetail(message, created));
     const handle: libcontainer.State = .{ .id = "example", .pid = 1234, .starttime = "alive" };
     implementation.state = handle;
     @memset(&detail, 'x');
