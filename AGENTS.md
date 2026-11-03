@@ -42,10 +42,9 @@ nix develop -c zig test --dep igvano --dep libcontainer -Mroot=src/main.zig \
   --dep libcontainer -Migvano=src/lib.zig -Mlibcontainer=src/libcontainer/root.zig   # CLI tests directly
 ```
 
-`zig build test` also compiles `examples/consumer` against the in-tree
-`libcontainer` module; `zig build examples` compiles it without running tests or
-installing it. The example's own build checks the public library as an external
-dependency: `cd examples/consumer && nix develop ../.. -c zig build`, then
+After public API changes, check the library as an external dependency with the
+independent `examples/consumer` project:
+`cd examples/consumer && nix develop ../.. -c zig build`, then
 `nix develop ../.. -c zig build -Dtarget=x86_64-linux-musl` for the Linux check.
 
 macOS skips every Linux-gated test, so a passing `zig build test` is not enough for Linux implementation changes. Linux checks (see README "Test"):

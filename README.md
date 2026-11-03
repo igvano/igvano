@@ -112,6 +112,14 @@ nix develop -c zig test --dep igvano --dep libcontainer -Mroot=src/main.zig \
   --dep libcontainer -Migvano=src/lib.zig -Mlibcontainer=src/libcontainer/root.zig
 ```
 
+After public API changes, build the independent consumer example to check the
+library as an external dependency:
+
+```sh
+cd examples/consumer && nix develop ../.. -c zig build
+nix develop ../.. -c zig build -Dtarget=x86_64-linux-musl
+```
+
 The Linux tests need root. Cross-compile the test binaries and run them in a
 privileged container or a Linux VM:
 
