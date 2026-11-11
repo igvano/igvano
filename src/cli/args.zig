@@ -74,11 +74,83 @@ pub fn parseArgsWithLog(args: []const []const u8, log: *?[]const u8, log_format:
         if (index != args.len) return oci.validationError(error.UnexpectedArgument, "unexpected argument; global flags must precede the subcommand", .{});
         return config;
     }
-    const flags_start = index;
-    try parseCommandOptions(args, &index, &config);
-    try parseCommandArguments(args, index, &config);
-    if (config.subcommand == .exec) config.exec_flags = args[flags_start..index];
+    var reordered: [max_reordered_args][]const u8 = undefined;
+    const command_args = try reorderArgs(commandFlagNames(config.subcommand), args[index..], &reordered);
+    var command_index: usize = 0;
+    try parseCommandOptions(command_args, &command_index, &config);
+    try parseCommandArguments(command_args, command_index, &config);
+    // exec and ps are never reordered, so these slices borrow args, not the buffer.
+    if (config.subcommand == .exec) config.exec_flags = command_args[0..command_index];
     return config;
+}
+
+// ponytail: fixed stack buffer instead of an allocator; non-exec/ps commands
+// never come close. Raise it, or pass an allocator, if a command ever needs more.
+const max_reordered_args = 128;
+
+/// Flag names (without dashes) each subcommand moves ahead of its positional
+/// arguments. exec and ps keep runc's SkipArgReorder; the rest take no flags.
+fn commandFlagNames(subcommand: Subcommand) []const []const u8 {
+    return switch (subcommand) {
+        .create => &.{ "bundle", "pid-file", "console-socket" },
+        .delete => &.{"force"},
+        .kill => &.{ "all", "a" },
+        .update => &.{
+            "resources",   "r",           "memory",     "memory-reservation", "memory-swap",   "kernel-memory",
+            "cpu-shares",  "cpu-share",   "cpu-period", "cpu-quota",          "cpu-rt-period", "cpu-rt-runtime",
+            "cpuset-cpus", "cpuset-mems", "pids-limit", "blkio-weight",
+        },
+        else => &.{},
+    };
+}
+
+/// Port of urfave/cli v1 reorderArgs, which runc relies on: the subcommand's
+/// own flags, each with the argument that may follow it, move ahead of the
+/// positional arguments, and everything after a bare `--` stays positional.
+fn reorderArgs(flag_names: []const []const u8, args: []const []const u8, buffer: *[max_reordered_args][]const u8) ![]const []const u8 {
+    if (flag_names.len == 0) return args;
+    if (args.len > buffer.len) return oci.validationError(error.UnexpectedArgument, "too many arguments", .{});
+    var remaining: [max_reordered_args][]const u8 = undefined;
+    var flags_len: usize = 0;
+    var remaining_len: usize = 0;
+    var may_take_value = false;
+    for (args, 0..) |arg, i| {
+        if (may_take_value and !isCommandFlag(flag_names, arg)) {
+            may_take_value = false;
+            buffer[flags_len] = arg;
+            flags_len += 1;
+        } else if (std.mem.eql(u8, arg, "--")) {
+            // The delimiter goes first, then the earlier positionals, then the rest verbatim.
+            std.mem.copyBackwards([]const u8, remaining[1 .. remaining_len + 1], remaining[0..remaining_len]);
+            remaining[0] = arg;
+            remaining_len += 1;
+            for (args[i + 1 ..]) |rest| {
+                remaining[remaining_len] = rest;
+                remaining_len += 1;
+            }
+            break;
+        } else if (isCommandFlag(flag_names, arg)) {
+            buffer[flags_len] = arg;
+            flags_len += 1;
+            may_take_value = std.mem.indexOfScalar(u8, arg, '=') == null;
+        } else {
+            remaining[remaining_len] = arg;
+            remaining_len += 1;
+        }
+    }
+    @memcpy(buffer[flags_len..][0..remaining_len], remaining[0..remaining_len]);
+    return buffer[0 .. flags_len + remaining_len];
+}
+
+fn isCommandFlag(flag_names: []const []const u8, arg: []const u8) bool {
+    if (std.mem.eql(u8, arg, "-") or std.mem.eql(u8, arg, "--") or !std.mem.startsWith(u8, arg, "-")) return false;
+    var name = if (std.mem.startsWith(u8, arg, "--")) arg[2..] else arg;
+    if (std.mem.startsWith(u8, name, "-")) name = name[1..];
+    name = name[0 .. std.mem.indexOfScalar(u8, name, '=') orelse name.len];
+    for (flag_names) |flag_name| {
+        if (std.mem.eql(u8, flag_name, name)) return true;
+    }
+    return false;
 }
 
 fn optionName(flag: []const u8) []const u8 {
@@ -697,7 +769,40 @@ test "create parsing rejects missing bundle and pid file values" {
     try std.testing.expectError(error.MissingPidFile, parseArgs(&.{ "igvano", "create", "--bundle", "/tmp/bundle", "--pid-file" }));
     try std.testing.expectError(error.MissingPidFile, parseArgs(&.{ "igvano", "create", "--bundle", "/tmp/bundle", "--pid-file=" }));
     try std.testing.expectError(error.UnknownOption, parseArgs(&.{ "igvano", "create", "--root", "/tmp", "--bundle", "/tmp/bundle", "example" }));
-    try std.testing.expectError(error.UnexpectedArgument, parseArgs(&.{ "igvano", "create", "--bundle", "/tmp/bundle", "example", "--pid-file", "init.pid" }));
+}
+
+test "command flags after the id are reordered like runc" {
+    const create = try parseArgs(&.{ "igvano", "create", "example", "--bundle", "/tmp/bundle", "--pid-file=init.pid" });
+    try std.testing.expectEqualStrings("example", create.id);
+    try std.testing.expectEqualStrings("/tmp/bundle", create.bundle.?);
+    try std.testing.expectEqualStrings("init.pid", create.pid_file.?);
+    const mixed = try parseArgs(&.{ "igvano", "create", "--bundle", "/tmp/bundle", "example", "--pid-file", "init.pid" });
+    try std.testing.expectEqualStrings("example", mixed.id);
+    try std.testing.expectEqualStrings("init.pid", mixed.pid_file.?);
+    for ([_][]const u8{ "--all", "-a" }) |flag| {
+        const kill = try parseArgs(&.{ "igvano", "kill", "example", "TERM", flag });
+        try std.testing.expect(kill.all);
+        try std.testing.expectEqualStrings("example", kill.id);
+        try std.testing.expectEqualStrings("TERM", kill.signal.?);
+    }
+    try std.testing.expect((try parseArgs(&.{ "igvano", "delete", "example", "--force" })).force);
+    const update = try parseArgs(&.{ "igvano", "update", "example", "--pids-limit", "10" });
+    try std.testing.expectEqualStrings("example", update.id);
+    try std.testing.expectEqual(@as(?i64, 10), update.resource_flags.pids.?.limit);
+    // Like urfave/cli, a flag takes the next non-flag argument with it.
+    try std.testing.expectError(error.InvalidId, parseArgs(&.{ "igvano", "kill", "example", "--all", "../x" }));
+    // Only the subcommand's own flags move; global flags stay positional, and `--` is still rejected.
+    try std.testing.expectError(error.UnexpectedArgument, parseArgs(&.{ "igvano", "state", "example", "--root", "/tmp" }));
+    try std.testing.expectError(error.UnexpectedArgument, parseArgs(&.{ "igvano", "create", "example", "--root", "/tmp" }));
+    try std.testing.expectError(error.UnknownOption, parseArgs(&.{ "igvano", "delete", "--force", "--", "example" }));
+    // exec and ps keep their trailing arguments in place.
+    try std.testing.expectEqualSlices([]const u8, &.{ "sh", "--all" }, (try parseArgs(&.{ "igvano", "exec", "example", "sh", "--all" })).exec_args);
+    try std.testing.expectEqualSlices([]const u8, &.{"--format"}, (try parseArgs(&.{ "igvano", "ps", "example", "--format" })).ps_args);
+    var too_many: [max_reordered_args + 3][]const u8 = @splat("--force");
+    too_many[0] = "igvano";
+    too_many[1] = "delete";
+    too_many[2] = "example";
+    try std.testing.expectError(error.UnexpectedArgument, parseArgs(&too_many));
 }
 
 test "kill parsing preserves an optional positional signal" {
@@ -721,8 +826,6 @@ test "kill parsing accepts all before the id" {
     try std.testing.expect(explicit_signal.all);
     try std.testing.expectError(error.MissingId, parseArgs(&.{ "igvano", "kill", "--all" }));
     try std.testing.expectError(error.MissingId, parseArgs(&.{ "igvano", "kill", "-a" }));
-    try std.testing.expectError(error.UnexpectedArgument, parseArgs(&.{ "igvano", "kill", "example", "--all" }));
-    try std.testing.expectError(error.UnexpectedArgument, parseArgs(&.{ "igvano", "kill", "example", "-a" }));
     try std.testing.expectError(error.UnknownOption, parseArgs(&.{ "igvano", "--all", "kill", "example" }));
     const rejected = [_]struct { subcommand: []const u8, err: anyerror }{
         .{ .subcommand = "create", .err = error.UnknownOption },
@@ -746,7 +849,6 @@ test "argument parsing accepts force only for delete" {
     try std.testing.expectError(error.MissingId, parseArgs(&.{ "igvano", "delete", "--force" }));
     try std.testing.expectError(error.UnknownOption, parseArgs(&.{ "igvano", "--force", "delete", "example" }));
     try std.testing.expectError(error.UnknownOption, parseArgs(&.{ "igvano", "delete", "--force=true", "example" }));
-    try std.testing.expectError(error.UnexpectedArgument, parseArgs(&.{ "igvano", "delete", "example", "--force" }));
     const rejected = [_]struct { subcommand: []const u8, err: anyerror }{
         .{ .subcommand = "create", .err = error.UnknownOption },
         .{ .subcommand = "state", .err = error.UnexpectedArgument },
