@@ -1,5 +1,10 @@
 # igvano
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/logo/igvano-horizontal-dark.svg">
+  <img alt="igvano logo: Ziggy the Ziguana standing on a shipping container" src="docs/logo/igvano-horizontal.svg" width="480">
+</picture>
+
 A toy OCI container runtime written in Zig. It started as an exercise in
 conformance with the [OCI runtime spec](https://github.com/opencontainers/runtime-spec),
 measured with [opencontainers/runtime-tools](https://github.com/opencontainers/runtime-tools),
@@ -228,3 +233,8 @@ See `AGENTS.md` for architecture rules and development conventions.
 ## License
 
 See [LICENSE](LICENSE).
+
+The logo uses [Ziggy the Ziguana](https://codeberg.org/ziglang/logo#official-mascots)
+by the Zig project, licensed under
+[CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). See
+[docs/logo](docs/logo/README.md) for details and changes.
