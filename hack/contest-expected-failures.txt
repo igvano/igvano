@@ -1,0 +1,95 @@
+# Expected contest failures, one "group::test" per line ("group::*" means
+# the group crashed or timed out). hack/contest.sh fails when a test outside
+# this list fails, or when a listed test stops failing (passes, skips or does
+# not run). Keep it sorted.
+
+# Also fail with runc v1.3.3 in the same container (environment or contest
+# expectations, not igvano).
+memory_policy::bind_static
+memory_policy::interleave_without_flags
+memory_policy::preferred_relative
+mounts_recursive::ratime_test
+mounts_recursive::rnostrictatime_test
+net_devices::address
+net_devices::back_device
+net_devices::net_device
+net_devices::net_device_rename
+net_devices::net_devices
+update::update_pids_limit_test
+
+# igvano gaps found by contest, not yet triaged. Fix them and delete the lines.
+cgroup_v2_cpu::test_cpu_period_unspecified_unchanged
+cgroup_v2_cpu::test_cpu_period_valid_set
+cgroup_v2_cpu::test_cpu_quota_negative_value_default_set
+cgroup_v2_cpu::test_cpu_weight_valid_set
+cgroup_v2_cpuset::test_cpuset_cpus_and_mems_set
+cgroup_v2_cpuset::test_cpuset_cpus_set
+cgroup_v2_cpuset::test_cpuset_mems_set
+cgroup_v2_unified::test_unified_io_max_multi_device
+delete::delete_non_existed_container
+delete::delete_running_container_test
+domainname_test::set_domainname_test
+exec::*
+exec_cpu_affinity::test_cpu_affinity_from_config_json
+exec_cpu_affinity::test_cpu_affinity_initial_and_final_set_from_process_json
+exec_cpu_affinity::test_cpu_affinity_only_initial_set_from_process_json
+fd_control::closes_fd
+fd_control::pass_single_fd
+hooks::hooks
+kill_container::kill_non_existed_container
+kill_container::kill_stopped_container_test
+kill_container::kill_with_empty_id_test
+kill_no_effect::kill_no_effect_test
+lifecycle::state
+mount_propagation::mount_propagation_private_test
+mount_propagation::mount_propagation_rslave_test
+mount_propagation::mount_propagation_slave_test
+mounts_recursive::rdev_test
+mounts_recursive::rdiratime_test
+mounts_recursive::rexec_test
+mounts_recursive::rnoatime_test
+mounts_recursive::rnodev_test
+mounts_recursive::rnodiratime_test
+mounts_recursive::rnoexec_test
+mounts_recursive::rnorelatime_test
+mounts_recursive::rnosuid_test
+mounts_recursive::rnosymfollow_test
+mounts_recursive::rrelatime_test
+mounts_recursive::rstrictatime_test
+mounts_recursive::rsymfollow_test
+no_pivot::no_pivot_test
+personality::personality_for_linux32
+poststop_fail::poststop_fail
+prestart::prestart
+prestart_fail::prestart_fail
+process_capabilities_bounding::bounding_unset_with_other_caps_fails_test
+process_capabilities_fail::process_capabilities_fail_test
+process_user::process_user_duplicate_gids_test
+process_user::process_user_unique_gids_test
+prohibit_symlink::*
+readonly_paths::readonly_rel_paths
+root_readonly::root_readonly_true_in_userns_test
+seccomp_notify::*
+set_io_priority::io_priority_class_be
+set_io_priority::io_priority_class_idle
+set_io_priority::io_priority_class_rt
+set_scheduler_policy::policy_batch
+set_scheduler_policy::policy_other
+start_container_hook_env_inherit::start_container_env_inherit
+terminal::terminal_console_size
+terminal::terminal_large_output
+terminal::terminal_newline_rendering
+terminal::terminal_no_console_socket
+terminal::terminal_run_exit_code
+terminal::terminal_run_sigwinch
+terminal::terminal_stdin_bridge
+time_ns::simple timens
+time_ns::simple timens + exec
+time_ns::simple timens + userns
+tmpcopyup::tmpcopyup_ro_test
+tmpcopyup::tmpcopyup_test
+update::cpu_burst_test
+update::update_blkio_weight_test
+update::update_cgroup_cpu_idle_test
+update::update_cgroup_v2_common_limits_test
+update::update_cpu_limits_test

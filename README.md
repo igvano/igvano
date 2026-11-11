@@ -168,6 +168,27 @@ Failures caused by runtime-tools bugs or kernel limits are labelled in the
 output. Pin the suite with `RUNTIME_TOOLS_REF=<ref>`. Run it from a checkout
 under `$HOME` (Colima only shares `$HOME` with its VM).
 
+### youki contest
+
+`hack/contest.sh` builds youki's Rust integration suite
+([contest](https://github.com/youki-dev/youki/tree/main/tests/contest)) at a
+pinned commit (`YOUKI_REF`), then runs it against igvano with
+`RUNTIME_KIND=runc` in a privileged `debian:bookworm-slim` container, one test
+group at a time. It fails when a test outside
+`hack/contest-expected-failures.txt` fails, or when a listed test stops failing, so
+delete a line once its fix lands. `CONTEST_GROUPS="<group>..."` runs a subset;
+`CONTEST_RUNTIME=<static runc>` runs the same suite against another runtime to
+tell environment failures from igvano ones. x86_64 only.
+
+```sh
+./hack/contest.sh
+CONTEST_GROUPS="lifecycle delete" ./hack/contest.sh
+```
+
+CI (`.github/workflows/ci.yml`) runs lint, `zig build test` on macOS, the
+Linux unit tests as root, contest, runtime-tools (report only) and
+`hack/kind.sh` with both cgroup drivers.
+
 ### containerd and CRI
 
 igvano is also checked with containerd v2.2's integration suite

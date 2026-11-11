@@ -1,0 +1,113 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: cachix/install-nix-action@91f6a0f59e94dfb2cfed0f4000f36a68ead1d20c # v31.11.4
+      - name: zig fmt
+        run: nix develop -c zig fmt --check build.zig src examples
+      - name: cccc complexity
+        run: nix develop -c cccc --table src/
+
+  unit-macos:
+    # Linux-gated tests skip here; this keeps the macOS dev build green.
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: cachix/install-nix-action@91f6a0f59e94dfb2cfed0f4000f36a68ead1d20c # v31.11.4
+      - run: nix develop -c zig build test
+
+  unit-linux:
+    # Same as README "Test": cross-compile, then run as root in a privileged container.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: cachix/install-nix-action@91f6a0f59e94dfb2cfed0f4000f36a68ead1d20c # v31.11.4
+      - name: Build test binaries
+        run: |
+          set -eu
+          nix develop -c zig test src/libcontainer/root.zig --test-no-exec -target x86_64-linux-musl -femit-bin=zig-out/libcontainer-tests-linux
+          nix develop -c zig test --test-no-exec -target x86_64-linux-musl -femit-bin=zig-out/lib-tests-linux \
+            --dep libcontainer -Mroot=src/lib.zig -Mlibcontainer=src/libcontainer/root.zig
+          # Doubled --dep libcontainer is intentional: one for root, one for igvano.
+          nix develop -c zig test --test-no-exec -target x86_64-linux-musl -femit-bin=zig-out/main-tests-linux \
+            --dep igvano --dep libcontainer -Mroot=src/main.zig \
+            --dep libcontainer -Migvano=src/lib.zig -Mlibcontainer=src/libcontainer/root.zig
+          nix develop -c zig build-exe src/test/seccomp-probe.zig -target x86_64-linux-musl -femit-bin=zig-out/seccomp-probe-x86_64
+      - name: Run as root (cgroup v2)
+        run: |
+          docker run --rm --init --privileged --platform linux/amd64 -v "$PWD/zig-out:/bins:ro" debian:bookworm-slim sh -c \
+            'set -e; apt-get update -qq && apt-get install -y -qq procps >/dev/null; cp /bins/*-tests-linux /bins/seccomp-probe-x86_64 /tmp/ &&
+             mkdir -p /tmp/work && cd /tmp/work && /tmp/libcontainer-tests-linux && /tmp/lib-tests-linux &&
+             IGVANO_SECCOMP_PROBE=/tmp/seccomp-probe-x86_64 /tmp/main-tests-linux'
+
+  contest:
+    # youki's Rust OCI integration suite; gated by hack/contest-expected-failures.txt.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: cachix/install-nix-action@91f6a0f59e94dfb2cfed0f4000f36a68ead1d20c # v31.11.4
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .zig-cache/contest-*
+          key: contest-${{ hashFiles('hack/contest.sh') }}
+      - run: ./hack/contest.sh
+      - if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: contest-log
+          path: .zig-cache/contest.log
+
+  runtime-tools:
+    # Report only: the PASS/FAIL table is the tracking metric (README "OCI conformance").
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: cachix/install-nix-action@91f6a0f59e94dfb2cfed0f4000f36a68ead1d20c # v31.11.4
+      - run: ./hack/conformance.sh
+      - if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: runtime-tools-log
+          path: .zig-cache/conformance.log
+
+  kind:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        cgroup-driver: [systemd, cgroupfs]
+    env:
+      KIND_VERSION: v0.30.0
+      KIND_SHA256: 517ab7fc89ddeed5fa65abf71530d90648d9638ef0c4cde22c2c11f8097b8889
+      KUBECTL_VERSION: v1.34.0
+      KUBECTL_SHA256: cfda68cba5848bc3b6c6135ae2f20ba2c78de20059f68789c090166d6abc3e2c
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: cachix/install-nix-action@91f6a0f59e94dfb2cfed0f4000f36a68ead1d20c # v31.11.4
+      - name: Install kind and kubectl
+        run: |
+          set -eu
+          mkdir -p "$HOME/.local/bin"
+          curl -fsSLo "$HOME/.local/bin/kind" "https://kind.sigs.k8s.io/dl/$KIND_VERSION/kind-linux-amd64"
+          curl -fsSLo "$HOME/.local/bin/kubectl" "https://dl.k8s.io/release/$KUBECTL_VERSION/bin/linux/amd64/kubectl"
+          printf '%s  %s\n' "$KIND_SHA256" "$HOME/.local/bin/kind" "$KUBECTL_SHA256" "$HOME/.local/bin/kubectl" | sha256sum -c -
+          chmod +x "$HOME/.local/bin/kind" "$HOME/.local/bin/kubectl"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - run: ./hack/kind.sh
+        env:
+          KIND_CGROUP_DRIVER: ${{ matrix.cgroup-driver }}
