@@ -186,15 +186,42 @@ CONTEST_GROUPS="lifecycle delete" ./hack/contest.sh
 ```
 
 CI (`.github/workflows/ci.yml`) runs lint, `zig build test` on macOS, the
-Linux unit tests as root, contest, runtime-tools (report only) and
-`hack/kind.sh` with both cgroup drivers.
+Linux unit tests as root, contest, runc's bats suite, containerd's
+`integration/client` suite, runtime-tools (report only) and `hack/kind.sh`
+with both cgroup drivers.
 
 ### containerd and CRI
 
-igvano is also checked with containerd v2.2's integration suite
-(`integration/client`, with igvano installed as `runc` on `PATH`) and with
+`hack/containerd.sh` builds containerd v2.2 (pinned with `CONTAINERD_REF`),
+installs igvano as `runc` under the stock `containerd-shim-runc-v2`, and runs
+the `integration/client` suite (without CRIU) in a privileged `golang`
+container. Like contest, it is gated by
+`hack/containerd-expected-failures.txt`; today igvano fails exactly the tests
+that runc v1.3.3 fails in the same container. `CONTAINERD_RUN=<regex>` runs a
+subset and `CONTAINERD_RUNTIME=<static runc>` runs it against runc. x86_64 only.
+
+```sh
+./hack/containerd.sh
+CONTAINERD_RUN='TestContainerExec' ./hack/containerd.sh
+```
+
+igvano has also been checked with
 [cri-tools](https://github.com/kubernetes-sigs/cri-tools)' `critest` through
-containerd's CRI plugin. On both cgroup v1 and v2 the results match runc's.
+containerd's CRI plugin, by hand, on cgroup v1 and v2.
+
+### runc compatibility (bats)
+
+`hack/runc-bats.sh` runs runc's own bats suite (`tests/integration` at runc
+v1.3.3, `RUNC_REF`) with igvano as `$RUNC`, one `.bats` file at a time, gated by
+`hack/runc-bats-expected-failures.txt`. Most of the suite still fails because
+its setup calls `runc spec` and most tests call `runc run`, neither of which
+igvano implements yet. `RUNC_BATS_FILES="<file>..."` runs a subset and
+`RUNC_BATS_RUNTIME=<static runc>` runs it against runc. x86_64 only.
+
+```sh
+./hack/runc-bats.sh
+RUNC_BATS_FILES="start kill" ./hack/runc-bats.sh
+```
 
 ### Kubernetes (kind)
 

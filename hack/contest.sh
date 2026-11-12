@@ -57,8 +57,6 @@ if [ "${1-}" = "--inside" ]; then
             printf '%s::*\tnot ok\n' "$group" >> results
         fi
     done
-    printf '\n'
-    awk -F '\t' '{ n[$2]++ } END { printf "ok %d, not ok %d, skipped %d\n", n["ok"], n["not ok"], n["skipped"] }' results
     cp results /outputs/results
     exit 0
 fi
@@ -80,7 +78,7 @@ status=0
         git -C "$src" remote add origin https://github.com/youki-dev/youki.git
         git -C "$src" fetch -q --depth 1 origin "$youki_ref"
         git -C "$src" checkout -q --detach FETCH_HEAD
-        docker run --rm -v "$src:/youki" -w /youki rust:bookworm sh -c '
+        docker run --rm -v "$src:/youki" -w /youki rust:bookworm@sha256:e6f2cff35d0f309acf8433b4f05878ed77092602c5065cc81801177da0bb3a9c sh -c '
             set -e
             git config --global --add safe.directory /youki
             apt-get update -qq
@@ -107,19 +105,8 @@ status=0
         --mount "type=bind,src=$snapshot/contest.sh,dst=/contest.sh,readonly" \
         -e "CONTEST_TIMEOUT=${CONTEST_TIMEOUT:-300}" \
         -e "CONTEST_GROUPS=${CONTEST_GROUPS:-}" \
-        debian:bookworm-slim sh /contest.sh --inside || exit "$?"
-    # Compare "group::test" names, limited to the groups that ran.
-    awk -F '\t' '$2 == "not ok" { print $1 }' "$snapshot/outputs/results" | LC_ALL=C sort -u > "$snapshot/failed"
-    grep -v '^#' "$expected" | sed '/^$/d' |
-        awk 'NR == FNR { ran[$0]; next } { group = $0; sub(/::.*/, "", group) } group in ran' "$snapshot/outputs/groups" - |
-        LC_ALL=C sort -u > "$snapshot/expected"
-    LC_ALL=C comm -23 "$snapshot/failed" "$snapshot/expected" > "$snapshot/unexpected"
-    LC_ALL=C comm -13 "$snapshot/failed" "$snapshot/expected" > "$snapshot/fixed"
-    printf '\nUnexpected failures (not in hack/contest-expected-failures.txt):\n'
-    sed 's/^/  /' "$snapshot/unexpected"
-    printf '\nListed but no longer failing (passed, skipped or missing; update hack/contest-expected-failures.txt):\n'
-    sed 's/^/  /' "$snapshot/fixed"
-    [ ! -s "$snapshot/unexpected" ] && [ ! -s "$snapshot/fixed" ]
+        debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc sh /contest.sh --inside || exit "$?"
+    sh "$repo/hack/gate.sh" "$snapshot/outputs/results" "$snapshot/outputs/groups" "$expected"
 ) > "$log" 2>&1 || status=$?
 cat "$log"
 printf '\nFull log: %s\n' "$log"

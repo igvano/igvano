@@ -1,7 +1,7 @@
 # Expected contest failures, one "group::test" per line ("group::*" means
 # the group crashed or timed out). hack/contest.sh fails when a test outside
 # this list fails, or when a listed test stops failing (passes, skips or does
-# not run). Keep it sorted.
+# not run). Keep each section sorted.
 
 # Also fail with runc v1.3.3 in the same container (environment or contest
 # expectations, not igvano).

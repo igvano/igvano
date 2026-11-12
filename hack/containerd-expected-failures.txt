@@ -1,0 +1,10 @@
+# Expected containerd integration/client failures, one "client::Test" per line
+# ("client::*" means the package panicked, timed out or did not build).
+# hack/containerd.sh fails when a test outside this list fails, or when a
+# listed test stops failing (passes, skips or does not run). Keep each section sorted.
+
+# Also fail with runc v1.3.3 in the same container (environment, not igvano).
+client::TestIssue10589
+client::TestIssue9103
+client::TestIssue9103/should_be_stopped_status_if_init_has_been_killed
+client::TestShimDoesNotLeakPipes
