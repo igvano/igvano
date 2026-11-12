@@ -16,6 +16,9 @@ pub const Subcommand = enum {
     pause,
     @"resume",
     delete,
+    spec,
+    run,
+    list,
 };
 
 const PsFormat = enum { table, json };
@@ -44,6 +47,8 @@ pub const Config = struct {
     resources_file: ?[]const u8 = null,
     resource_flags: oci.Spec.Resources = .{},
     detach: bool = false,
+    keep: bool = false,
+    quiet: bool = false,
     tty: ?bool = null,
     exec_cwd: ?[]const u8 = null,
     exec_user: ?ExecUser = null,
@@ -78,6 +83,10 @@ pub fn parseArgsWithLog(args: []const []const u8, log: *?[]const u8, log_format:
     const command_args = try reorderArgs(commandFlagNames(config.subcommand), args[index..], &reordered);
     var command_index: usize = 0;
     try parseCommandOptions(command_args, &command_index, &config);
+    if (config.subcommand == .spec or config.subcommand == .list) {
+        if (command_index != command_args.len) return oci.validationError(error.UnexpectedArgument, "{s}: takes no arguments", .{@tagName(config.subcommand)});
+        return config;
+    }
     try parseCommandArguments(command_args, command_index, &config);
     // exec and ps are never reordered, so these slices borrow args, not the buffer.
     if (config.subcommand == .exec) config.exec_flags = command_args[0..command_index];
@@ -92,8 +101,11 @@ const max_reordered_args = 128;
 /// arguments. exec and ps keep runc's SkipArgReorder; the rest take no flags.
 fn commandFlagNames(subcommand: Subcommand) []const []const u8 {
     return switch (subcommand) {
-        .create => &.{ "bundle", "pid-file", "console-socket" },
-        .delete => &.{"force"},
+        .create => &.{ "bundle", "b", "pid-file", "console-socket" },
+        .run => &.{ "bundle", "b", "pid-file", "console-socket", "detach", "d", "keep" },
+        .spec => &.{ "bundle", "b" },
+        .list => &.{ "quiet", "q", "format", "f" },
+        .delete => &.{ "force", "f" },
         .kill => &.{ "all", "a" },
         .update => &.{
             "resources",   "r",           "memory",     "memory-reservation", "memory-swap",   "kernel-memory",
@@ -198,7 +210,7 @@ fn parseGlobalOptions(args: []const []const u8, index: *usize, config: *Config, 
 fn parseCommandOptions(args: []const []const u8, index: *usize, config: *Config) !void {
     switch (config.subcommand) {
         .exec => try parseExecOptions(args, index, config),
-        .create => try parseCreateOptions(args, index, config),
+        .create, .run, .spec => try parseCreateOptions(args, index, config),
         .update => {
             const update = try parseUpdateArgs(args, index.*);
             index.* = update.index;
@@ -206,7 +218,7 @@ fn parseCommandOptions(args: []const []const u8, index: *usize, config: *Config)
             config.resource_flags = update.resource_flags;
         },
         .delete => try parseDeleteOptions(args, index, config),
-        .ps => try parsePsOptions(args, index, config),
+        .ps, .list => try parsePsOptions(args, index, config),
         .kill => {
             while (index.* < args.len and (std.mem.eql(u8, args[index.*], "--all") or
                 std.mem.eql(u8, args[index.*], "-a"))) : (index.* += 1)
@@ -242,15 +254,31 @@ fn parseExecOptions(args: []const []const u8, index: *usize, config: *Config) !v
     }
 }
 
+const CreateOption = enum { bundle, pid_file, console_socket, detach, keep };
+
+// spec takes only the bundle; detach and keep are run-only booleans.
+fn createOptionAllowed(subcommand: Subcommand, option: CreateOption, flag: []const u8) bool {
+    if (subcommand == .spec) return option == .bundle;
+    if (option != .detach and option != .keep) return true;
+    return subcommand == .run and std.mem.indexOfScalar(u8, flag, '=') == null;
+}
+
 fn parseCreateOptions(args: []const []const u8, index: *usize, config: *Config) !void {
-    const options = std.StaticStringMap(enum { bundle, pid_file, console_socket }).initComptime(.{
-        .{ "--bundle", .bundle }, .{ "--pid-file", .pid_file }, .{ "--console-socket", .console_socket },
+    const options = std.StaticStringMap(CreateOption).initComptime(.{
+        .{ "--bundle", .bundle }, .{ "-b", .bundle }, .{ "--pid-file", .pid_file }, .{ "--console-socket", .console_socket },
+        .{ "--detach", .detach }, .{ "-d", .detach }, .{ "--keep", .keep },
     });
     while (index.* < args.len and std.mem.startsWith(u8, args[index.*], "-")) : (index.* += 1) {
-        switch (options.get(optionName(args[index.*])) orelse return oci.validationError(error.UnknownOption, "unknown option '{s}'", .{args[index.*]})) {
+        const flag = args[index.*];
+        const option = options.get(optionName(flag)) orelse return oci.validationError(error.UnknownOption, "unknown option '{s}'", .{flag});
+        if (!createOptionAllowed(config.subcommand, option, flag))
+            return oci.validationError(error.UnknownOption, "unknown option '{s}'", .{flag});
+        switch (option) {
             .bundle => config.bundle = try longOptionValue(args, index, error.MissingBundle, false),
             .pid_file => config.pid_file = try longOptionValue(args, index, error.MissingPidFile, false),
             .console_socket => config.console_socket = try longOptionValue(args, index, error.MissingConsoleSocket, false),
+            .detach => config.detach = true,
+            .keep => config.keep = true,
         }
     }
     if (config.bundle == null) config.bundle = ".";
@@ -258,7 +286,7 @@ fn parseCreateOptions(args: []const []const u8, index: *usize, config: *Config) 
 
 fn parseDeleteOptions(args: []const []const u8, index: *usize, config: *Config) !void {
     while (index.* < args.len and std.mem.startsWith(u8, args[index.*], "-")) : (index.* += 1) {
-        if (!std.mem.eql(u8, args[index.*], "--force")) return oci.validationError(error.UnknownOption, "unknown option '{s}'", .{args[index.*]});
+        if (!std.mem.eql(u8, args[index.*], "--force") and !std.mem.eql(u8, args[index.*], "-f")) return oci.validationError(error.UnknownOption, "unknown option '{s}'", .{args[index.*]});
         config.force = true;
     }
 }
@@ -266,7 +294,12 @@ fn parseDeleteOptions(args: []const []const u8, index: *usize, config: *Config) 
 fn parsePsOptions(args: []const []const u8, index: *usize, config: *Config) !void {
     while (index.* < args.len and std.mem.startsWith(u8, args[index.*], "-")) : (index.* += 1) {
         const flag = args[index.*];
-        if (!std.mem.eql(u8, flag, "--format") and !std.mem.startsWith(u8, flag, "--format="))
+        if (config.subcommand == .list and (std.mem.eql(u8, flag, "--quiet") or std.mem.eql(u8, flag, "-q"))) {
+            config.quiet = true;
+            continue;
+        }
+        const name = optionName(flag);
+        if (!std.mem.eql(u8, name, "--format") and !std.mem.eql(u8, name, "-f"))
             return oci.validationError(error.UnknownOption, "unknown option '{s}'", .{args[index.*]});
         config.ps_format = std.meta.stringToEnum(PsFormat, try optionValue(args, index, error.MissingFormat)) orelse
             return oci.validationError(error.InvalidFormat, "--format: expected table or json", .{});
@@ -771,6 +804,32 @@ test "create parsing rejects missing bundle and pid file values" {
     try std.testing.expectError(error.UnknownOption, parseArgs(&.{ "igvano", "create", "--root", "/tmp", "--bundle", "/tmp/bundle", "example" }));
 }
 
+test "run and spec parsing accept runc's flags" {
+    const run = try parseArgs(&.{ "igvano", "run", "-d", "--console-socket", "/tmp/c.sock", "example", "-b", "/tmp/bundle", "--keep" });
+    try std.testing.expectEqual(Subcommand.run, run.subcommand);
+    try std.testing.expectEqualStrings("example", run.id);
+    try std.testing.expectEqualStrings("/tmp/bundle", run.bundle.?);
+    try std.testing.expectEqualStrings("/tmp/c.sock", run.console_socket.?);
+    try std.testing.expect(run.detach and run.keep);
+    const plain = try parseArgs(&.{ "igvano", "run", "example" });
+    try std.testing.expect(!plain.detach and !plain.keep);
+    try std.testing.expectEqualStrings(".", plain.bundle.?);
+    try std.testing.expectError(error.UnknownOption, parseArgs(&.{ "igvano", "create", "-d", "example" }));
+    try std.testing.expectError(error.UnknownOption, parseArgs(&.{ "igvano", "run", "--detach=true", "example" }));
+    try std.testing.expectError(error.MissingId, parseArgs(&.{ "igvano", "run", "-d" }));
+    try std.testing.expectEqualStrings("/tmp/bundle", (try parseArgs(&.{ "igvano", "create", "-b", "/tmp/bundle", "example" })).bundle.?);
+    try std.testing.expectEqualStrings(".", (try parseArgs(&.{ "igvano", "spec" })).bundle.?);
+    try std.testing.expectEqualStrings("/tmp/b", (try parseArgs(&.{ "igvano", "spec", "--bundle=/tmp/b" })).bundle.?);
+    try std.testing.expectError(error.UnexpectedArgument, parseArgs(&.{ "igvano", "spec", "example" }));
+    try std.testing.expectError(error.UnknownOption, parseArgs(&.{ "igvano", "spec", "--pid-file", "x" }));
+    const list = try parseArgs(&.{ "igvano", "list", "-q", "--format=json" });
+    try std.testing.expect(list.quiet);
+    try std.testing.expectEqual(PsFormat.json, list.ps_format);
+    try std.testing.expectEqual(PsFormat.json, (try parseArgs(&.{ "igvano", "list", "-f", "json" })).ps_format);
+    try std.testing.expectError(error.UnexpectedArgument, parseArgs(&.{ "igvano", "list", "example" }));
+    try std.testing.expectError(error.UnknownOption, parseArgs(&.{ "igvano", "ps", "-q", "example" }));
+}
+
 test "command flags after the id are reordered like runc" {
     const create = try parseArgs(&.{ "igvano", "create", "example", "--bundle", "/tmp/bundle", "--pid-file=init.pid" });
     try std.testing.expectEqualStrings("example", create.id);
@@ -786,6 +845,7 @@ test "command flags after the id are reordered like runc" {
         try std.testing.expectEqualStrings("TERM", kill.signal.?);
     }
     try std.testing.expect((try parseArgs(&.{ "igvano", "delete", "example", "--force" })).force);
+    try std.testing.expect((try parseArgs(&.{ "igvano", "delete", "-f", "example" })).force);
     const update = try parseArgs(&.{ "igvano", "update", "example", "--pids-limit", "10" });
     try std.testing.expectEqualStrings("example", update.id);
     try std.testing.expectEqual(@as(?i64, 10), update.resource_flags.pids.?.limit);
@@ -1004,8 +1064,11 @@ pub const usage =
     "       igvano [global flags] ps [--format table|json] <id> [ps args...]\n" ++
     "       igvano [global flags] update [--resources|-r <file|->] [resource flags...] <id>\n" ++
     "              --resources/-r ignores individual resource flags\n" ++
-    "       igvano [--root <dir>] [--log <file>] [--log-format text|json] delete [--force] <id>\n" ++
+    "       igvano [--root <dir>] [--log <file>] [--log-format text|json] delete [--force|-f] <id>\n" ++
     "       igvano [--root <dir>] [--log <file>] [--log-format text|json] kill [--all] <id> [signal]\n" ++
-    "       igvano [--root <dir>] [--log <file>] [--log-format text|json] create [--bundle <path>] [--pid-file <file>] [--console-socket <path>] <id>\n" ++
+    "       igvano [--root <dir>] [--log <file>] [--log-format text|json] create [--bundle|-b <path>] [--pid-file <file>] [--console-socket <path>] <id>\n" ++
+    "       igvano [global flags] run [--bundle|-b <path>] [--pid-file <file>] [--console-socket <path>] [--detach|-d] [--keep] <id>\n" ++
+    "       igvano [global flags] spec [--bundle|-b <path>]\n" ++
+    "       igvano [global flags] list [--quiet|-q] [--format|-f table|json]\n" ++
     "       igvano [global flags] exec [--process <file>] [--detach|-d] [--pid-file <file>] [--console-socket <path>]\n" ++
     "              [--tty|-t] [--cwd <dir>] [--env K=V]... [--user UID[:GID]] <id> [command args...]\n";

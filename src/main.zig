@@ -20,6 +20,9 @@ const psContainer = @import("cli/ps.zig").psContainer;
 const pauseContainer = @import("cli/pause.zig").pauseContainer;
 const stateContainer = @import("cli/state_cmd.zig").stateContainer;
 const features = @import("cli/features.zig").features;
+const writeSpec = @import("cli/spec.zig").writeSpec;
+const runContainer = @import("cli/run.zig").runContainer;
+const listContainers = @import("cli/list.zig").listContainers;
 pub const default_root = @import("cli/args.zig").default_root;
 
 pub fn main(init: std.process.Init) !u8 {
@@ -94,6 +97,9 @@ fn dispatchCommand(allocator: std.mem.Allocator, io: std.Io, config: Config) !u8
         .ps => try psContainer(allocator, io, null, config, std.Io.File.stdout()),
         .pause, .@"resume" => try pauseContainer(allocator, io, null, config),
         .delete => try deleteContainer(allocator, io, null, config),
+        .spec => try writeSpec(allocator, io, config),
+        .run => return runContainer(allocator, io, null, config),
+        .list => try listContainers(allocator, io, null, config),
     }
     return 0;
 }
@@ -162,10 +168,13 @@ comptime {
         _ = @import("cli/features.zig");
         _ = @import("cli/hooks.zig");
         _ = @import("cli/kill.zig");
+        _ = @import("cli/list.zig");
         _ = @import("cli/log.zig");
         _ = @import("cli/pause.zig");
         _ = @import("cli/process.zig");
         _ = @import("cli/ps.zig");
+        _ = @import("cli/run.zig");
+        _ = @import("cli/spec.zig");
         _ = @import("cli/start.zig");
         _ = @import("cli/state.zig");
         _ = @import("cli/state_cmd.zig");

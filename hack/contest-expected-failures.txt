@@ -77,12 +77,6 @@ set_scheduler_policy::policy_batch
 set_scheduler_policy::policy_other
 start_container_hook_env_inherit::start_container_env_inherit
 terminal::terminal_console_size
-terminal::terminal_large_output
-terminal::terminal_newline_rendering
-terminal::terminal_no_console_socket
-terminal::terminal_run_exit_code
-terminal::terminal_run_sigwinch
-terminal::terminal_stdin_bridge
 time_ns::simple timens
 time_ns::simple timens + exec
 time_ns::simple timens + userns

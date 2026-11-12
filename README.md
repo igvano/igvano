@@ -21,10 +21,13 @@ runc-compatible CLI:
 ```
 igvano [--root <dir>] [--log <file>] [--log-format text|json] [--systemd-cgroup] <command>
 
-  create [--bundle <path>] [--pid-file <file>] [--console-socket <path>] <id>
+  create [--bundle|-b <path>] [--pid-file <file>] [--console-socket <path>] <id>
+  run [--bundle|-b <path>] [--pid-file <file>] [--console-socket <path>] [--detach|-d] [--keep] <id>
   start <id>          state <id>          features
+  spec [--bundle|-b <path>]
+  list [--quiet|-q] [--format|-f table|json]
   kill [--all] <id> [signal]
-  delete [--force] <id>
+  delete [--force|-f] <id>
   exec [--process <file>] [--detach] [--pid-file <file>] [--console-socket <path>]
        [--tty] [--cwd <dir>] [--env K=V]... [--user UID[:GID]] <id> [command...]
   ps [--format table|json] <id> [ps args...]
@@ -213,9 +216,8 @@ containerd's CRI plugin, by hand, on cgroup v1 and v2.
 
 `hack/runc-bats.sh` runs runc's own bats suite (`tests/integration` at runc
 v1.3.3, `RUNC_REF`) with igvano as `$RUNC`, one `.bats` file at a time, gated by
-`hack/runc-bats-expected-failures.txt`. Most of the suite still fails because
-its setup calls `runc spec` and most tests call `runc run`, neither of which
-igvano implements yet. `RUNC_BATS_FILES="<file>..."` runs a subset and
+`hack/runc-bats-expected-failures.txt`. Leftover cgroups are removed between
+files, so a hung test that kills its file cannot fail later files. `RUNC_BATS_FILES="<file>..."` runs a subset and
 `RUNC_BATS_RUNTIME=<static runc>` runs it against runc. x86_64 only.
 
 ```sh

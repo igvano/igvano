@@ -4,7 +4,7 @@ Guidance for AI agents working in this repository.
 
 ## Project
 
-igvano is a toy OCI container runtime written in Zig. It conforms to the OCI runtime spec (validated with opencontainers/runtime-tools) and runs as a runc replacement under containerd's stock `containerd-shim-runc-v2` (`BinaryName`), including CRI. The CLI is runc-compatible: `create`, `start`, `state`, `kill [--all]`, `delete [--force]`, `exec`, `ps`, `pause`, `resume`, `update`, `features`, with the global flags `--root`, `--log`, `--log-format`, `--systemd-cgroup`. runc's behaviour is the reference wherever the spec is silent.
+igvano is a toy OCI container runtime written in Zig. It conforms to the OCI runtime spec (validated with opencontainers/runtime-tools) and runs as a runc replacement under containerd's stock `containerd-shim-runc-v2` (`BinaryName`), including CRI. The CLI is runc-compatible: `create`, `run [--detach] [--keep]`, `start`, `state`, `list`, `spec`, `kill [--all]`, `delete [--force]`, `exec`, `ps`, `pause`, `resume`, `update`, `features`, with the global flags `--root`, `--log`, `--log-format`, `--systemd-cgroup`. runc's behaviour is the reference wherever the spec is silent.
 
 ## Architecture
 

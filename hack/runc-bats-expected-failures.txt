@@ -1,5 +1,5 @@
 # Expected runc bats failures, one "file::test name" per line (file without
-# .bats; "file::*" means the file timed out). hack/runc-bats.sh fails when a
+# .bats; "file::*" means the file crashed or timed out). hack/runc-bats.sh fails when a
 # test outside this list fails, or when a listed test stops failing (passes,
 # skips or does not run). Keep each section sorted.
 
@@ -10,26 +10,17 @@ rlimits::runc run with RLIMIT_NOFILE(The same as system's hard value)
 spec::spec validator
 timens::runc run [timens with no offsets]
 
-# igvano gaps. Nearly all come from setup_bundle calling `runc spec` and from
-# `runc run`, which igvano does not implement yet. Delete lines as they pass.
+# igvano gaps found by the suite. Delete lines as they pass.
 capabilities::runc exec --cap
 capabilities::runc exec --cap [ambient is set from spec]
 capabilities::runc run [ambient caps not set in inheritable result in a warning]
-capabilities::runc run no capability
-capabilities::runc run with new privileges
 capabilities::runc run with some capabilities
 capabilities::runc run with unknown capability
 cgroups::runc create (limits + cgrouppath + permission on the cgroup dir) succeeds
-cgroups::runc create (no limits + no cgrouppath + no permission) succeeds
 cgroups::runc exec (cgroup v2 + init process in non-root cgroup) succeeds
-cgroups::runc exec (limits + cgrouppath + permission on the cgroup dir) succeeds
 cgroups::runc exec --ignore-paused
 cgroups::runc exec should refuse a paused container
 cgroups::runc run (blkio weight)
-cgroups::runc run (cgroup v2 resources.unified only)
-cgroups::runc run (cgroup v2 resources.unified override)
-cgroups::runc run (cgroup v2 resources.unified swap)
-cgroups::runc run (cgroupv2 mount inside container)
 cgroups::runc run (cpu.idle)
 cgroups::runc run (hugetlb limits)
 cgroups::runc run (per-device io weight for bfq)
@@ -43,33 +34,15 @@ cpu_affinity::runc exec [default CPU affinity should reset to cgroup cpuset]
 cpu_affinity::runc exec [default CPU affinity should reset]
 cpu_affinity::runc run [CPU affinity should reset to cgroup cpuset]
 cpu_affinity::runc run [CPU affinity should reset]
-create::runc create
-create::runc create --pid-file
-create::runc create --pid-file with new CWD
-create::runc create [shared pidns + rootless]
-create::runc create exec
-cwd::runc create can chdir if runc has access
-cwd::runc exec --user with no access to cwd
 debug::global --debug
 debug::global --debug to --log
 debug::global --debug to --log --log-format 'json'
 debug::global --debug to --log --log-format 'text'
-delete::runc delete
-delete::runc delete --force
-delete::runc delete --force [host pidns + init gone]
-delete::runc delete --force [paused container]
 delete::runc delete --force in cgroupv2 with subcgroups
-delete::runc delete [host pidns + init gone]
-dev::runc run [device cgroup allow rm block device]
-dev::runc run [device cgroup allow rw char device]
-dev::runc run [redundant default /dev/ptmx]
-dev::runc run [redundant default /dev/tty]
 dev::runc run/update [device cgroup deny]
 env::empty HOME env var is overridden
 env::empty HOME env var is overridden with multiple overrides
-env::env var HOME is set only once
 env::env var override
-env::env var override is set only once
 env::env var with new-line is honored
 events::events --interval 100ms
 events::events --interval 1s
@@ -79,20 +52,13 @@ events::events --stats with psi data
 events::events oom
 exec::runc --debug --log exec
 exec::runc --debug exec
-exec::runc exec
 exec::runc exec --additional-gids
 exec::runc exec --cgroup subcgroup [v2]
-exec::runc exec --env
-exec::runc exec --pid-file
-exec::runc exec --pid-file with new CWD
 exec::runc exec --preserve-fds
 exec::runc exec --user
-exec::runc exec --user vs /dev/null ownership
 exec::runc exec [execve error]
 exec::runc exec [exit codes]
 exec::runc exec check default home
-exec::runc exec ls -la
-exec::runc exec ls -la with --cwd
 help::runc -h
 help::runc command -h
 help::runc foo -h
@@ -102,62 +68,28 @@ hooks::runc run [hook fails]
 hooks::runc run [hook's argv is preserved]
 hooks::runc run [startContainer hook should inherit process environment]
 hooks_so::runc run (hooks library tests)
-host-mntns::runc run [host mount ns + hooks]
 ioprio::ioprio_set is applied to process group
 kill::kill KILL [host pidns + init gone]
 kill::kill KILL [host pidns]
-kill::kill KILL [shared pidns]
-kill::kill detached busybox
-list::list
-mask::mask paths [directory]
-mask::mask paths [file]
 mask::mask paths [prohibit symlink /proc]
-mounts::runc run [/proc is a symlink]
-mounts::runc run [bind mount]
-mounts::runc run [mount order, container bind-mount source]
-mounts::runc run [mount order, container bind-mount source] (userns)
-mounts::runc run [mount order, container idmap source] (userns)
+mask::mask paths [prohibit symlink /sys]
+mounts::*
 mounts::runc run [ro /dev mount]
-mounts::runc run [ro /sys/fs/cgroup mounts + cgroupns]
-mounts::runc run [ro /sys/fs/cgroup mounts]
-mounts::runc run [ro tmpfs mount]
-mounts::runc run [setgid / + mkdirall]
 mounts::runc run [tmpcopyup]
-mounts::runc run [tmpfs mount with absolute symlink]
-mounts_recursive::runc run [rbind,ro mount is read-only but not recursively]
-mounts_recursive::runc run [rbind,ro,rro mount is recursively read-only too]
-mounts_recursive::runc run [rbind,rro mount is recursively read-only]
 mounts_sshfs::runc run [bind mount {no,rel,strict}atime semantics]
 mounts_sshfs::runc run [dev,exec,suid,atime bind mount of a nodev,nosuid,noexec,noatime fuse sshfs mount]
 mounts_sshfs::runc run [explicit-rw bind mount of a ro fuse sshfs mount]
-mounts_sshfs::runc run [implied-rw bind mount of a ro fuse sshfs mount]
-mounts_sshfs::runc run [mount(8)-like behaviour: --bind with no options]
 mounts_sshfs::runc run [mount(8)-unlike behaviour: --bind with clearing flag]
-mounts_sshfs::runc run [ro bind mount of a nodev,nosuid,noexec fuse sshfs mount]
-mounts_sshfs::runc run [ro,noexec bind mount of a nosuid,noatime fuse sshfs mount]
 mounts_sshfs::runc run [ro,symfollow bind mount of a rw,nodev,nosymfollow fuse sshfs mount]
 no_pivot::runc run --no-pivot must not expose bare /proc
-pause::runc pause and resume
-pause::runc pause and resume with nonexist container
 personality::runc run personality for i686
-personality::runc run personality for x86_64
 personality::runc run personality with exec for i686
-personality::runc run personality with exec for x86_64
 pidfd-socket::runc create [ --pidfd-socket ] 
 pidfd-socket::runc exec [ --pidfd-socket ] [cgroups_v2] 
 pidfd-socket::runc run [ --pidfd-socket ] 
-ps::ps
-ps::ps -e -x
-ps::ps -f json
 ps::ps after the container stopped
-rlimits::runc exec with RLIMIT_NOFILE(Bigger than system's hard value)
-rlimits::runc exec with RLIMIT_NOFILE(Smaller than system's hard value)
-rlimits::runc exec with RLIMIT_NOFILE(The same as system's hard value)
 rlimits::runc run with RLIMIT_NOFILE(Bigger than system's hard value)
 rlimits::runc run with RLIMIT_NOFILE(Smaller than system's hard value)
-root::global --root
-run::runc run
-run::runc run --keep
 run::runc run --keep (check cgroup exists)
 run::runc run [/proc/self/exe clone]
 run::runc run [execve error]
@@ -181,66 +113,23 @@ seccomp-notify::runc run [seccomp] (SCMP_ACT_NOTIFY noNewPrivileges true)
 seccomp-notify::runc run [seccomp] (SCMP_ACT_NOTIFY startContainer hook)
 seccomp-notify::runc run [seccomp] (SCMP_ACT_NOTIFY write)
 seccomp-notify::runc run [seccomp] (ignore listener path if no notify act)
-seccomp::runc run [seccomp -ENOSYS handling]
-seccomp::runc run [seccomp defaultErrnoRet=ENXIO]
-seccomp::runc run [seccomp] (SCMP_ACT_ERRNO default)
-seccomp::runc run [seccomp] (SCMP_ACT_ERRNO explicit errno)
 seccomp::runc run [seccomp] (SECCOMP_FILTER_FLAG_*)
 seccomp::runc run [seccomp] (startContainer hook)
-spec::spec generation --bundle
-spec::spec generation cwd
-start::runc start
-start_detached::runc run detached
-start_detached::runc run detached ({u,g}id != 0)
-start_detached::runc run detached --pid-file
-start_detached::runc run detached --pid-file with new CWD
-start_hello::runc run
-start_hello::runc run ({u,g}id != 0)
-start_hello::runc run --pid-file
-start_hello::runc run [redundant seccomp rules]
-start_hello::runc run [rootless with host pidns]
 start_hello::runc run as user with no exec bit but CAP_DAC_OVERRIDE set
-start_hello::runc run with rootfs set to .
-state::state (kill + delete)
-state::state (pause + resume)
 timens::runc exec [simple timens]
 timens::runc run [simple timens + userns]
 timens::runc run [simple timens]
-tty::runc create [terminal=false]
-tty::runc exec [stdin not a tty]
 tty::runc exec [tty consolesize]
-tty::runc exec [tty owner]
 tty::runc exec [tty owner] ({u,g}id != 0)
-tty::runc exec [tty ptsname]
-tty::runc run -d [terminal=false]
-tty::runc run [stdin not a tty]
-tty::runc run [terminal=false]
-tty::runc run [tty owner]
 tty::runc run [tty owner] ({u,g}id != 0)
-tty::runc run [tty ptsname]
 umask::umask
 update::*
 update::cpu burst
-update::set cpu period with no quota
-update::set cpu quota with no period
 update::update cgroup cpu limits
 update::update cgroup cpu.idle
 update::update cgroup v1/v2 common limits
 update::update cgroup v2 resources via unified map
-update::update cpu period with no previous period/quota set
-update::update cpu quota with no previous period/quota set
-update::update cpuset parameters via resources.CPU
-update::update cpuset parameters via v2 unified map
 update::update devices [minimal transition rules]
 update::update memory vs CheckBeforeUpdate
-update::update paused container
-update::update per-device iops/bps values
 userns::userns join external namespaces [wrong userns owner]
-userns::userns join other container userns
-userns::userns join other container userns [bind-mounted nsfd]
-userns::userns join other container userns[selinux enabled]
-userns::userns with 2 inaccessible mounts
-userns::userns with bind mount before a cgroupfs mount
-userns::userns with inaccessible mount + exec
-userns::userns with simple mount
 version::runc version

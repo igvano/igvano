@@ -89,7 +89,7 @@ pub fn execContainer(allocator: std.mem.Allocator, io: std.Io, injected: ?Contai
     return runExec(allocator, io, container.?, config, options, &lock, locked);
 }
 
-fn reserveStdio() !void {
+pub fn reserveStdio() !void {
     const linux = std.os.linux;
     // Reserve stdio before locks, console sockets, or the signal
     // pipe can reuse their numbers and become attached-loop I/O.
@@ -171,7 +171,7 @@ fn inheritExecProfile(process: *oci.Spec.Process, saved_spec: ?std.json.Parsed(o
     }
 }
 
-fn enableExecSubreaper() !u32 {
+pub fn enableExecSubreaper() !u32 {
     const linux = std.os.linux;
     var was_subreaper: u32 = 0;
     // The helper exits after exec; adoption lets this frontend waitpid the
@@ -182,7 +182,7 @@ fn enableExecSubreaper() !u32 {
     return was_subreaper;
 }
 
-fn restoreExecSubreaper(was_subreaper: u32) void {
+pub fn restoreExecSubreaper(was_subreaper: u32) void {
     const linux = std.os.linux;
     _ = linux.prctl(@intFromEnum(linux.PR.SET_CHILD_SUBREAPER), was_subreaper, 0, 0, 0);
 }

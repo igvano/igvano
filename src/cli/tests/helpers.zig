@@ -230,7 +230,7 @@ pub const LockTestProcess = struct {
                 .create => createContainer(std.heap.page_allocator, io, container, config),
                 .start => startContainer(std.heap.page_allocator, io, container, config),
                 .delete => deleteContainer(std.heap.page_allocator, io, container, config),
-                .features, .ps, .pause, .@"resume", .kill, .update, .exec => unreachable,
+                .features, .ps, .pause, .@"resume", .kill, .update, .exec, .spec, .run, .list => unreachable,
             };
             if (operation) |_| {
                 if (expected_error != null) linux.exit_group(3);

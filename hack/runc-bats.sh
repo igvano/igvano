@@ -71,6 +71,13 @@ if [ "${1-}" = "--inside" ]; then
         if [ "$status" -ge 124 ] || { [ "$status" -ne 0 ] && ! grep -q '^not ok ' /tmp/tap; }; then
             printf '%s::*\tnot ok\n' "$file" >> /outputs/results
         fi
+        # Containers left by a killed test keep their cgroups, which would fail
+        # every later test reusing the id. Kill them and drop the cgroups.
+        # The harness itself lives in /sys/fs/cgroup/init; prune that subtree.
+        find /sys/fs/cgroup -mindepth 1 -path /sys/fs/cgroup/init -prune -o -type d -print |
+            while IFS= read -r dir; do printf '1\n' > "$dir/cgroup.kill" 2>/dev/null || true; done
+        sleep 1
+        find /sys/fs/cgroup -mindepth 1 -depth -type d ! -path /sys/fs/cgroup/init ! -path '/sys/fs/cgroup/init/*' -exec rmdir {} \; 2>/dev/null || true
     done
     exit 0
 fi

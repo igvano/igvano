@@ -24,15 +24,23 @@ const runHooks = @import("hooks.zig").runHooks;
 const warnHooks = @import("hooks.zig").warnHooks;
 
 pub fn createContainer(allocator: std.mem.Allocator, io: std.Io, injected: ?ContainerOverride, config: Config) !void {
+    _ = try createContainerFor(allocator, io, injected, config, null);
+}
+
+/// Returns the init's host PID. With `local_console` (run in the foreground),
+/// a terminal=true process without --console-socket gets a PTY whose
+/// controller is stored there instead of sent to a socket.
+pub fn createContainerFor(allocator: std.mem.Allocator, io: std.Io, injected: ?ContainerOverride, config: Config, local_console: ?*?std.posix.fd_t) !i32 {
     const cwd = std.Io.Dir.cwd();
     const bundle = try cwd.realPathFileAlloc(io, config.bundle orelse ".", allocator);
     defer allocator.free(bundle);
     const parsed = try oci.loadSpec(allocator, io, bundle);
     defer parsed.deinit();
     try oci.requireCreate(parsed.value);
-    const process_options = try prepareCreateProcess(allocator, parsed.value.process, config.console_socket != null);
+    const has_console = createHasConsole(parsed.value, config, local_console != null);
+    const process_options = try prepareCreateProcess(allocator, parsed.value.process, has_console);
     defer if (process_options) |options| allocator.free(options.rlimits);
-    const console_fds = if (config.console_socket != null) try libcontainer.linux.console.socketpair() else null;
+    const console_fds = if (has_console) try libcontainer.linux.console.socketpair() else null;
     defer closeConsoleFds(console_fds);
     const rootfs = try oci.resolveRootfs(allocator, bundle, parsed.value.root.path);
     defer allocator.free(rootfs);
@@ -81,7 +89,13 @@ pub fn createContainer(allocator: std.mem.Allocator, io: std.Io, injected: ?Cont
     };
     try applyCreateSpec(mount_allocator, &options, parsed.value);
     applyCreateProcess(&options, process_options);
-    try createPreparedContainer(allocator, mount_allocator, io, injected, config, bundle, parsed.value, options);
+    return createPreparedContainer(allocator, mount_allocator, io, injected, config, bundle, parsed.value, options, local_console);
+}
+
+fn createHasConsole(spec: oci.Spec, config: Config, local: bool) bool {
+    if (config.console_socket != null) return true;
+    const process = spec.process orelse return false;
+    return local and (process.terminal orelse false);
 }
 
 fn prepareCreateProcess(allocator: std.mem.Allocator, process: ?oci.Spec.Process, console_socket: bool) !?libcontainer.ExecOptions {
@@ -168,7 +182,7 @@ fn applyCreateProcess(options: *libcontainer.CreateOptions, process: ?libcontain
     }
 }
 
-fn createPreparedContainer(allocator: std.mem.Allocator, mount_allocator: std.mem.Allocator, io: std.Io, injected: ?ContainerOverride, config: Config, bundle: []const u8, spec: oci.Spec, prepared: libcontainer.CreateOptions) !void {
+fn createPreparedContainer(allocator: std.mem.Allocator, mount_allocator: std.mem.Allocator, io: std.Io, injected: ?ContainerOverride, config: Config, bundle: []const u8, spec: oci.Spec, prepared: libcontainer.CreateOptions, local_console: ?*?std.posix.fd_t) !i32 {
     const cwd = std.Io.Dir.cwd();
     const configured_hooks: oci.Spec.Hooks = spec.hooks orelse .{};
     var options = prepared;
@@ -230,13 +244,14 @@ fn createPreparedContainer(allocator: std.mem.Allocator, mount_allocator: std.me
     state.pid = handle.pid;
     try saveRootfsMount(allocator, io, state_dir, handle);
 
-    try reportCreateConsole(options.console_fds, config.console_socket);
+    try reportCreateConsole(options.console_fds, config.console_socket, local_console);
     state.status = .created;
     if (lock) |file| try requireLinkedLock(io, file);
     try oci.saveState(allocator, io, root, state);
     if (config.pid_file) |path| {
         try writePidFile(allocator, io, path, handle.pid);
     }
+    return handle.pid;
 }
 
 fn createdContainer(detail: ?[]const u8, created: libcontainer.Error!libcontainer.Container, failure: ?anyerror) !libcontainer.Container {
@@ -307,13 +322,18 @@ fn persistCreatingState(allocator: std.mem.Allocator, io: std.Io, root: []const 
     return fifo;
 }
 
-fn reportCreateConsole(console_fds: ?[2]std.posix.fd_t, console_socket: ?[]const u8) !void {
+fn reportCreateConsole(console_fds: ?[2]std.posix.fd_t, console_socket: ?[]const u8, local_console: ?*?std.posix.fd_t) !void {
     if (console_fds) |fds| {
         const controller = try libcontainer.linux.console.receiveFd(fds[0]);
+        const path = console_socket orelse {
+            // Run in the foreground keeps the controller and copies it to its own stdio.
+            local_console.?.* = controller;
+            return;
+        };
         defer _ = std.os.linux.close(controller);
         // Connect after fork so the blocked init cannot keep this connection
         // alive after create closes its copy.
-        const peer = try connectConsoleSocket(console_socket.?);
+        const peer = try connectConsoleSocket(path);
         defer _ = std.os.linux.close(peer);
         try libcontainer.linux.console.sendFd(peer, controller);
     }
