@@ -7,6 +7,8 @@ const diagnostics = @import("../diagnostic.zig");
 const seccomp = libcontainer.seccomp;
 const PreparedMount = @import("../mount.zig").PreparedMount;
 const mountDestination = @import("../mount.zig").mountDestination;
+const requireOrdinaryProcDestination = @import("../mount.zig").requireOrdinaryProcDestination;
+const pinOrdinaryProcDestination = @import("../mount.zig").pinOrdinaryProcDestination;
 const remountFlags = @import("../mount.zig").remountFlags;
 const applyMount = @import("../mount.zig").applyMount;
 const checkResult = @import("../syscall.zig").checkResult;
@@ -106,6 +108,46 @@ test "linux mount destinations follow relative and final symlinks within rootfs"
             return error.TestUnexpectedResult;
         } else |_| {}
     }
+}
+
+test "linux proc and sysfs refuse symlinked or non-directory destinations" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "rootfs/bad-proc");
+    try tmp.dir.createDirPath(std.testing.io, "rootfs/sys");
+    try tmp.dir.symLink(std.testing.io, "/bad-proc", "rootfs/proc", .{});
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "rootfs/file", .data = "" });
+    const rootfs = try std.fmt.allocPrintSentinel(std.testing.allocator, ".zig-cache/tmp/{s}/rootfs", .{tmp.sub_path}, 0);
+    defer std.testing.allocator.free(rootfs);
+    const root_fd = try openPath(linux.AT.FDCWD, rootfs, .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true });
+    defer closeFd(root_fd);
+    const base: PreparedMount = .{ .destination = "/proc", .source = "proc", .type = "proc", .flags = 0, .propagation = 0, .data = "" };
+    var step: RootfsStep = .{};
+    try std.testing.expectError(error.InvalidPath, requireOrdinaryProcDestination(root_fd, base, &step));
+    try std.testing.expect(std.mem.indexOf(u8, step.operation, "must be mounted on ordinary directory") != null);
+    var sysfs = base;
+    sysfs.type = "sysfs";
+    sysfs.destination = "/file";
+    try std.testing.expectError(error.InvalidPath, requireOrdinaryProcDestination(root_fd, sysfs, &step));
+    // A plain directory, a missing path, and other types are left to the mount.
+    sysfs.destination = "/sys";
+    try requireOrdinaryProcDestination(root_fd, sysfs, &step);
+    sysfs.destination = "/missing";
+    try requireOrdinaryProcDestination(root_fd, sysfs, &step);
+    var tmpfs = base;
+    tmpfs.type = "tmpfs";
+    try requireOrdinaryProcDestination(root_fd, tmpfs, &step);
+    // The pin used for the mount itself never follows a final symlink and fails closed when missing.
+    try std.testing.expectError(error.InvalidPath, pinOrdinaryProcDestination(root_fd, base, &step));
+    try std.testing.expect(try pinOrdinaryProcDestination(root_fd, tmpfs, &step) == null);
+    var missing = base;
+    missing.destination = "/missing";
+    try std.testing.expect(std.meta.isError(pinOrdinaryProcDestination(root_fd, missing, &step)));
+    sysfs.destination = "/sys";
+    const pinned = (try pinOrdinaryProcDestination(root_fd, sysfs, &step)).?;
+    defer closeFd(pinned);
+    try std.testing.expectEqual(@as(u16, linux.S.IFDIR), try fileType(pinned));
 }
 
 test "linux mount destinations reject procfs magic links" {

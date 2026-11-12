@@ -26,6 +26,7 @@ igvano [--root <dir>] [--log <file>] [--log-format text|json] [--systemd-cgroup]
   start <id>          state <id>          features
   spec [--bundle|-b <path>]
   list [--quiet|-q] [--format|-f table|json]
+  events [--stats] [--interval <duration>] <id>
   kill [--all] <id> [signal]
   delete [--force|-f] <id>
   exec [--process <file>] [--detach] [--pid-file <file>] [--console-socket <path>]

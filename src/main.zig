@@ -23,6 +23,7 @@ const features = @import("cli/features.zig").features;
 const writeSpec = @import("cli/spec.zig").writeSpec;
 const runContainer = @import("cli/run.zig").runContainer;
 const listContainers = @import("cli/list.zig").listContainers;
+const eventsContainer = @import("cli/events.zig").eventsContainer;
 pub const default_root = @import("cli/args.zig").default_root;
 
 pub fn main(init: std.process.Init) !u8 {
@@ -71,6 +72,8 @@ fn argumentErrorMessage(err: ParseArgsError) []const u8 {
         .{ "InvalidUser", "invalid --user; expected UID[:GID]" },
         .{ "InvalidBoolean", "invalid boolean; expected true or false" },
         .{ "MissingFormat", "missing value for --format" },
+        .{ "MissingInterval", "missing value for --interval" },
+        .{ "InvalidDuration", "invalid --interval; expected a positive duration such as 5s" },
         .{ "InvalidFormat", "invalid --format; expected table or json" },
         .{ "InvalidProcess", "invalid process environment; expected K=V" },
         .{ "UnexpectedArgument", "unexpected argument; global flags must precede the subcommand" },
@@ -100,6 +103,7 @@ fn dispatchCommand(allocator: std.mem.Allocator, io: std.Io, config: Config) !u8
         .spec => try writeSpec(allocator, io, config),
         .run => return runContainer(allocator, io, null, config),
         .list => try listContainers(allocator, io, null, config),
+        .events => try eventsContainer(allocator, io, null, config),
     }
     return 0;
 }
@@ -164,6 +168,7 @@ comptime {
         _ = @import("cli/create.zig");
         _ = @import("cli/delete.zig");
         _ = @import("cli/diagnostic.zig");
+        _ = @import("cli/events.zig");
         _ = @import("cli/exec.zig");
         _ = @import("cli/features.zig");
         _ = @import("cli/hooks.zig");

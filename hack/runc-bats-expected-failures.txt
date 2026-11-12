@@ -44,12 +44,6 @@ env::empty HOME env var is overridden
 env::empty HOME env var is overridden with multiple overrides
 env::env var override
 env::env var with new-line is honored
-events::events --interval 100ms
-events::events --interval 1s
-events::events --interval default
-events::events --stats
-events::events --stats with psi data
-events::events oom
 exec::runc --debug --log exec
 exec::runc --debug exec
 exec::runc exec --additional-gids
@@ -71,9 +65,8 @@ hooks_so::runc run (hooks library tests)
 ioprio::ioprio_set is applied to process group
 kill::kill KILL [host pidns + init gone]
 kill::kill KILL [host pidns]
-mask::mask paths [prohibit symlink /proc]
-mask::mask paths [prohibit symlink /sys]
-mounts::*
+mounts::runc run [mount order, container bind-mount source]
+mounts::runc run [mount order, container bind-mount source] (userns)
 mounts::runc run [ro /dev mount]
 mounts::runc run [tmpcopyup]
 mounts_sshfs::runc run [bind mount {no,rel,strict}atime semantics]

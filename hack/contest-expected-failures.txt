@@ -66,7 +66,6 @@ process_capabilities_bounding::bounding_unset_with_other_caps_fails_test
 process_capabilities_fail::process_capabilities_fail_test
 process_user::process_user_duplicate_gids_test
 process_user::process_user_unique_gids_test
-prohibit_symlink::*
 readonly_paths::readonly_rel_paths
 root_readonly::root_readonly_true_in_userns_test
 seccomp_notify::*

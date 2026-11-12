@@ -49,6 +49,7 @@ pub const Container = struct {
         .killAll = killAll,
         .update = update,
         .pids = pids,
+        .stats = stats,
         .freeze = freeze,
         .thaw = thaw,
         .frozen = frozen,
@@ -84,6 +85,11 @@ pub const Container = struct {
     fn pids(ptr: *anyopaque, allocator: std.mem.Allocator) libcontainer.Error![]i32 {
         const self: *Container = @ptrCast(@alignCast(ptr));
         return @import("linux/cgroup_ops.zig").pids(self.state, allocator);
+    }
+
+    fn stats(ptr: *anyopaque, allocator: std.mem.Allocator) libcontainer.Error!libcontainer.Stats {
+        const self: *Container = @ptrCast(@alignCast(ptr));
+        return @import("linux/stats.zig").stats(self.state, allocator);
     }
 
     fn freeze(ptr: *anyopaque) libcontainer.Error!void {
@@ -125,6 +131,7 @@ test {
     _ = @import("linux/devices.zig");
     _ = @import("linux/diagnostic.zig");
     _ = @import("linux/exec.zig");
+    _ = @import("linux/stats.zig");
     _ = @import("linux/freezer.zig");
     _ = @import("linux/mount.zig");
     _ = @import("linux/mount_sources.zig");

@@ -558,6 +558,50 @@ fn missingMountComponent(root_fd: posix.fd_t, parent: posix.fd_t, path: *Missing
     return (try findMountPath(root_fd, prefix.ptr, true, true)) orelse return missingMountPath(prefix.ptr);
 }
 
+/// Like runc, refuse proc and sysfs on an existing destination that is not a
+/// plain directory (a symlink was a past attack path). Missing is fine here:
+/// the destination is created and then pinned by pinOrdinaryProcDestination.
+pub fn requireOrdinaryProcDestination(root_fd: posix.fd_t, mount: PreparedMount, step: *RootfsStep) libcontainer.Error!void {
+    if (try openOrdinaryProcDestination(root_fd, mount, step, true)) |fd| closeFd(fd);
+}
+
+/// After the destination exists, reopen its final component without following
+/// it and mount through that fd, so a swap to a symlink after the check above
+/// cannot redirect proc or sysfs. Null for other mount types.
+pub fn pinOrdinaryProcDestination(root_fd: posix.fd_t, mount: PreparedMount, step: *RootfsStep) libcontainer.Error!?posix.fd_t {
+    return openOrdinaryProcDestination(root_fd, mount, step, false);
+}
+
+fn openOrdinaryProcDestination(root_fd: posix.fd_t, mount: PreparedMount, step: *RootfsStep, missing_ok: bool) libcontainer.Error!?posix.fd_t {
+    const kind = mount.type orelse return null;
+    if (!std.mem.eql(u8, kind, "proc") and !std.mem.eql(u8, kind, "sysfs")) return null;
+    // root_fd is already a pinned directory.
+    if (std.mem.eql(u8, mount.destination, "/")) return null;
+    // O_PATH|O_NOFOLLOW opens a final symlink itself; the prefix stays scoped to rootfs.
+    const flags: linux.O = .{ .PATH = true, .NOFOLLOW = true, .CLOEXEC = true };
+    const result = try openat2(root_fd, mount.destination.ptr, .{
+        .flags = @as(u32, @bitCast(flags)),
+        .resolve = RESOLVE_IN_ROOT | RESOLVE_NO_MAGICLINKS,
+    });
+    // Missing after creation means it was swapped away: fail closed.
+    if (linux.errno(result) == .NOENT and missing_ok) return null;
+    if (linux.errno(result) != .SUCCESS) {
+        step.operation = "pin proc or sysfs destination";
+        try checkResult(result);
+    }
+    const fd: posix.fd_t = @intCast(result);
+    errdefer closeFd(fd);
+    if (try fileType(fd) != linux.S.IFDIR) {
+        // RootfsStep.report names this operation and the destination.
+        step.operation = if (std.mem.eql(u8, kind, "proc"))
+            "filesystem \"proc\" must be mounted on ordinary directory"
+        else
+            "filesystem \"sysfs\" must be mounted on ordinary directory";
+        return error.InvalidPath;
+    }
+    return fd;
+}
+
 fn mountDestinationStep(root_fd: posix.fd_t, destination: []const u8, is_file: bool, create: bool, step: *RootfsStep) libcontainer.Error!posix.fd_t {
     return mountDestination(root_fd, destination, is_file, create) catch |err| {
         // setupRootfs replaces the thread-local diagnostic with this step.
@@ -617,7 +661,14 @@ pub fn applyMount(rootfs: [:0]const u8, root_fd: posix.fd_t, mount: PreparedMoun
     step.operation = "stat bind source";
     const is_file = if (source_fd) |fd| try fileType(fd) != linux.S.IFDIR else false;
     step.* = .{ .operation = "prepare mount destination", .path = mount.destination };
+    if (!bind) try requireOrdinaryProcDestination(root_fd, mount, step);
     var target_fd = try mountDestinationStep(root_fd, mount.destination, is_file, true, step);
+    if (!bind) {
+        if (try pinOrdinaryProcDestination(root_fd, mount, step)) |pinned| {
+            closeFd(target_fd);
+            target_fd = pinned;
+        }
+    }
     defer closeFd(target_fd);
     var source_buffer: [64]u8 = undefined;
     const source: ?[*:0]const u8 = if (source_fd) |fd|

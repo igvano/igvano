@@ -283,6 +283,50 @@ pub const State = struct {
     device_nodes: []const Device = &.{},
 };
 
+/// A cgroup resource snapshot. Times are nanoseconds and sizes bytes; a limit
+/// of maxInt(u64) means unlimited. `raw` is allocated by the caller's allocator.
+pub const Stats = struct {
+    cpu: Cpu = .{},
+    memory: Memory = .{},
+    pids: Pids = .{},
+    /// Cumulative OOM kills in the cgroup, for OOM notification by polling.
+    oom_kills: u64 = 0,
+
+    pub const Cpu = struct {
+        total: u64 = 0,
+        user: u64 = 0,
+        kernel: u64 = 0,
+        periods: u64 = 0,
+        throttled_periods: u64 = 0,
+        throttled_time: u64 = 0,
+        psi: ?Psi = null,
+    };
+
+    pub const Memory = struct {
+        usage: u64 = 0,
+        limit: u64 = 0,
+        max_usage: u64 = 0,
+        failcnt: u64 = 0,
+        cache: u64 = 0,
+        raw: []const Raw = &.{},
+        psi: ?Psi = null,
+    };
+
+    pub const Pids = struct {
+        current: u64 = 0,
+        limit: u64 = 0,
+    };
+
+    pub const Raw = struct { name: []const u8, value: u64 };
+
+    pub const Psi = struct {
+        some: Data = .{},
+        full: Data = .{},
+
+        pub const Data = struct { avg10: f64 = 0, avg60: f64 = 0, avg300: f64 = 0, total: u64 = 0 };
+    };
+};
+
 pub const Error = error{
     NotImplemented,
     Unsupported,
@@ -299,6 +343,7 @@ pub const Error = error{
     LivenessFailed,
     ProcessNotFound,
     CgroupWriteFailed,
+    CgroupReadFailed,
     CgroupDeleteFailed,
     HookFailed,
     HookTimeout,
@@ -323,6 +368,8 @@ pub const Container = struct {
         update: *const fn (ptr: *anyopaque, resources: Resources) Error!void = noUpdate,
         /// The caller owns the returned host PIDs, including descendant cgroups.
         pids: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator) Error![]i32 = noPids,
+        /// Raw entries are allocated with allocator; an arena suits callers.
+        stats: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator) Error!Stats = noStats,
         freeze: *const fn (ptr: *anyopaque) Error!void = noFreeze,
         thaw: *const fn (ptr: *anyopaque) Error!void = noFreeze,
         frozen: *const fn (ptr: *anyopaque) Error!bool = noFrozen,
@@ -340,6 +387,10 @@ pub const Container = struct {
         }
 
         fn noPids(_: *anyopaque, _: std.mem.Allocator) Error![]i32 {
+            return error.NotImplemented;
+        }
+
+        fn noStats(_: *anyopaque, _: std.mem.Allocator) Error!Stats {
             return error.NotImplemented;
         }
 
@@ -386,6 +437,11 @@ pub const Container = struct {
     /// Returns host PIDs, including descendant cgroups; free with allocator.
     pub fn pids(self: Container, allocator: std.mem.Allocator) Error![]i32 {
         return self.vtable.pids(self.ptr, allocator);
+    }
+
+    /// Reads the cgroup's CPU, memory and pids counters and its OOM kill count.
+    pub fn stats(self: Container, allocator: std.mem.Allocator) Error!Stats {
+        return self.vtable.stats(self.ptr, allocator);
     }
 
     /// Freezes the container's cgroup and waits for the requested state.

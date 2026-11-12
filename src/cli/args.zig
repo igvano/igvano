@@ -1,6 +1,7 @@
 const std = @import("std");
 const oci = @import("igvano").oci;
 const LogFormat = @import("log.zig").LogFormat;
+const parseDuration = @import("events.zig").parseDuration;
 
 pub const default_root = "/run/igvano";
 
@@ -19,6 +20,7 @@ pub const Subcommand = enum {
     spec,
     run,
     list,
+    events,
 };
 
 const PsFormat = enum { table, json };
@@ -49,6 +51,8 @@ pub const Config = struct {
     detach: bool = false,
     keep: bool = false,
     quiet: bool = false,
+    events_stats: bool = false,
+    events_interval_ns: u64 = 5 * std.time.ns_per_s,
     tty: ?bool = null,
     exec_cwd: ?[]const u8 = null,
     exec_user: ?ExecUser = null,
@@ -105,6 +109,7 @@ fn commandFlagNames(subcommand: Subcommand) []const []const u8 {
         .run => &.{ "bundle", "b", "pid-file", "console-socket", "detach", "d", "keep" },
         .spec => &.{ "bundle", "b" },
         .list => &.{ "quiet", "q", "format", "f" },
+        .events => &.{ "stats", "interval" },
         .delete => &.{ "force", "f" },
         .kill => &.{ "all", "a" },
         .update => &.{
@@ -219,6 +224,7 @@ fn parseCommandOptions(args: []const []const u8, index: *usize, config: *Config)
         },
         .delete => try parseDeleteOptions(args, index, config),
         .ps, .list => try parsePsOptions(args, index, config),
+        .events => try parseEventsOptions(args, index, config),
         .kill => {
             while (index.* < args.len and (std.mem.eql(u8, args[index.*], "--all") or
                 std.mem.eql(u8, args[index.*], "-a"))) : (index.* += 1)
@@ -282,6 +288,19 @@ fn parseCreateOptions(args: []const []const u8, index: *usize, config: *Config) 
         }
     }
     if (config.bundle == null) config.bundle = ".";
+}
+
+fn parseEventsOptions(args: []const []const u8, index: *usize, config: *Config) !void {
+    while (index.* < args.len and std.mem.startsWith(u8, args[index.*], "-")) : (index.* += 1) {
+        const flag = args[index.*];
+        if (std.mem.eql(u8, flag, "--stats")) {
+            config.events_stats = true;
+        } else if (std.mem.eql(u8, optionName(flag), "--interval")) {
+            const value = try optionValue(args, index, error.MissingInterval);
+            config.events_interval_ns = parseDuration(value) catch
+                return oci.validationError(error.InvalidDuration, "duration interval must be greater than 0 (got '{s}')", .{value});
+        } else return oci.validationError(error.UnknownOption, "unknown option '{s}'", .{flag});
+    }
 }
 
 fn parseDeleteOptions(args: []const []const u8, index: *usize, config: *Config) !void {
@@ -487,6 +506,7 @@ pub fn optionValue(args: []const []const u8, index: *usize, comptime missing: er
     MissingEnv,
     MissingUser,
     MissingFormat,
+    MissingInterval,
 }) ![]const u8 {
     const token = args[index.*];
     const flag = token[0 .. std.mem.indexOfScalar(u8, token, '=') orelse token.len];
@@ -1070,5 +1090,6 @@ pub const usage =
     "       igvano [global flags] run [--bundle|-b <path>] [--pid-file <file>] [--console-socket <path>] [--detach|-d] [--keep] <id>\n" ++
     "       igvano [global flags] spec [--bundle|-b <path>]\n" ++
     "       igvano [global flags] list [--quiet|-q] [--format|-f table|json]\n" ++
+    "       igvano [global flags] events [--stats] [--interval <duration>] <id>\n" ++
     "       igvano [global flags] exec [--process <file>] [--detach|-d] [--pid-file <file>] [--console-socket <path>]\n" ++
     "              [--tty|-t] [--cwd <dir>] [--env K=V]... [--user UID[:GID]] <id> [command args...]\n";
