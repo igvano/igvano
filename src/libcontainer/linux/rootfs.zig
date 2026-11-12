@@ -23,6 +23,7 @@ const mountinfoPath = @import("mountinfo.zig").mountinfoPath;
 const setupConsole = @import("console.zig").setupConsole;
 const consolePath = @import("console.zig").consolePath;
 const closeMountFds = @import("mount_sources.zig").closeMountFds;
+const receiveMountSource = @import("mount_sources.zig").receiveMountSource;
 const PreparedDevice = @import("device_nodes.zig").PreparedDevice;
 const setupDevices = @import("device_nodes.zig").setupDevices;
 const setupSymlinks = @import("device_nodes.zig").setupSymlinks;
@@ -251,6 +252,9 @@ pub const RootfsOptions = struct {
     readonly_paths: []const [:0]const u8 = &.{},
     sysctls: []const libcontainer.Sysctl = &.{},
     runtime_sync: ?struct { ready_fd: posix.fd_t, go_fd: posix.fd_t } = null,
+    /// Mount source helper, already given init's mount namespace; bind sources
+    /// are requested one by one, right before each mount.
+    mount_source_socket: ?posix.fd_t = null,
 };
 
 /// Paths now resolve entirely inside the container rootfs. Missing targets are
@@ -407,7 +411,17 @@ fn prepareRootfsBind(rootfs: [:0]const u8, options: RootfsOptions, step: *Rootfs
 }
 
 fn applyRootfsMounts(rootfs: [:0]const u8, mounts: []const PreparedMount, options: RootfsOptions, step: *RootfsStep) libcontainer.Error!void {
-    for (mounts) |mount| {
+    for (mounts) |original| {
+        var mount = original;
+        const received = options.mount_source_socket != null and mount.flags & linux.MS.BIND != 0;
+        if (options.mount_source_socket) |socket| {
+            step.* = .{ .operation = "receive bind source", .source = mount.source, .path = mount.destination };
+            try receiveMountSource(&mount, socket);
+        }
+        // The received fd belongs to this iteration; the slice's fds stay with closeMountFds.
+        defer if (received) {
+            if (if (mount.mappings != null) mount.mount_fd else mount.source_fd) |fd| closeFd(fd);
+        };
         step.* = .{ .operation = "open rootfs", .path = rootfs };
         const root_fd = try openPath(linux.AT.FDCWD, rootfs, .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true });
         defer closeFd(root_fd);

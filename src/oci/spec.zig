@@ -155,6 +155,7 @@ pub const Spec = struct {
             shares: ?u64 = null,
             realtimeRuntime: ?i64 = null,
             realtimePeriod: ?u64 = null,
+            idle: ?i64 = null,
             cpus: ?[]const u8 = null,
             mems: ?[]const u8 = null,
         };

@@ -113,9 +113,9 @@ fn commandFlagNames(subcommand: Subcommand) []const []const u8 {
         .delete => &.{ "force", "f" },
         .kill => &.{ "all", "a" },
         .update => &.{
-            "resources",   "r",           "memory",     "memory-reservation", "memory-swap",   "kernel-memory",
-            "cpu-shares",  "cpu-share",   "cpu-period", "cpu-quota",          "cpu-rt-period", "cpu-rt-runtime",
-            "cpuset-cpus", "cpuset-mems", "pids-limit", "blkio-weight",
+            "resources",  "r",           "memory",      "memory-reservation", "memory-swap",   "kernel-memory",
+            "cpu-shares", "cpu-share",   "cpu-period",  "cpu-quota",          "cpu-rt-period", "cpu-rt-runtime",
+            "cpu-idle",   "cpuset-cpus", "cpuset-mems", "pids-limit",         "blkio-weight",
         },
         else => &.{},
     };
@@ -404,6 +404,7 @@ fn parseCpuOption(args: []const []const u8, index: *usize, name: []const u8, res
         .{ "--cpu-quota", "quota", i64 },
         .{ "--cpu-rt-period", "realtimePeriod", u64 },
         .{ "--cpu-rt-runtime", "realtimeRuntime", i64 },
+        .{ "--cpu-idle", "idle", i64 },
     }) |entry| {
         if (std.mem.eql(u8, name, entry[0])) {
             const value = try optionValue(args, index, error.MissingResourceValue);
@@ -971,6 +972,7 @@ test "update parsing accepts every per-field flag with separate and equals value
         .{ .name = "--cpu-quota", .value = "-1" },
         .{ .name = "--cpu-rt-period", .value = "1000000" },
         .{ .name = "--cpu-rt-runtime", .value = "-1" },
+        .{ .name = "--cpu-idle", .value = "1" },
         .{ .name = "--cpuset-cpus", .value = "0-2" },
         .{ .name = "--cpuset-mems", .value = "0" },
         .{ .name = "--pids-limit", .value = "-1" },

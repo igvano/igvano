@@ -127,6 +127,8 @@ fn appendV1CpuWrites(allocator: std.mem.Allocator, writes: *std.ArrayList(V1Writ
                 try appendV1Write(allocator, writes, "cpu", field[1], try std.fmt.allocPrint(allocator, "{d}", .{value}), null, false);
         }
     }
+    if (cpu.idle) |value|
+        try appendV1Write(allocator, writes, "cpu", "cpu.idle", try std.fmt.allocPrint(allocator, "{d}", .{value}), null, false);
     if (cpu.cpus) |value|
         try appendV1Write(allocator, writes, "cpuset", "cpuset.cpus", try allocator.dupe(u8, value), null, false);
     if (cpu.mems) |value|
@@ -376,7 +378,7 @@ fn hasV1Controller(hierarchies: []const V1Hierarchy, controller: []const u8) boo
 test "v1 writes preserve native memory limits and CPU ordering" {
     const writes = try v1Writes(std.testing.allocator, .{
         .memory = .{ .limit = -1, .reservation = 32, .swap = -1, .kernel = 64, .kernel_tcp = 128, .swappiness = 50, .disable_oom_killer = true },
-        .cpu = .{ .shares = 1024, .period = 100000, .quota = 50000, .realtime_period = 1000000, .realtime_runtime = 950000, .cpus = "0-2,4", .mems = "0,2" },
+        .cpu = .{ .shares = 1024, .period = 100000, .quota = 50000, .realtime_period = 1000000, .realtime_runtime = 950000, .idle = 1, .cpus = "0-2,4", .mems = "0,2" },
         .pids = .{ .limit = -1 },
     });
     defer freeV1Writes(std.testing.allocator, writes);
@@ -393,6 +395,7 @@ test "v1 writes preserve native memory limits and CPU ordering" {
         .{ .controller = "cpu", .name = "cpu.cfs_quota_us", .value = "50000" },
         .{ .controller = "cpu", .name = "cpu.rt_period_us", .value = "1000000" },
         .{ .controller = "cpu", .name = "cpu.rt_runtime_us", .value = "950000" },
+        .{ .controller = "cpu", .name = "cpu.idle", .value = "1" },
         .{ .controller = "cpuset", .name = "cpuset.cpus", .value = "0-2,4" },
         .{ .controller = "cpuset", .name = "cpuset.mems", .value = "0,2" },
         .{ .controller = "pids", .name = "pids.max", .value = "max" },

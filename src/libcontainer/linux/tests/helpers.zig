@@ -324,7 +324,7 @@ pub fn testPrivateUserNamespaceBindLocks(idmapped: bool) !void {
                 .mappings = if (idmapped) mappings else null,
                 .userns_fd = if (idmapped) userns else null,
             }};
-            const helper = startMountSourceHelper(&mounts) catch linux.exit_group(8);
+            const helper = startMountSourceHelper(&mounts, true) catch linux.exit_group(8);
             checkResult(linux.setns(userns, linux.CLONE.NEWUSER)) catch linux.exit_group(10);
             checkResult(linux.unshare(linux.CLONE.NEWNS)) catch linux.exit_group(11);
             checkResult(linux.setgid(0)) catch linux.exit_group(12);

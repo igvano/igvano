@@ -19,7 +19,6 @@ cgroups::runc create (limits + cgrouppath + permission on the cgroup dir) succee
 cgroups::runc exec (cgroup v2 + init process in non-root cgroup) succeeds
 cgroups::runc exec --ignore-paused
 cgroups::runc exec should refuse a paused container
-cgroups::runc run (cpu.idle)
 cgroups::runc run (hugetlb limits)
 cgroups::runc run (per-device multiple iops via unified)
 cgroups::runc run/create should error for a non-empty cgroup
@@ -62,8 +61,6 @@ hooks_so::runc run (hooks library tests)
 ioprio::ioprio_set is applied to process group
 kill::kill KILL [host pidns + init gone]
 kill::kill KILL [host pidns]
-mounts::runc run [mount order, container bind-mount source]
-mounts::runc run [mount order, container bind-mount source] (userns)
 mounts::runc run [ro /dev mount]
 mounts::runc run [tmpcopyup]
 mounts_sshfs::runc run [bind mount {no,rel,strict}atime semantics]
@@ -116,7 +113,6 @@ umask::umask
 update::*
 update::cpu burst
 update::update cgroup cpu limits
-update::update cgroup cpu.idle
 update::update cgroup v1/v2 common limits
 update::update cgroup v2 resources via unified map
 update::update devices [minimal transition rules]

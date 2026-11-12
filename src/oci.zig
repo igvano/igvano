@@ -51,6 +51,7 @@ pub const mount_option_table = @import("oci/mounts.zig").mount_option_table;
 pub const parseMountOptions = @import("oci/mounts.zig").parseMountOptions;
 pub const validateMountDestination = @import("oci/mounts.zig").validateMountDestination;
 pub const resolveMountDestination = @import("oci/mounts.zig").resolveMountDestination;
+pub const resolveContainerMountDestination = @import("oci/mounts.zig").resolveContainerMountDestination;
 pub const validateIDMappings = @import("oci/mounts.zig").validateIDMappings;
 pub const mountMappings = @import("oci/mounts.zig").mountMappings;
 pub const containerIDMappings = @import("oci/mounts.zig").containerIDMappings;

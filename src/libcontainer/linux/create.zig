@@ -72,7 +72,7 @@ const resolveExecutable = @import("process.zig").resolveExecutable;
 const closeMountFds = @import("mount_sources.zig").closeMountFds;
 const prepareIDMappedMounts = @import("mount_sources.zig").prepareIDMappedMounts;
 const startMountSourceHelper = @import("mount_sources.zig").startMountSourceHelper;
-const receiveMountSources = @import("mount_sources.zig").receiveMountSources;
+const console = @import("console.zig").console;
 const PreparedDevice = @import("device_nodes.zig").PreparedDevice;
 const prepareAppArmor = @import("procfs.zig").prepareAppArmor;
 const applyAppArmor = @import("procfs.zig").applyAppArmor;
@@ -465,7 +465,11 @@ fn createWithMountSources(ctx: *CreateContext) libcontainer.Error!libcontainer.S
             break;
         }
     }
-    const mount_source_helper = if (needs_mount_sources) try startMountSourceHelper(ctx.init.mounts) else null;
+    const mount_source_helper = if (needs_mount_sources) try startMountSourceHelper(
+        ctx.init.mounts,
+        // Only a mount namespace igvano unshares itself; one joined by path keeps NO_SYMLINKS.
+        ctx.namespaces.flags & linux.CLONE.NEWNS != 0,
+    ) else null;
     ctx.mount_source_socket = if (mount_source_helper) |helper| helper.socket else null;
     defer if (mount_source_helper) |helper| {
         if (ctx.mount_source_socket) |fd| closeFd(fd);
@@ -566,10 +570,10 @@ fn runInitChild(ctx: *const CreateContext) noreturn {
     const fd_dir = openPath(ctx.proc_dir, "self/fd", .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true }) catch linux.exit_group(1);
     enterInitNamespaces(ctx);
     if (ctx.mount_source_socket) |socket| {
+        // Sources are requested during rootfs setup, one per bind mount.
         const namespace = openPath(ctx.proc_dir, "self/ns/mnt", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }) catch |err| failCreate(ctx.sync.ready[1], err);
-        receiveMountSources(ctx.init.mounts, socket, namespace) catch |err| failCreate(ctx.sync.ready[1], err);
+        console.sendFd(socket, namespace) catch |err| failCreate(ctx.sync.ready[1], err);
         closeFd(namespace);
-        closeFd(socket);
     }
     closeFd(ctx.proc_dir);
     const create_input = std.fmt.bufPrint(ctx.init.create_state, "{s}{d}{s}", .{
@@ -588,6 +592,7 @@ fn runInitChild(ctx: *const CreateContext) noreturn {
         .sysctls = ctx.options.sysctls,
         .runtime_sync = .{ .ready_fd = ctx.sync.ready[1], .go_fd = ctx.sync.create_go[0] },
         .console_fd = if (ctx.options.console_fds) |fds| fds[1] else null,
+        .mount_source_socket = ctx.mount_source_socket,
     }, ctx.init.start_hooks, start_input, ctx.init.apparmor_command, ctx.init.seccomp_program);
 }
 

@@ -131,6 +131,36 @@ pub fn resolveMountDestination(allocator: std.mem.Allocator, destination: []cons
     return std.fs.path.resolve(allocator, &.{destination});
 }
 
+/// Like runc, a destination spelled as a host path lexically inside the rootfs
+/// means that path relative to the rootfs; any other path is inside the rootfs.
+pub fn resolveContainerMountDestination(allocator: std.mem.Allocator, rootfs: []const u8, destination: []const u8) ![]u8 {
+    const resolved = try resolveMountDestination(allocator, destination);
+    errdefer allocator.free(resolved);
+    const root = try std.fs.path.resolve(allocator, &.{rootfs});
+    defer allocator.free(root);
+    if (root.len <= 1 or !std.mem.startsWith(u8, resolved, root)) return resolved;
+    if (resolved.len != root.len and resolved[root.len] != '/') return resolved;
+    const inside = try allocator.dupe(u8, if (resolved.len == root.len) "/" else resolved[root.len..]);
+    allocator.free(resolved);
+    return inside;
+}
+
+test "mount destinations under the rootfs host path are taken relative to it" {
+    const allocator = std.testing.allocator;
+    for ([_][3][]const u8{
+        .{ "/b/rootfs", "/b/rootfs/mnt/x", "/mnt/x" },
+        .{ "/b/rootfs/", "/b/rootfs", "/" },
+        .{ "/b/rootfs", "/b/rootfs/../rootfs/mnt", "/mnt" },
+        .{ "/b/rootfs", "/b/rootfsx/mnt", "/b/rootfsx/mnt" },
+        .{ "/b/rootfs", "/mnt", "/mnt" },
+        .{ "/", "/mnt", "/mnt" },
+    }) |case| {
+        const got = try resolveContainerMountDestination(allocator, case[0], case[1]);
+        defer allocator.free(got);
+        try std.testing.expectEqualStrings(case[2], got);
+    }
+}
+
 /// Map ranges are half-open; widen before adding to avoid wrapping u32 IDs.
 pub fn validateIDMappings(mappings: []const Spec.IDMapping) error{InvalidConfig}!void {
     if (mappings.len == 0 or mappings.len > 340) return invalidConfig("ID mappings: expected 1..340 ranges", .{});

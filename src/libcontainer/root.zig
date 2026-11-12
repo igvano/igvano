@@ -195,6 +195,8 @@ pub const Resources = struct {
         period: ?u64 = null,
         realtime_runtime: ?i64 = null,
         realtime_period: ?u64 = null,
+        /// cgroup cpu.idle (SCHED_IDLE group); the kernel accepts only 0 or 1.
+        idle: ?i64 = null,
         cpus: ?[]const u8 = null,
         mems: ?[]const u8 = null,
     };

@@ -48,7 +48,7 @@ pub fn createContainerFor(allocator: std.mem.Allocator, io: std.Io, injected: ?C
     defer mount_arena.deinit();
     const mount_allocator = mount_arena.allocator();
     const settings: oci.Spec.Linux = parsed.value.linux orelse .{};
-    const mounts = try prepareCreateMounts(mount_allocator, bundle, parsed.value.mounts, settings);
+    const mounts = try prepareCreateMounts(mount_allocator, bundle, rootfs, parsed.value.mounts, settings);
     const seccomp_config = try oci.prepareSeccomp(allocator, settings.seccomp);
     defer oci.freeSeccomp(allocator, seccomp_config);
     const sysctls = try oci.prepareSysctls(mount_allocator, settings);
@@ -136,7 +136,7 @@ fn namespaceKind(kind: @FieldType(oci.Spec.Namespace, "type")) libcontainer.Name
     };
 }
 
-fn prepareCreateMounts(mount_allocator: std.mem.Allocator, bundle: []const u8, configured: ?[]const oci.Spec.Mount, settings: oci.Spec.Linux) ![]libcontainer.Mount {
+fn prepareCreateMounts(mount_allocator: std.mem.Allocator, bundle: []const u8, rootfs: []const u8, configured: ?[]const oci.Spec.Mount, settings: oci.Spec.Linux) ![]libcontainer.Mount {
     const spec_mounts = configured orelse &.{};
     const mounts = try mount_allocator.alloc(libcontainer.Mount, spec_mounts.len);
     for (spec_mounts, mounts, 0..) |mount, *prepared, i| {
@@ -150,7 +150,7 @@ fn prepareCreateMounts(mount_allocator: std.mem.Allocator, bundle: []const u8, c
             break :bind try oci.resolveRootfs(mount_allocator, bundle, path);
         } else mount.source;
         prepared.* = .{
-            .destination = try oci.resolveMountDestination(mount_allocator, mount.destination),
+            .destination = try oci.resolveContainerMountDestination(mount_allocator, rootfs, mount.destination),
             .source = source,
             .type = mount.type,
             .flags = options.flags,

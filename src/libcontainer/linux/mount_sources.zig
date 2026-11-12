@@ -58,9 +58,12 @@ pub fn prepareIDMappedMounts(allocator: std.mem.Allocator, mounts: []PreparedMou
 /// Join only init's mount namespace: opening sources there pins its locked
 /// mounts, rather than unlocked host mounts. In particular, a mount namespace
 /// joined by path resolves bind sources there, just as ordinary binds do.
-/// Sources opened with host credentials in this mode must contain no symlinks.
-/// Ordinary bind mounts opened in the runtime's own namespace still allow them.
-pub fn startMountSourceHelper(mounts: []const PreparedMount) libcontainer.Error!struct { pid: i32, socket: posix.fd_t } {
+/// Sources are opened one at a time, when init asks for each just before
+/// mounting it, so a source inside the rootfs sees the earlier mounts (runc's
+/// mount order). In a namespace joined by path, sources must contain no
+/// symlinks (`allow_symlinks` false); in init's own private copy of the
+/// runtime's namespace they resolve like ordinary bind sources.
+pub fn startMountSourceHelper(mounts: []const PreparedMount, allow_symlinks: bool) libcontainer.Error!struct { pid: i32, socket: posix.fd_t } {
     const sockets = try console.socketpair();
     errdefer for (sockets) |fd| closeFd(fd);
     const child = try forkProcess();
@@ -70,25 +73,28 @@ pub fn startMountSourceHelper(mounts: []const PreparedMount) libcontainer.Error!
         const namespace = console.receiveFd(sockets[0]) catch linux.exit_group(1);
         checkResult(linux.setns(namespace, linux.CLONE.NEWNS)) catch |err| failCreate(sockets[0], err);
         closeFd(namespace);
-        sendMountSources(mounts, sockets[0]) catch |err| failCreate(sockets[0], err);
+        sendMountSources(mounts, sockets[0], allow_symlinks) catch |err| failCreate(sockets[0], err);
         linux.exit_group(0);
     }
     closeFd(sockets[0]);
     return .{ .pid = child, .socket = sockets[1] };
 }
 
-pub fn sendMountSources(mounts: []const PreparedMount, socket: posix.fd_t) libcontainer.Error!void {
+pub fn sendMountSources(mounts: []const PreparedMount, socket: posix.fd_t, allow_symlinks: bool) libcontainer.Error!void {
     for (mounts) |mount| {
         if (mount.flags & linux.MS.BIND == 0) continue;
+        // Wait until init has applied every earlier mount; EOF means it stopped.
+        var request: [1]u8 = undefined;
+        if (!readAll(socket, &request)) return;
         var step: RootfsStep = .{ .operation = "open bind source", .source = mount.source, .path = mount.destination };
         errdefer |err| if (step.operation.len != 0) step.report(err);
         const source = mount.source orelse return error.InvalidConfig;
         const how: OpenHow = .{
             .flags = @as(u32, @bitCast(linux.O{ .PATH = true, .CLOEXEC = true })),
-            .resolve = RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS,
+            .resolve = RESOLVE_NO_MAGICLINKS | (if (allow_symlinks) 0 else RESOLVE_NO_SYMLINKS),
         };
         const opened = try openat2(linux.AT.FDCWD, source.ptr, how);
-        if (linux.errno(opened) == .LOOP) {
+        if (linux.errno(opened) == .LOOP and !allow_symlinks) {
             step.operation = "";
             reportDiagnostic("bind source {s} contains a symlink; symlinks are not allowed when joining a mount namespace", .{source});
             return error.CreateFailed;
@@ -107,16 +113,24 @@ pub fn sendMountSources(mounts: []const PreparedMount, socket: posix.fd_t) libco
     }
 }
 
+/// All sources at once, for callers that mount nothing in between.
 pub fn receiveMountSources(mounts: []PreparedMount, socket: posix.fd_t, namespace: posix.fd_t) libcontainer.Error!void {
     try console.sendFd(socket, namespace);
-    for (mounts) |*mount| {
-        if (mount.flags & linux.MS.BIND == 0) continue;
-        var response: CreateResponse = .{};
-        if (!readAll(socket, std.mem.asBytes(&response))) return mountSourceHelperExited();
-        if (response.failureError()) |err| return err;
-        const fd = (try console.receiveFdOrEof(socket)) orelse return mountSourceHelperExited();
-        if (mount.mappings != null) mount.mount_fd = fd else mount.source_fd = fd;
-    }
+    for (mounts) |*mount| try receiveMountSource(mount, socket);
+}
+
+/// Asks the helper for one bind source, after the namespace fd was sent.
+/// No-op for other mounts; the helper skips them the same way.
+pub fn receiveMountSource(mount: *PreparedMount, socket: posix.fd_t) libcontainer.Error!void {
+    if (mount.flags & linux.MS.BIND == 0) return;
+    const request = [_]u8{1};
+    if (linux.errno(linux.sendto(socket, &request, 1, linux.MSG.NOSIGNAL, null, 0)) != .SUCCESS)
+        return mountSourceHelperExited();
+    var response: CreateResponse = .{};
+    if (!readAll(socket, std.mem.asBytes(&response))) return mountSourceHelperExited();
+    if (response.failureError()) |err| return err;
+    const fd = (try console.receiveFdOrEof(socket)) orelse return mountSourceHelperExited();
+    if (mount.mappings != null) mount.mount_fd = fd else mount.source_fd = fd;
 }
 
 fn mountSourceHelperExited() libcontainer.Error {

@@ -61,6 +61,9 @@ fn appendV2MemoryWrites(allocator: std.mem.Allocator, writes: *std.ArrayList(Wri
 }
 
 fn appendV2CpuWrites(allocator: std.mem.Allocator, writes: *std.ArrayList(Write), cpu: Resources.Cpu) libcontainer.Error!void {
+    // Like runc, cpu.idle goes first; the kernel validates the value.
+    if (cpu.idle) |idle|
+        try appendWrite(allocator, writes, "cpu.idle", try std.fmt.allocPrint(allocator, "{d}", .{idle}));
     const quota = cpu.quota orelse -1;
     if (quota < -1) return error.InvalidConfig;
     const period = if ((cpu.period orelse 0) == 0) 100000 else cpu.period.?;
@@ -248,6 +251,8 @@ test "v2 writes preserve unlimited values and CPU defaults" {
         .{ .resources = .{ .cpu = .{ .period = 200000 } }, .name = "cpu.max", .value = "max 200000" },
         .{ .resources = .{ .cpu = .{ .quota = 50000 } }, .name = "cpu.max", .value = "50000 100000" },
         .{ .resources = .{ .cpu = .{ .quota = 0, .period = 0 } }, .name = "cpu.max", .value = "max 100000" },
+        .{ .resources = .{ .cpu = .{ .idle = 1 } }, .name = "cpu.idle", .value = "1" },
+        .{ .resources = .{ .cpu = .{ .idle = 0 } }, .name = "cpu.idle", .value = "0" },
     };
     for (cases) |case| {
         const writes = try v2Writes(std.testing.allocator, case.resources);

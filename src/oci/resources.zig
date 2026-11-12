@@ -80,6 +80,7 @@ fn resourceCpu(cpu: Spec.Resources.Cpu) !libcontainer.Resources.Cpu {
         .period = cpu.period,
         .realtime_runtime = cpu.realtimeRuntime,
         .realtime_period = cpu.realtimePeriod,
+        .idle = cpu.idle,
         .cpus = cpu.cpus,
         .mems = cpu.mems,
     };

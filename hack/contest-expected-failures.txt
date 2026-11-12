@@ -82,10 +82,8 @@ time_ns::simple timens + userns
 tmpcopyup::tmpcopyup_ro_test
 tmpcopyup::tmpcopyup_test
 update::cpu_burst_test
-update::update_cgroup_cpu_idle_test
 update::update_cgroup_v2_common_limits_test
 update::update_cpu_limits_test
 
-# Host-dependent ("? " prefix): may pass or fail. io.bfq.weight needs the BFQ scheduler; cpu.idle (unsupported by igvano) reads 1 on some hosts.
-? cgroup_v2_cpu::test_cpu_idle_set
+# Host-dependent ("? " prefix): may pass or fail. io.bfq.weight needs the BFQ scheduler.
 ? update::update_blkio_weight_test
