@@ -246,13 +246,12 @@ fn testInheritedMountNamespace(rootfs: [:0]const u8, fifo: [:0]const u8, cgroup_
     defer std.testing.allocator.free(after);
     try std.testing.expectEqualStrings(before, after);
 
-    // A configured root mount covers the self-bind whose identity cleanup owns.
-    // Both prepared root destinations are "/".
-    // The second pass checks repeated stacked-root create/fail/delete leaves no residue.
-    for ([_][]const u8{ "/", "/" }) |destination| {
+    // Like runc, a mount on top of the rootfs is refused; repeated attempts
+    // leave no residue of the self-bind.
+    for (0..2) |_| {
         const stacked_mounts = [_]libcontainer.Mount{
             .{
-                .destination = destination,
+                .destination = "/",
                 .source = source,
                 .type = null,
                 .flags = linux.MS.BIND | linux.MS.REC,
@@ -262,37 +261,10 @@ fn testInheritedMountNamespace(rootfs: [:0]const u8, fifo: [:0]const u8, cgroup_
             mounts[0],
             mounts[1],
         };
-        options.mounts = &.{
-            stacked_mounts[0],
-            .{ .destination = "/invalid", .source = "none", .type = "igvano.invalid", .flags = 0, .propagation = 0, .data = "" },
-        };
-        try expectCreateError(error.CreateFailed, options);
-        try expectNoRootfsMount(rootfs);
         options.mounts = &stacked_mounts;
-        options.on_create = .{ .ptr = &callback_context, .run = Callback.fail };
-        try expectCreateError(error.HookFailed, options);
+        try expectCreateError(error.InvalidPath, options);
         try expectNoRootfsMount(rootfs);
-        options.on_create = null;
-        options.process.?.cwd = "/missing-cwd";
-        try expectCreateError(error.CreateFailed, options);
-        try expectNoRootfsMount(rootfs);
-        options.process.?.cwd = "/";
-        var stacked_handle_instance = try LinuxContainer.create(options);
-        defer stacked_handle_instance.deinit(options.allocator);
-        const stacked_handle = stacked_handle_instance.state;
-        const stacked_handle_container = stacked_handle_instance.container();
-        defer {
-            stacked_handle_container.kill(9) catch {};
-            stacked_handle_container.delete() catch {};
-        }
-        const top_fd = try openPath(linux.AT.FDCWD, rootfs, .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true });
-        defer closeFd(top_fd);
-        try std.testing.expect(stacked_handle.rootfs_mount_id.? != try mountId(top_fd));
         try expectOutsideRootfsUnchanged(before, rootfs);
-        try stacked_handle_container.kill(9);
-        try stacked_handle_container.delete();
-        try expectNoRootfsMount(rootfs);
-        try stacked_handle_container.delete();
     }
     options.mounts = mounts[0..mount_count];
 
