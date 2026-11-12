@@ -133,6 +133,7 @@ The Linux tests need root. Cross-compile the test binaries and run them in a
 privileged container or a Linux VM:
 
 ```sh
+mkdir -p zig-out
 nix develop -c zig test src/libcontainer/root.zig --test-no-exec -target x86_64-linux-musl -femit-bin=zig-out/libcontainer-tests-linux
 nix develop -c zig test --test-no-exec -target x86_64-linux-musl -femit-bin=zig-out/lib-tests-linux \
   --dep libcontainer -Mroot=src/lib.zig -Mlibcontainer=src/libcontainer/root.zig

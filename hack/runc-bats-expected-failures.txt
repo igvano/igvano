@@ -7,7 +7,6 @@
 env::non-empty HOME env is used
 mounts_propagation::runc run [rootfsPropagation shared]
 rlimits::runc run with RLIMIT_NOFILE(The same as system's hard value)
-spec::spec validator
 timens::runc run [timens with no offsets]
 
 # igvano gaps found by the suite. Delete lines as they pass.
@@ -20,10 +19,8 @@ cgroups::runc create (limits + cgrouppath + permission on the cgroup dir) succee
 cgroups::runc exec (cgroup v2 + init process in non-root cgroup) succeeds
 cgroups::runc exec --ignore-paused
 cgroups::runc exec should refuse a paused container
-cgroups::runc run (blkio weight)
 cgroups::runc run (cpu.idle)
 cgroups::runc run (hugetlb limits)
-cgroups::runc run (per-device io weight for bfq)
 cgroups::runc run (per-device multiple iops via unified)
 cgroups::runc run/create should error for a non-empty cgroup
 cgroups::runc run/create should refuse pre-existing frozen cgroup
@@ -126,3 +123,8 @@ update::update devices [minimal transition rules]
 update::update memory vs CheckBeforeUpdate
 userns::userns join external namespaces [wrong userns owner]
 version::runc version
+
+# Host-dependent ("? " prefix): may pass or fail. blkio/bfq need the BFQ scheduler; spec validator needs proxy.golang.org (go mod tidy), blocked on some networks.
+? cgroups::runc run (blkio weight)
+? cgroups::runc run (per-device io weight for bfq)
+? spec::spec validator

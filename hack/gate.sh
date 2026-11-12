@@ -4,6 +4,7 @@
 #   results:  "group::test<TAB>ok|not ok|skipped" lines.
 #   groups:   the groups that ran, one per line.
 #   expected: "group::test" lines ("group::*" = the group crashed or timed out).
+#             "? group::test" marks a host-dependent test: it may pass or fail.
 # Fails when a test outside <expected> failed, or when a listed test of a
 # group that ran did not fail (passed, skipped or produced no result).
 set -eu
@@ -20,9 +21,12 @@ if [ -s "$work/duplicates" ]; then
 fi
 awk -F '\t' '$2 == "not ok" { print $1 }' "$results" | LC_ALL=C sort -u > "$work/failed"
 grep -v '^#' "$expected" | sed '/^$/d' |
-    awk 'NR == FNR { ran[$0]; next } { group = $0; sub(/::.*/, "", group) } group in ran' "$groups" - |
-    LC_ALL=C sort -u > "$work/expected"
-LC_ALL=C comm -23 "$work/failed" "$work/expected" > "$work/unexpected"
+    awk 'NR == FNR { ran[$0]; next } { name = $0; sub(/^\? /, "", name); group = name; sub(/::.*/, "", group) } group in ran' "$groups" - |
+    LC_ALL=C sort -u > "$work/listed"
+grep -v '^? ' "$work/listed" > "$work/expected" || true
+sed -n 's/^? //p' "$work/listed" > "$work/either"
+# Host-dependent tests count neither as unexpected failures nor as fixed.
+LC_ALL=C comm -23 "$work/failed" "$work/expected" | grep -Fxv -f "$work/either" > "$work/unexpected" || true
 LC_ALL=C comm -13 "$work/failed" "$work/expected" > "$work/fixed"
 awk -F '\t' '{ n[$2]++ } END { printf "ok %d, not ok %d, skipped %d\n", n["ok"], n["not ok"], n["skipped"] }' "$results"
 printf '\nUnexpected failures (not in %s):\n' "$expected"
