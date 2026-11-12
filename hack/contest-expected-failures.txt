@@ -79,8 +79,6 @@ terminal::terminal_console_size
 time_ns::simple timens
 time_ns::simple timens + exec
 time_ns::simple timens + userns
-tmpcopyup::tmpcopyup_ro_test
-tmpcopyup::tmpcopyup_test
 update::cpu_burst_test
 update::update_cgroup_v2_common_limits_test
 update::update_cpu_limits_test

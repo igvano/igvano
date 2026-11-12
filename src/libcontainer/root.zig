@@ -246,6 +246,8 @@ pub const Mount = struct {
     data: []const u8,
     recursive_readonly: ?bool = null,
     mappings: ?MountMappings = null,
+    /// For tmpfs: copy the directory it covers into it first (runc's tmpcopyup).
+    copy_up: bool = false,
 };
 
 pub const IDMapping = struct {

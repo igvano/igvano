@@ -9,6 +9,7 @@ const PreparedMount = @import("../mount.zig").PreparedMount;
 const mountDestination = @import("../mount.zig").mountDestination;
 const requireOrdinaryProcDestination = @import("../mount.zig").requireOrdinaryProcDestination;
 const pinOrdinaryProcDestination = @import("../mount.zig").pinOrdinaryProcDestination;
+const requireBelowRootfs = @import("../mount.zig").requireBelowRootfs;
 const remountFlags = @import("../mount.zig").remountFlags;
 const applyMount = @import("../mount.zig").applyMount;
 const checkResult = @import("../syscall.zig").checkResult;
@@ -108,6 +109,29 @@ test "linux mount destinations follow relative and final symlinks within rootfs"
             return error.TestUnexpectedResult;
         } else |_| {}
     }
+}
+
+test "linux mounts refuse destinations that resolve to the rootfs itself" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "rootfs/mnt");
+    try tmp.dir.symLink(std.testing.io, "/", "rootfs/top", .{});
+    try tmp.dir.symLink(std.testing.io, "mnt/..", "rootfs/up", .{});
+    const rootfs = try std.fmt.allocPrintSentinel(std.testing.allocator, ".zig-cache/tmp/{s}/rootfs", .{tmp.sub_path}, 0);
+    defer std.testing.allocator.free(rootfs);
+    const root_fd = try openPath(linux.AT.FDCWD, rootfs, .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true });
+    defer closeFd(root_fd);
+    var step: RootfsStep = .{};
+    for ([_][]const u8{ "/", "/top", "/up" }) |destination| {
+        const fd = try mountDestination(root_fd, destination, false, false);
+        defer closeFd(fd);
+        try std.testing.expectError(error.InvalidPath, requireBelowRootfs(root_fd, fd, &step));
+        try std.testing.expectEqualStrings("mountpoint is on the top of rootfs", step.operation);
+    }
+    const mnt = try mountDestination(root_fd, "/mnt", false, false);
+    defer closeFd(mnt);
+    try requireBelowRootfs(root_fd, mnt, &step);
 }
 
 test "linux proc and sysfs refuse symlinked or non-directory destinations" {

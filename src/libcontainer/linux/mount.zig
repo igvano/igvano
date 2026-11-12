@@ -21,6 +21,7 @@ const reportDiagnostic = @import("diagnostic.zig").reportDiagnostic;
 const V1Hierarchy = @import("cgroup_v1.zig").V1Hierarchy;
 const v1Hierarchies = @import("cgroup_v1.zig").v1Hierarchies;
 const RootfsStep = @import("rootfs.zig").RootfsStep;
+const copyTree = @import("copyup.zig").copyTree;
 
 const ST_NOATIME: usize = 1024;
 const ST_RELATIME: usize = 4096; // Unlike MS_RELATIME.
@@ -115,6 +116,7 @@ pub fn prepareMounts(allocator: std.mem.Allocator, mounts: []const libcontainer.
             .data = try pathString(allocator, mount.data),
             .recursive_readonly = mount.recursive_readonly,
             .mappings = mount.mappings,
+            .copy_up = mount.copy_up,
         });
     }
     return prepared.toOwnedSlice(allocator);
@@ -324,6 +326,7 @@ pub const PreparedMount = struct {
     data: [:0]const u8,
     recursive_readonly: ?bool = null,
     mappings: ?libcontainer.MountMappings = null,
+    copy_up: bool = false,
     /// O_PATH source opened with host credentials in init's mount namespace.
     source_fd: ?posix.fd_t = null,
     /// Detached idmapped tree cloned from init's locked mount namespace.
@@ -648,6 +651,8 @@ pub fn bindRemount(target_fd: posix.fd_t, target: [*:0]const u8, requested: u32)
 }
 
 pub fn applyMount(rootfs: [:0]const u8, root_fd: posix.fd_t, mount: PreparedMount, private_mount_namespace: bool, rootfs_propagation: u32, step: *RootfsStep) libcontainer.Error!void {
+    // Every destination now resolves below rootfs, through root_fd.
+    _ = rootfs;
     const ms = linux.MS;
     const bind = mount.flags & ms.BIND != 0;
     step.* = .{ .operation = "open bind source", .source = mount.source, .path = mount.destination };
@@ -660,35 +665,86 @@ pub fn applyMount(rootfs: [:0]const u8, root_fd: posix.fd_t, mount: PreparedMoun
     };
     step.operation = "stat bind source";
     const is_file = if (source_fd) |fd| try fileType(fd) != linux.S.IFDIR else false;
+    var target_fd = try openMountTarget(root_fd, mount, is_file, step);
+    defer closeFd(target_fd);
+    const copy_up = isCopyUp(mount);
+    // Read the covered directory through an fd taken before the tmpfs hides it.
+    const covered: ?posix.fd_t = if (copy_up) try openCovered(target_fd, step) else null;
+    defer if (covered) |fd| closeFd(fd);
+    var source_buffer: [64]u8 = undefined;
+    const source = mountSource(&source_buffer, source_fd, mount);
+    var attach = mount;
+    // A read-only copy-up tmpfs is filled first and made read-only after.
+    if (copy_up) attach.flags &= ~@as(u32, linux.MS.RDONLY);
+    try attachMount(attach, source, target_fd, step);
+    // The original fd pins the covered mount. Reopen to address the new mount
+    // for remount and propagation changes, with symlinks still scoped to rootfs.
+    step.operation = "open mounted destination";
+    const mounted_fd = try mountDestinationStep(root_fd, mount.destination, is_file, false, step);
+    closeFd(target_fd);
+    target_fd = mounted_fd;
+    if (covered) |from| try copyUp(from, target_fd, mount, step);
+    try isolateBindMount(mount, target_fd, private_mount_namespace, rootfs_propagation, step);
+    try applyMountAttributes(mount, target_fd, step);
+}
+
+/// Resolves (creating if needed) and pins the destination, refusing the rootfs
+/// itself and, for proc and sysfs, anything but a plain directory.
+fn openMountTarget(root_fd: posix.fd_t, mount: PreparedMount, is_file: bool, step: *RootfsStep) libcontainer.Error!posix.fd_t {
+    const bind = mount.flags & linux.MS.BIND != 0;
     step.* = .{ .operation = "prepare mount destination", .path = mount.destination };
     if (!bind) try requireOrdinaryProcDestination(root_fd, mount, step);
     var target_fd = try mountDestinationStep(root_fd, mount.destination, is_file, true, step);
+    errdefer closeFd(target_fd);
     if (!bind) {
         if (try pinOrdinaryProcDestination(root_fd, mount, step)) |pinned| {
             closeFd(target_fd);
             target_fd = pinned;
         }
     }
-    defer closeFd(target_fd);
-    var source_buffer: [64]u8 = undefined;
-    const source: ?[*:0]const u8 = if (source_fd) |fd|
-        fdPath(&source_buffer, fd).ptr
-    else if (mount.source) |value|
-        value.ptr
-    else
-        null;
-    try attachMount(mount, source, target_fd, step);
-    // The original fd pins the covered mount. Reopen to address the new mount
-    // for remount and propagation changes, with symlinks still scoped to rootfs.
-    step.operation = "open mounted destination";
-    const mounted_fd = if (std.mem.eql(u8, mount.destination, "/"))
-        try openPath(linux.AT.FDCWD, rootfs, .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true })
-    else
-        try mountDestinationStep(root_fd, mount.destination, is_file, false, step);
-    closeFd(target_fd);
-    target_fd = mounted_fd;
-    try isolateBindMount(mount, target_fd, private_mount_namespace, rootfs_propagation, step);
-    try applyMountAttributes(mount, target_fd, step);
+    try requireBelowRootfs(root_fd, target_fd, step);
+    return target_fd;
+}
+
+fn isCopyUp(mount: PreparedMount) bool {
+    if (!mount.copy_up or mount.flags & linux.MS.BIND != 0) return false;
+    return std.mem.eql(u8, mount.type orelse return false, "tmpfs");
+}
+
+fn mountSource(buffer: *[64]u8, source_fd: ?posix.fd_t, mount: PreparedMount) ?[*:0]const u8 {
+    if (source_fd) |fd| return fdPath(buffer, fd).ptr;
+    return if (mount.source) |value| value.ptr else null;
+}
+
+fn openCovered(target_fd: posix.fd_t, step: *RootfsStep) libcontainer.Error!posix.fd_t {
+    step.operation = "open directory to copy up";
+    return openPath(target_fd, ".", .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true });
+}
+
+/// Like runc, refuse a mount whose destination resolves to the rootfs itself,
+/// spelled "/" or reached through symlinks: it would hide the whole rootfs.
+pub fn requireBelowRootfs(root_fd: posix.fd_t, target_fd: posix.fd_t, step: *RootfsStep) libcontainer.Error!void {
+    var root: linux.Statx = undefined;
+    var target: linux.Statx = undefined;
+    try checkResult(linux.statx(root_fd, "", linux.AT.EMPTY_PATH, .{ .INO = true }, &root));
+    try checkResult(linux.statx(target_fd, "", linux.AT.EMPTY_PATH, .{ .INO = true }, &target));
+    if (root.ino == target.ino and root.dev_major == target.dev_major and root.dev_minor == target.dev_minor) {
+        step.operation = "mountpoint is on the top of rootfs";
+        return error.InvalidPath;
+    }
+}
+
+fn copyUp(from: posix.fd_t, mounted_fd: posix.fd_t, mount: PreparedMount, step: *RootfsStep) libcontainer.Error!void {
+    step.operation = "tmpcopyup: copy covered directory";
+    const to = try openPath(mounted_fd, ".", .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true });
+    defer closeFd(to);
+    try copyTree(from, to);
+    if (mount.flags & linux.MS.RDONLY != 0) {
+        step.operation = "tmpcopyup: remount read-only";
+        var buffer: [64]u8 = undefined;
+        const requested = (mount.flags & ~@as(u32, linux.MS.REC)) | linux.MS.BIND | linux.MS.REMOUNT;
+        try bindRemount(mounted_fd, fdPath(&buffer, mounted_fd), requested);
+    }
 }
 
 fn attachMount(mount: PreparedMount, source: ?[*:0]const u8, target_fd: posix.fd_t, step: *RootfsStep) libcontainer.Error!void {

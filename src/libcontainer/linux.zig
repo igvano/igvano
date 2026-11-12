@@ -126,6 +126,7 @@ test {
     _ = @import("linux/cgroup_v1.zig");
     _ = @import("linux/cgroup_v2.zig");
     _ = @import("linux/console.zig");
+    _ = @import("linux/copyup.zig");
     _ = @import("linux/create.zig");
     _ = @import("linux/device_nodes.zig");
     _ = @import("linux/devices.zig");

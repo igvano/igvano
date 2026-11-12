@@ -27,6 +27,8 @@ pub const MountOptions = struct {
     propagation: u32,
     data: [:0]u8,
     recursive_readonly: ?bool = null,
+    /// runc's tmpcopyup extension: copy the covered directory into a tmpfs.
+    copy_up: bool = false,
 };
 
 pub const mount_option_table = options: {
@@ -39,6 +41,7 @@ pub const mount_option_table = options: {
         propagation: u32 = 0,
         recursive_readonly: ?bool = null,
         idmap: ?bool = null,
+        copy_up: bool = false,
     }{
         .{ .name = "defaults" },
         .{ .name = "ro", .set = ms.RDONLY },
@@ -72,41 +75,42 @@ pub const mount_option_table = options: {
         .{ .name = "rrw", .recursive_readonly = false },
         .{ .name = "idmap", .idmap = false },
         .{ .name = "ridmap", .idmap = true },
+        .{ .name = "tmpcopyup", .copy_up = true },
     };
 };
 
 pub fn parseMountOptions(allocator: std.mem.Allocator, options: []const []const u8, mount_type: ?[]const u8) !MountOptions {
     const ms = std.os.linux.MS;
-    var flags: u32 = if (mount_type != null and std.mem.eql(u8, mount_type.?, "bind")) ms.BIND else 0;
-    var propagation: u32 = 0;
-    var recursive_readonly: ?bool = null;
+    var result: MountOptions = .{ .flags = if (mount_type != null and std.mem.eql(u8, mount_type.?, "bind")) ms.BIND else 0, .propagation = 0, .data = undefined };
     var data: std.ArrayList(u8) = .empty;
     defer data.deinit(allocator);
-    option: for (options) |option| {
+    for (options) |option| {
         if (std.mem.indexOfScalar(u8, option, 0) != null) return invalidConfig("mount options: must not contain NUL", .{});
-        for (mount_option_table) |entry| {
-            if (std.mem.eql(u8, option, entry.name)) {
-                flags = (flags & ~entry.clear) | entry.set;
-                if (entry.propagation != 0) propagation = entry.propagation;
-                if (entry.recursive_readonly) |readonly| recursive_readonly = readonly;
-                continue :option;
-            }
-        }
+        if (applyMountOption(&result, option)) continue;
         if (data.items.len != 0) try data.append(allocator, ',');
         try data.appendSlice(allocator, option);
     }
     // Discard filesystem data for bind mounts because the kernel ignores it.
-    if (flags & ms.BIND != 0) {
+    if (result.flags & ms.BIND != 0) {
         if (data.items.len != 0)
             std.debug.print("igvano: warning: bind mount ignores options: {s}\n", .{data.items});
         data.clearRetainingCapacity();
     }
-    return .{
-        .flags = flags,
-        .propagation = propagation,
-        .data = try data.toOwnedSliceSentinel(allocator, 0),
-        .recursive_readonly = recursive_readonly,
-    };
+    result.data = try data.toOwnedSliceSentinel(allocator, 0);
+    return result;
+}
+
+/// False for an option outside the table, which is filesystem data.
+fn applyMountOption(result: *MountOptions, option: []const u8) bool {
+    for (mount_option_table) |entry| {
+        if (!std.mem.eql(u8, option, entry.name)) continue;
+        result.flags = (result.flags & ~entry.clear) | entry.set;
+        if (entry.propagation != 0) result.propagation = entry.propagation;
+        if (entry.recursive_readonly) |readonly| result.recursive_readonly = readonly;
+        if (entry.copy_up) result.copy_up = true;
+        return true;
+    }
+    return false;
 }
 
 pub fn validateMountDestination(destination: []const u8) !void {
@@ -316,6 +320,14 @@ test "bind mount recursive read-only options are explicit and ordered" {
 }
 
 test "mount options translate flags propagation and filesystem data" {
+    {
+        const copy = try parseMountOptions(std.testing.allocator, &.{ "tmpcopyup", "ro", "mode=755" }, "tmpfs");
+        defer std.testing.allocator.free(copy.data);
+        try std.testing.expect(copy.copy_up);
+        try std.testing.expectEqual(@as(u32, std.os.linux.MS.RDONLY), copy.flags);
+        // tmpcopyup is runc's extension, never tmpfs data.
+        try std.testing.expectEqualStrings("mode=755", copy.data);
+    }
     const ms = std.os.linux.MS;
     const cases = [_]struct {
         options: []const []const u8,
