@@ -9,7 +9,6 @@
 capabilities::runc exec --cap
 capabilities::runc exec --cap [ambient is set from spec]
 capabilities::runc run [ambient caps not set in inheritable result in a warning]
-capabilities::runc run with some capabilities
 capabilities::runc run with unknown capability
 cgroups::runc create (limits + cgrouppath + permission on the cgroup dir) succeeds
 cgroups::runc exec (cgroup v2 + init process in non-root cgroup) succeeds

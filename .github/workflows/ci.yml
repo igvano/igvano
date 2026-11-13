@@ -93,6 +93,9 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: cachix/install-nix-action@91f6a0f59e94dfb2cfed0f4000f36a68ead1d20c # v31.11.4
+      # Ubuntu 24.04 confines unprivileged user namespaces with AppArmor,
+      # which takes every capability from a rootless container.
+      - run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - run: ./hack/runc-bats.sh
         env:
           RUNC_BATS_ROOTLESS: "1"

@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const linux = std.os.linux;
 const posix = std.posix;
 const libcontainer = @import("../root.zig");
@@ -293,6 +294,7 @@ fn onlySelfGidMap(gid_map: []const u8) bool {
 }
 
 test "only a single map of the caller's own GID needs setgroups deny" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     var buffer: [64]u8 = undefined;
     const gid = linux.getegid();
     try std.testing.expect(onlySelfGidMap(try std.fmt.bufPrint(&buffer, "0 {d} 1\n", .{gid})));
