@@ -169,6 +169,11 @@ test "backend cgroup paths must name a normalized child directory" {
     }
 }
 
+fn missingSwapIsFine(filename: []const u8, value: []const u8) bool {
+    return std.mem.eql(u8, filename, "memory.swap.max") and
+        (std.mem.eql(u8, value, "max") or std.mem.eql(u8, value, "0"));
+}
+
 pub fn writeCgroupFile(dir: posix.fd_t, filename: []const u8, value: []const u8, path: []const u8) libcontainer.Error!void {
     if (filename.len == 0 or std.mem.indexOfAny(u8, filename, "/\x00") != null or
         std.mem.eql(u8, filename, ".") or std.mem.eql(u8, filename, "..")) return error.InvalidPath;
@@ -180,8 +185,7 @@ pub fn writeCgroupFile(dir: posix.fd_t, filename: []const u8, value: []const u8,
             .SUCCESS => break :open @intCast(result),
             .INTR => continue,
             // Like runc, a host without swap ignores unlimiting or disabling it.
-            .NOENT => if (std.mem.eql(u8, filename, "memory.swap.max") and
-                (std.mem.eql(u8, value, "max") or std.mem.eql(u8, value, "0"))) return else {
+            .NOENT => if (missingSwapIsFine(filename, value)) return else {
                 reportDiagnostic("cgroup '{s}' cannot open {s}: NOENT", .{ path, filename });
                 return error.CgroupWriteFailed;
             },

@@ -116,9 +116,9 @@ fn commandFlagNames(subcommand: Subcommand) []const []const u8 {
         .delete => &.{ "force", "f" },
         .kill => &.{ "all", "a" },
         .update => &.{
-            "resources",  "r",           "memory",      "memory-reservation", "memory-swap",   "kernel-memory",
-            "cpu-shares", "cpu-share",   "cpu-period",  "cpu-quota",          "cpu-rt-period", "cpu-rt-runtime",
-            "cpu-idle",   "cpu-burst",   "cpuset-cpus", "cpuset-mems",        "pids-limit",    "blkio-weight",
+            "resources",  "r",         "memory",      "memory-reservation", "memory-swap",   "kernel-memory",
+            "cpu-shares", "cpu-share", "cpu-period",  "cpu-quota",          "cpu-rt-period", "cpu-rt-runtime",
+            "cpu-idle",   "cpu-burst", "cpuset-cpus", "cpuset-mems",        "pids-limit",    "blkio-weight",
         },
         else => &.{},
     };
