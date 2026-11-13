@@ -358,8 +358,9 @@ test "seccomp rejects unsupported or unknown schema values even for unknown sysc
     defer arena.deinit();
     try std.testing.expect((try prepareSeccomp(arena.allocator(), .{ .defaultAction = "SCMP_ACT_ALLOW" })).?.architectures.len == 1);
     // A listener path alone is ignored; notify rules with one are accepted.
+    // mkdirat exists on every architecture; aarch64 has no mkdir.
     _ = try prepareSeccomp(arena.allocator(), .{ .defaultAction = "SCMP_ACT_ALLOW", .listenerPath = "/listener" });
-    const notify = (try prepareSeccomp(arena.allocator(), .{ .defaultAction = "SCMP_ACT_ALLOW", .listenerPath = "/l", .syscalls = &.{.{ .names = &.{"mkdir"}, .action = "SCMP_ACT_NOTIFY" }} })).?;
+    const notify = (try prepareSeccomp(arena.allocator(), .{ .defaultAction = "SCMP_ACT_ALLOW", .listenerPath = "/l", .syscalls = &.{.{ .names = &.{"mkdirat"}, .action = "SCMP_ACT_NOTIFY" }} })).?;
     try std.testing.expectEqual(libcontainer.seccomp.Action.notify, notify.rules[0].action);
     try std.testing.expect((try prepareSeccomp(arena.allocator(), .{
         .defaultAction = "SCMP_ACT_ALLOW",
