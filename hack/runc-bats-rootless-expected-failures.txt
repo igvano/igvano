@@ -9,7 +9,6 @@ capabilities::runc run with unknown capability
 cgroups::runc create (limits + cgrouppath + permission on the cgroup dir) succeeds
 cgroups::runc exec --ignore-paused
 cgroups::runc exec should refuse a paused container
-cgroups::runc run (blkio weight)
 cgroups::runc run (hugetlb limits)
 cgroups::runc run/create should error for a non-empty cgroup
 cgroups::runc run/create should refuse pre-existing frozen cgroup
@@ -50,3 +49,6 @@ version::runc version
 
 # Rootless-only igvano gaps. Delete lines as they pass.
 dev::runc run [redundant default /dev/ptmx]
+
+# Host-dependent ("? " prefix): may pass or fail. blkio needs the BFQ scheduler.
+? cgroups::runc run (blkio weight)
