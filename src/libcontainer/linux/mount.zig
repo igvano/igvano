@@ -114,7 +114,7 @@ pub fn prepareMounts(allocator: std.mem.Allocator, mounts: []const libcontainer.
             .flags = mount.flags,
             .propagation = mount.propagation,
             .data = try pathString(allocator, mount.data),
-            .recursive_readonly = mount.recursive_readonly,
+            .recursive_attr = mount.recursive_attr,
             .mappings = mount.mappings,
             .copy_up = mount.copy_up,
         });
@@ -162,7 +162,7 @@ fn prepareV1CgroupMount(allocator: std.mem.Allocator, prepared: *std.ArrayList(P
             .flags = mount.flags | linux.MS.BIND,
             .propagation = 0,
             .data = "",
-            .recursive_readonly = mount.recursive_readonly,
+            .recursive_attr = mount.recursive_attr,
         });
         if (std.mem.indexOfScalar(u8, basename, ',') != null) {
             var names = std.mem.tokenizeScalar(u8, basename, ',');
@@ -324,7 +324,7 @@ pub const PreparedMount = struct {
     flags: u32,
     propagation: u32,
     data: [:0]const u8,
-    recursive_readonly: ?bool = null,
+    recursive_attr: ?libcontainer.RecursiveAttr = null,
     mappings: ?libcontainer.MountMappings = null,
     copy_up: bool = false,
     /// O_PATH source opened with host credentials in init's mount namespace.
@@ -802,12 +802,9 @@ fn applyMountAttributes(mount: PreparedMount, target_fd: posix.fd_t, step: *Root
         const requested = (mount.flags & ~@as(u32, ms.REC)) | ms.BIND | ms.REMOUNT;
         try bindRemount(target_fd, fdPath(&target_buffer, target_fd), requested);
     }
-    if (mount.recursive_readonly) |readonly| {
+    if (mount.recursive_attr) |change| {
         step.operation = "mount_setattr";
-        const attr: MountAttr = .{
-            .attr_set = if (readonly) 1 else 0, // MOUNT_ATTR_RDONLY
-            .attr_clr = if (readonly) 0 else 1,
-        };
+        const attr: MountAttr = .{ .attr_set = change.set, .attr_clr = change.clear };
         // Zig 0.16's wrapper omits the attr pointer and size; use the full ABI.
         try checkResult(linux.syscall5(.mount_setattr, @intCast(target_fd), @intFromPtr(""), linux.AT.EMPTY_PATH | linux.AT.RECURSIVE, @intFromPtr(&attr), @sizeOf(MountAttr)));
     }

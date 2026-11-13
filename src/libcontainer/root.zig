@@ -255,6 +255,12 @@ pub const Resources = struct {
 
 /// Mount options and destinations have already been translated by the frontend.
 // ponytail: MS_* flags tie this neutral interface to Linux; acceptable while
+/// MOUNT_ATTR_* bits to set and clear on a mount and every submount.
+pub const RecursiveAttr = struct {
+    set: u64 = 0,
+    clear: u64 = 0,
+};
+
 // Linux is the only implementation. Translate to neutral options when another is added.
 pub const Mount = struct {
     destination: []const u8,
@@ -263,7 +269,8 @@ pub const Mount = struct {
     flags: u32,
     propagation: u32,
     data: []const u8,
-    recursive_readonly: ?bool = null,
+    /// mount_setattr(AT_RECURSIVE) change from runc's "r*" options.
+    recursive_attr: ?RecursiveAttr = null,
     mappings: ?MountMappings = null,
     /// For tmpfs: copy the directory it covers into it first (runc's tmpcopyup).
     copy_up: bool = false,

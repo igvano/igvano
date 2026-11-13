@@ -100,7 +100,7 @@ fn expectFeatureMounts(allocator: std.mem.Allocator, reported_mounts: []const st
         try std.testing.expectEqualStrings("", options.data);
         if (std.mem.eql(u8, reported.string, "rro")) {
             has_rro = true;
-            try std.testing.expectEqual(@as(?bool, true), options.recursive_readonly);
+            try std.testing.expectEqual(@as(u64, 1), options.recursive_attr.?.set);
         }
         if (std.mem.eql(u8, reported.string, "idmap")) has_idmap = true;
         if (std.mem.eql(u8, reported.string, "ridmap")) has_ridmap = true;

@@ -26,20 +26,37 @@ pub const MountOptions = struct {
     flags: u32,
     propagation: u32,
     data: [:0]u8,
-    recursive_readonly: ?bool = null,
+    recursive_attr: ?libcontainer.RecursiveAttr = null,
     /// runc's tmpcopyup extension: copy the covered directory into a tmpfs.
     copy_up: bool = false,
 };
 
+/// MOUNT_ATTR_* values from linux/mount.h.
+pub const mount_attr = struct {
+    pub const rdonly: u64 = 0x1;
+    pub const nosuid: u64 = 0x2;
+    pub const nodev: u64 = 0x4;
+    pub const noexec: u64 = 0x8;
+    pub const atime_mask: u64 = 0x70;
+    pub const relatime: u64 = 0x0;
+    pub const noatime: u64 = 0x10;
+    pub const strictatime: u64 = 0x20;
+    pub const nodiratime: u64 = 0x80;
+    pub const nosymfollow: u64 = 0x200000;
+};
+
+const RecursiveOption = struct { clear: bool, flag: u64 };
+
 pub const mount_option_table = options: {
     const ms = std.os.linux.MS;
     const atime = ms.NOATIME | ms.RELATIME | ms.STRICTATIME;
+    const a = mount_attr;
     break :options [_]struct {
         name: []const u8,
         set: u32 = 0,
         clear: u32 = 0,
         propagation: u32 = 0,
-        recursive_readonly: ?bool = null,
+        recursive: ?RecursiveOption = null,
         idmap: ?bool = null,
         copy_up: bool = false,
     }{
@@ -71,8 +88,25 @@ pub const mount_option_table = options: {
         .{ .name = "rshared", .propagation = ms.SHARED | ms.REC },
         .{ .name = "unbindable", .propagation = ms.UNBINDABLE },
         .{ .name = "runbindable", .propagation = ms.UNBINDABLE | ms.REC },
-        .{ .name = "rro", .recursive_readonly = true },
-        .{ .name = "rrw", .recursive_readonly = false },
+        // runc's recAttrFlags, applied with mount_setattr(AT_RECURSIVE).
+        .{ .name = "rro", .recursive = .{ .clear = false, .flag = a.rdonly } },
+        .{ .name = "rrw", .recursive = .{ .clear = true, .flag = a.rdonly } },
+        .{ .name = "rnosuid", .recursive = .{ .clear = false, .flag = a.nosuid } },
+        .{ .name = "rsuid", .recursive = .{ .clear = true, .flag = a.nosuid } },
+        .{ .name = "rnodev", .recursive = .{ .clear = false, .flag = a.nodev } },
+        .{ .name = "rdev", .recursive = .{ .clear = true, .flag = a.nodev } },
+        .{ .name = "rnoexec", .recursive = .{ .clear = false, .flag = a.noexec } },
+        .{ .name = "rexec", .recursive = .{ .clear = true, .flag = a.noexec } },
+        .{ .name = "rnodiratime", .recursive = .{ .clear = false, .flag = a.nodiratime } },
+        .{ .name = "rdiratime", .recursive = .{ .clear = true, .flag = a.nodiratime } },
+        .{ .name = "rrelatime", .recursive = .{ .clear = false, .flag = a.relatime } },
+        .{ .name = "rnorelatime", .recursive = .{ .clear = true, .flag = a.relatime } },
+        .{ .name = "rnoatime", .recursive = .{ .clear = false, .flag = a.noatime } },
+        .{ .name = "ratime", .recursive = .{ .clear = true, .flag = a.noatime } },
+        .{ .name = "rstrictatime", .recursive = .{ .clear = false, .flag = a.strictatime } },
+        .{ .name = "rnostrictatime", .recursive = .{ .clear = true, .flag = a.strictatime } },
+        .{ .name = "rnosymfollow", .recursive = .{ .clear = false, .flag = a.nosymfollow } },
+        .{ .name = "rsymfollow", .recursive = .{ .clear = true, .flag = a.nosymfollow } },
         .{ .name = "idmap", .idmap = false },
         .{ .name = "ridmap", .idmap = true },
         .{ .name = "tmpcopyup", .copy_up = true },
@@ -96,8 +130,29 @@ pub fn parseMountOptions(allocator: std.mem.Allocator, options: []const []const 
             std.debug.print("igvano: warning: bind mount ignores options: {s}\n", .{data.items});
         data.clearRetainingCapacity();
     }
+    // Like runc, an all-zero change (only "rnorelatime") does nothing.
+    if (result.recursive_attr) |attr| {
+        if (attr.set == 0 and attr.clear == 0) result.recursive_attr = null;
+    }
     result.data = try data.toOwnedSliceSentinel(allocator, 0);
     return result;
+}
+
+fn applyRecursiveOption(result: *MountOptions, option: RecursiveOption) void {
+    var attr = result.recursive_attr orelse libcontainer.RecursiveAttr{};
+    if (option.clear) {
+        attr.clear |= option.flag;
+        attr.set &= ~option.flag;
+        // runc fails "ratime" with EINVAL: the kernel only clears the whole mask.
+        // Like youki, clear it all, which leaves the default relatime.
+        if (option.flag != 0 and option.flag & mount_attr.atime_mask == option.flag) attr.clear |= mount_attr.atime_mask;
+    } else {
+        attr.set |= option.flag;
+        attr.clear &= ~option.flag;
+        // mount_setattr(2): an access-time mode in attr_set needs the whole mask cleared.
+        if (option.flag & mount_attr.atime_mask == option.flag) attr.clear |= mount_attr.atime_mask;
+    }
+    result.recursive_attr = attr;
 }
 
 /// False for an option outside the table, which is filesystem data.
@@ -106,7 +161,7 @@ fn applyMountOption(result: *MountOptions, option: []const u8) bool {
         if (!std.mem.eql(u8, option, entry.name)) continue;
         result.flags = (result.flags & ~entry.clear) | entry.set;
         if (entry.propagation != 0) result.propagation = entry.propagation;
-        if (entry.recursive_readonly) |readonly| result.recursive_readonly = readonly;
+        if (entry.recursive) |recursive| applyRecursiveOption(result, recursive);
         if (entry.copy_up) result.copy_up = true;
         return true;
     }
@@ -302,19 +357,27 @@ test "linux path restrictions parse ordered string lists and propagation modes" 
     , .{}));
 }
 
-test "bind mount recursive read-only options are explicit and ordered" {
-    const cases = [_]struct { options: []const []const u8, recursive: ?bool }{
+test "recursive mount options build runc's mount_setattr change in order" {
+    const a = mount_attr;
+    const R = libcontainer.RecursiveAttr;
+    const cases = [_]struct { options: []const []const u8, recursive: ?R }{
         .{ .options = &.{ "ro", "rbind" }, .recursive = null },
-        .{ .options = &.{ "rbind", "rro" }, .recursive = true },
-        .{ .options = &.{ "bind", "rrw" }, .recursive = false },
-        .{ .options = &.{ "rbind", "rro", "rrw" }, .recursive = false },
-        .{ .options = &.{ "rbind", "rrw", "rro" }, .recursive = true },
-        .{ .options = &.{ "mode=755", "rbind", "rro" }, .recursive = true },
+        .{ .options = &.{ "rbind", "rro" }, .recursive = .{ .set = a.rdonly } },
+        .{ .options = &.{ "bind", "rrw" }, .recursive = .{ .clear = a.rdonly } },
+        .{ .options = &.{ "rbind", "rro", "rrw" }, .recursive = .{ .clear = a.rdonly } },
+        .{ .options = &.{ "rbind", "rrw", "rro" }, .recursive = .{ .set = a.rdonly } },
+        .{ .options = &.{ "mode=755", "rbind", "rro" }, .recursive = .{ .set = a.rdonly } },
+        .{ .options = &.{ "rbind", "rnosuid", "rnodev" }, .recursive = .{ .set = a.nosuid | a.nodev } },
+        .{ .options = &.{ "rbind", "rnoatime" }, .recursive = .{ .set = a.noatime, .clear = a.atime_mask } },
+        .{ .options = &.{ "rbind", "rrelatime" }, .recursive = .{ .clear = a.atime_mask } },
+        .{ .options = &.{ "rbind", "rnorelatime" }, .recursive = null },
+        .{ .options = &.{ "rbind", "ratime" }, .recursive = .{ .clear = a.atime_mask } },
+        .{ .options = &.{ "rbind", "rnosymfollow", "rsymfollow" }, .recursive = .{ .clear = a.nosymfollow } },
     };
     for (cases) |case| {
         const options = try parseMountOptions(std.testing.allocator, case.options, null);
         defer std.testing.allocator.free(options.data);
-        try std.testing.expectEqual(case.recursive, options.recursive_readonly);
+        try std.testing.expectEqual(case.recursive, options.recursive_attr);
         try std.testing.expectEqualStrings("", options.data);
     }
 }
