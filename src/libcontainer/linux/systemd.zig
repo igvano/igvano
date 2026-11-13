@@ -23,7 +23,7 @@ test "systemd memory-only updates leave device properties untouched" {
     }
 }
 
-test "systemd legacy device properties preserve defaults and configured devices with wildcard majors" {
+test "systemd legacy device properties preserve defaults and configured rules with wildcard majors" {
     const AllocationTest = struct {
         fn run(allocator: std.mem.Allocator) !void {
             const rules = try v2DeviceRules(allocator, &.{
@@ -31,7 +31,7 @@ test "systemd legacy device properties preserve defaults and configured devices 
                 .{ .allow = true, .kind = .char, .minor = 5 },
                 .{ .allow = true, .kind = .block, .major = 8, .minor = 0, .access = "rw" },
                 .{ .allow = false, .kind = .block, .major = 8, .minor = 0, .access = "w" },
-            }, &.{.{ .path = "/dev/custom", .kind = .character, .major = 10, .minor = 237 }});
+            });
             defer allocator.free(rules);
             const properties = try systemdProperties(allocator, .{}, .legacy, rules);
             defer freeSystemdProperties(allocator, properties);
@@ -52,7 +52,6 @@ test "systemd legacy device properties preserve defaults and configured devices 
                 .{ "/dev/char/5:2", "rwm" },
                 .{ "/dev/block/8:0", "r" },
                 .{ "/dev/char/10:200", "rwm" },
-                .{ "/dev/char/10:237", "rwm" },
                 .{ "char-136", "rwm" },
             };
             try std.testing.expectEqualStrings("DeviceAllow", properties[2].name);
@@ -328,7 +327,6 @@ fn setSystemdMemoryProperties(allocator: std.mem.Allocator, properties: *std.Arr
 
 fn setSystemdCpuProperties(allocator: std.mem.Allocator, properties: *std.ArrayList(dbus.Property), cpu: Resources.Cpu) libcontainer.Error!void {
     if (cpu.shares) |shares| if (shares != 0) {
-        _ = try cpuWeight(shares);
         try setSystemdProperty(allocator, properties, .{ .name = "CPUShares", .value = .{ .uint64 = shares } });
     };
     if (cpu.quota != null or cpu.period != null) try systemdQuota(allocator, properties, cpu.quota orelse -1, cpu.period orelse 0);

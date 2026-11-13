@@ -19,7 +19,6 @@ cgroups::runc run (per-device multiple iops via unified)
 cgroups::runc run/create should error for a non-empty cgroup
 cgroups::runc run/create should refuse pre-existing frozen cgroup
 delete::runc delete --force in cgroupv2 with subcgroups
-dev::runc run/update [device cgroup deny]
 env::empty HOME env var is overridden
 env::empty HOME env var is overridden with multiple overrides
 env::env var with new-line is honored
@@ -72,7 +71,6 @@ tty::runc exec [tty consolesize]
 tty::runc exec [tty owner] ({u,g}id != 0)
 tty::runc run [tty owner] ({u,g}id != 0)
 umask::umask
-update::update devices [minimal transition rules]
 userns::userns join external namespaces [wrong userns owner]
 version::runc version
 

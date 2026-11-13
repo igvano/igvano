@@ -26,33 +26,23 @@ const default_device_rules = [_]Resources.DeviceRule{
 };
 
 /// As on v1, append required device allows after the user's policy.
-pub fn v2DeviceRules(allocator: std.mem.Allocator, rules: []const Resources.DeviceRule, devices: []const libcontainer.Device) libcontainer.Error![]Resources.DeviceRule {
+/// Like runc, the configured rules and then the default allows. Devices in
+/// linux.devices are only created; the cgroup allows them only through
+/// linux.resources.devices (containerd and CRI-O add those rules).
+pub fn v2DeviceRules(allocator: std.mem.Allocator, rules: []const Resources.DeviceRule) libcontainer.Error![]Resources.DeviceRule {
     var result: std.ArrayList(Resources.DeviceRule) = .empty;
     defer result.deinit(allocator);
     try result.appendSlice(allocator, rules);
     try result.appendSlice(allocator, &default_device_rules);
-    for (devices) |device| {
-        if (device.kind == .fifo) continue;
-        try result.append(allocator, .{
-            .allow = true,
-            .kind = if (device.kind == .character) .char else .block,
-            .major = device.major,
-            .minor = device.minor,
-        });
-    }
     return result.toOwnedSlice(allocator);
 }
 
-test "v2 device rules append default and configured allows after explicit denies" {
+test "v2 device rules append the default allows, but not linux.devices nodes" {
     const allocator = std.testing.allocator;
     const rules = try v2DeviceRules(allocator, &.{
         .{ .allow = false },
         .{ .allow = false, .kind = .char, .major = 1, .minor = 3 },
         .{ .allow = false, .kind = .block, .major = 8, .minor = 0 },
-    }, &.{
-        .{ .path = "/dev/custom", .kind = .character, .major = 10, .minor = 237 },
-        .{ .path = "/dev/disk", .kind = .block, .major = 8, .minor = 0 },
-        .{ .path = "/dev/fifo", .kind = .fifo },
     });
     defer allocator.free(rules);
     const expected: []const Resources.DeviceRule = &.{
@@ -70,8 +60,6 @@ test "v2 device rules append default and configured allows after explicit denies
         .{ .allow = true, .kind = .char, .major = 136 },
         .{ .allow = true, .kind = .char, .major = 5, .minor = 2 },
         .{ .allow = true, .kind = .char, .major = 10, .minor = 200 },
-        .{ .allow = true, .kind = .char, .major = 10, .minor = 237 },
-        .{ .allow = true, .kind = .block, .major = 8, .minor = 0 },
     };
     try std.testing.expectEqualDeep(expected, @as([]const Resources.DeviceRule, rules));
 }

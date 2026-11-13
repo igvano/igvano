@@ -18,7 +18,13 @@ const mountinfoPath = @import("mountinfo.zig").mountinfoPath;
 const cgroupFrozen = @import("freezer.zig").cgroupFrozen;
 const waitFrozen = @import("freezer.zig").waitFrozen;
 
-pub const Write = struct { name: []const u8, value: []const u8 };
+pub const Write = struct {
+    name: []const u8,
+    value: []const u8,
+    /// Like runc: the kernel may refuse this write (EINVAL) until the named
+    /// later write lands, e.g. a burst above the old quota. Retry after it.
+    retry_after: ?[]const u8 = null,
+};
 
 /// Pure cgroup v2 mapping. The caller owns the slice and both strings.
 pub fn v2Writes(allocator: std.mem.Allocator, resources: Resources) libcontainer.Error![]Write {
@@ -90,18 +96,19 @@ fn appendV2CpuWrites(allocator: std.mem.Allocator, writes: *std.ArrayList(Write)
     const quota = cpu.quota orelse -1;
     if (quota < -1) return error.InvalidConfig;
     const period = if ((cpu.period orelse 0) == 0) 100000 else cpu.period.?;
-    if (cpu.quota != null or cpu.period != null) {
+    const writes_max = cpu.quota != null or cpu.period != null;
+    // Like runc, burst goes first, then again after cpu.max if refused.
+    if (cpu.burst) |burst| {
+        try appendWrite(allocator, writes, "cpu.max.burst", try std.fmt.allocPrint(allocator, "{d}", .{burst}));
+        if (writes_max) writes.items[writes.items.len - 1].retry_after = "cpu.max";
+    }
+    if (writes_max) {
         const value = if (quota <= 0)
             try std.fmt.allocPrint(allocator, "max {d}", .{period})
         else
             try std.fmt.allocPrint(allocator, "{d} {d}", .{ quota, period });
         try appendWrite(allocator, writes, "cpu.max", value);
     }
-    // After cpu.max: the kernel caps burst at the quota.
-    // ponytail: lowering the quota below the current burst in one update
-    // fails; runc retries burst around cpu.max to handle that.
-    if (cpu.burst) |burst|
-        try appendWrite(allocator, writes, "cpu.max.burst", try std.fmt.allocPrint(allocator, "{d}", .{burst}));
     if (cpu.shares) |shares| {
         const weight = try cpuWeight(shares);
         if (weight != 0)
@@ -168,12 +175,12 @@ pub fn cgroupLimit(allocator: std.mem.Allocator, limit: i64) libcontainer.Error!
 
 /// Zero shares means unset. runc's quadratic fit (opencontainers/cgroups
 /// ConvertCPUSharesToCgroupV2Value) maps 2, 1024 and 262144 to the weights
-/// 1, 100 and 10000, so the default shares give the default weight.
+/// 1, 100 and 10000, so the default shares give the default weight; values
+/// outside 2..262144 clamp, as in runc.
 pub fn cpuWeight(shares: u64) libcontainer.Error!u64 {
     if (shares == 0) return 0;
-    if (shares < 2 or shares > 262144) return error.InvalidConfig;
-    if (shares == 2) return 1;
-    if (shares == 262144) return 10000;
+    if (shares <= 2) return 1;
+    if (shares >= 262144) return 10000;
     const l = std.math.log2(@as(f64, @floatFromInt(shares)));
     const exponent = (l * l + 125 * l) / 612.0 - 7.0 / 34.0;
     return @intFromFloat(@ceil(std.math.pow(f64, 10, exponent)));
@@ -259,8 +266,8 @@ test "cpu shares map to cgroup2 weights without underflow or overflow" {
         .{ .shares = 262144, .weight = 10000 },
     };
     for (cases) |case| try std.testing.expectEqual(case.weight, try cpuWeight(case.shares));
-    for ([_]u64{ 1, 262145, std.math.maxInt(u64) }) |shares|
-        try std.testing.expectError(error.InvalidConfig, cpuWeight(shares));
+    for ([_][2]u64{ .{ 1, 1 }, .{ 262145, 10000 }, .{ std.math.maxInt(u64), 10000 } }) |case|
+        try std.testing.expectEqual(case[1], try cpuWeight(case[0]));
 }
 
 test "v2 writes preserve existing memory cpu and pids mappings" {
@@ -724,4 +731,16 @@ fn controllersEnabled(dir: posix.fd_t, controllers: []const u8) libcontainer.Err
         return false;
     }
     return true;
+}
+
+test "v2 burst goes before cpu.max and retries after it, like runc" {
+    const writes = try v2Writes(std.testing.allocator, .{ .cpu = .{ .quota = 50000, .period = 100000, .burst = 20000 } });
+    defer freeWrites(std.testing.allocator, writes);
+    try std.testing.expectEqualDeep(&[_]Write{
+        .{ .name = "cpu.max.burst", .value = "20000", .retry_after = "cpu.max" },
+        .{ .name = "cpu.max", .value = "50000 100000" },
+    }, writes);
+    const alone = try v2Writes(std.testing.allocator, .{ .cpu = .{ .burst = 0 } });
+    defer freeWrites(std.testing.allocator, alone);
+    try std.testing.expectEqualDeep(&[_]Write{.{ .name = "cpu.max.burst", .value = "0" }}, alone);
 }

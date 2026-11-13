@@ -21,6 +21,7 @@ const openCgroupRoot = @import("cgroup.zig").openCgroupRoot;
 const readCgroupFile = @import("cgroup.zig").readCgroupFile;
 const collectCgroupPids = @import("cgroup.zig").collectCgroupPids;
 const writeCgroupFile = @import("cgroup.zig").writeCgroupFile;
+const writeV2List = @import("cgroup.zig").writeV2List;
 const cgroupPopulated = @import("cgroup.zig").cgroupPopulated;
 const removeCgroup = @import("cgroup.zig").removeCgroup;
 const V1Hierarchy = @import("cgroup_v1.zig").V1Hierarchy;
@@ -158,7 +159,7 @@ fn updateV1(allocator: std.mem.Allocator, handle: libcontainer.State, resources:
     var device_rules: []const Resources.DeviceRule = &.{};
     defer allocator.free(device_rules);
     if (handle.systemd and resources.devices.len != 0) {
-        device_rules = try v2DeviceRules(allocator, resources.devices, handle.device_nodes);
+        device_rules = try v2DeviceRules(allocator, resources.devices);
     }
     if (handle.systemd) try completeV1Cpu(allocator, hierarchies, &requested);
     try setSystemdResources(allocator, handle, requested, .legacy, false, device_rules);
@@ -209,7 +210,7 @@ fn updateV2(allocator: std.mem.Allocator, root: posix.fd_t, handle: libcontainer
     try setSystemdResources(allocator, handle, requested, .unified, omit_inferred_memory_limit, &.{});
     try writeV2Resources(cgroup, writes, path, inferred_memory_limit);
     if (resources.devices.len != 0) {
-        const rules = try v2DeviceRules(allocator, resources.devices, handle.device_nodes);
+        const rules = try v2DeviceRules(allocator, resources.devices);
         defer allocator.free(rules);
         try applyV2DeviceFilter(allocator, cgroup, rules, path, true);
     }
@@ -276,15 +277,8 @@ fn unifiedHasMemoryLimit(entries: []const Resources.Unified) bool {
 }
 
 fn writeV2Resources(cgroup: posix.fd_t, writes: []const Write, path: []const u8, inferred_memory_limit: bool) libcontainer.Error!void {
-    var skip_memory_limit = inferred_memory_limit;
-    for (writes) |write| {
-        // The current limit was needed only to convert total swap.
-        if (skip_memory_limit and std.mem.eql(u8, write.name, "memory.max")) {
-            skip_memory_limit = false;
-            continue;
-        }
-        try writeCgroupFile(cgroup, write.name, write.value, path);
-    }
+    // The current limit was needed only to convert total swap.
+    try writeV2List(cgroup, writes, path, if (inferred_memory_limit) "memory.max" else null);
 }
 
 pub fn pids(handle: libcontainer.State, allocator: std.mem.Allocator) libcontainer.Error![]i32 {

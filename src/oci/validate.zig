@@ -284,9 +284,6 @@ test "frontend validation failures retain specific diagnostics" {
         try std.testing.expect(diagnosticFor(error.OutOfMemory) == null);
     }
     clearDiagnostic();
-    try std.testing.expectError(error.InvalidConfig, cgroupResources(std.testing.allocator, .{ .cpu = .{ .shares = 1 } }));
-    try std.testing.expect(std.mem.startsWith(u8, diagnostic().?, "linux.resources.cpu.shares:"));
-    clearDiagnostic();
     try std.testing.expectError(error.InvalidConfig, prepareSeccomp(std.testing.allocator, .{ .defaultAction = "unknown" }));
     try std.testing.expect(std.mem.startsWith(u8, diagnostic().?, "linux.seccomp:"));
     clearDiagnostic();

@@ -16,7 +16,6 @@ const closeFd = @import("syscall.zig").closeFd;
 const openPath = @import("syscall.zig").openPath;
 const reportDiagnostic = @import("diagnostic.zig").reportDiagnostic;
 const cgroupLimit = @import("cgroup_v2.zig").cgroupLimit;
-const cpuWeight = @import("cgroup_v2.zig").cpuWeight;
 const ioWeight = @import("cgroup_v2.zig").ioWeight;
 const walkCgroup = @import("cgroup_v2.zig").walkCgroup;
 const createCgroupDirectory = @import("cgroup.zig").createCgroupDirectory;
@@ -42,6 +41,8 @@ pub const V1Write = struct {
     value: []const u8,
     fallback: ?[]const u8 = null,
     optional: bool = false,
+    /// See cgroup_v2.Write.retry_after.
+    retry_after: ?[]const u8 = null,
 };
 
 /// Controller and fallback names are static; the caller owns name and value.
@@ -111,12 +112,11 @@ fn appendV1MemoryWrites(allocator: std.mem.Allocator, writes: *std.ArrayList(V1W
 
 fn appendV1CpuWrites(allocator: std.mem.Allocator, writes: *std.ArrayList(V1Write), cpu: Resources.Cpu) libcontainer.Error!void {
     if (cpu.shares) |value| {
-        _ = try cpuWeight(value);
         if (value != 0)
             try appendV1Write(allocator, writes, "cpu", "cpu.shares", try std.fmt.allocPrint(allocator, "{d}", .{value}), null, false);
     }
+    try appendV1QuotaCoupledWrites(allocator, writes, cpu);
     inline for (.{
-        .{ "period", "cpu.cfs_period_us" },
         .{ "quota", "cpu.cfs_quota_us" },
         .{ "realtime_period", "cpu.rt_period_us" },
         .{ "realtime_runtime", "cpu.rt_runtime_us" },
@@ -127,14 +127,26 @@ fn appendV1CpuWrites(allocator: std.mem.Allocator, writes: *std.ArrayList(V1Writ
                 try appendV1Write(allocator, writes, "cpu", field[1], try std.fmt.allocPrint(allocator, "{d}", .{value}), null, false);
         }
     }
-    if (cpu.burst) |value|
-        try appendV1Write(allocator, writes, "cpu", "cpu.cfs_burst_us", try std.fmt.allocPrint(allocator, "{d}", .{value}), null, false);
     if (cpu.idle) |value|
         try appendV1Write(allocator, writes, "cpu", "cpu.idle", try std.fmt.allocPrint(allocator, "{d}", .{value}), null, false);
     if (cpu.cpus) |value|
         try appendV1Write(allocator, writes, "cpuset", "cpuset.cpus", try allocator.dupe(u8, value), null, false);
     if (cpu.mems) |value|
         try appendV1Write(allocator, writes, "cpuset", "cpuset.mems", try allocator.dupe(u8, value), null, false);
+}
+
+/// Like runc: period and burst go before the quota and, if refused with
+/// EINVAL, again after it. A kernel without CFS burst ignores it.
+fn appendV1QuotaCoupledWrites(allocator: std.mem.Allocator, writes: *std.ArrayList(V1Write), cpu: Resources.Cpu) libcontainer.Error!void {
+    const retry: ?[]const u8 = if ((cpu.quota orelse 0) != 0) "cpu.cfs_quota_us" else null;
+    if (cpu.period) |value| if (value != 0) {
+        try appendV1Write(allocator, writes, "cpu", "cpu.cfs_period_us", try std.fmt.allocPrint(allocator, "{d}", .{value}), null, false);
+        writes.items[writes.items.len - 1].retry_after = retry;
+    };
+    if (cpu.burst) |value| {
+        try appendV1Write(allocator, writes, "cpu", "cpu.cfs_burst_us", try std.fmt.allocPrint(allocator, "{d}", .{value}), null, true);
+        writes.items[writes.items.len - 1].retry_after = retry;
+    }
 }
 
 fn appendV1PidsWrites(allocator: std.mem.Allocator, writes: *std.ArrayList(V1Write), pids: Resources.Pids) libcontainer.Error!void {
@@ -224,7 +236,7 @@ test "v1 creation preserves configured device order and round-trips wildcard def
         .{ .allow = false },
         .{ .allow = true, .kind = .char, .major = 10, .minor = 229 },
         .{ .allow = true, .kind = .block, .major = 8, .minor = -1, .access = "rw" },
-    }, &.{});
+    });
     defer allocator.free(configured);
     var target = try deviceEmulator(allocator, configured);
     defer target.deinit(allocator);
@@ -393,7 +405,7 @@ test "v1 writes preserve native memory limits and CPU ordering" {
         .{ .controller = "memory", .name = "memory.swappiness", .value = "50" },
         .{ .controller = "memory", .name = "memory.oom_control", .value = "1" },
         .{ .controller = "cpu", .name = "cpu.shares", .value = "1024" },
-        .{ .controller = "cpu", .name = "cpu.cfs_period_us", .value = "100000" },
+        .{ .controller = "cpu", .name = "cpu.cfs_period_us", .value = "100000", .retry_after = "cpu.cfs_quota_us" },
         .{ .controller = "cpu", .name = "cpu.cfs_quota_us", .value = "50000" },
         .{ .controller = "cpu", .name = "cpu.rt_period_us", .value = "1000000" },
         .{ .controller = "cpu", .name = "cpu.rt_runtime_us", .value = "950000" },
@@ -532,7 +544,6 @@ test "v1 mapping rejects unified and malformed resources and preserves wildcard 
         .{ .memory = .{ .limit = -2 } },
         .{ .memory = .{ .limit = 128, .swap = 64 } },
         .{ .memory = .{ .swappiness = 101 } },
-        .{ .cpu = .{ .shares = 1 } },
         .{ .cpu = .{ .quota = -2 } },
         .{ .block_io = .{ .weight = 9 } },
         .{ .hugepage_limits = &.{.{ .page_size = "../2MB", .limit = 1 }} },
@@ -634,7 +645,7 @@ pub fn walkV1Cgroup(allocator: std.mem.Allocator, root: posix.fd_t, mount_root: 
 }
 
 /// Keep errno available for BFQ fallbacks and deprecated kmem handling.
-fn tryV1Write(dir: posix.fd_t, filename: []const u8, value: []const u8) linux.E {
+pub fn tryV1Write(dir: posix.fd_t, filename: []const u8, value: []const u8) linux.E {
     var buffer: [256]u8 = undefined;
     const name = std.fmt.bufPrintZ(&buffer, "{s}", .{filename}) catch return .INVAL;
     const fd: posix.fd_t = open: while (true) {
@@ -693,7 +704,7 @@ fn requiredV1Controller(controller: []const u8, resources: Resources, devices: [
 pub fn applyV1Writes(allocator: std.mem.Allocator, hierarchies: []const V1Hierarchy, writes: []const V1Write, resources: Resources, devices: ?[]const libcontainer.Device, path: []const u8, create: bool) libcontainer.Error!void {
     const has_devices = devices != null or resources.devices.len != 0;
     const nodes = devices orelse &.{};
-    const configured = if (has_devices) try v2DeviceRules(allocator, resources.devices, nodes) else &.{};
+    const configured = if (has_devices) try v2DeviceRules(allocator, resources.devices) else &.{};
     defer allocator.free(configured);
     var target = try deviceEmulator(allocator, configured);
     defer target.deinit(allocator);
@@ -761,15 +772,43 @@ fn v1MemoryWriteOrder(allocator: std.mem.Allocator, hierarchy: V1Hierarchy, writ
 
 fn applyV1HierarchyWrites(allocator: std.mem.Allocator, hierarchy: V1Hierarchy, writes: []const V1Write, resources: Resources, path: []const u8, kmem_warned: *bool) libcontainer.Error!void {
     const order = try v1MemoryWriteOrder(allocator, hierarchy, writes, resources);
+    var pending: V1Pending = .{};
     for (writes, 0..) |write, index| {
         if (!hierarchy.has(write.controller)) continue;
         if (order.swap_first) |swap| {
             if (index == swap) continue;
             if (index == order.limit.?) try writeV1Resource(hierarchy.leaf.?, writes[swap], path, kmem_warned);
         }
+        if (write.retry_after != null and pending.tryFirst(hierarchy.leaf.?, write)) continue;
         try writeV1Resource(hierarchy.leaf.?, write, path, kmem_warned);
+        try pending.retryAfter(hierarchy.leaf.?, write.name, path, kmem_warned);
     }
 }
+
+/// Coupled writes refused with EINVAL, retried after their dependency.
+const V1Pending = struct {
+    items: [2]?V1Write = .{ null, null },
+
+    /// True when handled: written, or queued for a retry.
+    fn tryFirst(self: *V1Pending, dir: posix.fd_t, write: V1Write) bool {
+        switch (tryV1Write(dir, write.name, write.value)) {
+            .SUCCESS => return true,
+            .INVAL => for (&self.items) |*slot| if (slot.* == null) {
+                slot.* = write;
+                return true;
+            },
+            else => {},
+        }
+        return false;
+    }
+
+    fn retryAfter(self: *V1Pending, dir: posix.fd_t, name: []const u8, path: []const u8, kmem_warned: *bool) libcontainer.Error!void {
+        for (&self.items) |*slot| if (slot.*) |retry| if (std.mem.eql(u8, retry.retry_after.?, name)) {
+            try writeV1Resource(dir, retry, path, kmem_warned);
+            slot.* = null;
+        };
+    }
+};
 
 fn applyV1DeviceWrites(allocator: std.mem.Allocator, dir: posix.fd_t, target: DeviceEmulator, path: []const u8, create: bool, kmem_warned: *bool) libcontainer.Error!void {
     const list = try readCgroupFile(allocator, dir, "devices.list");

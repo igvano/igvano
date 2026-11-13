@@ -101,7 +101,7 @@ test "linux v1 device updates verify readback after writing only the transition"
     const denied = try tmp.dir.readFileAlloc(std.testing.io, "devices.deny", std.testing.allocator, .limited(64));
     defer std.testing.allocator.free(denied);
     try std.testing.expectEqualStrings("untouched", denied);
-    const configured = try v2DeviceRules(std.testing.allocator, resources.devices, &.{});
+    const configured = try v2DeviceRules(std.testing.allocator, resources.devices);
     defer std.testing.allocator.free(configured);
     var target = try deviceEmulator(std.testing.allocator, configured);
     defer target.deinit(std.testing.allocator);
@@ -373,7 +373,7 @@ test "linux v2 device filter skips load errors in a user namespace for every pol
                 if (std.mem.indexOf(u8, diagnostics.last_diagnostic[0..diagnostics.last_diagnostic_len], "warning:") == null)
                     linux.exit_group(6);
             }
-            const implicit = v2DeviceRules(allocator, &.{}, &.{}) catch linux.exit_group(7);
+            const implicit = v2DeviceRules(allocator, &.{}) catch linux.exit_group(7);
             applyV2DeviceFilter(allocator, -1, implicit, "rootless-implicit-devices", false) catch linux.exit_group(8);
             allocator.free(implicit);
             var actual: linux.rlimit = undefined;

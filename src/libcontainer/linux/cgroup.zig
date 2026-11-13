@@ -21,6 +21,7 @@ const v1Writes = @import("cgroup_v1.zig").v1Writes;
 const V1Hierarchy = @import("cgroup_v1.zig").V1Hierarchy;
 const walkV1Cgroup = @import("cgroup_v1.zig").walkV1Cgroup;
 const applyV1Writes = @import("cgroup_v1.zig").applyV1Writes;
+const tryV1Write = @import("cgroup_v1.zig").tryV1Write;
 
 pub const CgroupMode = enum { unified, legacy };
 pub const CgroupRoot = struct { fd: posix.fd_t, fs_type: usize, mode: CgroupMode };
@@ -169,9 +170,34 @@ test "backend cgroup paths must name a normalized child directory" {
     }
 }
 
+/// Applies v2 writes in order, retrying a refused coupled write right after
+/// the write it depends on (see Write.retry_after). `skip` drops the first
+/// write of that name.
+pub fn writeV2List(dir: posix.fd_t, writes: []const Write, path: []const u8, skip: ?[]const u8) libcontainer.Error!void {
+    var pending: ?Write = null;
+    var skipping = skip;
+    for (writes) |write| {
+        if (skipping) |name| if (std.mem.eql(u8, name, write.name)) {
+            skipping = null;
+            continue;
+        };
+        if (write.retry_after != null) switch (tryV1Write(dir, write.name, write.value)) {
+            .SUCCESS => continue,
+            .INVAL => {
+                pending = write;
+                continue;
+            },
+            else => {},
+        };
+        try writeCgroupFile(dir, write.name, write.value, path);
+        if (pending) |retry| if (std.mem.eql(u8, retry.retry_after.?, write.name)) {
+            try writeCgroupFile(dir, retry.name, retry.value, path);
+            pending = null;
+        };
+    }
+}
+
 fn missingFileIsFine(filename: []const u8, value: []const u8) bool {
-    // Like runc, a kernel without CFS burst ignores cpu.cfs_burst_us.
-    if (std.mem.eql(u8, filename, "cpu.cfs_burst_us")) return true;
     return std.mem.eql(u8, filename, "memory.swap.max") and
         (std.mem.eql(u8, value, "max") or std.mem.eql(u8, value, "0"));
 }
@@ -186,8 +212,7 @@ pub fn writeCgroupFile(dir: posix.fd_t, filename: []const u8, value: []const u8,
         switch (linux.errno(result)) {
             .SUCCESS => break :open @intCast(result),
             .INTR => continue,
-            // Like runc, a host without swap ignores unlimiting or disabling
-            // it, and one without CFS burst ignores the v1 burst.
+            // Like runc, a host without swap ignores unlimiting or disabling it.
             .NOENT => if (missingFileIsFine(filename, value)) return else {
                 reportDiagnostic("cgroup '{s}' cannot open {s}: NOENT", .{ path, filename });
                 return error.CgroupWriteFailed;
@@ -440,12 +465,12 @@ test "cgroup membership verifies hierarchy and subtree boundaries" {
 pub fn configureCgroup(allocator: std.mem.Allocator, root: posix.fd_t, mode: CgroupMode, cgroup: *?posix.fd_t, hierarchies: []V1Hierarchy, options: libcontainer.CreateOptions, writes: []const Write, v1_writes: []const V1Write) libcontainer.Error!void {
     if (mode == .unified) {
         cgroup.* = (try walkCgroup(root, options.cgroup_path, !options.systemd, writes)) orelse return error.CreateFailed;
-        for (writes) |write| try writeCgroupFile(cgroup.*.?, write.name, write.value, options.cgroup_path);
+        try writeV2List(cgroup.*.?, writes, options.cgroup_path, null);
         // BPF_CGROUP_DEVICE needs CAP_SYS_ADMIN in the initial user
         // namespace, so a non-root runtime cannot enforce device rules.
         const no_bpf = options.rootless_cgroups and linux.geteuid() != 0;
         if (!no_bpf and !devicefilter.isAllowAll(options.resources.devices)) {
-            const rules = try v2DeviceRules(allocator, options.resources.devices, options.devices);
+            const rules = try v2DeviceRules(allocator, options.resources.devices);
             defer allocator.free(rules);
             try applyV2DeviceFilter(allocator, cgroup.*.?, rules, options.cgroup_path, false);
         }

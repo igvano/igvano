@@ -73,8 +73,6 @@ fn resourceMemory(memory: Spec.Resources.Memory) !libcontainer.Resources.Memory 
 fn resourceCpu(cpu: Spec.Resources.Cpu) !libcontainer.Resources.Cpu {
     try validateResourceLimit(cpu.quota, "linux.resources.cpu.quota");
     try validateResourceLimit(cpu.realtimeRuntime, "linux.resources.cpu.realtimeRuntime");
-    if (cpu.shares) |shares|
-        if (shares != 0 and (shares < 2 or shares > 262144)) return invalidConfig("linux.resources.cpu.shares: expected 0 or 2..262144", .{});
     return .{
         .shares = cpu.shares,
         .quota = cpu.quota,
@@ -298,15 +296,11 @@ test "cgroup resource validation rejects invalid signed limits and cpu shares" {
         .{ .memory = .{ .limit = -2 } },
         .{ .pids = .{ .limit = -2 } },
         .{ .cpu = .{ .quota = -2 } },
-        .{ .cpu = .{ .shares = 1 } },
-        .{ .memory = .{ .limit = 64 }, .cpu = .{ .shares = 1 } },
         .{ .memory = .{ .reservation = -2 } },
         .{ .memory = .{ .swap = -2 } },
         .{ .memory = .{ .kernel = -2 } },
         .{ .memory = .{ .kernelTCP = -2 } },
         .{ .cpu = .{ .realtimeRuntime = -2 } },
-        .{ .cpu = .{ .shares = 262145 } },
-        .{ .cpu = .{ .shares = std.math.maxInt(u64) } },
     }) |resources| {
         try std.testing.expectError(error.InvalidConfig, cgroupResources(std.testing.allocator, resources));
     }

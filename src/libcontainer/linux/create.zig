@@ -936,7 +936,7 @@ fn writeInitMappings(ctx: *CreateContext, pid: i32) libcontainer.Error!void {
 
 fn adoptInitSystemd(ctx: *CreateContext, init_pid: i32) libcontainer.Error!void {
     const device_rules = if (ctx.cgroups.cgroup_root.mode == .legacy)
-        try v2DeviceRules(ctx.allocator, ctx.options.resources.devices, ctx.options.devices)
+        try v2DeviceRules(ctx.allocator, ctx.options.resources.devices)
     else
         &.{};
     defer ctx.allocator.free(device_rules);
