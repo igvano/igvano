@@ -257,7 +257,8 @@ pub const RootfsOptions = struct {
     mount_source_socket: ?posix.fd_t = null,
     /// Read end of the runtime's "seccomp listener copied" pipe (init sync).
     seccomp_ack_fd: ?posix.fd_t = null,
-    /// The runtime is not root (see installSeccompListener).
+    /// Init is dumpable by design: a non-root runtime that created the user
+    /// namespace (see installSeccompListener).
     rootless: bool = false,
 };
 

@@ -8,6 +8,9 @@
 # the run to the listed files (space separated, without .bats);
 # RUNC_BATS_TIMEOUT overrides the seconds allowed per file.
 # RUNC_BATS_RUNTIME=<static binary> runs the suite against e.g. runc instead.
+# RUNC_BATS_ROOTLESS=1 runs it as an unprivileged user, like runc's
+# tests/rootless.sh with the idmap and cgroup features, gated by
+# hack/runc-bats-rootless-expected-failures.txt.
 # Exit status: 0 when the failures match the list exactly, 1 otherwise.
 set -eu
 
@@ -29,7 +32,7 @@ if [ "${1-}" = "--inside" ]; then
         done
     fi
     apt-get update -qq
-    apt-get install -y -qq --no-install-recommends jq iproute2 uidmap libseccomp-dev xz-utils >/dev/null
+    apt-get install -y -qq --no-install-recommends jq iproute2 uidmap libseccomp-dev xz-utils sudo >/dev/null
     git init -q /tmp/bats-core
     git -C /tmp/bats-core fetch -q --depth 1 https://github.com/bats-core/bats-core.git "$BATS_REF"
     git -C /tmp/bats-core checkout -q --detach FETCH_HEAD
@@ -47,6 +50,22 @@ if [ "${1-}" = "--inside" ]; then
     printf 'runc tests %s\n' "$(git rev-parse HEAD)"
     make test-binaries >/dev/null
     export RUNC=/usr/local/sbin/runc
+    if [ -n "${RUNC_BATS_ROOTLESS:-}" ]; then
+        # runc's tests/rootless.sh, enable_idmap: subordinate IDs for newuidmap.
+        useradd -u2000 -m -d/home/rootless -s/bin/bash rootless
+        echo rootless:100000:65536 >> /etc/subuid
+        echo rootless:200000:65536 >> /etc/subgid
+        export ROOTLESS_FEATURES=idmap+cgroup
+        export ROOTLESS_UIDMAP_START=100000 ROOTLESS_UIDMAP_LENGTH=65536
+        export ROOTLESS_GIDMAP_START=200000 ROOTLESS_GIDMAP_LENGTH=65536
+        export AUX_UID=1024
+        AUX_DIR=$(mktemp -d)
+        chown "$((100000 - 1000 + AUX_UID))" "$AUX_DIR"
+        export AUX_DIR
+        chmod a+rx /runc /runc/tests /runc/tests/integration
+        # The rootless user cannot write testdata; fetch the images as root.
+        tests/integration/get-images.sh >/dev/null
+    fi
     all_files=$(cd tests/integration && ls ./*.bats | sed 's|^\./||; s|\.bats$||')
     files=${RUNC_BATS_FILES:-$all_files}
     for file in $files; do
@@ -57,9 +76,20 @@ if [ "${1-}" = "--inside" ]; then
     for file in $files; do
         printf '\n===== %s =====\n' "$file"
         status=0
+        bats="bats -t tests/integration/$file.bats"
+        if [ -n "${RUNC_BATS_ROOTLESS:-}" ]; then
+            # runc's tests/rootless.sh, enable_cgroup: delegate one cgroup v2 subtree.
+            cg=/sys/fs/cgroup/runc-cgroups-integration-test
+            for c in $(cat /sys/fs/cgroup/cgroup.controllers); do echo "+$c" > /sys/fs/cgroup/cgroup.subtree_control; done
+            mkdir -p "$cg"
+            chown root:rootless "$cg" "$cg/cgroup.subtree_control" "$cg/cgroup.procs" /sys/fs/cgroup/cgroup.procs
+            chmod g+rwx "$cg"
+            chmod g+rw "$cg/cgroup.subtree_control" "$cg/cgroup.procs" /sys/fs/cgroup/cgroup.procs
+            bats="sudo -HE -u rootless PATH=$PATH $(command -v bats) -t tests/integration/$file.bats"
+        fi
         # Some tests want a terminal; script(1) provides one, like youki's runner.
         timeout --kill-after=5 "$timeout_seconds" \
-            script -qefc "bats -t tests/integration/$file.bats" /dev/null < /dev/null > /tmp/tap.raw 2>&1 || status=$?
+            script -qefc "$bats" /dev/null < /dev/null > /tmp/tap.raw 2>&1 || status=$?
         tr -d '\r' < /tmp/tap.raw > /tmp/tap
         cat /tmp/tap
         printf '\nExit status: %s\n' "$status"
@@ -83,7 +113,8 @@ if [ "${1-}" = "--inside" ]; then
 fi
 
 repo=$(CDPATH='' cd "$(dirname "$0")/.." && pwd)
-log=${RUNC_BATS_LOG:-"$repo/.zig-cache/runc-bats.log"}
+suffix=${RUNC_BATS_ROOTLESS:+-rootless}
+log=${RUNC_BATS_LOG:-"$repo/.zig-cache/runc-bats$suffix.log"}
 mkdir -p "$(dirname "$log")"
 printf 'Running runc bats harness; full log: %s\n' "$log"
 status=0
@@ -103,8 +134,9 @@ status=0
         -e "RUNC_REF=${RUNC_REF:-$RUNC_REF_DEFAULT}" -e "BATS_REF=$BATS_REF" \
         -e "RUNC_BATS_FILES=${RUNC_BATS_FILES:-}" \
         -e "RUNC_BATS_TIMEOUT=${RUNC_BATS_TIMEOUT:-600}" \
+        -e "RUNC_BATS_ROOTLESS=${RUNC_BATS_ROOTLESS:-}" \
         golang:1.25-bookworm@sha256:3b4a11519ad929d1e1d261a12cff056f0c85b735253d7d861346b9c6f8b36437 sh /runc-bats.sh --inside || exit "$?"
-    sh "$repo/hack/gate.sh" "$snapshot/outputs/results" "$snapshot/outputs/groups" "$repo/hack/runc-bats-expected-failures.txt"
+    sh "$repo/hack/gate.sh" "$snapshot/outputs/results" "$snapshot/outputs/groups" "$repo/hack/runc-bats$suffix-expected-failures.txt"
 ) > "$log" 2>&1 || status=$?
 cat "$log"
 printf '\nFull log: %s\n' "$log"

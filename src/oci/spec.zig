@@ -63,8 +63,9 @@ pub const Spec = struct {
     };
 
     pub const User = struct {
-        uid: u32,
-        gid: u32,
+        // runc's decoder takes "user": {} as root, too.
+        uid: u32 = 0,
+        gid: u32 = 0,
         additionalGids: ?[]const u32 = null,
     };
 

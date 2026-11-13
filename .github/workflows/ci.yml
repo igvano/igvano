@@ -86,6 +86,22 @@ jobs:
           name: runc-bats-log
           path: .zig-cache/runc-bats.log
 
+  runc-bats-rootless:
+    # The same suite as an unprivileged user (idmap + cgroup features);
+    # gated by hack/runc-bats-rootless-expected-failures.txt.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: cachix/install-nix-action@91f6a0f59e94dfb2cfed0f4000f36a68ead1d20c # v31.11.4
+      - run: ./hack/runc-bats.sh
+        env:
+          RUNC_BATS_ROOTLESS: "1"
+      - if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: runc-bats-rootless-log
+          path: .zig-cache/runc-bats-rootless.log
+
   containerd:
     # containerd's integration/client suite; gated by hack/containerd-expected-failures.txt.
     runs-on: ubuntu-24.04

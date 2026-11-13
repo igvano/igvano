@@ -129,8 +129,10 @@ pub fn runProcess(configured: ?libcontainer.Process, executable: ?[*:0]const u8,
 /// fd number on `report_fd` (write must never be notified, which the frontend
 /// enforces), then wait for the runtime to copy it before closing ours.
 /// Notified syscalls made meanwhile simply wait for the agent.
-/// `rootless`: the runtime is not root, so pidfd_getfd passes the ptrace
-/// check only while this task is dumpable; stay dumpable until the ack.
+/// `rootless`: init of a non-root runtime that created the user namespace,
+/// already dumpable by design. setuid to a non-root user clears dumpable,
+/// and pidfd_getfd then fails the ptrace check, so restore it until the
+/// ack. Other callers fail closed, as runc does.
 pub fn installSeccompListener(program: seccomp.Program, report_fd: posix.fd_t, ack_fd: posix.fd_t, rootless: bool) libcontainer.Error!void {
     var listener: i32 = -1;
     const result = seccomp.installListener(program, &listener);
@@ -238,16 +240,25 @@ pub fn applyProcessSettings(process: ProcessSettings) libcontainer.Error!void {
         }
         // With a user namespace, additional_gids (like uid/gid) are namespace IDs.
         const groups = process.additional_gids;
-        // Like runc, a user namespace with setgroups "deny" (rootless) keeps
-        // no supplementary groups: drop to none is refused, and is moot.
+        // Like runc, skip it only in a user namespace with setgroups "deny"
+        // (rootless), where the kernel refuses it; otherwise fail closed.
         const result = linux.setgroups(groups.len, groups.ptr);
-        if (!(linux.errno(result) == .PERM and groups.len == 0)) try checkResult(result);
+        if (!(linux.errno(result) == .PERM and groups.len == 0 and setgroupsDenied())) try checkResult(result);
         try checkResult(linux.setgid(process.gid));
         try checkResult(linux.setuid(process.uid));
         if (process.capabilities) |caps| try applyCapabilities(caps);
     } else {
         return error.NotImplemented;
     }
+}
+
+fn setgroupsDenied() bool {
+    const fd = openPath(linux.AT.FDCWD, "/proc/self/setgroups", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }) catch return false;
+    defer closeFd(fd);
+    var buffer: [16]u8 = undefined;
+    const count = linux.read(fd, &buffer, buffer.len);
+    if (linux.errno(count) != .SUCCESS) return false;
+    return std.mem.eql(u8, std.mem.trim(u8, buffer[0..count], " \n"), "deny");
 }
 
 fn dropBoundingCapabilities(bounding: u64) libcontainer.Error!void {

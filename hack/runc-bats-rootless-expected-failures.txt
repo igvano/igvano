@@ -1,0 +1,52 @@
+# Expected rootless runc bats failures (RUNC_BATS_ROOTLESS=1), in the format
+# of hack/runc-bats-expected-failures.txt.
+
+# Also expected as root (hack/runc-bats-expected-failures.txt).
+capabilities::runc exec --cap
+capabilities::runc exec --cap [ambient is set from spec]
+capabilities::runc run [ambient caps not set in inheritable result in a warning]
+capabilities::runc run with unknown capability
+cgroups::runc create (limits + cgrouppath + permission on the cgroup dir) succeeds
+cgroups::runc exec --ignore-paused
+cgroups::runc exec should refuse a paused container
+cgroups::runc run (blkio weight)
+cgroups::runc run (hugetlb limits)
+cgroups::runc run/create should error for a non-empty cgroup
+cgroups::runc run/create should refuse pre-existing frozen cgroup
+env::empty HOME env var is overridden
+env::empty HOME env var is overridden with multiple overrides
+env::env var with new-line is honored
+exec::runc exec --preserve-fds
+exec::runc exec --user
+exec::runc exec [execve error]
+exec::runc exec [exit codes]
+exec::runc exec check default home
+hooks::runc create [hook fails]
+hooks::runc create [second createRuntime hook fails]
+hooks::runc run [hook fails]
+hooks::runc run [hook's argv is preserved]
+hooks::runc run [startContainer hook should inherit process environment]
+ioprio::ioprio_set is applied to process group
+kill::kill KILL [host pidns + init gone]
+kill::kill KILL [host pidns]
+mounts::runc run [ro /dev mount]
+personality::runc run personality for i686
+personality::runc run personality with exec for i686
+ps::ps after the container stopped
+run::runc run --keep (check cgroup exists)
+run::runc run [/proc/self/exe clone]
+run::runc run [execve error]
+run::runc run [hostname domainname]
+run::runc run [joining existing container namespaces]
+run::runc run check default home
+run::runc run with tmpfs perms
+seccomp::runc run [seccomp] (SECCOMP_FILTER_FLAG_*)
+seccomp::runc run [seccomp] (startContainer hook)
+tty::runc exec [tty consolesize]
+tty::runc exec [tty owner] ({u,g}id != 0)
+tty::runc run [tty owner] ({u,g}id != 0)
+umask::umask
+version::runc version
+
+# Rootless-only igvano gaps. Delete lines as they pass.
+dev::runc run [redundant default /dev/ptmx]

@@ -104,6 +104,9 @@ const CreateNamespaces = struct {
     gid_map: []const u8 = undefined,
     /// A non-root runtime with a created or joined user namespace.
     rootless_userns: bool = false,
+    /// rootless_userns with a new user namespace and no namespace joins: init
+    /// stays dumpable like runc's; joined namespaces keep it non-dumpable.
+    rootless_dumpable: bool = false,
 };
 
 const CreateInit = struct {
@@ -304,6 +307,7 @@ fn prepareCreatePaths(ctx: *CreateContext) libcontainer.Error!void {
     ctx.namespaces.fifo_gid = if (ctx.namespaces.user_namespace or ctx.namespaces.joined_user_namespace) try mappedRootID(ctx.namespaces.container_mappings.gid) else 0;
     ctx.namespaces.uid_map = try formatIDMappings(ctx.allocator, ctx.options.uid_mappings);
     ctx.namespaces.rootless_userns = ctx.namespaces.isolation_flags & linux.CLONE.NEWUSER != 0 and linux.geteuid() != 0;
+    ctx.namespaces.rootless_dumpable = ctx.namespaces.rootless_userns and ctx.namespaces.user_namespace and ctx.namespaces.joins.items.len == 0;
     ctx.namespaces.gid_map = try formatIDMappings(ctx.allocator, ctx.options.gid_mappings);
     ctx.init.fifo = try ctx.allocator.dupeZ(u8, ctx.options.exec_fifo);
     ctx.init.rootfs = try processString(ctx.allocator, ctx.options.rootfs);
@@ -630,11 +634,11 @@ fn runCreateChild(ctx: *const CreateContext) noreturn {
     // task's /proc files belong to root, so the runtime could neither write
     // its ID maps nor open its namespaces for exec. Every process involved
     // already runs as the same host user.
-    if (ctx.namespaces.rootless_userns) setDumpable(ctx, true);
+    if (ctx.namespaces.rootless_dumpable) setDumpable(ctx, true);
     // NEWPID affects the next fork, making child2 pid 1 inside the namespace.
     const child2 = forkProcess() catch |err| failCreate(ctx.sync.report[1], err);
     if (child2 == 0) runInitChild(ctx);
-    if (ctx.namespaces.rootless_userns) setDumpable(ctx, false);
+    if (ctx.namespaces.rootless_dumpable) setDumpable(ctx, false);
     reportCreatedInit(ctx, child2);
 }
 
@@ -713,7 +717,7 @@ fn runInitChild(ctx: *const CreateContext) noreturn {
         .console_fd = if (ctx.options.console_fds) |fds| fds[1] else null,
         .mount_source_socket = ctx.mount_source_socket,
         .seccomp_ack_fd = if (ctx.sync.seccomp_ack) |fds| fds[0] else null,
-        .rootless = ctx.namespaces.rootless_userns,
+        .rootless = ctx.namespaces.rootless_dumpable,
     }, ctx.init.start_hooks, start_input, ctx.init.apparmor_command, ctx.init.seccomp_program);
 }
 

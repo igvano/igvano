@@ -169,7 +169,9 @@ test "backend cgroup paths must name a normalized child directory" {
     }
 }
 
-fn missingSwapIsFine(filename: []const u8, value: []const u8) bool {
+fn missingFileIsFine(filename: []const u8, value: []const u8) bool {
+    // Like runc, a kernel without CFS burst ignores cpu.cfs_burst_us.
+    if (std.mem.eql(u8, filename, "cpu.cfs_burst_us")) return true;
     return std.mem.eql(u8, filename, "memory.swap.max") and
         (std.mem.eql(u8, value, "max") or std.mem.eql(u8, value, "0"));
 }
@@ -184,8 +186,9 @@ pub fn writeCgroupFile(dir: posix.fd_t, filename: []const u8, value: []const u8,
         switch (linux.errno(result)) {
             .SUCCESS => break :open @intCast(result),
             .INTR => continue,
-            // Like runc, a host without swap ignores unlimiting or disabling it.
-            .NOENT => if (missingSwapIsFine(filename, value)) return else {
+            // Like runc, a host without swap ignores unlimiting or disabling
+            // it, and one without CFS burst ignores the v1 burst.
+            .NOENT => if (missingFileIsFine(filename, value)) return else {
                 reportDiagnostic("cgroup '{s}' cannot open {s}: NOENT", .{ path, filename });
                 return error.CgroupWriteFailed;
             },
@@ -444,12 +447,7 @@ pub fn configureCgroup(allocator: std.mem.Allocator, root: posix.fd_t, mode: Cgr
         if (!no_bpf and !devicefilter.isAllowAll(options.resources.devices)) {
             const rules = try v2DeviceRules(allocator, options.resources.devices, options.devices);
             defer allocator.free(rules);
-            // Like runc, rootless device rules are best effort: attaching a
-            // BPF program needs CAP_SYS_ADMIN in the initial user namespace.
-            applyV2DeviceFilter(allocator, cgroup.*.?, rules, options.cgroup_path, false) catch |err| {
-                if (!options.rootless_cgroups) return err;
-                @import("diagnostic.zig").last_diagnostic_len = 0;
-            };
+            try applyV2DeviceFilter(allocator, cgroup.*.?, rules, options.cgroup_path, false);
         }
     } else {
         for (hierarchies) |*hierarchy| {

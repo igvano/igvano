@@ -75,8 +75,6 @@ const ExecContext = struct {
     ready: [2]posix.fd_t = undefined,
     /// Runtime -> exec child: "seccomp listener copied"; only with notify rules.
     seccomp_ack: ?[2]posix.fd_t = null,
-    /// The runtime is not root (see installSeccompListener).
-    rootless: bool = false,
 };
 
 pub fn exec(handle: libcontainer.State, options: libcontainer.ExecOptions) libcontainer.Error!i32 {
@@ -163,7 +161,6 @@ fn execWithNamespacesOf(handle: libcontainer.State, options: libcontainer.ExecOp
         .hierarchies = hierarchies,
         .joins = joins,
         .ns_fds = ns_fds,
-        .rootless = linux.geteuid() != 0,
     };
     return execWithNamespaces(&context);
 }
@@ -436,7 +433,7 @@ fn finishExecProcess(context: *const ExecContext) noreturn {
     const ack_fd = if (context.seccomp_ack) |fds| fds[0] else null;
     if (!process.no_new_privileges) {
         if (seccomp_program) |program|
-            installSeccompFor(program, ready[1], ack_fd, context.rootless) catch |err| failCreate(ready[1], err);
+            installSeccompFor(program, ready[1], ack_fd, false) catch |err| failCreate(ready[1], err);
     }
     var finalized_process = process;
     finalized_process.rlimits = &.{};
@@ -449,7 +446,7 @@ fn finishExecProcess(context: *const ExecContext) noreturn {
         failCreate(ready[1], error.CreateFailed);
     if (process.no_new_privileges) {
         if (seccomp_program) |program|
-            installSeccompFor(program, ready[1], ack_fd, context.rootless) catch |err| failCreate(ready[1], err);
+            installSeccompFor(program, ready[1], ack_fd, false) catch |err| failCreate(ready[1], err);
     }
     execResolved(executable, argv.ptr, envp.ptr) catch {
         failCreate(ready[1], error.CreateFailed);

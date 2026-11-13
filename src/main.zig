@@ -50,7 +50,10 @@ pub fn main(init: std.process.Init) !u8 {
         };
         if (root) |value| config.root = value;
     }
-    if (config.debug) config.debug_log = @import("cli/log.zig").openDebugLog(config.log, config.log_format);
+    if (config.debug) config.debug_log = @import("cli/log.zig").openDebugLog(config.log, config.log_format) catch |err| {
+        std.debug.print("igvano: cannot open log '{s}': {s}\n", .{ config.log orelse "", @errorName(err) });
+        return 1;
+    };
     return dispatchCommand(allocator, init.io, config) catch |err| {
         reportError(allocator, init.io, diagnostics.last_container_detail, config, err);
         return 1;

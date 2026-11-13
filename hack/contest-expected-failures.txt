@@ -19,7 +19,6 @@ update::update_pids_limit_test
 cgroup_v2_cpu::test_cpu_period_unspecified_unchanged
 cgroup_v2_cpu::test_cpu_period_valid_set
 cgroup_v2_cpu::test_cpu_quota_negative_value_default_set
-cgroup_v2_cpu::test_cpu_weight_valid_set
 cgroup_v2_cpuset::test_cpuset_cpus_and_mems_set
 cgroup_v2_cpuset::test_cpuset_cpus_set
 cgroup_v2_cpuset::test_cpuset_mems_set
@@ -49,7 +48,6 @@ process_capabilities_fail::process_capabilities_fail_test
 process_user::process_user_duplicate_gids_test
 process_user::process_user_unique_gids_test
 readonly_paths::readonly_rel_paths
-root_readonly::root_readonly_true_in_userns_test
 set_io_priority::io_priority_class_be
 set_io_priority::io_priority_class_idle
 set_io_priority::io_priority_class_rt
