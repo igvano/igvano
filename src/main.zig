@@ -42,11 +42,37 @@ pub fn main(init: std.process.Init) !u8 {
         return 1;
     };
     diagnostics.last_container_detail = null;
+    config.path_env = init.minimal.environ.getPosix("PATH");
+    if (config.root.ptr == default_root.ptr) {
+        const root = xdgRoot(allocator, init.minimal.environ.getPosix("XDG_RUNTIME_DIR")) catch |err| {
+            std.debug.print("igvano: the path in $XDG_RUNTIME_DIR must be writable by the user: {s}\n", .{@errorName(err)});
+            return 1;
+        };
+        if (root) |value| config.root = value;
+    }
     if (config.debug) config.debug_log = @import("cli/log.zig").openDebugLog(config.log, config.log_format);
     return dispatchCommand(allocator, init.io, config) catch |err| {
         reportError(allocator, init.io, diagnostics.last_container_detail, config, err);
         return 1;
     };
+}
+
+/// Like runc, a non-root runtime keeps state in $XDG_RUNTIME_DIR/igvano,
+/// sticky so XDG cleanup leaves it alone. Root keeps /run/igvano.
+// ponytail: runc also honors XDG for root in a user namespace unless
+// USER=root; add that when a nested runtime needs it.
+fn xdgRoot(allocator: std.mem.Allocator, xdg: ?[]const u8) !?[]const u8 {
+    if (comptime builtin.os.tag != .linux) return null;
+    const linux = std.os.linux;
+    const dir = xdg orelse return null;
+    if (dir.len == 0 or linux.geteuid() == 0) return null;
+    const root = try std.fs.path.joinZ(allocator, &.{ dir, "igvano" });
+    switch (linux.errno(linux.mkdir(root, 0o700))) {
+        .SUCCESS, .EXIST => {},
+        else => return error.InvalidRoot,
+    }
+    if (linux.errno(linux.chmod(root, 0o1700)) != .SUCCESS) return error.InvalidRoot;
+    return root;
 }
 
 fn argumentErrorMessage(err: ParseArgsError) []const u8 {

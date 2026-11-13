@@ -438,10 +438,18 @@ pub fn configureCgroup(allocator: std.mem.Allocator, root: posix.fd_t, mode: Cgr
     if (mode == .unified) {
         cgroup.* = (try walkCgroup(root, options.cgroup_path, !options.systemd, writes)) orelse return error.CreateFailed;
         for (writes) |write| try writeCgroupFile(cgroup.*.?, write.name, write.value, options.cgroup_path);
-        if (!devicefilter.isAllowAll(options.resources.devices)) {
+        // BPF_CGROUP_DEVICE needs CAP_SYS_ADMIN in the initial user
+        // namespace, so a non-root runtime cannot enforce device rules.
+        const no_bpf = options.rootless_cgroups and linux.geteuid() != 0;
+        if (!no_bpf and !devicefilter.isAllowAll(options.resources.devices)) {
             const rules = try v2DeviceRules(allocator, options.resources.devices, options.devices);
             defer allocator.free(rules);
-            try applyV2DeviceFilter(allocator, cgroup.*.?, rules, options.cgroup_path, false);
+            // Like runc, rootless device rules are best effort: attaching a
+            // BPF program needs CAP_SYS_ADMIN in the initial user namespace.
+            applyV2DeviceFilter(allocator, cgroup.*.?, rules, options.cgroup_path, false) catch |err| {
+                if (!options.rootless_cgroups) return err;
+                @import("diagnostic.zig").last_diagnostic_len = 0;
+            };
         }
     } else {
         for (hierarchies) |*hierarchy| {

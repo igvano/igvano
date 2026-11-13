@@ -102,6 +102,8 @@ const CreateNamespaces = struct {
     fifo_gid: u32 = undefined,
     uid_map: []const u8 = undefined,
     gid_map: []const u8 = undefined,
+    /// A non-root runtime with a created or joined user namespace.
+    rootless_userns: bool = false,
 };
 
 const CreateInit = struct {
@@ -132,6 +134,8 @@ const CreateCgroups = struct {
     cgroup_writes: []const Write = undefined,
     v1_writes: []const V1Write = undefined,
     cgroup: ?posix.fd_t = null,
+    /// Rootless without cgroup permission: init joins no cgroup.
+    skipped: bool = false,
 };
 
 const CreateSync = struct {
@@ -299,6 +303,7 @@ fn prepareCreatePaths(ctx: *CreateContext) libcontainer.Error!void {
     ctx.namespaces.fifo_uid = if (ctx.namespaces.user_namespace or ctx.namespaces.joined_user_namespace) try mappedRootID(ctx.namespaces.container_mappings.uid) else 0;
     ctx.namespaces.fifo_gid = if (ctx.namespaces.user_namespace or ctx.namespaces.joined_user_namespace) try mappedRootID(ctx.namespaces.container_mappings.gid) else 0;
     ctx.namespaces.uid_map = try formatIDMappings(ctx.allocator, ctx.options.uid_mappings);
+    ctx.namespaces.rootless_userns = ctx.namespaces.isolation_flags & linux.CLONE.NEWUSER != 0 and linux.geteuid() != 0;
     ctx.namespaces.gid_map = try formatIDMappings(ctx.allocator, ctx.options.gid_mappings);
     ctx.init.fifo = try ctx.allocator.dupeZ(u8, ctx.options.exec_fifo);
     ctx.init.rootfs = try processString(ctx.allocator, ctx.options.rootfs);
@@ -443,8 +448,34 @@ fn createWithHostDescriptors(ctx: *CreateContext) libcontainer.Error!libcontaine
     // fs cgroups are ready before fork; systemd adopts init at the
     // early mapping exchange, while init is blocked before rootfs work.
     if (!ctx.options.systemd)
-        try configureCgroup(ctx.allocator, ctx.cgroups.cgroup_root.fd, ctx.cgroups.cgroup_root.mode, &ctx.cgroups.cgroup, ctx.cgroups.hierarchies, ctx.options, ctx.cgroups.cgroup_writes, ctx.cgroups.v1_writes);
+        configureCgroup(ctx.allocator, ctx.cgroups.cgroup_root.fd, ctx.cgroups.cgroup_root.mode, &ctx.cgroups.cgroup, ctx.cgroups.hierarchies, ctx.options, ctx.cgroups.cgroup_writes, ctx.cgroups.v1_writes) catch |err| {
+            if (!skipRootlessCgroup(ctx, err)) return err;
+        };
     return createWithMountSources(ctx);
+}
+
+/// runc's fs2 Apply: rootless, no permission, the default path and no
+/// limits means running without a cgroup instead of failing.
+fn skipRootlessCgroup(ctx: *CreateContext, err: libcontainer.Error) bool {
+    if (err != error.PermissionDenied or !ctx.options.rootless_cgroups) return false;
+    if (!ctx.options.cgroup_path_default) {
+        reportDiagnostic("rootless needs no limits + no cgrouppath when no permission is granted for cgroups", .{});
+        return false;
+    }
+    if (ctx.cgroups.cgroup_writes.len != 0 or ctx.cgroups.v1_writes.len != 0) {
+        reportDiagnostic("rootless needs no limits + no cgrouppath when no permission is granted for cgroups", .{});
+        return false;
+    }
+    if (ctx.cgroups.cgroup) |fd| closeFd(fd);
+    ctx.cgroups.cgroup = null;
+    removeV1Cgroups(ctx.cgroups.hierarchies, ctx.options.cgroup_path) catch {};
+    for (ctx.cgroups.hierarchies) |*hierarchy| {
+        if (hierarchy.leaf) |fd| closeFd(fd);
+        hierarchy.leaf = null;
+    }
+    ctx.cgroups.skipped = true;
+    diagnostics.last_diagnostic_len = 0;
+    return true;
 }
 
 fn cleanupFailedCreate(ctx: *CreateContext) void {
@@ -484,6 +515,7 @@ fn createWithMountSources(ctx: *CreateContext) libcontainer.Error!libcontainer.S
         ctx.init.mounts,
         // Only a mount namespace igvano unshares itself; one joined by path keeps NO_SYMLINKS.
         ctx.namespaces.flags & linux.CLONE.NEWNS != 0,
+        ctx.namespaces.rootless_userns,
     ) else null;
     ctx.mount_source_socket = if (mount_source_helper) |helper| helper.socket else null;
     defer if (mount_source_helper) |helper| {
@@ -549,8 +581,9 @@ fn closeSeccompAck(ctx: *const CreateContext) void {
     for (fds) |fd| if (fd >= 0) closeFd(fd);
 }
 
-/// Opened with host credentials: the kernel checks CAP_SYS_TIME against the
-/// opener, and a new user namespace has no mapping for the caller yet.
+/// Opened with the runtime's credentials before any namespace change: the
+/// kernel checks CAP_SYS_TIME of the opener against the new time namespace's
+/// owner, which the runtime's user (root, or the rootless user) owns.
 fn openTimeOffsets(ctx: *const CreateContext) ?posix.fd_t {
     if (ctx.init.time_offsets.len == 0) return null;
     return openPath(ctx.proc_dir, "self/timens_offsets", .{ .ACCMODE = .WRONLY, .CLOEXEC = true }) catch |err| failCreate(ctx.sync.report[1], err);
@@ -566,7 +599,14 @@ fn writeTimeOffsets(ctx: *const CreateContext, fd: ?posix.fd_t) void {
     closeFd(opened);
 }
 
+fn setDumpable(ctx: *const CreateContext, dumpable: bool) void {
+    checkResult(linux.prctl(@intFromEnum(linux.PR.SET_DUMPABLE), @intFromBool(dumpable), 0, 0, 0)) catch |err| failCreate(ctx.sync.report[1], err);
+}
+
 fn runCreateChild(ctx: *const CreateContext) noreturn {
+    // Open before dropping dumpable: a non-dumpable task's /proc files
+    // belong to root, which a non-root runtime cannot open.
+    const time_offsets = openTimeOffsets(ctx);
     checkResult(linux.prctl(@intFromEnum(linux.PR.SET_DUMPABLE), 0, 0, 0, 0)) catch |err| failCreate(ctx.sync.report[1], err);
     if (ctx.options.console_fds) |fds| closeFd(fds[0]);
     if (ctx.sync.seccomp_ack) |fds| closeFd(fds[1]);
@@ -581,15 +621,20 @@ fn runCreateChild(ctx: *const CreateContext) noreturn {
     // Set with host privileges before entering user namespaces.
     // Child2 inherits the adjustment across fork and exec.
     applyOomScoreAdj(ctx.proc_dir, ctx.options.oom_score_adj) catch |err| failCreate(ctx.sync.report[1], err);
-    const time_offsets = openTimeOffsets(ctx);
     joinNamespacesWithUser(ctx.namespaces.joins.items, ctx.namespaces.joined_user_fd) catch |err| failCreate(ctx.sync.report[1], err);
     // NEWUSER is unshared together with the others so it owns them.
     const early_flags = if (ctx.options.systemd) ctx.namespaces.flags & ~@as(usize, linux.CLONE.NEWCGROUP) else ctx.namespaces.flags;
     if (early_flags != 0) checkResult(linux.unshare(early_flags)) catch |err| failCreate(ctx.sync.report[1], err);
     writeTimeOffsets(ctx, time_offsets);
+    // Like runc, a non-root runtime keeps init dumpable: a non-dumpable
+    // task's /proc files belong to root, so the runtime could neither write
+    // its ID maps nor open its namespaces for exec. Every process involved
+    // already runs as the same host user.
+    if (ctx.namespaces.rootless_userns) setDumpable(ctx, true);
     // NEWPID affects the next fork, making child2 pid 1 inside the namespace.
     const child2 = forkProcess() catch |err| failCreate(ctx.sync.report[1], err);
     if (child2 == 0) runInitChild(ctx);
+    if (ctx.namespaces.rootless_userns) setDumpable(ctx, false);
     reportCreatedInit(ctx, child2);
 }
 
@@ -645,10 +690,9 @@ fn runInitChild(ctx: *const CreateContext) noreturn {
     const fd_dir = openPath(ctx.proc_dir, "self/fd", .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true }) catch linux.exit_group(1);
     enterInitNamespaces(ctx);
     if (ctx.mount_source_socket) |socket| {
+        if (ctx.namespaces.rootless_userns) sendInitNamespace(ctx, socket, "self/ns/user");
         // Sources are requested during rootfs setup, one per bind mount.
-        const namespace = openPath(ctx.proc_dir, "self/ns/mnt", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }) catch |err| failCreate(ctx.sync.ready[1], err);
-        console.sendFd(socket, namespace) catch |err| failCreate(ctx.sync.ready[1], err);
-        closeFd(namespace);
+        sendInitNamespace(ctx, socket, "self/ns/mnt");
     }
     closeFd(ctx.proc_dir);
     const create_input = std.fmt.bufPrint(ctx.init.create_state, "{s}{d}{s}", .{
@@ -669,7 +713,14 @@ fn runInitChild(ctx: *const CreateContext) noreturn {
         .console_fd = if (ctx.options.console_fds) |fds| fds[1] else null,
         .mount_source_socket = ctx.mount_source_socket,
         .seccomp_ack_fd = if (ctx.sync.seccomp_ack) |fds| fds[0] else null,
+        .rootless = ctx.namespaces.rootless_userns,
     }, ctx.init.start_hooks, start_input, ctx.init.apparmor_command, ctx.init.seccomp_program);
+}
+
+fn sendInitNamespace(ctx: *const CreateContext, socket: posix.fd_t, path: [*:0]const u8) void {
+    const namespace = openPath(ctx.proc_dir, path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }) catch |err| failCreate(ctx.sync.ready[1], err);
+    console.sendFd(socket, namespace) catch |err| failCreate(ctx.sync.ready[1], err);
+    closeFd(namespace);
 }
 
 fn enterInitNamespaces(ctx: *const CreateContext) void {
@@ -687,6 +738,7 @@ fn enterInitNamespaces(ctx: *const CreateContext) void {
         checkResult(linux.setgid(0)) catch linux.exit_group(1);
         checkResult(linux.setuid(0)) catch linux.exit_group(1);
     }
+
     // systemd has adopted init before NEWCGROUP captures its
     // namespace root. Explicitly joined cgroup namespaces stay joined.
     if (ctx.options.systemd and ctx.namespaces.flags & linux.CLONE.NEWCGROUP != 0)
@@ -861,15 +913,21 @@ fn releaseInitMappings(ctx: *CreateContext) libcontainer.Error!void {
         // any early failure kill it before closing the release pipe.
         errdefer _ = linux.kill(mapping_response.pid, .KILL);
         if (ctx.options.systemd) try adoptInitSystemd(ctx, mapping_response.pid);
-        if (ctx.namespaces.user_namespace) {
-            try writeUserMappings(mapping_response.pid, ctx.namespaces.gid_map, ctx.namespaces.uid_map);
-            // Init needs ownership as namespace root, even for a non-root process.
-            try checkResult(linux.chown(ctx.init.fifo, ctx.namespaces.fifo_uid, ctx.namespaces.fifo_gid));
-        }
+        if (ctx.namespaces.user_namespace) try writeInitMappings(ctx, mapping_response.pid);
         if (!writeAll(fd, &.{1})) return error.CreateFailed;
         closeFd(fd);
         ctx.sync.map_writer = null;
     }
+}
+
+fn writeInitMappings(ctx: *CreateContext, pid: i32) libcontainer.Error!void {
+    try writeUserMappings(pid, ctx.namespaces.gid_map, ctx.namespaces.uid_map, .{
+        .rootless = linux.geteuid() != 0,
+        .newuidmap = if (ctx.options.newuidmap) |path| try pathString(ctx.allocator, path) else null,
+        .newgidmap = if (ctx.options.newgidmap) |path| try pathString(ctx.allocator, path) else null,
+    });
+    // Init needs ownership as namespace root, even for a non-root process.
+    try checkResult(linux.chown(ctx.init.fifo, ctx.namespaces.fifo_uid, ctx.namespaces.fifo_gid));
 }
 
 fn adoptInitSystemd(ctx: *CreateContext, init_pid: i32) libcontainer.Error!void {
@@ -941,7 +999,7 @@ fn createHandle(ctx: *const CreateContext, pid: i32, starttime: []const u8) libc
         .id = ctx.options.id,
         .pid = pid,
         .starttime = starttime,
-        .cgroup_path = ctx.options.cgroup_path,
+        .cgroup_path = if (ctx.cgroups.skipped) null else ctx.options.cgroup_path,
         .systemd = ctx.options.systemd,
         .device_nodes = ctx.options.devices,
         .rootfs_mount = if (ctx.namespaces.private_mount_namespace) null else ctx.options.rootfs,
@@ -1064,10 +1122,15 @@ fn runPreparedInit(init: *const InitContext) noreturn {
     const fifo_name = std.fmt.bufPrintZ(&fifo_buffer, "{d}", .{init.fifo_fd}) catch unreachable;
     setInitHostname(init);
     setupRootfs(init.rootfs, init.mounts, init.devices, init.symlinks, init.readonly_rootfs, init.rootfs_options) catch |err| failCreate(init.ready_fd, err);
-    checkResult(linux.chdir(init.cwd)) catch |err| failCreate(init.ready_fd, err);
+    // Like runc, a cwd only the process user may enter (e.g. a mapped
+    // user's 0700 directory) is entered after setuid instead.
+    const cwd_result = linux.chdir(init.cwd);
+    const retry_cwd = linux.errno(cwd_result) == .ACCES;
+    if (!retry_cwd) checkResult(cwd_result) catch |err| failCreate(init.ready_fd, err);
     applyAppArmor(init.apparmor_command) catch |err| failCreate(init.ready_fd, err);
     closeExecFrom(3, init.fd_dir) catch |err| failCreate(init.ready_fd, err);
     applyInitProcess(init, fifo_name);
+    if (retry_cwd) checkResult(linux.chdir(init.cwd)) catch |err| failCreate(init.ready_fd, err);
     var executable_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const executable = if (init.process != null)
         resolveExecutable(init.argv, init.envp, &executable_buffer) catch |err| failCreate(init.ready_fd, err)
@@ -1101,7 +1164,7 @@ fn applyInitProcess(init: *const InitContext, fifo_name: [:0]const u8) void {
         // With NNP=true, install after startContainer hooks (unfiltered); NNP=false hooks run filtered, intentionally.
         if (!process.no_new_privileges) {
             if (init.seccomp_program) |program|
-                installSeccompFor(program, init.ready_fd, init.rootfs_options.seccomp_ack_fd) catch |err| failCreate(init.ready_fd, err);
+                installSeccompFor(program, init.ready_fd, init.rootfs_options.seccomp_ack_fd, init.rootfs_options.rootless) catch |err| failCreate(init.ready_fd, err);
         }
         applyProcess(process, init.capabilities, &.{}) catch |err| {
             childError("cannot apply process settings: ", err);
@@ -1117,7 +1180,7 @@ fn applyInitProcess(init: *const InitContext, fifo_name: [:0]const u8) void {
 fn installLateListener(init: *const InitContext) void {
     const program = listenerProgram(init.seccomp_program) orelse return;
     const ack = init.rootfs_options.seccomp_ack_fd orelse failCreate(init.ready_fd, error.CreateFailed);
-    installSeccompListener(program, init.ready_fd, ack) catch |err| failCreate(init.ready_fd, err);
+    installSeccompListener(program, init.ready_fd, ack, init.rootfs_options.rootless) catch |err| failCreate(init.ready_fd, err);
 }
 
 fn listenerProgram(program: ?seccomp.Program) ?seccomp.Program {

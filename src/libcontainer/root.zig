@@ -87,6 +87,16 @@ pub const CreateOptions = struct {
     seccomp: ?seccomp.Config = null,
     /// Required when the seccomp config has notify rules.
     on_seccomp_listener: ?SeccompListenerCallback = null,
+    /// linux.cgroupsPath was omitted, so cgroup_path is igvano's default.
+    cgroup_path_default: bool = false,
+    /// runc's rootless cgroup manager: with no permission to create a
+    /// default cgroup and no limits, run without one; device rules are
+    /// best effort.
+    rootless_cgroups: bool = false,
+    /// Absolute newuidmap/newgidmap paths; a non-root runtime uses them for
+    /// maps beyond its own IDs, like runc.
+    newuidmap: ?[]const u8 = null,
+    newgidmap: ?[]const u8 = null,
     debug: ?DebugLog = null,
 };
 

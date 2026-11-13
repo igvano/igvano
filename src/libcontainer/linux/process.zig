@@ -129,22 +129,26 @@ pub fn runProcess(configured: ?libcontainer.Process, executable: ?[*:0]const u8,
 /// fd number on `report_fd` (write must never be notified, which the frontend
 /// enforces), then wait for the runtime to copy it before closing ours.
 /// Notified syscalls made meanwhile simply wait for the agent.
-pub fn installSeccompListener(program: seccomp.Program, report_fd: posix.fd_t, ack_fd: posix.fd_t) libcontainer.Error!void {
+/// `rootless`: the runtime is not root, so pidfd_getfd passes the ptrace
+/// check only while this task is dumpable; stay dumpable until the ack.
+pub fn installSeccompListener(program: seccomp.Program, report_fd: posix.fd_t, ack_fd: posix.fd_t, rootless: bool) libcontainer.Error!void {
     var listener: i32 = -1;
     const result = seccomp.installListener(program, &listener);
     if (result != .SUCCESS) return seccompFailed(result);
     defer closeFd(listener);
     defer closeFd(ack_fd);
+    if (rootless) try checkResult(linux.prctl(@intFromEnum(linux.PR.SET_DUMPABLE), 1, 0, 0, 0));
     const response: CreateResponse = .{ .seccomp_fd = listener };
     if (!writeAll(report_fd, std.mem.asBytes(&response))) return error.CreateFailed;
     var byte: [1]u8 = undefined;
     if (!readAll(ack_fd, &byte) or byte[0] != 1) return error.CreateFailed;
+    if (rootless) try checkResult(linux.prctl(@intFromEnum(linux.PR.SET_DUMPABLE), 0, 0, 0, 0));
 }
 
 /// Installs with a listener when the program has notify rules.
-pub fn installSeccompFor(program: seccomp.Program, report_fd: posix.fd_t, ack_fd: ?posix.fd_t) libcontainer.Error!void {
+pub fn installSeccompFor(program: seccomp.Program, report_fd: posix.fd_t, ack_fd: ?posix.fd_t, rootless: bool) libcontainer.Error!void {
     if (program.flags & seccomp.filter_flag_new_listener == 0) return installSeccomp(program);
-    return installSeccompListener(program, report_fd, ack_fd orelse return error.CreateFailed);
+    return installSeccompListener(program, report_fd, ack_fd orelse return error.CreateFailed, rootless);
 }
 
 pub fn installSeccomp(program: seccomp.Program) libcontainer.Error!void {
@@ -234,7 +238,10 @@ pub fn applyProcessSettings(process: ProcessSettings) libcontainer.Error!void {
         }
         // With a user namespace, additional_gids (like uid/gid) are namespace IDs.
         const groups = process.additional_gids;
-        try checkResult(linux.setgroups(groups.len, groups.ptr));
+        // Like runc, a user namespace with setgroups "deny" (rootless) keeps
+        // no supplementary groups: drop to none is refused, and is moot.
+        const result = linux.setgroups(groups.len, groups.ptr);
+        if (!(linux.errno(result) == .PERM and groups.len == 0)) try checkResult(result);
         try checkResult(linux.setgid(process.gid));
         try checkResult(linux.setuid(process.uid));
         if (process.capabilities) |caps| try applyCapabilities(caps);

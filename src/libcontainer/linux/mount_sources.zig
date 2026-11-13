@@ -63,13 +63,21 @@ pub fn prepareIDMappedMounts(allocator: std.mem.Allocator, mounts: []PreparedMou
 /// mount order). In a namespace joined by path, sources must contain no
 /// symlinks (`allow_symlinks` false); in init's own private copy of the
 /// runtime's namespace they resolve like ordinary bind sources.
-pub fn startMountSourceHelper(mounts: []const PreparedMount, allow_symlinks: bool) libcontainer.Error!struct { pid: i32, socket: posix.fd_t } {
+/// A non-root runtime has no CAP_SYS_ADMIN of its own, so with `join_user`
+/// init sends its user namespace first and the helper joins it, as runc's
+/// mount source helper does.
+pub fn startMountSourceHelper(mounts: []const PreparedMount, allow_symlinks: bool, join_user: bool) libcontainer.Error!struct { pid: i32, socket: posix.fd_t } {
     const sockets = try console.socketpair();
     errdefer for (sockets) |fd| closeFd(fd);
     const child = try forkProcess();
     if (child == 0) {
         closeFd(sockets[1]);
         checkResult(linux.prctl(@intFromEnum(linux.PR.SET_DUMPABLE), 0, 0, 0, 0)) catch |err| failCreate(sockets[0], err);
+        if (join_user) {
+            const user = console.receiveFd(sockets[0]) catch linux.exit_group(1);
+            checkResult(linux.setns(user, linux.CLONE.NEWUSER)) catch |err| failCreate(sockets[0], err);
+            closeFd(user);
+        }
         const namespace = console.receiveFd(sockets[0]) catch linux.exit_group(1);
         checkResult(linux.setns(namespace, linux.CLONE.NEWNS)) catch |err| failCreate(sockets[0], err);
         closeFd(namespace);

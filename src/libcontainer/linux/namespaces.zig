@@ -257,21 +257,83 @@ pub fn createMountUserNamespace(allocator: std.mem.Allocator, mappings: libconta
     var response: CreateResponse = .{};
     if (!readAll(ready[0], std.mem.asBytes(&response))) return error.CreateFailed;
     if (response.failureError()) |err| return err;
-    try writeUserMappings(child, gid_map, uid_map);
+    try writeUserMappings(child, gid_map, uid_map, .{});
     var path_buffer: [64]u8 = undefined;
     const path = std.fmt.bufPrintZ(&path_buffer, "/proc/{d}/ns/user", .{child}) catch unreachable;
     return openPath(linux.AT.FDCWD, path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true });
 }
 
+/// How a non-root runtime writes ID maps, as in runc's nsexec.
+pub const MappingTools = struct {
+    /// The runtime's effective UID is not 0.
+    rootless: bool = false,
+    /// newuidmap/newgidmap from shadow-utils, tried when a map write gets EPERM.
+    newuidmap: ?[:0]const u8 = null,
+    newgidmap: ?[:0]const u8 = null,
+};
+
 /// The runtime parent writes maps from its original user namespace.
-pub fn writeUserMappings(pid: i32, gid_map: []const u8, uid_map: []const u8) libcontainer.Error!void {
+pub fn writeUserMappings(pid: i32, gid_map: []const u8, uid_map: []const u8, tools: MappingTools) libcontainer.Error!void {
     var path_buffer: [32]u8 = undefined;
     const path = std.fmt.bufPrintZ(&path_buffer, "/proc/{d}", .{pid}) catch unreachable;
     const dir = try openPath(linux.AT.FDCWD, path, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true });
     defer closeFd(dir);
-    // setgroups defaults to "allow"; only rootless setup needs a "deny" write.
-    try writeMappingFile(dir, "gid_map", gid_map);
-    try writeMappingFile(dir, "uid_map", uid_map);
+    // setgroups defaults to "allow". The kernel only lets an unprivileged
+    // user map its own GID after "deny"; other maps go through newgidmap.
+    if (tools.rootless and onlySelfGidMap(gid_map)) try writeMappingFile(dir, "setgroups", "deny");
+    try writeMapping(dir, pid, "gid_map", gid_map, tools.newgidmap);
+    try writeMapping(dir, pid, "uid_map", uid_map, tools.newuidmap);
+}
+
+/// runc's requiresRootOrMappingTool, inverted: exactly "0 <egid> 1".
+fn onlySelfGidMap(gid_map: []const u8) bool {
+    var buffer: [32]u8 = undefined;
+    const self = std.fmt.bufPrint(&buffer, "0 {d} 1\n", .{linux.getegid()}) catch return false;
+    return std.mem.eql(u8, gid_map, self);
+}
+
+test "only a single map of the caller's own GID needs setgroups deny" {
+    var buffer: [64]u8 = undefined;
+    const gid = linux.getegid();
+    try std.testing.expect(onlySelfGidMap(try std.fmt.bufPrint(&buffer, "0 {d} 1\n", .{gid})));
+    try std.testing.expect(!onlySelfGidMap(try std.fmt.bufPrint(&buffer, "0 {d} 2\n", .{gid})));
+    try std.testing.expect(!onlySelfGidMap(try std.fmt.bufPrint(&buffer, "0 {d} 1\n1 200000 65536\n", .{gid})));
+    try std.testing.expect(!onlySelfGidMap(try std.fmt.bufPrint(&buffer, "0 {d} 1\n", .{gid +% 1})));
+}
+
+fn writeMapping(dir: posix.fd_t, pid: i32, name: [*:0]const u8, text: []const u8, tool: ?[:0]const u8) libcontainer.Error!void {
+    if (text.len == 0) return;
+    writeMappingFile(dir, name, text) catch |err| {
+        const path = tool orelse return err;
+        if (err != error.PermissionDenied) return err;
+        return runMappingTool(path, pid, text);
+    };
+}
+
+/// newuidmap <pid> <container> <host> <size>...; maps are already validated
+/// to at most 340 ranges, so the argument array is bounded.
+fn runMappingTool(tool: [:0]const u8, pid: i32, text: []const u8) libcontainer.Error!void {
+    var args: [2 + 3 * 340 + 1]?[*:0]const u8 = @splat(null);
+    var words: [3 * 340][16]u8 = undefined;
+    var pid_buffer: [16]u8 = undefined;
+    args[0] = tool.ptr;
+    args[1] = (std.fmt.bufPrintZ(&pid_buffer, "{d}", .{pid}) catch unreachable).ptr;
+    var count: usize = 0;
+    var fields = std.mem.tokenizeAny(u8, text, " \n");
+    while (fields.next()) |field| : (count += 1) {
+        if (count == words.len) return error.InvalidConfig;
+        args[2 + count] = (std.fmt.bufPrintZ(&words[count], "{s}", .{field}) catch return error.InvalidConfig).ptr;
+    }
+    const envp = [_:null]?[*:0]const u8{};
+    const child = try forkProcess();
+    if (child == 0) {
+        _ = linux.execve(tool.ptr, @ptrCast(&args), &envp);
+        linux.exit_group(127);
+    }
+    if (try waitChild(child) != 0) {
+        reportDiagnostic("{s} {d} failed", .{ tool, pid });
+        return error.PermissionDenied;
+    }
 }
 
 fn writeMappingFile(dir: posix.fd_t, name: [*:0]const u8, text: []const u8) libcontainer.Error!void {

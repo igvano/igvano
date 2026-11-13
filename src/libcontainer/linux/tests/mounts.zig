@@ -731,7 +731,7 @@ test "linux accessible user namespace binds retain locked host mount restriction
             .propagation = 0,
             .data = "",
         }};
-        const helper = startMountSourceHelper(&mounts, true) catch linux.exit_group(5);
+        const helper = startMountSourceHelper(&mounts, true, false) catch linux.exit_group(5);
         checkResult(linux.setns(userns, linux.CLONE.NEWUSER)) catch linux.exit_group(7);
         checkResult(linux.unshare(linux.CLONE.NEWNS)) catch linux.exit_group(8);
         checkResult(linux.setgid(0)) catch linux.exit_group(9);

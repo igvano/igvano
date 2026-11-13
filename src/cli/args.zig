@@ -41,6 +41,10 @@ pub const Config = struct {
     console_socket: ?[]const u8 = null,
     signal: ?[]const u8 = null,
     systemd: bool = false,
+    /// spec --rootless.
+    rootless: bool = false,
+    /// $PATH, for newuidmap/newgidmap lookups by a non-root runtime.
+    path_env: ?[]const u8 = null,
     /// --debug; main opens debug_log from it.
     debug: bool = false,
     debug_log: ?@import("libcontainer").DebugLog = null,
@@ -110,7 +114,7 @@ fn commandFlagNames(subcommand: Subcommand) []const []const u8 {
     return switch (subcommand) {
         .create => &.{ "bundle", "b", "pid-file", "console-socket" },
         .run => &.{ "bundle", "b", "pid-file", "console-socket", "detach", "d", "keep" },
-        .spec => &.{ "bundle", "b" },
+        .spec => &.{ "bundle", "b", "rootless" },
         .list => &.{ "quiet", "q", "format", "f" },
         .events => &.{ "stats", "interval" },
         .delete => &.{ "force", "f" },
@@ -263,11 +267,12 @@ fn parseExecOptions(args: []const []const u8, index: *usize, config: *Config) !v
     }
 }
 
-const CreateOption = enum { bundle, pid_file, console_socket, detach, keep };
+const CreateOption = enum { bundle, pid_file, console_socket, detach, keep, rootless };
 
 // spec takes only the bundle; detach and keep are run-only booleans.
 fn createOptionAllowed(subcommand: Subcommand, option: CreateOption, flag: []const u8) bool {
-    if (subcommand == .spec) return option == .bundle;
+    if (subcommand == .spec) return option == .bundle or (option == .rootless and std.mem.indexOfScalar(u8, flag, '=') == null);
+    if (option == .rootless) return false;
     if (option != .detach and option != .keep) return true;
     return subcommand == .run and std.mem.indexOfScalar(u8, flag, '=') == null;
 }
@@ -275,7 +280,7 @@ fn createOptionAllowed(subcommand: Subcommand, option: CreateOption, flag: []con
 fn parseCreateOptions(args: []const []const u8, index: *usize, config: *Config) !void {
     const options = std.StaticStringMap(CreateOption).initComptime(.{
         .{ "--bundle", .bundle }, .{ "-b", .bundle }, .{ "--pid-file", .pid_file }, .{ "--console-socket", .console_socket },
-        .{ "--detach", .detach }, .{ "-d", .detach }, .{ "--keep", .keep },
+        .{ "--detach", .detach }, .{ "-d", .detach }, .{ "--keep", .keep },         .{ "--rootless", .rootless },
     });
     while (index.* < args.len and std.mem.startsWith(u8, args[index.*], "-")) : (index.* += 1) {
         const flag = args[index.*];
@@ -288,6 +293,7 @@ fn parseCreateOptions(args: []const []const u8, index: *usize, config: *Config) 
             .console_socket => config.console_socket = try longOptionValue(args, index, error.MissingConsoleSocket, false),
             .detach => config.detach = true,
             .keep => config.keep = true,
+            .rootless => config.rootless = true,
         }
     }
     if (config.bundle == null) config.bundle = ".";

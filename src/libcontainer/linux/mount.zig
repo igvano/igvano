@@ -117,9 +117,16 @@ pub fn prepareMounts(allocator: std.mem.Allocator, mounts: []const libcontainer.
             .recursive_attr = mount.recursive_attr,
             .mappings = mount.mappings,
             .copy_up = mount.copy_up,
+            .cgroup2_fallback = try cgroup2Fallback(allocator, mount_type, mount.flags, cgroup_path),
         });
     }
     return prepared.toOwnedSlice(allocator);
+}
+
+fn cgroup2Fallback(allocator: std.mem.Allocator, mount_type: ?[]const u8, flags: u32, cgroup_path: []const u8) libcontainer.Error!?[:0]const u8 {
+    const value = mount_type orelse return null;
+    if (!std.mem.eql(u8, value, "cgroup2") or flags & linux.MS.BIND != 0) return null;
+    return try std.fmt.allocPrintSentinel(allocator, "/sys/fs/cgroup/{s}", .{cgroup_path}, 0);
 }
 
 fn validateMountMappings(mount: libcontainer.Mount) libcontainer.Error!void {
@@ -327,6 +334,9 @@ pub const PreparedMount = struct {
     recursive_attr: ?libcontainer.RecursiveAttr = null,
     mappings: ?libcontainer.MountMappings = null,
     copy_up: bool = false,
+    /// For cgroup2: what to bind when the kernel refuses a new cgroup2
+    /// mount (EPERM or EBUSY in a user namespace), as runc does.
+    cgroup2_fallback: ?[:0]const u8 = null,
     /// O_PATH source opened with host credentials in init's mount namespace.
     source_fd: ?posix.fd_t = null,
     /// Detached idmapped tree cloned from init's locked mount namespace.
@@ -676,7 +686,7 @@ pub fn applyMount(rootfs: [:0]const u8, root_fd: posix.fd_t, mount: PreparedMoun
     var attach = mount;
     // A read-only copy-up tmpfs is filled first and made read-only after.
     if (copy_up) attach.flags &= ~@as(u32, linux.MS.RDONLY);
-    try attachMount(attach, source, target_fd, step);
+    const cgroup2_bound = try attachMount(attach, source, target_fd, step);
     // The original fd pins the covered mount. Reopen to address the new mount
     // for remount and propagation changes, with symlinks still scoped to rootfs.
     step.operation = "open mounted destination";
@@ -685,6 +695,11 @@ pub fn applyMount(rootfs: [:0]const u8, root_fd: posix.fd_t, mount: PreparedMoun
     target_fd = mounted_fd;
     if (covered) |from| try copyUp(from, target_fd, mount, step);
     try isolateBindMount(mount, target_fd, private_mount_namespace, rootfs_propagation, step);
+    if (cgroup2_bound) {
+        step.operation = "bind remount cgroup2 fallback";
+        var buffer: [64]u8 = undefined;
+        try bindRemount(target_fd, fdPath(&buffer, target_fd), (mount.flags & ~@as(u32, ms.REC)) | ms.BIND | ms.REMOUNT);
+    }
     try applyMountAttributes(mount, target_fd, step);
 }
 
@@ -747,7 +762,8 @@ fn copyUp(from: posix.fd_t, mounted_fd: posix.fd_t, mount: PreparedMount, step: 
     }
 }
 
-fn attachMount(mount: PreparedMount, source: ?[*:0]const u8, target_fd: posix.fd_t, step: *RootfsStep) libcontainer.Error!void {
+/// True when a cgroup2 mount fell back to a bind that still needs its flags.
+fn attachMount(mount: PreparedMount, source: ?[*:0]const u8, target_fd: posix.fd_t, step: *RootfsStep) libcontainer.Error!bool {
     const ms = linux.MS;
     const bind = mount.flags & ms.BIND != 0;
     var target_buffer: [64]u8 = undefined;
@@ -763,15 +779,41 @@ fn attachMount(mount: PreparedMount, source: ?[*:0]const u8, target_fd: posix.fd
         flags.F_EMPTY_PATH = true;
         flags.T_EMPTY_PATH = true;
         try checkResult(linux.move_mount(fd, "", target_fd, "", flags));
-    } else {
-        try checkResult(linux.mount(
-            source,
-            fdPath(&target_buffer, target_fd),
-            if (bind) null else if (mount.type) |value| value.ptr else null,
-            if (bind) mount.flags & (ms.BIND | ms.REC) else mount.flags,
-            if (bind or mount.data.len == 0) 0 else @intFromPtr(mount.data.ptr),
-        ));
+        return false;
     }
+    const result = linux.mount(
+        source,
+        fdPath(&target_buffer, target_fd),
+        if (bind) null else if (mount.type) |value| value.ptr else null,
+        if (bind) mount.flags & (ms.BIND | ms.REC) else mount.flags,
+        if (bind or mount.data.len == 0) 0 else @intFromPtr(mount.data.ptr),
+    );
+    if (mount.cgroup2_fallback) |fallback| switch (linux.errno(result)) {
+        .PERM, .BUSY => return bindCgroup2(fallback, target_fd, step),
+        else => {},
+    };
+    try checkResult(result);
+    return false;
+}
+
+/// runc's mountCgroupV2 fallback: without its own cgroup namespace root,
+/// a user namespace cannot mount cgroup2, so bind the container's cgroup
+/// (or the whole tree) read-only. A missing cgroup, as for a rootless
+/// container without one, masks the mountpoint with a read-only tmpfs.
+fn bindCgroup2(source: [:0]const u8, target_fd: posix.fd_t, step: *RootfsStep) libcontainer.Error!bool {
+    const ms = linux.MS;
+    var target_buffer: [64]u8 = undefined;
+    const target = fdPath(&target_buffer, target_fd);
+    step.operation = "bind cgroup2 fallback";
+    step.source = source;
+    const result = linux.mount(source, target, null, ms.BIND | ms.REC, 0);
+    if (linux.errno(result) == .NOENT) {
+        step.operation = "mask cgroup2 mountpoint";
+        try checkResult(linux.mount("tmpfs", target, "tmpfs", ms.RDONLY | ms.NOSUID | ms.NODEV | ms.NOEXEC, 0));
+        return false;
+    }
+    try checkResult(result);
+    return true;
 }
 
 fn isolateBindMount(mount: PreparedMount, target_fd: posix.fd_t, private_mount_namespace: bool, rootfs_propagation: u32, step: *RootfsStep) libcontainer.Error!void {

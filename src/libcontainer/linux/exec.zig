@@ -75,6 +75,8 @@ const ExecContext = struct {
     ready: [2]posix.fd_t = undefined,
     /// Runtime -> exec child: "seccomp listener copied"; only with notify rules.
     seccomp_ack: ?[2]posix.fd_t = null,
+    /// The runtime is not root (see installSeccompListener).
+    rootless: bool = false,
 };
 
 pub fn exec(handle: libcontainer.State, options: libcontainer.ExecOptions) libcontainer.Error!i32 {
@@ -83,7 +85,8 @@ pub fn exec(handle: libcontainer.State, options: libcontainer.ExecOptions) libco
     if (!try alive(handle)) return error.ProcessNotFound;
     if (options.argv.len == 0 or options.argv[0].len == 0 or !std.fs.path.isAbsolute(options.cwd))
         return error.InvalidProcess;
-    try validateCgroupPath(options.cgroup_path);
+    // Empty: the container has no cgroup (rootless without permission).
+    if (options.cgroup_path.len != 0) try validateCgroupPath(options.cgroup_path);
     var arena: std.heap.ArenaAllocator = .init(options.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -128,6 +131,7 @@ fn prepareExecProcess(allocator: std.mem.Allocator, options: libcontainer.ExecOp
 }
 
 fn execWithCgroups(handle: libcontainer.State, options: libcontainer.ExecOptions, allocator: std.mem.Allocator, prepared: ExecProcess, proc_dir: posix.fd_t, root: posix.fd_t) libcontainer.Error!i32 {
+    if (options.cgroup_path.len == 0) return execWithNamespacesOf(handle, options, allocator, prepared, proc_dir, root, null, &.{});
     const cgroup_root = try openCgroupRoot();
     defer closeFd(cgroup_root.fd);
     const cgroup: ?posix.fd_t = if (cgroup_root.mode == .unified)
@@ -139,7 +143,10 @@ fn execWithCgroups(handle: libcontainer.State, options: libcontainer.ExecOptions
     defer if (cgroup_root.mode == .legacy) freeV1Hierarchies(allocator, hierarchies);
     for (hierarchies) |*hierarchy|
         hierarchy.leaf = (try walkV1Cgroup(allocator, hierarchy.root.?, hierarchy.mount_root, options.cgroup_path, false, false)) orelse return error.ProcessNotFound;
+    return execWithNamespacesOf(handle, options, allocator, prepared, proc_dir, root, cgroup, hierarchies);
+}
 
+fn execWithNamespacesOf(handle: libcontainer.State, options: libcontainer.ExecOptions, allocator: std.mem.Allocator, prepared: ExecProcess, proc_dir: posix.fd_t, root: posix.fd_t, cgroup: ?posix.fd_t, hierarchies: []V1Hierarchy) libcontainer.Error!i32 {
     var joins: [8]NamespaceJoin = undefined;
     var ns_fds: [8]posix.fd_t = @splat(-1);
     defer for (ns_fds) |fd| if (fd >= 0) closeFd(fd);
@@ -156,6 +163,7 @@ fn execWithCgroups(handle: libcontainer.State, options: libcontainer.ExecOptions
         .hierarchies = hierarchies,
         .joins = joins,
         .ns_fds = ns_fds,
+        .rootless = linux.geteuid() != 0,
     };
     return execWithNamespaces(&context);
 }
@@ -428,7 +436,7 @@ fn finishExecProcess(context: *const ExecContext) noreturn {
     const ack_fd = if (context.seccomp_ack) |fds| fds[0] else null;
     if (!process.no_new_privileges) {
         if (seccomp_program) |program|
-            installSeccompFor(program, ready[1], ack_fd) catch |err| failCreate(ready[1], err);
+            installSeccompFor(program, ready[1], ack_fd, context.rootless) catch |err| failCreate(ready[1], err);
     }
     var finalized_process = process;
     finalized_process.rlimits = &.{};
@@ -441,7 +449,7 @@ fn finishExecProcess(context: *const ExecContext) noreturn {
         failCreate(ready[1], error.CreateFailed);
     if (process.no_new_privileges) {
         if (seccomp_program) |program|
-            installSeccompFor(program, ready[1], ack_fd) catch |err| failCreate(ready[1], err);
+            installSeccompFor(program, ready[1], ack_fd, context.rootless) catch |err| failCreate(ready[1], err);
     }
     execResolved(executable, argv.ptr, envp.ptr) catch {
         failCreate(ready[1], error.CreateFailed);

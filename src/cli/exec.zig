@@ -134,7 +134,8 @@ fn prepareExecOptions(process_allocator: std.mem.Allocator, io: std.Io, state: L
     options.seccomp = try oci.prepareSeccomp(process_allocator, seccomp);
     agent.* = SeccompAgent.init(process_allocator, seccomp, state.parsed.value);
     if (agent.*) |*value| options.on_seccomp_listener = value.callback();
-    options.cgroup_path = state.container_state.?.cgroup_path orelse return oci.validationError(error.InvalidState, "exec: saved cgroup path is missing", .{});
+    // Empty means no cgroup to join: a rootless create that had no permission.
+    options.cgroup_path = state.container_state.?.cgroup_path orelse "";
     options.console_fds = if (process.terminal orelse false) try libcontainer.linux.console.socketpair() else null;
     options.debug = config.debug_log;
     return options;

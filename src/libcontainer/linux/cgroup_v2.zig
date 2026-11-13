@@ -708,5 +708,20 @@ fn enableCgroupControllers(dir: posix.fd_t, controllers: []const u8, path: []con
             return error.CgroupWriteFailed;
         }
     }
+    // A rootless runtime cannot write a delegated cgroup's root-owned
+    // parents; that is fine when the controllers are enabled already.
+    if (controllersEnabled(dir, controllers) catch false) return;
     try writeCgroupFile(dir, "cgroup.subtree_control", controllers, path);
+}
+
+fn controllersEnabled(dir: posix.fd_t, controllers: []const u8) libcontainer.Error!bool {
+    const enabled = try readCgroupFile(std.heap.page_allocator, dir, "cgroup.subtree_control");
+    defer std.heap.page_allocator.free(enabled);
+    var wanted = std.mem.tokenizeScalar(u8, controllers, ' ');
+    outer: while (wanted.next()) |entry| {
+        var names = std.mem.tokenizeAny(u8, enabled, " \n");
+        while (names.next()) |name| if (std.mem.eql(u8, name, entry[1..])) continue :outer;
+        return false;
+    }
+    return true;
 }

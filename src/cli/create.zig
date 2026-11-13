@@ -74,6 +74,10 @@ pub fn createContainerFor(allocator: std.mem.Allocator, io: std.Io, injected: ?C
         .console_fds = console_fds,
         .mounts = mounts,
         .cgroup_path = cgroup_path,
+        .cgroup_path_default = settings.cgroupsPath == null,
+        .rootless_cgroups = rootlessCgroups(),
+        .newuidmap = try mappingTool(mount_allocator, io, config.path_env, "newuidmap"),
+        .newgidmap = try mappingTool(mount_allocator, io, config.path_env, "newgidmap"),
         .systemd = config.systemd,
         .systemd_slice = if (systemd_config) |value| value.slice else "system.slice",
         .systemd_unit = if (systemd_config) |value| value.unit else "",
@@ -92,6 +96,38 @@ pub fn createContainerFor(allocator: std.mem.Allocator, io: std.Io, injected: ?C
     try applyCreateSpec(mount_allocator, &options, parsed.value);
     applyCreateProcess(&options, process_options);
     return createPreparedContainer(allocator, mount_allocator, io, injected, config, bundle, parsed.value, options, local_console);
+}
+
+/// Like runc, a non-root runtime looks the tools up on PATH before create.
+/// The caller's arena owns the result.
+fn mappingTool(allocator: std.mem.Allocator, io: std.Io, path_env: ?[]const u8, name: []const u8) !?[]const u8 {
+    if (comptime builtin.os.tag != .linux) return null;
+    if (std.os.linux.geteuid() == 0) return null;
+    const path = path_env orelse return null;
+    var dirs = std.mem.tokenizeScalar(u8, path, ':');
+    while (dirs.next()) |dir| {
+        if (!std.fs.path.isAbsolute(dir)) continue;
+        const candidate = try std.fs.path.join(allocator, &.{ dir, name });
+        std.Io.Dir.cwd().access(io, candidate, .{ .execute = true }) catch continue;
+        return candidate;
+    }
+    return null;
+}
+
+/// runc's shouldUseRootlessCgroupManager for cgroupfs: a non-root user, or
+/// root inside a user namespace, may lack permission for cgroups.
+fn rootlessCgroups() bool {
+    if (comptime builtin.os.tag != .linux) return false;
+    if (std.os.linux.geteuid() != 0) return true;
+    // The initial user namespace maps every ID: "0 0 4294967295".
+    var buffer: [128]u8 = undefined;
+    const fd = std.posix.openat(std.posix.AT.FDCWD, "/proc/self/uid_map", .{ .CLOEXEC = true }, 0) catch return false;
+    defer _ = std.os.linux.close(fd);
+    const count = std.posix.read(fd, &buffer) catch return false;
+    var fields = std.mem.tokenizeAny(u8, buffer[0..count], " \n");
+    const expected = [_][]const u8{ "0", "0", "4294967295" };
+    for (expected) |field| if (!std.mem.eql(u8, fields.next() orelse "", field)) return true;
+    return fields.next() != null;
 }
 
 fn createHasConsole(spec: oci.Spec, config: Config, local: bool) bool {
@@ -378,6 +414,12 @@ pub const CreateContext = struct {
         const path = try std.fs.path.join(self.allocator, &.{ self.state_dir, oci.starttime_file_name });
         defer self.allocator.free(path);
         try oci.atomicWrite(self.io, path, handle.starttime);
+        // A rootless create without cgroup permission ran without a cgroup.
+        if (handle.cgroup_path == null) {
+            const cgroup = try std.fs.path.join(self.allocator, &.{ self.state_dir, oci.cgroup_file_name });
+            defer self.allocator.free(cgroup);
+            std.Io.Dir.cwd().deleteFile(self.io, cgroup) catch |err| if (err != error.FileNotFound) return err;
+        }
         try saveRootfsMount(self.allocator, self.io, self.state_dir, handle);
         try oci.saveState(self.allocator, self.io, self.root, self.state.*);
         try runHooks(self.allocator, self.hooks.createRuntime, self.state.*);
