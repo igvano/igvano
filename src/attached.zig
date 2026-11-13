@@ -97,6 +97,16 @@ pub const Signals = struct {
     }
 };
 
+/// Like runc's recvtty, keep "\n" as "\n" in output copied to a pipe or file.
+/// A terminal output is put in raw mode, so it still needs the PTY's "\r\n".
+pub fn clearOnlcr(controller: fd_t, output: fd_t) void {
+    var term: linux.termios = undefined;
+    if (linux.errno(linux.ioctl(output, linux.T.CGETS, @intFromPtr(&term))) == .SUCCESS) return;
+    if (linux.errno(linux.ioctl(controller, linux.T.CGETS, @intFromPtr(&term))) != .SUCCESS) return;
+    term.oflag.ONLCR = false;
+    _ = linux.ioctl(controller, linux.T.CSETS, @intFromPtr(&term));
+}
+
 fn resize(input: fd_t, controller: fd_t) void {
     var size: std.posix.winsize = undefined;
     if (linux.errno(linux.ioctl(input, linux.T.IOCGWINSZ, @intFromPtr(&size))) == .SUCCESS)
@@ -206,7 +216,10 @@ pub fn wait(pid: i32, reaped: *bool, signals: *Signals, controller: ?fd_t, input
     defer restoreControllerFlags(controller, controller_flags);
     // stdin/stdout share their open file descriptions with the caller's shell.
     // Leave their flags alone; poll gates the blocking reads and writes.
-    if (controller) |fd| resize(input, fd);
+    if (controller) |fd| {
+        clearOnlcr(fd, output);
+        resize(input, fd);
+    }
     var terminal: AttachedIo = .{ .controller = controller, .input = input, .output = output, .input_open = controller != null, .console_open = controller != null };
     var exit_status: ?u8 = null;
     while (true) {

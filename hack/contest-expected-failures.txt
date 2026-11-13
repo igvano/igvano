@@ -68,7 +68,6 @@ process_user::process_user_duplicate_gids_test
 process_user::process_user_unique_gids_test
 readonly_paths::readonly_rel_paths
 root_readonly::root_readonly_true_in_userns_test
-seccomp_notify::*
 set_io_priority::io_priority_class_be
 set_io_priority::io_priority_class_idle
 set_io_priority::io_priority_class_rt
@@ -76,9 +75,6 @@ set_scheduler_policy::policy_batch
 set_scheduler_policy::policy_other
 start_container_hook_env_inherit::start_container_env_inherit
 terminal::terminal_console_size
-time_ns::simple timens
-time_ns::simple timens + exec
-time_ns::simple timens + userns
 update::cpu_burst_test
 update::update_cgroup_v2_common_limits_test
 update::update_cpu_limits_test

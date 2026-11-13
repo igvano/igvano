@@ -179,6 +179,7 @@ comptime {
         _ = @import("cli/process.zig");
         _ = @import("cli/ps.zig");
         _ = @import("cli/run.zig");
+        _ = @import("cli/seccomp_agent.zig");
         _ = @import("cli/spec.zig");
         _ = @import("cli/start.zig");
         _ = @import("cli/state.zig");

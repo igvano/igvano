@@ -82,7 +82,14 @@ pub const Spec = struct {
         readonlyPaths: ?[]const []const u8 = null,
         rootfsPropagation: ?Propagation = null,
         seccomp: ?Seccomp = null,
+        timeOffsets: ?TimeOffsets = null,
     };
+
+    pub const TimeOffsets = struct {
+        monotonic: ?TimeOffset = null,
+        boottime: ?TimeOffset = null,
+    };
+    pub const TimeOffset = struct { secs: i64 = 0, nanosecs: u32 = 0 };
 
     pub const Seccomp = struct {
         defaultAction: []const u8,

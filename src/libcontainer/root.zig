@@ -48,6 +48,8 @@ pub const CreateOptions = struct {
     exec_fifo: []const u8,
     process: ?Process = null,
     namespaces: []const Namespace = &.{},
+    /// Clock offsets for a new time namespace (CLOCK_MONOTONIC, CLOCK_BOOTTIME).
+    time_offsets: ?TimeOffsets = null,
     uid_mappings: []const IDMapping = &.{},
     gid_mappings: []const IDMapping = &.{},
     hostname: ?[]const u8 = null,
@@ -83,6 +85,8 @@ pub const CreateOptions = struct {
     rootfs_propagation: ?u32 = null,
     apparmor_profile: ?[]const u8 = null,
     seccomp: ?seccomp.Config = null,
+    /// Required when the seccomp config has notify rules.
+    on_seccomp_listener: ?SeccompListenerCallback = null,
 };
 
 pub const Process = struct {
@@ -95,6 +99,12 @@ pub const Process = struct {
     additional_gids: []const u32 = &.{},
     no_new_privileges: bool = false,
 };
+
+pub const TimeOffsets = struct {
+    monotonic: ?TimeOffset = null,
+    boottime: ?TimeOffset = null,
+};
+pub const TimeOffset = struct { secs: i64, nanosecs: u32 };
 
 pub const Namespace = struct {
     kind: Kind,
@@ -121,6 +131,15 @@ pub const ExecOptions = struct {
     console_fds: ?[2]std.posix.fd_t = null,
     cgroup_path: []const u8 = "",
     seccomp: ?seccomp.Config = null,
+    /// Required when the seccomp config has notify rules.
+    on_seccomp_listener: ?SeccompListenerCallback = null,
+};
+
+/// Receives the runtime's copy of a seccomp notify fd (borrowed; closed after
+/// return) and the host PID of the process that installed the filter.
+pub const SeccompListenerCallback = struct {
+    ptr: *anyopaque,
+    run: *const fn (*anyopaque, std.posix.fd_t, i32) Error!void,
 };
 
 pub const CreateCallback = struct {

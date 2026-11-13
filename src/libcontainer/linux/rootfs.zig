@@ -255,6 +255,8 @@ pub const RootfsOptions = struct {
     /// Mount source helper, already given init's mount namespace; bind sources
     /// are requested one by one, right before each mount.
     mount_source_socket: ?posix.fd_t = null,
+    /// Read end of the runtime's "seccomp listener copied" pipe (init sync).
+    seccomp_ack_fd: ?posix.fd_t = null,
 };
 
 /// Paths now resolve entirely inside the container rootfs. Missing targets are

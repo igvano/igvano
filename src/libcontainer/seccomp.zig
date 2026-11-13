@@ -9,6 +9,8 @@ pub const Action = enum {
     trace,
     log,
     allow,
+    /// SECCOMP_RET_USER_NOTIF: ask the listener (a seccomp agent) to decide.
+    notify,
 
     pub fn encode(self: Action, data: ?u16) u32 {
         return switch (self) {
@@ -19,6 +21,7 @@ pub const Action = enum {
             .trace => 0x7ff00000 | @as(u32, data orelse 1),
             .log => 0x7ffc0000,
             .allow => 0x7fff0000,
+            .notify => 0x7fc00000,
         };
     }
 };
@@ -67,7 +70,9 @@ pub const Config = struct {
     rules: []const Rule = &.{},
 };
 pub const Filter = extern struct { code: u16, jt: u8 = 0, jf: u8 = 0, k: u32 };
+/// `flags` includes SECCOMP_FILTER_FLAG_NEW_LISTENER when any rule notifies.
 pub const Program = struct { filters: []const Filter, flags: u32 };
+pub const filter_flag_new_listener: u32 = 8;
 pub const Error = error{ InvalidConfig, FilterTooLarge, UnsupportedArchitecture } || std.mem.Allocator.Error;
 pub const max_insns = 4096;
 
@@ -100,7 +105,12 @@ pub fn compile(allocator: std.mem.Allocator, config: Config, host: Arch) Error!P
         returns.clearRetainingCapacity();
         try builder.archRules(config, arch, &failures, &returns);
     }
-    return .{ .filters = try builder.code.toOwnedSlice(allocator), .flags = config.flags };
+    var flags = config.flags;
+    for (config.rules) |rule| if (rule.action == .notify) {
+        flags |= filter_flag_new_listener;
+    };
+    if (config.default_action == .notify) return error.InvalidConfig;
+    return .{ .filters = try builder.code.toOwnedSlice(allocator), .flags = flags };
 }
 
 const ReturnJump = struct {
@@ -331,6 +341,18 @@ pub fn install(program: Program) std.os.linux.E {
     return linux.errno(result);
 }
 
+/// Like install, for a program with notify rules: on success, listener holds
+/// the new CLOEXEC notification fd. No allocation.
+pub fn installListener(program: Program, listener: *i32) std.os.linux.E {
+    if (comptime builtin.os.tag != .linux) return .NOSYS;
+    const linux = std.os.linux;
+    const SockFprog = extern struct { len: u16, filter: [*]const Filter };
+    const descriptor: SockFprog = .{ .len = @intCast(program.filters.len), .filter = program.filters.ptr };
+    const result = linux.syscall3(.seccomp, 1, program.flags | filter_flag_new_listener, @intFromPtr(&descriptor));
+    if (linux.errno(result) == .SUCCESS) listener.* = @intCast(result);
+    return linux.errno(result);
+}
+
 const TestData = @import("test/seccomp.zig").Data;
 const interpret = @import("test/seccomp.zig").interpret;
 
@@ -356,6 +378,19 @@ test "seccomp unknown syscalls return ENOSYS above each ABI maximum" {
         try std.testing.expectEqual(@as(u32, 0x0005000d), try interpret(program.filters, .{ .arch = compat.audit(), .nr = 20 }));
         try std.testing.expectEqual(@as(u32, 0x80000000), try interpret(program.filters, .{ .arch = 0 }));
     }
+}
+
+test "seccomp notify rules return USER_NOTIF and request a listener" {
+    const program = try compile(std.testing.allocator, .{
+        .default_action = .allow,
+        .architectures = &.{.x86_64},
+        .rules = &.{.{ .arch = .x86_64, .number = 83, .action = .notify }},
+    }, .x86_64);
+    defer std.testing.allocator.free(program.filters);
+    try std.testing.expect(program.flags & filter_flag_new_listener != 0);
+    try std.testing.expectEqual(@as(u32, 0x7fc00000), try interpret(program.filters, .{ .nr = 83 }));
+    try std.testing.expectEqual(@as(u32, 0x7fff0000), try interpret(program.filters, .{ .nr = 84 }));
+    try std.testing.expectError(error.InvalidConfig, compile(std.testing.allocator, .{ .default_action = .notify, .architectures = &.{.x86_64} }, .x86_64));
 }
 
 test "seccomp ENOSYS stub follows runc default action conditions" {

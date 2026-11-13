@@ -21,6 +21,7 @@ const saveRootfsMount = @import("state.zig").saveRootfsMount;
 const requireUnusedRootfs = @import("state.zig").requireUnusedRootfs;
 const hookStateTemplate = @import("hooks.zig").hookStateTemplate;
 const runHooks = @import("hooks.zig").runHooks;
+const SeccompAgent = @import("seccomp_agent.zig").Agent;
 const warnHooks = @import("hooks.zig").warnHooks;
 
 pub fn createContainer(allocator: std.mem.Allocator, io: std.Io, injected: ?ContainerOverride, config: Config) !void {
@@ -171,6 +172,10 @@ fn applyCreateSpec(allocator: std.mem.Allocator, options: *libcontainer.CreateOp
     options.uid_mappings = try oci.containerIDMappings(allocator, settings.uidMappings orelse &.{});
     options.gid_mappings = try oci.containerIDMappings(allocator, settings.gidMappings orelse &.{});
     options.hostname = spec.hostname;
+    if (settings.timeOffsets) |offsets| options.time_offsets = .{
+        .monotonic = if (offsets.monotonic) |value| .{ .secs = value.secs, .nanosecs = value.nanosecs } else null,
+        .boottime = if (offsets.boottime) |value| .{ .secs = value.secs, .nanosecs = value.nanosecs } else null,
+    };
     options.readonly_rootfs = spec.root.readonly;
 }
 
@@ -199,10 +204,7 @@ fn createPreparedContainer(allocator: std.mem.Allocator, mount_allocator: std.me
         .bundle = bundle,
         .annotations = spec.annotations,
     };
-    cwd.createDir(io, state_dir, .fromMode(0o700)) catch |err| switch (err) {
-        error.PathAlreadyExists => return error.ContainerExists,
-        else => return err,
-    };
+    try createStateDirectory(io, state_dir);
     var lock: ?std.Io.File = null;
     defer if (lock) |file| file.close(io);
     var setup_attempted = false;
@@ -232,9 +234,12 @@ fn createPreparedContainer(allocator: std.mem.Allocator, mount_allocator: std.me
     options.create_hook_state = create_hook_state;
     options.start_hook_state = start_hook_state;
     options.on_create = .{ .ptr = &create_context, .run = CreateContext.run };
+    // Like runc, the agent sees the container still creating.
+    var agent = SeccompAgent.fromSpec(allocator, spec, state);
+    options.on_seccomp_listener = SeccompAgent.callbackOf(&agent);
     var instance: ContainerInstance = undefined;
     const created = createInstance(&instance, injected, options);
-    const container = try createdContainer(createDiagnostic(injected), created, create_context.failure);
+    const container = try createdContainer(createDiagnostic(injected), created, create_context.failure orelse SeccompAgent.failureOf(agent));
     defer instance.deinit(allocator);
     const handle = instance.state;
     errdefer cleanup: {
@@ -253,6 +258,13 @@ fn createPreparedContainer(allocator: std.mem.Allocator, mount_allocator: std.me
         try writePidFile(allocator, io, path, handle.pid);
     }
     return handle.pid;
+}
+
+fn createStateDirectory(io: std.Io, state_dir: []const u8) !void {
+    std.Io.Dir.cwd().createDir(io, state_dir, .fromMode(0o700)) catch |err| switch (err) {
+        error.PathAlreadyExists => return error.ContainerExists,
+        else => return err,
+    };
 }
 
 fn createdContainer(detail: ?[]const u8, created: libcontainer.Error!libcontainer.Container, failure: ?anyerror) !libcontainer.Container {

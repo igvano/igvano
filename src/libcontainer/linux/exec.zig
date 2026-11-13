@@ -35,7 +35,8 @@ const readProcStatAt = @import("proc.zig").readProcStatAt;
 const closeExecFrom = @import("process.zig").closeExecFrom;
 const closeFdRange = @import("process.zig").closeFdRange;
 const kernelCapabilities = @import("process.zig").kernelCapabilities;
-const installSeccomp = @import("process.zig").installSeccomp;
+const installSeccompFor = @import("process.zig").installSeccompFor;
+const deliverSeccompListener = @import("process.zig").deliverSeccompListener;
 const applyOomScoreAdj = @import("process.zig").applyOomScoreAdj;
 const ProcessSettings = @import("process.zig").ProcessSettings;
 const applyProcessSettings = @import("process.zig").applyProcessSettings;
@@ -69,6 +70,8 @@ const ExecContext = struct {
     ns_fds: [8]posix.fd_t,
     report: [2]posix.fd_t = undefined,
     ready: [2]posix.fd_t = undefined,
+    /// Runtime -> exec child: "seccomp listener copied"; only with notify rules.
+    seccomp_ack: ?[2]posix.fd_t = null,
 };
 
 pub fn exec(handle: libcontainer.State, options: libcontainer.ExecOptions) libcontainer.Error!i32 {
@@ -180,19 +183,59 @@ fn execWithNamespaces(context: *ExecContext) libcontainer.Error!i32 {
     defer if (owns_ready) for (ready) |fd| closeFd(fd);
     context.report = report;
     context.ready = ready;
+    context.seccomp_ack = try listenerAckPipe(context.process.seccomp_program, context.options.on_seccomp_listener != null);
+    defer closeAckEnd(context, 0);
+    defer closeAckEnd(context, 1);
     const helper = try forkProcess();
     if (helper == 0) runExecHelper(context);
     for (ready) |fd| closeFd(fd);
     owns_ready = false;
     closeFd(report_writer.?);
     report_writer = null;
+    closeAckEnd(context, 0);
     var response: CreateResponse = .{};
-    const reported = readAll(report[0], std.mem.asBytes(&response));
+    const reported = try readExecReport(context, report[0], helper, &response);
     const status = try waitChild(helper);
     if (!reported) return error.CreateFailed;
     if (response.failureError()) |err| return err;
     if (status != 0 or response.pid <= 0) return error.CreateFailed;
     return response.pid;
+}
+
+fn listenerAckPipe(program: ?seccomp.Program, has_callback: bool) libcontainer.Error!?[2]posix.fd_t {
+    const value = program orelse return null;
+    if (value.flags & seccomp.filter_flag_new_listener == 0) return null;
+    // Checked before fork: without a callback the listener fd has nowhere to go.
+    if (!has_callback) {
+        reportDiagnostic("seccomp notify rules need a listener callback", .{});
+        return error.InvalidConfig;
+    }
+    return try makePipe();
+}
+
+/// Idempotent: a closed end is marked -1.
+fn closeAckEnd(context: *ExecContext, end: usize) void {
+    if (context.seccomp_ack) |*fds| {
+        if (fds[end] >= 0) closeFd(fds[end]);
+        fds[end] = -1;
+    }
+}
+
+/// Reads the helper's final report, first serving any seccomp listener reports.
+fn readExecReport(context: *ExecContext, report: posix.fd_t, helper: i32, response: *CreateResponse) libcontainer.Error!bool {
+    var reported = readAll(report, std.mem.asBytes(response));
+    while (reported and response.failure == 0 and response.seccomp_fd >= 0) {
+        const ack = if (context.seccomp_ack) |fds| fds[1] else -1;
+        deliverSeccompListener(response.pid, response.seccomp_fd, ack, context.options.on_seccomp_listener) catch |err| {
+            _ = linux.kill(response.pid, .KILL);
+            closeAckEnd(context, 1);
+            _ = waitChild(helper) catch {};
+            return err;
+        };
+        response.* = .{};
+        reported = readAll(report, std.mem.asBytes(response));
+    }
+    return reported;
 }
 
 fn runExecHelper(context: *ExecContext) noreturn {
@@ -206,6 +249,7 @@ fn runExecHelper(context: *ExecContext) noreturn {
     checkResult(linux.prctl(@intFromEnum(linux.PR.SET_DUMPABLE), 0, 0, 0, 0)) catch |err| failCreate(report[1], err);
     closeFd(report[0]);
     if (options.console_fds) |fds| closeFd(fds[0]);
+    if (context.seccomp_ack) |fds| closeFd(fds[1]);
     joinExecCgroups(context);
     skipCurrentNamespaces(context);
     var stat_buffer: [4096]u8 = undefined;
@@ -307,7 +351,8 @@ fn closeExecHostFds(context: *const ExecContext, fd_dir: posix.fd_t) void {
     // Actually close host directories before cwd can follow /proc/self/fd.
     // Keep stdio, the sync pipe, console socket and the fd scan handle.
     const console_fd = if (options.console_fds) |fds| fds[1] else ready[1];
-    var keep = [_]posix.fd_t{ ready[1], console_fd, fd_dir };
+    const ack_fd = if (context.seccomp_ack) |fds| fds[0] else ready[1];
+    var keep = [_]posix.fd_t{ ready[1], console_fd, fd_dir, ack_fd };
     std.mem.sort(posix.fd_t, &keep, {}, std.sort.asc(posix.fd_t));
     var next_fd: u32 = 3;
     for (keep) |fd| {
@@ -348,9 +393,10 @@ fn finishExecProcess(context: *const ExecContext) noreturn {
     const seccomp_program = context.process.seccomp_program;
     // Retain CAP_SYS_ADMIN for installation when NNP is false,
     // matching init's ordering before dropping process privileges.
+    const ack_fd = if (context.seccomp_ack) |fds| fds[0] else null;
     if (!process.no_new_privileges) {
         if (seccomp_program) |program|
-            installSeccomp(program) catch |err| failCreate(ready[1], err);
+            installSeccompFor(program, ready[1], ack_fd) catch |err| failCreate(ready[1], err);
     }
     var finalized_process = process;
     finalized_process.rlimits = &.{};
@@ -363,7 +409,7 @@ fn finishExecProcess(context: *const ExecContext) noreturn {
         failCreate(ready[1], error.CreateFailed);
     if (process.no_new_privileges) {
         if (seccomp_program) |program|
-            installSeccomp(program) catch |err| failCreate(ready[1], err);
+            installSeccompFor(program, ready[1], ack_fd) catch |err| failCreate(ready[1], err);
     }
     execResolved(executable, argv.ptr, envp.ptr) catch {
         failCreate(ready[1], error.CreateFailed);
@@ -378,7 +424,7 @@ fn finishExecHelper(context: *const ExecContext, child: i32) noreturn {
     // before execve without reporting an error. runc's setnsProcess.start
     // similarly accepts sync-socket EOF after procReady (parseSync).
     // Leave either child for the caller to reap.
-    waitExecReady(ready[0]) catch |err| {
+    waitExecReady(ready[0], report[1], child) catch |err| {
         _ = linux.kill(child, .KILL);
         _ = waitChild(child) catch {};
         failCreate(report[1], err);
@@ -395,7 +441,7 @@ fn finishExecHelper(context: *const ExecContext, child: i32) noreturn {
     linux.exit_group(0);
 }
 
-fn waitExecReady(fd: posix.fd_t) libcontainer.Error!void {
+fn waitExecReady(fd: posix.fd_t, report_fd: posix.fd_t, child: i32) libcontainer.Error!void {
     var response: CreateResponse = .{};
     const bytes = std.mem.asBytes(&response);
     while (true) {
@@ -404,7 +450,12 @@ fn waitExecReady(fd: posix.fd_t) libcontainer.Error!void {
             .SUCCESS => {
                 if (result == 0) return;
                 if (!readAll(fd, bytes[1..])) return error.CreateFailed;
-                return response.failureError() orelse error.CreateFailed;
+                if (response.failureError()) |err| return err;
+                if (response.seccomp_fd < 0) return error.CreateFailed;
+                // Forward the listener report with the child's host PID; keep waiting.
+                response.pid = child;
+                if (!writeAll(report_fd, bytes)) return error.CreateFailed;
+                response = .{};
             },
             .INTR => continue,
             else => return error.CreateFailed,

@@ -4,10 +4,6 @@
 # skips or does not run). Keep each section sorted.
 
 # Also fail with runc v1.3.3 in the same container (environment, not igvano).
-env::non-empty HOME env is used
-mounts_propagation::runc run [rootfsPropagation shared]
-rlimits::runc run with RLIMIT_NOFILE(The same as system's hard value)
-timens::runc run [timens with no offsets]
 
 # igvano gaps found by the suite. Delete lines as they pass.
 capabilities::runc exec --cap
@@ -38,7 +34,6 @@ delete::runc delete --force in cgroupv2 with subcgroups
 dev::runc run/update [device cgroup deny]
 env::empty HOME env var is overridden
 env::empty HOME env var is overridden with multiple overrides
-env::env var override
 env::env var with new-line is honored
 exec::runc --debug --log exec
 exec::runc --debug exec
@@ -74,8 +69,6 @@ pidfd-socket::runc create [ --pidfd-socket ]
 pidfd-socket::runc exec [ --pidfd-socket ] [cgroups_v2] 
 pidfd-socket::runc run [ --pidfd-socket ] 
 ps::ps after the container stopped
-rlimits::runc run with RLIMIT_NOFILE(Bigger than system's hard value)
-rlimits::runc run with RLIMIT_NOFILE(Smaller than system's hard value)
 run::runc run --keep (check cgroup exists)
 run::runc run [/proc/self/exe clone]
 run::runc run [execve error]
@@ -86,25 +79,9 @@ run::runc run with tmpfs
 run::runc run with tmpfs perms
 scheduler::scheduler is applied
 scheduler::scheduler vs cpus
-seccomp-notify::runc exec [seccomp] (SCMP_ACT_NOTIFY noNewPrivileges false)
-seccomp-notify::runc exec [seccomp] (SCMP_ACT_NOTIFY noNewPrivileges true)
-seccomp-notify::runc run [seccomp] (SCMP_ACT_NOTIFY error chmod)
-seccomp-notify::runc run [seccomp] (SCMP_ACT_NOTIFY example config)
-seccomp-notify::runc run [seccomp] (SCMP_ACT_NOTIFY important syscalls noNewPrivileges false)
-seccomp-notify::runc run [seccomp] (SCMP_ACT_NOTIFY important syscalls noNewPrivileges true)
-seccomp-notify::runc run [seccomp] (SCMP_ACT_NOTIFY kill seccompagent)
-seccomp-notify::runc run [seccomp] (SCMP_ACT_NOTIFY no seccompagent)
-seccomp-notify::runc run [seccomp] (SCMP_ACT_NOTIFY noNewPrivileges false)
-seccomp-notify::runc run [seccomp] (SCMP_ACT_NOTIFY noNewPrivileges true)
-seccomp-notify::runc run [seccomp] (SCMP_ACT_NOTIFY startContainer hook)
-seccomp-notify::runc run [seccomp] (SCMP_ACT_NOTIFY write)
-seccomp-notify::runc run [seccomp] (ignore listener path if no notify act)
 seccomp::runc run [seccomp] (SECCOMP_FILTER_FLAG_*)
 seccomp::runc run [seccomp] (startContainer hook)
 start_hello::runc run as user with no exec bit but CAP_DAC_OVERRIDE set
-timens::runc exec [simple timens]
-timens::runc run [simple timens + userns]
-timens::runc run [simple timens]
 tty::runc exec [tty consolesize]
 tty::runc exec [tty owner] ({u,g}id != 0)
 tty::runc run [tty owner] ({u,g}id != 0)
@@ -123,3 +100,4 @@ version::runc version
 ? cgroups::runc run (blkio weight)
 ? cgroups::runc run (per-device io weight for bfq)
 ? spec::spec validator
+? timens::runc run [timens with no offsets]

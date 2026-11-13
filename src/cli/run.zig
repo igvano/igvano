@@ -37,6 +37,8 @@ pub fn runContainer(allocator: std.mem.Allocator, io: std.Io, injected: ?Contain
         _ = linux.close(fd);
     };
     const pid = try createContainerFor(allocator, io, injected, config, &controller);
+    // Before start: output written earlier would already carry "\r\n".
+    if (controller) |fd| attached.clearOnlcr(fd, 1);
     var reaped = false;
     errdefer {
         if (!reaped) {

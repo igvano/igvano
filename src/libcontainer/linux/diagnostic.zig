@@ -49,6 +49,9 @@ pub const CreateResponse = extern struct {
     rootfs_mount_id: u64 = 0,
     message: [512]u8 = @splat(0),
     message_len: u32 = 0,
+    /// Set by a process that installed a seccomp notify filter: the listener
+    /// fd number in that process, for the runtime to copy with pidfd_getfd.
+    seccomp_fd: i32 = -1,
 
     pub fn failureError(self: *const CreateResponse) ?libcontainer.Error {
         if (self.failure == 0) return null;

@@ -64,6 +64,7 @@ pub const processRlimits = @import("oci/process.zig").processRlimits;
 pub const processConfig = @import("oci/process.zig").processConfig;
 
 pub const prepareSeccomp = @import("oci/seccomp.zig").prepareSeccomp;
+pub const seccompNotifies = @import("oci/seccomp.zig").seccompNotifies;
 pub const freeSeccomp = @import("oci/seccomp.zig").freeSeccomp;
 
 pub const SystemdCgroup = @import("oci/systemd.zig").SystemdCgroup;

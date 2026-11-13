@@ -65,6 +65,9 @@ const closeExecFrom = @import("process.zig").closeExecFrom;
 const kernelCapabilities = @import("process.zig").kernelCapabilities;
 const runProcess = @import("process.zig").runProcess;
 const installSeccomp = @import("process.zig").installSeccomp;
+const installSeccompFor = @import("process.zig").installSeccompFor;
+const installSeccompListener = @import("process.zig").installSeccompListener;
+const deliverSeccompListener = @import("process.zig").deliverSeccompListener;
 const applyOomScoreAdj = @import("process.zig").applyOomScoreAdj;
 const applyProcess = @import("process.zig").applyProcess;
 const applyRlimits = @import("process.zig").applyRlimits;
@@ -116,6 +119,8 @@ const CreateInit = struct {
     start_state: []u8 = undefined,
     masked_paths: []const [:0]const u8 = undefined,
     readonly_paths: []const [:0]const u8 = undefined,
+    /// /proc/self/timens_offsets text, written by child1 after unshare.
+    time_offsets: []const u8 = "",
 };
 
 const CreateCgroups = struct {
@@ -137,6 +142,8 @@ const CreateSync = struct {
     owns_pid_pipe: bool = true,
     owns_create_go: bool = true,
     create_writer: ?posix.fd_t = null,
+    /// Runtime -> init: "seccomp listener copied"; only with notify rules.
+    seccomp_ack: ?[2]posix.fd_t = null,
     map_writer: ?posix.fd_t = null,
     child1_reaped: bool = false,
 };
@@ -184,6 +191,11 @@ fn validateCreate(ctx: *CreateContext) libcontainer.Error!void {
         reportDiagnostic("cannot change propagation without a private mount namespace", .{});
         return error.InvalidConfig;
     }
+    // Offsets can only be set on a time namespace igvano creates, like runc.
+    if (ctx.options.time_offsets != null and ctx.namespaces.flags & linux.CLONE.NEWTIME == 0) {
+        reportDiagnostic("time offsets require a new time namespace", .{});
+        return error.InvalidConfig;
+    }
     if (ctx.options.hostname != null and ctx.namespaces.isolation_flags & linux.CLONE.NEWUTS == 0)
         return error.InvalidConfig;
     try validateCreateProcess(ctx);
@@ -226,6 +238,7 @@ fn prepareCreate(ctx: *CreateContext) libcontainer.Error!libcontainer.State {
         });
     }
     try validateMountNamespaceJoins(ctx);
+    if (ctx.options.time_offsets) |offsets| ctx.init.time_offsets = try timeOffsetsText(ctx.allocator, offsets);
     try prepareCreateMappings(ctx);
     return prepareJoinedUserNamespace(ctx);
 }
@@ -485,6 +498,14 @@ fn forkCreate(ctx: *CreateContext) libcontainer.Error!libcontainer.State {
     defer if (ctx.sync.owns_pid_pipe) {
         for (ctx.sync.pid_pipe) |fd| closeFd(fd);
     };
+    const listens = listenerProgram(ctx.init.seccomp_program) != null;
+    // Checked before fork: without a callback the listener fd has nowhere to go.
+    if (listens and ctx.options.on_seccomp_listener == null) {
+        reportDiagnostic("seccomp notify rules need a listener callback", .{});
+        return error.InvalidConfig;
+    }
+    ctx.sync.seccomp_ack = if (listens) try makePipe() else null;
+    defer closeSeccompAck(ctx);
     try prepareCreatePipes(ctx);
     defer if (ctx.sync.owns_create_go) {
         for (ctx.sync.create_go) |fd| closeFd(fd);
@@ -520,9 +541,32 @@ fn prepareCreatePipes(ctx: *CreateContext) libcontainer.Error!void {
     } else null;
 }
 
+fn closeSeccompAck(ctx: *const CreateContext) void {
+    const fds = ctx.sync.seccomp_ack orelse return;
+    for (fds) |fd| if (fd >= 0) closeFd(fd);
+}
+
+/// Opened with host credentials: the kernel checks CAP_SYS_TIME against the
+/// opener, and a new user namespace has no mapping for the caller yet.
+fn openTimeOffsets(ctx: *const CreateContext) ?posix.fd_t {
+    if (ctx.init.time_offsets.len == 0) return null;
+    return openPath(ctx.proc_dir, "self/timens_offsets", .{ .ACCMODE = .WRONLY, .CLOEXEC = true }) catch |err| failCreate(ctx.sync.report[1], err);
+}
+
+/// Offsets apply to the time namespace for children, before any child enters it.
+fn writeTimeOffsets(ctx: *const CreateContext, fd: ?posix.fd_t) void {
+    const opened = fd orelse return;
+    if (!writeAll(opened, ctx.init.time_offsets)) {
+        reportDiagnostic("cannot write time namespace offsets", .{});
+        failCreate(ctx.sync.report[1], error.CreateFailed);
+    }
+    closeFd(opened);
+}
+
 fn runCreateChild(ctx: *const CreateContext) noreturn {
     checkResult(linux.prctl(@intFromEnum(linux.PR.SET_DUMPABLE), 0, 0, 0, 0)) catch |err| failCreate(ctx.sync.report[1], err);
     if (ctx.options.console_fds) |fds| closeFd(fds[0]);
+    if (ctx.sync.seccomp_ack) |fds| closeFd(fds[1]);
     if (ctx.options.systemd) closeFd(ctx.cgroups.systemd_client.fd);
     closeFd(ctx.sync.create_go[1]);
     if (ctx.sync.map_pipe) |fds| closeFd(fds[1]);
@@ -532,14 +576,40 @@ fn runCreateChild(ctx: *const CreateContext) noreturn {
     // Set with host privileges before entering user namespaces.
     // Child2 inherits the adjustment across fork and exec.
     applyOomScoreAdj(ctx.proc_dir, ctx.options.oom_score_adj) catch |err| failCreate(ctx.sync.report[1], err);
+    const time_offsets = openTimeOffsets(ctx);
     joinNamespacesWithUser(ctx.namespaces.joins.items, ctx.namespaces.joined_user_fd) catch |err| failCreate(ctx.sync.report[1], err);
     // NEWUSER is unshared together with the others so it owns them.
     const early_flags = if (ctx.options.systemd) ctx.namespaces.flags & ~@as(usize, linux.CLONE.NEWCGROUP) else ctx.namespaces.flags;
     if (early_flags != 0) checkResult(linux.unshare(early_flags)) catch |err| failCreate(ctx.sync.report[1], err);
+    writeTimeOffsets(ctx, time_offsets);
     // NEWPID affects the next fork, making child2 pid 1 inside the namespace.
     const child2 = forkProcess() catch |err| failCreate(ctx.sync.report[1], err);
     if (child2 == 0) runInitChild(ctx);
     reportCreatedInit(ctx, child2);
+}
+
+/// One "<clock> <secs> <nanosecs>" line per clock, as /proc/PID/timens_offsets takes.
+fn timeOffsetsText(allocator: std.mem.Allocator, offsets: libcontainer.TimeOffsets) libcontainer.Error![]u8 {
+    var text: std.ArrayList(u8) = .empty;
+    errdefer text.deinit(allocator);
+    inline for (.{ "monotonic", "boottime" }) |clock| {
+        if (@field(offsets, clock)) |offset| {
+            if (offset.nanosecs >= std.time.ns_per_s) {
+                reportDiagnostic("time offset {s}: nanosecs must be below 1000000000", .{clock});
+                return error.InvalidConfig;
+            }
+            try text.print(allocator, clock ++ " {d} {d}\n", .{ offset.secs, offset.nanosecs });
+        }
+    }
+    return text.toOwnedSlice(allocator);
+}
+
+test "time offsets format one line per clock and reject bad nanoseconds" {
+    const text = try timeOffsetsText(std.testing.allocator, .{ .monotonic = .{ .secs = 7881, .nanosecs = 2718281 }, .boottime = .{ .secs = -1337, .nanosecs = 0 } });
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("monotonic 7881 2718281\nboottime -1337 0\n", text);
+    defer diagnostics.last_diagnostic_len = 0;
+    try std.testing.expectError(error.InvalidConfig, timeOffsetsText(std.testing.allocator, .{ .boottime = .{ .secs = 0, .nanosecs = std.time.ns_per_s } }));
 }
 
 fn joinCreateCgroups(ctx: *const CreateContext) void {
@@ -593,6 +663,7 @@ fn runInitChild(ctx: *const CreateContext) noreturn {
         .runtime_sync = .{ .ready_fd = ctx.sync.ready[1], .go_fd = ctx.sync.create_go[0] },
         .console_fd = if (ctx.options.console_fds) |fds| fds[1] else null,
         .mount_source_socket = ctx.mount_source_socket,
+        .seccomp_ack_fd = if (ctx.sync.seccomp_ack) |fds| fds[0] else null,
     }, ctx.init.start_hooks, start_input, ctx.init.apparmor_command, ctx.init.seccomp_program);
 }
 
@@ -624,6 +695,7 @@ fn closeCreateChildFds(ctx: *const CreateContext) void {
     if (ctx.options.console_fds) |fds| closeFd(fds[1]);
     closeFd(ctx.sync.create_go[0]);
     closeFd(ctx.sync.pid_pipe[0]);
+    if (ctx.sync.seccomp_ack) |fds| closeFd(fds[0]);
 }
 
 fn sendInitHostPid(ctx: *const CreateContext, child2: i32) void {
@@ -698,7 +770,14 @@ fn reportInitIdentity(ctx: *const CreateContext, child2: i32, response: *CreateR
 
 fn waitInitInitialized(ctx: *const CreateContext, child2: i32) void {
     var init_response: CreateResponse = .{};
-    const initialized = readAll(ctx.sync.ready[0], std.mem.asBytes(&init_response));
+    var initialized = readAll(ctx.sync.ready[0], std.mem.asBytes(&init_response));
+    // Forward a seccomp listener report with init's host PID, then keep waiting.
+    while (initialized and init_response.failure == 0 and init_response.seccomp_fd >= 0) {
+        init_response.pid = child2;
+        reportInitIdentity(ctx, child2, &init_response);
+        init_response = .{};
+        initialized = readAll(ctx.sync.ready[0], std.mem.asBytes(&init_response));
+    }
     closeFd(ctx.sync.ready[0]);
     if (!initialized or init_response.failure != 0) {
         _ = waitChild(child2) catch {};
@@ -731,6 +810,10 @@ fn awaitCreateParent(ctx: *CreateContext) libcontainer.Error!libcontainer.State 
     ctx.sync.owns_pid_pipe = false;
     closeFd(ctx.sync.report[1]);
     for (ctx.sync.ready) |fd| closeFd(fd);
+    if (ctx.sync.seccomp_ack) |*fds| {
+        closeFd(fds[0]);
+        fds[0] = -1;
+    }
     defer closeFd(ctx.sync.report[0]);
     // Keep a reader to prevent SIGPIPE if init exits before release.
     defer closeFd(ctx.sync.create_go[0]);
@@ -876,7 +959,13 @@ fn validateInitResponse(response: CreateResponse) libcontainer.Error!void {
 
 fn awaitInitializedInit(ctx: *CreateContext) libcontainer.Error!CreateResponse {
     var response: CreateResponse = .{};
-    const initialized = readAll(ctx.sync.report[0], std.mem.asBytes(&response));
+    var initialized = readAll(ctx.sync.report[0], std.mem.asBytes(&response));
+    while (initialized and response.failure == 0 and response.seccomp_fd >= 0) {
+        const ack = if (ctx.sync.seccomp_ack) |fds| fds[1] else return error.CreateFailed;
+        try deliverSeccompListener(response.pid, response.seccomp_fd, ack, ctx.options.on_seccomp_listener);
+        response = .{};
+        initialized = readAll(ctx.sync.report[0], std.mem.asBytes(&response));
+    }
     ctx.sync.child1_reaped = true;
     const status = try waitChild(ctx.sync.child1);
     if (!initialized) return error.CreateFailed;
@@ -1004,13 +1093,28 @@ fn applyInitProcess(init: *const InitContext, fifo_name: [:0]const u8) void {
         // With NNP=true, install after startContainer hooks (unfiltered); NNP=false hooks run filtered, intentionally.
         if (!process.no_new_privileges) {
             if (init.seccomp_program) |program|
-                installSeccomp(program) catch |err| failCreate(init.ready_fd, err);
+                installSeccompFor(program, init.ready_fd, init.rootfs_options.seccomp_ack_fd) catch |err| failCreate(init.ready_fd, err);
         }
         applyProcess(process, init.capabilities, &.{}) catch |err| {
             childError("cannot apply process settings: ", err);
             failCreate(init.ready_fd, err);
         };
+        if (process.no_new_privileges) installLateListener(init);
     }
+}
+
+/// A listener must reach the runtime while create still waits, so with
+/// NNP=true it is installed after the process settings, like runc: start
+/// hooks then run filtered.
+fn installLateListener(init: *const InitContext) void {
+    const program = listenerProgram(init.seccomp_program) orelse return;
+    const ack = init.rootfs_options.seccomp_ack_fd orelse failCreate(init.ready_fd, error.CreateFailed);
+    installSeccompListener(program, init.ready_fd, ack) catch |err| failCreate(init.ready_fd, err);
+}
+
+fn listenerProgram(program: ?seccomp.Program) ?seccomp.Program {
+    const value = program orelse return null;
+    return if (value.flags & seccomp.filter_flag_new_listener != 0) value else null;
 }
 
 fn waitInitStart(init: *const InitContext, fifo_name: [:0]const u8) posix.fd_t {
@@ -1036,7 +1140,9 @@ fn startInitProcess(init: *const InitContext, executable: ?[*:0]const u8, fd: po
         linux.exit_group(1);
     };
     if (!writeAll(fd, &.{1})) linux.exit_group(1);
-    runProcess(init.process, executable, init.argv, init.envp, init.seccomp_program) catch |err| {
+    // A notify filter was already installed during create.
+    const late_program = if (listenerProgram(init.seccomp_program) == null) init.seccomp_program else null;
+    runProcess(init.process, executable, init.argv, init.envp, late_program) catch |err| {
         if (err != error.ExecFailed) childError("cannot execute process: ", err);
         _ = writeAll(fd, &.{0});
         linux.exit_group(1);

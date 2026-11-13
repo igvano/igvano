@@ -112,7 +112,7 @@ fn expectFeatureMounts(allocator: std.mem.Allocator, reported_mounts: []const st
 fn expectFeatureSeccomp(allocator: std.mem.Allocator, seccomp: std.json.ObjectMap) !void {
     try std.testing.expect(seccomp.get("enabled").?.bool);
     const lists = [_]struct { name: []const u8, count: usize }{
-        .{ .name = "actions", .count = 8 },
+        .{ .name = "actions", .count = 9 },
         .{ .name = "operators", .count = 7 },
         .{ .name = "archs", .count = 24 },
         .{ .name = "knownFlags", .count = 4 },
@@ -124,8 +124,11 @@ fn expectFeatureSeccomp(allocator: std.mem.Allocator, seccomp: std.json.ObjectMa
         for (reported) |item| {
             var profile: Spec.Seccomp = .{ .defaultAction = "SCMP_ACT_ALLOW" };
             if (std.mem.eql(u8, list.name, "actions")) {
-                try std.testing.expect(!std.mem.eql(u8, item.string, "SCMP_ACT_NOTIFY"));
-                profile.defaultAction = item.string;
+                // NOTIFY is valid only on rules, with a listener.
+                if (std.mem.eql(u8, item.string, "SCMP_ACT_NOTIFY")) {
+                    profile.listenerPath = "/listener";
+                    profile.syscalls = &.{.{ .names = &.{"mkdir"}, .action = item.string }};
+                } else profile.defaultAction = item.string;
             } else if (std.mem.eql(u8, list.name, "operators")) {
                 profile.syscalls = &.{.{ .names = &.{"personality"}, .action = "SCMP_ACT_ERRNO", .args = &.{.{
                     .index = 0,

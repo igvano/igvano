@@ -40,11 +40,15 @@ pub const console = struct {
     }
 
     pub fn sendFd(socket: posix.fd_t, fd: posix.fd_t) libcontainer.Error!void {
+        return sendFdWithData(socket, fd, "ptmx");
+    }
+
+    /// One sendmsg carrying `data` and `fd` (SCM_RIGHTS); data must be non-empty.
+    pub fn sendFdWithData(socket: posix.fd_t, fd: posix.fd_t, data: []const u8) libcontainer.Error!void {
         if (comptime builtin.os.tag != .linux) return error.NotImplemented;
         var rights: Rights = std.mem.zeroes(Rights);
         rights.header = .{ .len = rights_len, .level = linux.SOL.SOCKET, .type = linux.SCM.RIGHTS };
         rights.fd = fd;
-        const data = "ptmx";
         const iov = [_]posix.iovec_const{.{ .base = data.ptr, .len = data.len }};
         const message: linux.msghdr_const = .{
             .name = null,

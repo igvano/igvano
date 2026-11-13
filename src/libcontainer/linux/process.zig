@@ -9,6 +9,8 @@ const closeFd = @import("syscall.zig").closeFd;
 const writeAll = @import("syscall.zig").writeAll;
 const openPath = @import("syscall.zig").openPath;
 const reportDiagnostic = @import("diagnostic.zig").reportDiagnostic;
+const CreateResponse = @import("diagnostic.zig").CreateResponse;
+const readAll = @import("syscall.zig").readAll;
 
 /// Mark inherited descriptors before installing seccomp. A pinned self/fd
 /// directory allows the fallback even when the container has no /proc mount.
@@ -110,15 +112,64 @@ pub fn runProcess(configured: ?libcontainer.Process, executable: ?[*:0]const u8,
 // No descriptor sweep or rlimit syscall belongs after this point. FIFO opens
 // use O_CLOEXEC; hook memfds and relocated fds use MFD_CLOEXEC/F_DUPFD_CLOEXEC,
 // and only intentional hook stdio dup2/dup3 targets clear CLOEXEC.
+/// The NOTIFY-capable form of installSeccomp. Like runc, report the listener
+/// fd number on `report_fd` (write must never be notified, which the frontend
+/// enforces), then wait for the runtime to copy it before closing ours.
+/// Notified syscalls made meanwhile simply wait for the agent.
+pub fn installSeccompListener(program: seccomp.Program, report_fd: posix.fd_t, ack_fd: posix.fd_t) libcontainer.Error!void {
+    var listener: i32 = -1;
+    const result = seccomp.installListener(program, &listener);
+    if (result != .SUCCESS) return seccompFailed(result);
+    defer closeFd(listener);
+    defer closeFd(ack_fd);
+    const response: CreateResponse = .{ .seccomp_fd = listener };
+    if (!writeAll(report_fd, std.mem.asBytes(&response))) return error.CreateFailed;
+    var byte: [1]u8 = undefined;
+    if (!readAll(ack_fd, &byte) or byte[0] != 1) return error.CreateFailed;
+}
+
+/// Installs with a listener when the program has notify rules.
+pub fn installSeccompFor(program: seccomp.Program, report_fd: posix.fd_t, ack_fd: ?posix.fd_t) libcontainer.Error!void {
+    if (program.flags & seccomp.filter_flag_new_listener == 0) return installSeccomp(program);
+    return installSeccompListener(program, report_fd, ack_fd orelse return error.CreateFailed);
+}
+
 pub fn installSeccomp(program: seccomp.Program) libcontainer.Error!void {
     const result = seccomp.install(program);
-    if (result != .SUCCESS) {
-        var errno_buffer: [16]u8 = undefined;
-        const errno_name = std.enums.tagName(linux.E, result) orelse
-            (std.fmt.bufPrint(&errno_buffer, "{d}", .{@intFromEnum(result)}) catch unreachable);
-        reportDiagnostic("cannot install seccomp filter: E{s}", .{errno_name});
+    if (result != .SUCCESS) return seccompFailed(result);
+}
+
+fn seccompFailed(result: linux.E) libcontainer.Error {
+    var errno_buffer: [16]u8 = undefined;
+    const errno_name = std.enums.tagName(linux.E, result) orelse
+        (std.fmt.bufPrint(&errno_buffer, "{d}", .{@intFromEnum(result)}) catch unreachable);
+    reportDiagnostic("cannot install seccomp filter: E{s}", .{errno_name});
+    return error.CreateFailed;
+}
+
+/// Runtime side of installSeccompListener: copy fd `target` out of `pid`
+/// (pidfd_getfd, Linux 5.6+), let the process go on, then hand the copy to
+/// the frontend, which sends it to the seccomp agent.
+pub fn deliverSeccompListener(pid: i32, target: i32, ack_fd: posix.fd_t, callback: ?libcontainer.SeccompListenerCallback) libcontainer.Error!void {
+    const pidfd = linux.pidfd_open(pid, 0);
+    if (linux.errno(pidfd) != .SUCCESS) {
+        reportDiagnostic("cannot open pidfd for seccomp listener of pid {d}: E{s}", .{ pid, @tagName(linux.errno(pidfd)) });
         return error.CreateFailed;
     }
+    defer closeFd(@intCast(pidfd));
+    const copied = linux.pidfd_getfd(@intCast(pidfd), target, 0);
+    if (linux.errno(copied) != .SUCCESS) {
+        reportDiagnostic("cannot copy seccomp listener fd {d} from pid {d}: E{s}", .{ target, pid, @tagName(linux.errno(copied)) });
+        return error.CreateFailed;
+    }
+    const listener: posix.fd_t = @intCast(copied);
+    defer closeFd(listener);
+    if (!writeAll(ack_fd, &.{1})) return error.CreateFailed;
+    const send = callback orelse {
+        reportDiagnostic("seccomp notify filter installed without a listener callback", .{});
+        return error.InvalidConfig;
+    };
+    try send.run(send.ptr, listener, pid);
 }
 
 pub fn applyOomScoreAdj(proc_dir: posix.fd_t, oom_score_adj: ?i32) libcontainer.Error!void {

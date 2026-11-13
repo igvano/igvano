@@ -6,9 +6,10 @@ const Spec = @import("spec.zig").Spec;
 pub fn prepareSeccomp(allocator: std.mem.Allocator, configured: ?Spec.Seccomp) !?libcontainer.seccomp.Config {
     const config = configured orelse return null;
     const seccomp = libcontainer.seccomp;
-    if (config.listenerPath != null)
-        return seccompInvalid("seccomp notify is not supported", .{});
+    // Like runc: a listener path without notify rules is ignored.
     const default_action = try seccompAction(config.defaultAction);
+    if (default_action == .notify) return seccompInvalid("SCMP_ACT_NOTIFY cannot be used as default action", .{});
+    try validateSeccompNotify(config);
     if (config.defaultErrnoRet != null and default_action != .errno and default_action != .trace)
         return seccompInvalid("seccomp defaultErrnoRet is not supported by {s}", .{config.defaultAction});
     const default_errno = try seccompErrno(config.defaultErrnoRet);
@@ -110,9 +111,27 @@ fn seccompInvalid(comptime fmt: []const u8, args: anytype) error{InvalidConfig} 
     return invalidConfig("linux.seccomp: " ++ fmt, args);
 }
 
+/// True when any rule sends syscalls to the seccomp agent at listenerPath.
+pub fn seccompNotifies(config: Spec.Seccomp) bool {
+    for (config.syscalls orelse &.{}) |syscall| {
+        if (std.mem.eql(u8, syscall.action, "SCMP_ACT_NOTIFY")) return true;
+    }
+    return false;
+}
+
+fn validateSeccompNotify(config: Spec.Seccomp) error{InvalidConfig}!void {
+    if (!seccompNotifies(config)) return;
+    if ((config.listenerPath orelse @as([]const u8, "")).len == 0)
+        return seccompInvalid("SCMP_ACT_NOTIFY requires listenerPath", .{});
+    for (config.syscalls orelse &.{}) |syscall| {
+        if (!std.mem.eql(u8, syscall.action, "SCMP_ACT_NOTIFY")) continue;
+        // The runtime reports the listener fd to its parent with write.
+        for (syscall.names) |name| if (std.mem.eql(u8, name, "write"))
+            return seccompInvalid("SCMP_ACT_NOTIFY cannot be used for the write syscall", .{});
+    }
+}
+
 fn seccompAction(name: []const u8) error{InvalidConfig}!libcontainer.seccomp.Action {
-    if (std.mem.eql(u8, name, "SCMP_ACT_NOTIFY"))
-        return seccompInvalid("seccomp notify is not supported", .{});
     return seccomp_actions.get(name) orelse seccompInvalid("unknown seccomp action: {s}", .{name});
 }
 
@@ -128,6 +147,7 @@ pub const seccomp_actions = std.StaticStringMap(libcontainer.seccomp.Action).ini
     .{ "SCMP_ACT_KILL_PROCESS", .kill_process }, .{ "SCMP_ACT_TRAP", .trap },
     .{ "SCMP_ACT_ERRNO", .errno },               .{ "SCMP_ACT_TRACE", .trace },
     .{ "SCMP_ACT_LOG", .log },                   .{ "SCMP_ACT_ALLOW", .allow },
+    .{ "SCMP_ACT_NOTIFY", .notify },
 });
 
 pub const seccomp_arches = std.StaticStringMap(?libcontainer.seccomp.Arch).initComptime(.{
@@ -166,7 +186,8 @@ pub const seccomp_ops = std.StaticStringMap(libcontainer.seccomp.Op).initComptim
 pub const seccomp_flags = std.StaticStringMap(u32).initComptime(.{
     .{ "SECCOMP_FILTER_FLAG_LOG", 2 },
     .{ "SECCOMP_FILTER_FLAG_SPEC_ALLOW", 4 },
-    // Meaningless without notify, which igvano rejects.
+    // ponytail: accepted but not set; needs Linux 5.19 and changes only how
+    // a notified task reacts to non-fatal signals.
     .{ "SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV", 0 },
     // Like runc, init/exec are single-threaded at installation.
     .{ "SECCOMP_FILTER_FLAG_TSYNC", 0 },
@@ -314,7 +335,6 @@ test "seccomp rejects unsupported or unknown schema values even for unknown sysc
     const cases = [_]Spec.Seccomp{
         .{ .defaultAction = "unknown" },
         .{ .defaultAction = "SCMP_ACT_NOTIFY" },
-        .{ .defaultAction = "SCMP_ACT_ALLOW", .listenerPath = "/listener" },
         .{ .defaultAction = "SCMP_ACT_ALLOW", .architectures = &.{"SCMP_ARCH_UNKNOWN"} },
         .{ .defaultAction = "SCMP_ACT_ALLOW", .flags = &.{"SECCOMP_FILTER_FLAG_NEW_LISTENER"} },
         .{ .defaultAction = "SCMP_ACT_ALLOW", .flags = &.{"unknown"} },
@@ -323,6 +343,8 @@ test "seccomp rejects unsupported or unknown schema values even for unknown sysc
         .{ .defaultAction = "SCMP_ACT_ALLOW", .syscalls = &.{.{ .names = &.{"unknown"}, .action = "SCMP_ACT_KILL", .errnoRet = 1 }} },
         .{ .defaultAction = "SCMP_ACT_ALLOW", .syscalls = &.{.{ .names = &.{"unknown"}, .action = "unknown" }} },
         .{ .defaultAction = "SCMP_ACT_ALLOW", .syscalls = &.{.{ .names = &.{"unknown"}, .action = "SCMP_ACT_NOTIFY" }} },
+        .{ .defaultAction = "SCMP_ACT_ALLOW", .listenerPath = "", .syscalls = &.{.{ .names = &.{"mkdir"}, .action = "SCMP_ACT_NOTIFY" }} },
+        .{ .defaultAction = "SCMP_ACT_ALLOW", .listenerPath = "/l", .syscalls = &.{.{ .names = &.{ "mkdir", "write" }, .action = "SCMP_ACT_NOTIFY" }} },
         .{ .defaultAction = "SCMP_ACT_ALLOW", .syscalls = &.{.{ .names = &.{"unknown"}, .action = "SCMP_ACT_ALLOW", .args = &.{.{ .index = 0, .value = 0, .op = "unknown" }} }} },
         .{ .defaultAction = "SCMP_ACT_ALLOW", .syscalls = &.{.{ .names = &.{"mkdir"}, .action = "SCMP_ACT_ERRNO", .args = &.{.{ .index = 6, .value = 0, .op = "SCMP_CMP_EQ" }} }} },
     };
@@ -335,6 +357,10 @@ test "seccomp rejects unsupported or unknown schema values even for unknown sysc
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     try std.testing.expect((try prepareSeccomp(arena.allocator(), .{ .defaultAction = "SCMP_ACT_ALLOW" })).?.architectures.len == 1);
+    // A listener path alone is ignored; notify rules with one are accepted.
+    _ = try prepareSeccomp(arena.allocator(), .{ .defaultAction = "SCMP_ACT_ALLOW", .listenerPath = "/listener" });
+    const notify = (try prepareSeccomp(arena.allocator(), .{ .defaultAction = "SCMP_ACT_ALLOW", .listenerPath = "/l", .syscalls = &.{.{ .names = &.{"mkdir"}, .action = "SCMP_ACT_NOTIFY" }} })).?;
+    try std.testing.expectEqual(libcontainer.seccomp.Action.notify, notify.rules[0].action);
     try std.testing.expect((try prepareSeccomp(arena.allocator(), .{
         .defaultAction = "SCMP_ACT_ALLOW",
         .architectures = &.{"SCMP_ARCH_NATIVE"},

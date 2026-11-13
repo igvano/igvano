@@ -18,6 +18,7 @@ const lockContainer = @import("state.zig").lockContainer;
 const requireLinkedLock = @import("state.zig").requireLinkedLock;
 const LiveState = @import("state.zig").LiveState;
 const readLiveState = @import("state.zig").readLiveState;
+const SeccompAgent = @import("seccomp_agent.zig").Agent;
 
 fn execProcessConfig(allocator: std.mem.Allocator, inherited: oci.Spec.Process, config: Config) !oci.Spec.Process {
     var process = inherited;
@@ -82,11 +83,16 @@ pub fn execContainer(allocator: std.mem.Allocator, io: std.Io, injected: ?Contai
     var arena: std.heap.ArenaAllocator = .init(allocator);
     defer arena.deinit();
     const process_allocator = arena.allocator();
-    const options = try prepareExecOptions(process_allocator, io, state, config);
+    var agent: ?SeccompAgent = null;
+    const options = try prepareExecOptions(process_allocator, io, state, config, &agent);
     defer if (options.console_fds) |fds| for (fds) |fd| {
         _ = linux.close(fd);
     };
-    return runExec(allocator, io, container.?, config, options, &lock, locked);
+    return runExec(allocator, io, container.?, config, options, &lock, locked) catch |err| {
+        // The agent's own error carries the reason, e.g. a failed connect.
+        if (agent) |value| if (value.failure) |reason| return reason;
+        return err;
+    };
 }
 
 pub fn reserveStdio() !void {
@@ -111,7 +117,7 @@ pub fn reserveStdio() !void {
     }
 }
 
-fn prepareExecOptions(process_allocator: std.mem.Allocator, io: std.Io, state: LiveState, config: Config) !libcontainer.ExecOptions {
+fn prepareExecOptions(process_allocator: std.mem.Allocator, io: std.Io, state: LiveState, config: Config, agent: *?SeccompAgent) !libcontainer.ExecOptions {
     const saved_bundle = try std.fs.path.join(process_allocator, &.{ config.root, config.id });
     // Legacy containers did not snapshot config.json at create.
     const saved_spec = try loadExecSpec(process_allocator, io, saved_bundle, state.parsed.value.bundle, config.process_file != null);
@@ -126,6 +132,8 @@ fn prepareExecOptions(process_allocator: std.mem.Allocator, io: std.Io, state: L
         break :seccomp settings.seccomp;
     };
     options.seccomp = try oci.prepareSeccomp(process_allocator, seccomp);
+    agent.* = SeccompAgent.init(process_allocator, seccomp, state.parsed.value);
+    if (agent.*) |*value| options.on_seccomp_listener = value.callback();
     options.cgroup_path = state.container_state.?.cgroup_path orelse return oci.validationError(error.InvalidState, "exec: saved cgroup path is missing", .{});
     options.console_fds = if (process.terminal orelse false) try libcontainer.linux.console.socketpair() else null;
     return options;
