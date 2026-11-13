@@ -44,20 +44,43 @@ fn appendV2MemoryWrites(allocator: std.mem.Allocator, writes: *std.ArrayList(Wri
     }
     if (memory.reservation) |reservation|
         try appendWrite(allocator, writes, "memory.low", try cgroupLimit(allocator, reservation));
-    if (memory.swap) |swap| {
-        const limit = memory.limit orelse 0;
-        if (swap < -1) return error.InvalidConfig;
-        if (swap == -1) {
-            try appendWrite(allocator, writes, "memory.swap.max", try allocator.dupe(u8, "max"));
-        } else if (swap > 0) {
-            if (limit <= 0) {
-                reportDiagnostic("swap limit requires a memory limit", .{});
-                return error.InvalidConfig;
-            }
-            if (swap < limit) return error.InvalidConfig;
-            try appendWrite(allocator, writes, "memory.swap.max", try cgroupLimit(allocator, swap - limit));
-        }
+    if (try swapMax(memory.limit orelse 0, memory.swap orelse 0)) |swap|
+        try appendWrite(allocator, writes, "memory.swap.max", try cgroupLimit(allocator, swap));
+}
+
+/// runc's ConvertMemorySwapToCgroupV2Value: spec swap is memory+swap, and
+/// cgroup2 swap is separate. Null writes nothing.
+fn swapMax(limit: i64, swap: i64) libcontainer.Error!?i64 {
+    if (swap < -1) return error.InvalidConfig;
+    // Unlimited memory without a swap value means unlimited swap too.
+    if (limit == -1 and swap == 0) return -1;
+    if (swap == -1) return -1;
+    if (swap == 0) return null;
+    if (limit == -1) return swap;
+    if (limit <= 0) {
+        reportDiagnostic("swap limit requires a memory limit", .{});
+        return error.InvalidConfig;
     }
+    if (swap < limit) {
+        reportDiagnostic("memory+swap limit should be >= memory limit", .{});
+        return error.InvalidConfig;
+    }
+    return swap - limit;
+}
+
+test "v2 swap follows runc's memory+swap conversion" {
+    const cases = [_]struct { limit: i64, swap: i64, max: ?i64 }{
+        .{ .limit = -1, .swap = 0, .max = -1 },
+        .{ .limit = 64, .swap = -1, .max = -1 },
+        .{ .limit = 64, .swap = 0, .max = null },
+        .{ .limit = -1, .swap = 128, .max = 128 },
+        .{ .limit = 64, .swap = 128, .max = 64 },
+        .{ .limit = 64, .swap = 64, .max = 0 },
+    };
+    for (cases) |case| try std.testing.expectEqual(case.max, try swapMax(case.limit, case.swap));
+    defer @import("diagnostic.zig").last_diagnostic_len = 0;
+    try std.testing.expectError(error.InvalidConfig, swapMax(0, 128));
+    try std.testing.expectError(error.InvalidConfig, swapMax(64, 32));
 }
 
 fn appendV2CpuWrites(allocator: std.mem.Allocator, writes: *std.ArrayList(Write), cpu: Resources.Cpu) libcontainer.Error!void {
@@ -74,6 +97,11 @@ fn appendV2CpuWrites(allocator: std.mem.Allocator, writes: *std.ArrayList(Write)
             try std.fmt.allocPrint(allocator, "{d} {d}", .{ quota, period });
         try appendWrite(allocator, writes, "cpu.max", value);
     }
+    // After cpu.max: the kernel caps burst at the quota.
+    // ponytail: lowering the quota below the current burst in one update
+    // fails; runc retries burst around cpu.max to handle that.
+    if (cpu.burst) |burst|
+        try appendWrite(allocator, writes, "cpu.max.burst", try std.fmt.allocPrint(allocator, "{d}", .{burst}));
     if (cpu.shares) |shares| {
         const weight = try cpuWeight(shares);
         if (weight != 0)
@@ -138,11 +166,17 @@ pub fn cgroupLimit(allocator: std.mem.Allocator, limit: i64) libcontainer.Error!
     return std.fmt.allocPrint(allocator, "{d}", .{limit});
 }
 
-/// Zero shares means unset; the remaining range maps to [1, 10000].
+/// Zero shares means unset. runc's quadratic fit (opencontainers/cgroups
+/// ConvertCPUSharesToCgroupV2Value) maps 2, 1024 and 262144 to the weights
+/// 1, 100 and 10000, so the default shares give the default weight.
 pub fn cpuWeight(shares: u64) libcontainer.Error!u64 {
     if (shares == 0) return 0;
     if (shares < 2 or shares > 262144) return error.InvalidConfig;
-    return 1 + ((shares - 2) * 9999) / 262142;
+    if (shares == 2) return 1;
+    if (shares == 262144) return 10000;
+    const l = std.math.log2(@as(f64, @floatFromInt(shares)));
+    const exponent = (l * l + 125 * l) / 612.0 - 7.0 / 34.0;
+    return @intFromFloat(@ceil(std.math.pow(f64, 10, exponent)));
 }
 
 pub fn ioWeight(weight: u16) libcontainer.Error!u64 {
@@ -220,7 +254,8 @@ test "cpu shares map to cgroup2 weights without underflow or overflow" {
     const cases = [_]struct { shares: u64, weight: u64 }{
         .{ .shares = 0, .weight = 0 },
         .{ .shares = 2, .weight = 1 },
-        .{ .shares = 1024, .weight = 39 },
+        .{ .shares = 100, .weight = 17 },
+        .{ .shares = 1024, .weight = 100 },
         .{ .shares = 262144, .weight = 10000 },
     };
     for (cases) |case| try std.testing.expectEqual(case.weight, try cpuWeight(case.shares));
@@ -238,14 +273,13 @@ test "v2 writes preserve existing memory cpu and pids mappings" {
     try std.testing.expectEqualDeep(&[_]Write{
         .{ .name = "memory.max", .value = "67108864" },
         .{ .name = "cpu.max", .value = "50000 100000" },
-        .{ .name = "cpu.weight", .value = "39" },
+        .{ .name = "cpu.weight", .value = "100" },
         .{ .name = "pids.max", .value = "32" },
     }, writes);
 }
 
 test "v2 writes preserve unlimited values and CPU defaults" {
     const cases = [_]struct { resources: Resources, name: []const u8, value: []const u8 }{
-        .{ .resources = .{ .memory = .{ .limit = -1 } }, .name = "memory.max", .value = "max" },
         .{ .resources = .{ .pids = .{ .limit = -1 } }, .name = "pids.max", .value = "max" },
         .{ .resources = .{ .cpu = .{ .quota = -1, .period = 200000 } }, .name = "cpu.max", .value = "max 200000" },
         .{ .resources = .{ .cpu = .{ .period = 200000 } }, .name = "cpu.max", .value = "max 200000" },
@@ -277,7 +311,7 @@ test "v2 writes preserve unlimited values and CPU defaults" {
         .cpu = .{ .shares = 1024 },
     });
     defer freeWrites(std.testing.allocator, writes);
-    try std.testing.expectEqualDeep(&[_]Write{.{ .name = "cpu.weight", .value = "39" }}, writes);
+    try std.testing.expectEqualDeep(&[_]Write{.{ .name = "cpu.weight", .value = "100" }}, writes);
 }
 
 test "v2 resource mapping frees partially allocated writes on allocation failure" {
@@ -323,6 +357,13 @@ test "v2 writes map memory reservation and total swap to swap-only limits" {
             .{ .name = "memory.max", .value = "max" }, .{ .name = "memory.swap.max", .value = "max" },
         } },
         .{ .memory = .{ .swap = -1 }, .expected = &.{.{ .name = "memory.swap.max", .value = "max" }} },
+        // Like runc, unlimited memory without a swap value unlimits swap too.
+        .{ .memory = .{ .limit = -1 }, .expected = &.{
+            .{ .name = "memory.max", .value = "max" }, .{ .name = "memory.swap.max", .value = "max" },
+        } },
+        .{ .memory = .{ .limit = -1, .swap = 64 }, .expected = &.{
+            .{ .name = "memory.max", .value = "max" }, .{ .name = "memory.swap.max", .value = "64" },
+        } },
         .{ .memory = .{ .limit = 0, .swap = -1 }, .expected = &.{.{ .name = "memory.swap.max", .value = "max" }} },
         .{ .memory = .{ .swap = 0 }, .expected = &.{} },
         .{ .memory = .{ .limit = 0, .swap = 0 }, .expected = &.{} },
@@ -336,7 +377,6 @@ test "v2 writes map memory reservation and total swap to swap-only limits" {
         .{ .swap = 128 },
         .{ .limit = 128, .swap = 64 },
         .{ .limit = 0, .swap = 64 },
-        .{ .limit = -1, .swap = 64 },
         .{ .limit = 64, .swap = -2 },
     }) |memory|
         try std.testing.expectError(error.InvalidConfig, v2Writes(std.testing.allocator, .{ .memory = memory }));
@@ -352,7 +392,7 @@ test "v2 writes preserve cpuset strings" {
 
 test "v2 swap without a finite memory limit reports why it is invalid" {
     defer diagnostics.last_diagnostic_len = 0;
-    for ([_]?i64{ null, 0, -1 }) |limit| {
+    for ([_]?i64{ null, 0 }) |limit| {
         diagnostics.last_diagnostic_len = 0;
         try std.testing.expectError(error.InvalidConfig, v2Writes(std.testing.allocator, .{ .memory = .{ .limit = limit, .swap = 128 } }));
         try std.testing.expectEqualStrings("swap limit requires a memory limit", diagnostics.last_diagnostic[0..diagnostics.last_diagnostic_len]);

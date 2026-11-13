@@ -162,6 +162,7 @@ pub const Spec = struct {
             kernelTCP: ?i64 = null,
             swappiness: ?u64 = null,
             disableOOMKiller: ?bool = null,
+            checkBeforeUpdate: ?bool = null,
         };
         pub const Cpu = struct {
             quota: ?i64 = null,
@@ -170,6 +171,7 @@ pub const Spec = struct {
             realtimeRuntime: ?i64 = null,
             realtimePeriod: ?u64 = null,
             idle: ?i64 = null,
+            burst: ?u64 = null,
             cpus: ?[]const u8 = null,
             mems: ?[]const u8 = null,
         };

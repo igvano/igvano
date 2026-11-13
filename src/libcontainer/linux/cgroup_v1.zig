@@ -127,6 +127,8 @@ fn appendV1CpuWrites(allocator: std.mem.Allocator, writes: *std.ArrayList(V1Writ
                 try appendV1Write(allocator, writes, "cpu", field[1], try std.fmt.allocPrint(allocator, "{d}", .{value}), null, false);
         }
     }
+    if (cpu.burst) |value|
+        try appendV1Write(allocator, writes, "cpu", "cpu.cfs_burst_us", try std.fmt.allocPrint(allocator, "{d}", .{value}), null, false);
     if (cpu.idle) |value|
         try appendV1Write(allocator, writes, "cpu", "cpu.idle", try std.fmt.allocPrint(allocator, "{d}", .{value}), null, false);
     if (cpu.cpus) |value|

@@ -199,6 +199,7 @@ fn updateV2(allocator: std.mem.Allocator, root: posix.fd_t, handle: libcontainer
         std.debug.print("igvano: warning: cgroup v2 has no equivalent for: {s}; ignoring\n", .{ignored_fields});
     const cgroup = (try walkCgroup(root, path, false, writes)) orelse return error.ProcessNotFound;
     defer closeFd(cgroup);
+    if (resources.memory) |memory| try checkMemoryUsage(allocator, cgroup, memory);
     if (try completeV2Cpu(allocator, cgroup, &requested)) {
         const completed = try v2Writes(allocator, requested);
         freeWrites(allocator, writes);
@@ -211,6 +212,26 @@ fn updateV2(allocator: std.mem.Allocator, root: posix.fd_t, handle: libcontainer
         const rules = try v2DeviceRules(allocator, resources.devices, handle.device_nodes);
         defer allocator.free(rules);
         try applyV2DeviceFilter(allocator, cgroup, rules, path, true);
+    }
+}
+
+/// runc's CheckMemoryUsage: with checkBeforeUpdate, refuse limits at or
+/// below memory.current. Best effort: an unreadable usage allows the update.
+fn checkMemoryUsage(allocator: std.mem.Allocator, cgroup: posix.fd_t, memory: Resources.Memory) libcontainer.Error!void {
+    if (!memory.check_before_update) return;
+    const limit = memory.limit orelse 0;
+    const swap = memory.swap orelse 0;
+    if (limit <= 0 and swap <= 0) return;
+    const text = readCgroupFile(allocator, cgroup, "memory.current") catch return;
+    defer allocator.free(text);
+    const usage = std.fmt.parseInt(u64, std.mem.trim(u8, text, " \t\n"), 10) catch return;
+    if (swap > 0 and @as(u64, @intCast(swap)) <= usage) {
+        reportDiagnostic("rejecting memory+swap limit {d} <= usage {d}", .{ swap, usage });
+        return error.InvalidConfig;
+    }
+    if (limit > 0 and @as(u64, @intCast(limit)) <= usage) {
+        reportDiagnostic("rejecting memory limit {d} <= usage {d}", .{ limit, usage });
+        return error.InvalidConfig;
     }
 }
 

@@ -42,7 +42,7 @@ test "resource updates write only requested limits and replace explicit v1 devic
     defer freeWrites(std.testing.allocator, v2);
     try std.testing.expectEqual(@as(usize, 1), v2.len);
     try std.testing.expectEqualStrings("cpu.weight", v2[0].name);
-    try std.testing.expectEqualStrings("20", v2[0].value);
+    try std.testing.expectEqualStrings("59", v2[0].value);
     const devices = try v1Writes(std.testing.allocator, .{
         .devices = &.{.{ .allow = true, .kind = .block, .major = 8, .minor = 0, .access = "rw" }},
     });
@@ -179,6 +179,12 @@ pub fn writeCgroupFile(dir: posix.fd_t, filename: []const u8, value: []const u8,
         switch (linux.errno(result)) {
             .SUCCESS => break :open @intCast(result),
             .INTR => continue,
+            // Like runc, a host without swap ignores unlimiting or disabling it.
+            .NOENT => if (std.mem.eql(u8, filename, "memory.swap.max") and
+                (std.mem.eql(u8, value, "max") or std.mem.eql(u8, value, "0"))) return else {
+                reportDiagnostic("cgroup '{s}' cannot open {s}: NOENT", .{ path, filename });
+                return error.CgroupWriteFailed;
+            },
             else => |err| {
                 reportDiagnostic("cgroup '{s}' cannot open {s}: {s}", .{ path, filename, @tagName(err) });
                 return error.CgroupWriteFailed;

@@ -118,7 +118,7 @@ fn commandFlagNames(subcommand: Subcommand) []const []const u8 {
         .update => &.{
             "resources",  "r",           "memory",      "memory-reservation", "memory-swap",   "kernel-memory",
             "cpu-shares", "cpu-share",   "cpu-period",  "cpu-quota",          "cpu-rt-period", "cpu-rt-runtime",
-            "cpu-idle",   "cpuset-cpus", "cpuset-mems", "pids-limit",         "blkio-weight",
+            "cpu-idle",   "cpu-burst",   "cpuset-cpus", "cpuset-mems",        "pids-limit",    "blkio-weight",
         },
         else => &.{},
     };
@@ -408,6 +408,7 @@ fn parseCpuOption(args: []const []const u8, index: *usize, name: []const u8, res
         .{ "--cpu-rt-period", "realtimePeriod", u64 },
         .{ "--cpu-rt-runtime", "realtimeRuntime", i64 },
         .{ "--cpu-idle", "idle", i64 },
+        .{ "--cpu-burst", "burst", u64 },
     }) |entry| {
         if (std.mem.eql(u8, name, entry[0])) {
             const value = try optionValue(args, index, error.MissingResourceValue);

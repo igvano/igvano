@@ -57,9 +57,6 @@ set_scheduler_policy::policy_batch
 set_scheduler_policy::policy_other
 start_container_hook_env_inherit::start_container_env_inherit
 terminal::terminal_console_size
-update::cpu_burst_test
-update::update_cgroup_v2_common_limits_test
-update::update_cpu_limits_test
 
 # Host-dependent ("? " prefix): may pass or fail. io.bfq.weight needs the BFQ scheduler.
 ? update::update_blkio_weight_test

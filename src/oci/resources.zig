@@ -66,6 +66,7 @@ fn resourceMemory(memory: Spec.Resources.Memory) !libcontainer.Resources.Memory 
         .kernel_tcp = memory.kernelTCP,
         .swappiness = memory.swappiness,
         .disable_oom_killer = memory.disableOOMKiller,
+        .check_before_update = memory.checkBeforeUpdate orelse false,
     };
 }
 
@@ -81,6 +82,7 @@ fn resourceCpu(cpu: Spec.Resources.Cpu) !libcontainer.Resources.Cpu {
         .realtime_runtime = cpu.realtimeRuntime,
         .realtime_period = cpu.realtimePeriod,
         .idle = cpu.idle,
+        .burst = cpu.burst,
         .cpus = cpu.cpus,
         .mems = cpu.mems,
     };
@@ -143,8 +145,7 @@ fn resourceDeviceRules(allocator: std.mem.Allocator, configured: ?[]const Spec.R
             .char
         else
             return invalidConfig("linux.resources.devices[{d}].type: expected a, b or c", .{i});
-        for (entry.access) |access|
-            if (access != 'r' and access != 'w' and access != 'm') return invalidConfig("linux.resources.devices[{d}].access: expected r, w or m", .{i});
+        if (deviceAccess(entry.access).len == 0) return invalidConfig("linux.resources.devices[{d}].access: needs r, w or m", .{i});
         try validateResourceLimit(entry.major, "linux.resources.devices.major");
         try validateResourceLimit(entry.minor, "linux.resources.devices.minor");
         device.* = .{
@@ -152,10 +153,29 @@ fn resourceDeviceRules(allocator: std.mem.Allocator, configured: ?[]const Spec.R
             .kind = kind,
             .major = if (entry.major == -1) null else entry.major,
             .minor = if (entry.minor == -1) null else entry.minor,
-            .access = entry.access,
+            .access = deviceAccess(entry.access),
         };
     }
     return translated;
+}
+
+/// Like runc's Permissions.toSet: keep r, w and m, and ignore anything else.
+fn deviceAccess(access: []const u8) []const u8 {
+    const names = [_][]const u8{ "", "r", "w", "rw", "m", "rm", "wm", "rwm" };
+    var set: usize = 0;
+    for (access) |char| switch (char) {
+        'r' => set |= 1,
+        'w' => set |= 2,
+        'm' => set |= 4,
+        else => {},
+    };
+    return names[set];
+}
+
+test "device access keeps only r, w and m, like runc" {
+    try std.testing.expectEqualStrings("rw", deviceAccess("rwa"));
+    try std.testing.expectEqualStrings("rwm", deviceAccess("mwr"));
+    try std.testing.expectEqualStrings("", deviceAccess("x"));
 }
 
 fn validateResourceLimit(value: ?i64, comptime field: []const u8) error{InvalidConfig}!void {
@@ -305,8 +325,8 @@ test "cgroup resources validate device types access and wildcard numbers" {
     for ([_]Spec.Resources.DeviceRule{
         .{ .allow = true, .type = "" },
         .{ .allow = true, .type = "char" },
-        .{ .allow = true, .access = "rx" },
-        .{ .allow = true, .access = "r\x00" },
+        .{ .allow = true, .access = "x" },
+        .{ .allow = true, .access = "" },
         .{ .allow = true, .major = -2 },
         .{ .allow = true, .minor = -2 },
     }) |device| {

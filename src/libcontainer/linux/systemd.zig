@@ -134,7 +134,7 @@ test "systemd properties use hierarchy-specific limits and round CPU quotas up" 
         .{ .name = "MemorySwapMax", .value = .{ .uint64 = 4096 } },
         .{ .name = "CPUQuotaPeriodUSec", .value = .{ .uint64 = 100000 } },
         .{ .name = "CPUQuotaPerSecUSec", .value = .{ .uint64 = 20000 } },
-        .{ .name = "CPUWeight", .value = .{ .uint64 = 39 } },
+        .{ .name = "CPUWeight", .value = .{ .uint64 = 100 } },
         .{ .name = "AllowedCPUs", .value = .{ .bytes = &.{ 7, 1 } } },
         .{ .name = "AllowedMemoryNodes", .value = .{ .bytes = &.{1} } },
         .{ .name = "TasksMax", .value = .{ .uint64 = std.math.maxInt(u64) } },

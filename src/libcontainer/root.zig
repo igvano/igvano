@@ -227,6 +227,8 @@ pub const Resources = struct {
         kernel_tcp: ?i64 = null,
         swappiness: ?u64 = null,
         disable_oom_killer: ?bool = null,
+        /// cgroup v2: refuse a limit at or below current usage, like runc.
+        check_before_update: bool = false,
     };
     pub const Cpu = struct {
         shares: ?u64 = null,
@@ -236,6 +238,8 @@ pub const Resources = struct {
         realtime_period: ?u64 = null,
         /// cgroup cpu.idle (SCHED_IDLE group); the kernel accepts only 0 or 1.
         idle: ?i64 = null,
+        /// cpu.max.burst (v2) or cpu.cfs_burst_us (v1); 0 is written.
+        burst: ?u64 = null,
         cpus: ?[]const u8 = null,
         mems: ?[]const u8 = null,
     };
@@ -273,14 +277,14 @@ pub const Resources = struct {
     pub const Unified = struct { key: []const u8, value: []const u8 };
 };
 
-/// Mount options and destinations have already been translated by the frontend.
-// ponytail: MS_* flags tie this neutral interface to Linux; acceptable while
 /// MOUNT_ATTR_* bits to set and clear on a mount and every submount.
 pub const RecursiveAttr = struct {
     set: u64 = 0,
     clear: u64 = 0,
 };
 
+/// Mount options and destinations have already been translated by the frontend.
+// ponytail: MS_* flags tie this neutral interface to Linux; acceptable while
 // Linux is the only implementation. Translate to neutral options when another is added.
 pub const Mount = struct {
     destination: []const u8,
