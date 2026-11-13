@@ -19,24 +19,11 @@ cgroups::runc run (hugetlb limits)
 cgroups::runc run (per-device multiple iops via unified)
 cgroups::runc run/create should error for a non-empty cgroup
 cgroups::runc run/create should refuse pre-existing frozen cgroup
-cpu_affinity::runc exec [CPU affinity, initial and final set from config.json]
-cpu_affinity::runc exec [CPU affinity, initial and final set from process.json]
-cpu_affinity::runc exec [CPU affinity, only initial set from process.json]
-cpu_affinity::runc exec [default CPU affinity should reset to cgroup cpuset]
-cpu_affinity::runc exec [default CPU affinity should reset]
-cpu_affinity::runc run [CPU affinity should reset to cgroup cpuset]
-cpu_affinity::runc run [CPU affinity should reset]
-debug::global --debug
-debug::global --debug to --log
-debug::global --debug to --log --log-format 'json'
-debug::global --debug to --log --log-format 'text'
 delete::runc delete --force in cgroupv2 with subcgroups
 dev::runc run/update [device cgroup deny]
 env::empty HOME env var is overridden
 env::empty HOME env var is overridden with multiple overrides
 env::env var with new-line is honored
-exec::runc --debug --log exec
-exec::runc --debug exec
 exec::runc exec --additional-gids
 exec::runc exec --cgroup subcgroup [v2]
 exec::runc exec --preserve-fds

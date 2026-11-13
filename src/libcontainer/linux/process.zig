@@ -12,6 +12,19 @@ const reportDiagnostic = @import("diagnostic.zig").reportDiagnostic;
 const CreateResponse = @import("diagnostic.zig").CreateResponse;
 const readAll = @import("syscall.zig").readAll;
 
+/// sched_setaffinity(2) on the caller; children inherit it across fork and exec.
+pub fn setCpuAffinity(set: *const libcontainer.CpuSet) libcontainer.Error!void {
+    return checkResult(linux.syscall3(.sched_setaffinity, 0, @sizeOf(libcontainer.CpuSet), @intFromPtr(set)));
+}
+
+/// Like runc's tryResetCPUAffinity: drop an affinity inherited from the caller
+/// (taskset, systemd). The kernel clamps all-ones to the CPUs online and in
+/// the cgroup cpuset. Best effort, as in runc.
+pub fn resetCpuAffinity() void {
+    const all: libcontainer.CpuSet = @splat(std.math.maxInt(u64));
+    _ = linux.syscall3(.sched_setaffinity, 0, @sizeOf(libcontainer.CpuSet), @intFromPtr(&all));
+}
+
 /// Mark inherited descriptors before installing seccomp. A pinned self/fd
 /// directory allows the fallback even when the container has no /proc mount.
 pub fn closeExecFrom(first: u32, fd_dir: ?posix.fd_t) libcontainer.Error!void {

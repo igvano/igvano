@@ -28,9 +28,6 @@ delete::delete_non_existed_container
 delete::delete_running_container_test
 domainname_test::set_domainname_test
 exec::*
-exec_cpu_affinity::test_cpu_affinity_from_config_json
-exec_cpu_affinity::test_cpu_affinity_initial_and_final_set_from_process_json
-exec_cpu_affinity::test_cpu_affinity_only_initial_set_from_process_json
 fd_control::closes_fd
 fd_control::pass_single_fd
 hooks::hooks

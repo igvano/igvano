@@ -24,6 +24,7 @@ const writeAll = @import("syscall.zig").writeAll;
 const openPath = @import("syscall.zig").openPath;
 const fdPath = @import("syscall.zig").fdPath;
 const reportDiagnostic = @import("diagnostic.zig").reportDiagnostic;
+const debugLog = @import("diagnostic.zig").debugLog;
 const CreateResponse = @import("diagnostic.zig").CreateResponse;
 const childError = @import("diagnostic.zig").childError;
 const failCreate = @import("diagnostic.zig").failCreate;
@@ -69,6 +70,7 @@ const installSeccompFor = @import("process.zig").installSeccompFor;
 const installSeccompListener = @import("process.zig").installSeccompListener;
 const deliverSeccompListener = @import("process.zig").deliverSeccompListener;
 const applyOomScoreAdj = @import("process.zig").applyOomScoreAdj;
+const resetCpuAffinity = @import("process.zig").resetCpuAffinity;
 const applyProcess = @import("process.zig").applyProcess;
 const applyRlimits = @import("process.zig").applyRlimits;
 const resolveExecutable = @import("process.zig").resolveExecutable;
@@ -517,6 +519,7 @@ fn forkCreate(ctx: *CreateContext) libcontainer.Error!libcontainer.State {
         return err;
     };
     if (ctx.sync.child1 == 0) runCreateChild(ctx);
+    debugLog(ctx.options.debug, "nsexec[{d}]: nsexec container setup", .{ctx.sync.child1});
     return awaitCreateParent(ctx);
 }
 
@@ -573,6 +576,8 @@ fn runCreateChild(ctx: *const CreateContext) noreturn {
     closeFd(ctx.cgroups.cgroup_root.fd);
     closeFd(ctx.sync.report[0]);
     joinCreateCgroups(ctx);
+    // Match the container cpuset, not the caller's affinity, like runc.
+    resetCpuAffinity();
     // Set with host privileges before entering user namespaces.
     // Child2 inherits the adjustment across fork and exec.
     applyOomScoreAdj(ctx.proc_dir, ctx.options.oom_score_adj) catch |err| failCreate(ctx.sync.report[1], err);
@@ -828,7 +833,10 @@ fn awaitCreateParent(ctx: *CreateContext) libcontainer.Error!libcontainer.State 
     errdefer if (!ctx.sync.child1_reaped) reapFailedCreateChild(ctx);
     try releaseInitMappings(ctx);
     try receiveRootfsMount(ctx);
-    return finishCreateParent(ctx);
+    const state = try finishCreateParent(ctx);
+    debugLog(ctx.options.debug, "child process in init()", .{});
+    debugLog(ctx.options.debug, "init: closing the pipe to signal completion", .{});
+    return state;
 }
 
 fn reapFailedCreateChild(ctx: *CreateContext) void {

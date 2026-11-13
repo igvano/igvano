@@ -61,6 +61,7 @@ pub const capabilityNumber = @import("oci/process.zig").capabilityNumber;
 pub const rlimitResource = @import("oci/process.zig").rlimitResource;
 pub const processCapabilities = @import("oci/process.zig").processCapabilities;
 pub const processRlimits = @import("oci/process.zig").processRlimits;
+pub const cpuAffinity = @import("oci/process.zig").cpuAffinity;
 pub const processConfig = @import("oci/process.zig").processConfig;
 
 pub const prepareSeccomp = @import("oci/seccomp.zig").prepareSeccomp;

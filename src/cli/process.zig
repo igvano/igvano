@@ -19,6 +19,7 @@ pub fn prepareProcess(allocator: std.mem.Allocator, process: oci.Spec.Process, h
         .no_new_privileges = config.no_new_privileges,
         .apparmor_profile = process.apparmorProfile,
         .oom_score_adj = process.oomScoreAdj,
+        .cpu_affinity = try oci.cpuAffinity(process.execCPUAffinity),
     };
 }
 

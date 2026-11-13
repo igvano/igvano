@@ -71,3 +71,16 @@ pub fn failCreate(fd: posix.fd_t, err: libcontainer.Error) noreturn {
     _ = writeAll(fd, std.mem.asBytes(&response));
     linux.exit_group(1);
 }
+
+/// One --debug line without allocation, so forked children can log too.
+/// Messages are fixed text and numbers, so neither format needs escaping.
+/// They reuse runc's nsexec and init wording, which tools and tests grep for.
+pub fn debugLog(debug: ?libcontainer.DebugLog, comptime fmt: []const u8, args: anytype) void {
+    const log = debug orelse return;
+    var buffer: [256]u8 = undefined;
+    const line = (if (log.json)
+        std.fmt.bufPrint(&buffer, "{{\"level\":\"debug\",\"msg\":\"" ++ fmt ++ "\"}}\n", args)
+    else
+        std.fmt.bufPrint(&buffer, "level=debug msg=\"" ++ fmt ++ "\"\n", args)) catch return;
+    _ = writeAll(log.fd, line);
+}

@@ -16,6 +16,7 @@ const readAll = @import("syscall.zig").readAll;
 const writeAll = @import("syscall.zig").writeAll;
 const openPath = @import("syscall.zig").openPath;
 const reportDiagnostic = @import("diagnostic.zig").reportDiagnostic;
+const debugLog = @import("diagnostic.zig").debugLog;
 const CreateResponse = @import("diagnostic.zig").CreateResponse;
 const childError = @import("diagnostic.zig").childError;
 const failCreate = @import("diagnostic.zig").failCreate;
@@ -38,6 +39,8 @@ const kernelCapabilities = @import("process.zig").kernelCapabilities;
 const installSeccompFor = @import("process.zig").installSeccompFor;
 const deliverSeccompListener = @import("process.zig").deliverSeccompListener;
 const applyOomScoreAdj = @import("process.zig").applyOomScoreAdj;
+const setCpuAffinity = @import("process.zig").setCpuAffinity;
+const resetCpuAffinity = @import("process.zig").resetCpuAffinity;
 const ProcessSettings = @import("process.zig").ProcessSettings;
 const applyProcessSettings = @import("process.zig").applyProcessSettings;
 const applyRlimits = @import("process.zig").applyRlimits;
@@ -188,6 +191,7 @@ fn execWithNamespaces(context: *ExecContext) libcontainer.Error!i32 {
     defer closeAckEnd(context, 1);
     const helper = try forkProcess();
     if (helper == 0) runExecHelper(context);
+    debugLog(context.options.debug, "nsexec[{d}]: nsexec container setup", .{helper});
     for (ready) |fd| closeFd(fd);
     owns_ready = false;
     closeFd(report_writer.?);
@@ -199,6 +203,8 @@ fn execWithNamespaces(context: *ExecContext) libcontainer.Error!i32 {
     if (!reported) return error.CreateFailed;
     if (response.failureError()) |err| return err;
     if (status != 0 or response.pid <= 0) return error.CreateFailed;
+    debugLog(context.options.debug, "child process in init()", .{});
+    debugLog(context.options.debug, "setns_init: about to exec", .{});
     return response.pid;
 }
 
@@ -250,7 +256,7 @@ fn runExecHelper(context: *ExecContext) noreturn {
     closeFd(report[0]);
     if (options.console_fds) |fds| closeFd(fds[0]);
     if (context.seccomp_ack) |fds| closeFd(fds[1]);
-    joinExecCgroups(context);
+    joinExecCgroupsWithAffinity(context);
     skipCurrentNamespaces(context);
     var stat_buffer: [4096]u8 = undefined;
     const stat = readProcStatAt(proc_dir, handle.pid, &stat_buffer) catch |err| failCreate(report[1], err);
@@ -262,6 +268,32 @@ fn runExecHelper(context: *ExecContext) noreturn {
     const child = forkProcess() catch |err| failCreate(report[1], err);
     if (child == 0) runExecChild(context);
     finishExecHelper(context, child);
+}
+
+/// Initial affinity applies before the cgroup join, and final affinity (or a
+/// reset) inside the container cgroup, like runc's setnsProcess.
+fn joinExecCgroupsWithAffinity(context: *const ExecContext) void {
+    const options = context.options;
+    const report = context.report;
+    const affinity = options.cpu_affinity orelse libcontainer.CPUAffinity{};
+    if (affinity.initial) |*set| setCpuAffinity(set) catch |err| {
+        reportDiagnostic("error setting initial CPU affinity: {s}", .{@errorName(err)});
+        failCreate(report[1], err);
+    };
+    logCpuAffinity(options.debug);
+    joinExecCgroups(context);
+    if (affinity.final) |*set| setCpuAffinity(set) catch |err| {
+        reportDiagnostic("error setting final CPU affinity: {s}", .{@errorName(err)});
+        failCreate(report[1], err);
+    } else if (affinity.initial == null) resetCpuAffinity();
+}
+
+/// runc's nsexec logs the first 64 CPUs of the starting affinity for its tests.
+fn logCpuAffinity(debug: ?libcontainer.DebugLog) void {
+    if (debug == null) return;
+    var set: libcontainer.CpuSet = @splat(0);
+    if (linux.errno(linux.syscall3(.sched_getaffinity, 0, @sizeOf(libcontainer.CpuSet), @intFromPtr(&set))) != .SUCCESS) return;
+    debugLog(debug, "nsexec[{d}]: affinity: 0x{x}", .{ linux.getpid(), set[0] });
 }
 
 fn resetExecSignals(report_fd: posix.fd_t) void {

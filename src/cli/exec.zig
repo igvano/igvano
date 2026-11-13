@@ -136,6 +136,7 @@ fn prepareExecOptions(process_allocator: std.mem.Allocator, io: std.Io, state: L
     if (agent.*) |*value| options.on_seccomp_listener = value.callback();
     options.cgroup_path = state.container_state.?.cgroup_path orelse return oci.validationError(error.InvalidState, "exec: saved cgroup path is missing", .{});
     options.console_fds = if (process.terminal orelse false) try libcontainer.linux.console.socketpair() else null;
+    options.debug = config.debug_log;
     return options;
 }
 
@@ -171,12 +172,13 @@ fn loadExecProcess(process_allocator: std.mem.Allocator, io: std.Io, saved_spec:
 }
 
 fn inheritExecProfile(process: *oci.Spec.Process, saved_spec: ?std.json.Parsed(oci.Spec)) void {
+    const spec = saved_spec orelse return;
+    const inherited = spec.value.process orelse return;
     // Like runc, an omitted or empty exec profile inherits the container default.
-    if (process.apparmorProfile == null or process.apparmorProfile.?.len == 0) {
-        if (saved_spec) |spec| {
-            if (spec.value.process) |inherited| process.apparmorProfile = inherited.apparmorProfile;
-        }
-    }
+    if (process.apparmorProfile == null or process.apparmorProfile.?.len == 0)
+        process.apparmorProfile = inherited.apparmorProfile;
+    // config.json's execCPUAffinity is the default for every exec.
+    if (process.execCPUAffinity == null) process.execCPUAffinity = inherited.execCPUAffinity;
 }
 
 pub fn enableExecSubreaper() !u32 {

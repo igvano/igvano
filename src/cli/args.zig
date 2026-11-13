@@ -41,6 +41,9 @@ pub const Config = struct {
     console_socket: ?[]const u8 = null,
     signal: ?[]const u8 = null,
     systemd: bool = false,
+    /// --debug; main opens debug_log from it.
+    debug: bool = false,
+    debug_log: ?@import("libcontainer").DebugLog = null,
     force: bool = false,
     all: bool = false,
     ps_format: PsFormat = .table,
@@ -206,7 +209,7 @@ fn parseGlobalOptions(args: []const []const u8, index: *usize, config: *Config, 
             },
             .debug, .systemd => {
                 if (std.mem.indexOfScalar(u8, flag, '=') != null) return oci.validationError(error.UnknownOption, "unknown option '{s}'", .{flag});
-                if (option == .systemd) config.systemd = true;
+                if (option == .systemd) config.systemd = true else config.debug = true;
             },
         }
     }

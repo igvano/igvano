@@ -87,6 +87,7 @@ pub const CreateOptions = struct {
     seccomp: ?seccomp.Config = null,
     /// Required when the seccomp config has notify rules.
     on_seccomp_listener: ?SeccompListenerCallback = null,
+    debug: ?DebugLog = null,
 };
 
 pub const Process = struct {
@@ -133,6 +134,25 @@ pub const ExecOptions = struct {
     seccomp: ?seccomp.Config = null,
     /// Required when the seccomp config has notify rules.
     on_seccomp_listener: ?SeccompListenerCallback = null,
+    /// Null resets the affinity to every CPU the cgroup allows, like runc.
+    cpu_affinity: ?CPUAffinity = null,
+    debug: ?DebugLog = null,
+};
+
+/// Where --debug lines go: an O_APPEND log file or stderr.
+pub const DebugLog = struct {
+    fd: std.posix.fd_t,
+    json: bool = false,
+};
+
+/// A sched_setaffinity(2) mask of 1024 CPUs, the size of glibc's cpu_set_t.
+pub const CpuSet = [16]u64;
+
+/// runtime-spec execCPUAffinity: initial is set before the process joins the
+/// container cgroup, final right after.
+pub const CPUAffinity = struct {
+    initial: ?CpuSet = null,
+    final: ?CpuSet = null,
 };
 
 /// Receives the runtime's copy of a seccomp notify fd (borrowed; closed after

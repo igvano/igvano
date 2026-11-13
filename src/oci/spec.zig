@@ -36,9 +36,16 @@ pub const Spec = struct {
         noNewPrivileges: bool = false,
         apparmorProfile: ?[]const u8 = null,
         oomScoreAdj: ?i32 = null,
-        user: User,
+        /// Optional, as in runc: an omitted user is root.
+        user: User = .{ .uid = 0, .gid = 0 },
         capabilities: ?Capabilities = null,
         rlimits: ?[]const Rlimit = null,
+        execCPUAffinity: ?CPUAffinity = null,
+    };
+
+    pub const CPUAffinity = struct {
+        initial: ?[]const u8 = null,
+        final: ?[]const u8 = null,
     };
 
     pub const Capabilities = struct {

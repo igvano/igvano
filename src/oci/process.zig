@@ -17,6 +17,58 @@ pub fn processConfig(process: Spec.Process) libcontainer.Process {
     };
 }
 
+/// Like runc, an affinity with neither list set is no affinity at all.
+pub fn cpuAffinity(affinity: ?Spec.CPUAffinity) error{InvalidConfig}!?libcontainer.CPUAffinity {
+    const value = affinity orelse return null;
+    const result: libcontainer.CPUAffinity = .{
+        .initial = try cpuSet("initial", value.initial),
+        .final = try cpuSet("final", value.final),
+    };
+    return if (result.initial == null and result.final == null) null else result;
+}
+
+/// A Linux CPU list such as "0-3,7", with runc's tolerance for spaces and empty items.
+fn cpuSet(comptime field: []const u8, list: ?[]const u8) error{InvalidConfig}!?libcontainer.CpuSet {
+    const text = list orelse return null;
+    if (text.len == 0) return null;
+    const bad = "process.execCPUAffinity." ++ field ++ ": ";
+    const max = @bitSizeOf(libcontainer.CpuSet);
+    var set: libcontainer.CpuSet = @splat(0);
+    var items = std.mem.splitScalar(u8, text, ',');
+    var count: usize = 0;
+    while (items.next()) |raw| {
+        const item = std.mem.trim(u8, raw, " \t");
+        if (item.len == 0) continue;
+        const dash = std.mem.indexOfScalar(u8, item, '-');
+        const first = try cpuNumber(bad, if (dash) |i| item[0..i] else item, max);
+        const last = if (dash) |i| try cpuNumber(bad, item[i + 1 ..], max) else first;
+        if (first > last) return invalidConfig(bad ++ "invalid range: {s}", .{item});
+        for (first..last + 1) |cpu| {
+            set[cpu / 64] |= @as(u64, 1) << @intCast(cpu % 64);
+            count += 1;
+        }
+    }
+    if (count == 0) return invalidConfig(bad ++ "no CPUs found in \"{s}\"", .{text});
+    return set;
+}
+
+fn cpuNumber(comptime bad: []const u8, text: []const u8, max: usize) error{InvalidConfig}!usize {
+    const value = std.fmt.parseUnsigned(u32, text, 10) catch return invalidConfig(bad ++ "invalid CPU '{s}'", .{text});
+    if (value >= max) return invalidConfig(bad ++ "values larger than {d} are not supported", .{max - 1});
+    return value;
+}
+
+test "exec CPU affinity parses runc CPU lists" {
+    defer @import("diagnostic.zig").clearDiagnostic();
+    try std.testing.expectEqual(@as(?libcontainer.CPUAffinity, null), try cpuAffinity(null));
+    try std.testing.expectEqual(@as(?libcontainer.CPUAffinity, null), try cpuAffinity(.{ .initial = "", .final = "" }));
+    const value = (try cpuAffinity(.{ .initial = " 0-2, ,5", .final = "1023" })).?;
+    try std.testing.expectEqual(@as(u64, 0b100111), value.initial.?[0]);
+    try std.testing.expectEqual(@as(u64, 1) << 63, value.final.?[15]);
+    for ([_][]const u8{ "1024", "3-1", "a", ",", "1-", "-1" }) |list|
+        try std.testing.expectError(error.InvalidConfig, cpuAffinity(.{ .initial = list }));
+}
+
 pub const capability_names = names: {
     var result: [std.os.linux.CAP.LAST_CAP + 1][]const u8 = undefined;
     for (std.meta.declarations(std.os.linux.CAP)) |decl| {

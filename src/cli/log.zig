@@ -3,6 +3,18 @@ const oci = @import("igvano").oci;
 
 pub const LogFormat = enum { text, json };
 
+/// --debug lines go to --log when set, else stderr, like runc. The fd stays
+/// open until exit; a log that cannot be opened disables debug output.
+pub fn openDebugLog(path: ?[]const u8, log_format: LogFormat) ?@import("libcontainer").DebugLog {
+    const fd = if (path) |value| std.posix.openat(std.posix.AT.FDCWD, value, .{
+        .ACCMODE = .WRONLY,
+        .CREAT = true,
+        .APPEND = true,
+        .CLOEXEC = true,
+    }, 0o600) catch return null else 2;
+    return .{ .fd = fd, .json = log_format == .json };
+}
+
 pub fn appendErrorLog(allocator: std.mem.Allocator, io: std.Io, path: []const u8, log_format: LogFormat, message: []const u8) !void {
     var line: std.Io.Writer.Allocating = .init(allocator);
     defer line.deinit();

@@ -33,7 +33,7 @@ pub fn main(init: std.process.Init) !u8 {
 
     var log: ?[]const u8 = null;
     var log_format: LogFormat = .text;
-    const config = parseArgsWithLog(args, &log, &log_format) catch |err| {
+    var config = parseArgsWithLog(args, &log, &log_format) catch |err| {
         const message = argumentErrorMessage(err);
         var buffer: [1024]u8 = undefined;
         const line = std.fmt.bufPrint(&buffer, "igvano: {s}", .{oci.diagnosticFor(err) orelse message}) catch unreachable;
@@ -42,6 +42,7 @@ pub fn main(init: std.process.Init) !u8 {
         return 1;
     };
     diagnostics.last_container_detail = null;
+    if (config.debug) config.debug_log = @import("cli/log.zig").openDebugLog(config.log, config.log_format);
     return dispatchCommand(allocator, init.io, config) catch |err| {
         reportError(allocator, init.io, diagnostics.last_container_detail, config, err);
         return 1;
