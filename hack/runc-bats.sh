@@ -93,6 +93,14 @@ if [ "${1-}" = "--inside" ]; then
         tr -d '\r' < /tmp/tap.raw > /tmp/tap
         cat /tmp/tap
         printf '\nExit status: %s\n' "$status"
+        # On a timeout, show what is left and where it waits, before cleanup.
+        if [ "$status" -ge 124 ]; then
+            printf 'core_pattern: %s\n' "$(cat /proc/sys/kernel/core_pattern)"
+            for proc in /proc/[0-9]*; do
+                printf '%s %s wchan=%s %s\n' "${proc#/proc/}" "$(cut -d' ' -f3,4 "$proc/stat" 2>/dev/null)" \
+                    "$(cat "$proc/wchan" 2>/dev/null)" "$(tr '\0' ' ' < "$proc/cmdline" 2>/dev/null)"
+            done
+        fi
         # TAP: "ok 3 name", "not ok 4 name", "ok 5 name # skip (reason)".
         sed -n "/^ok [0-9]* .* # skip/{s/^ok [0-9]* \(.*\) # skip.*/$file::\1	skipped/p;d}
                 s/^ok [0-9]* \(.*\)/$file::\1	ok/p
