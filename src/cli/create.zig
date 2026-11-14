@@ -175,7 +175,7 @@ fn prepareCreateNamespaces(allocator: std.mem.Allocator, configured: ?[]const oc
     const result = try allocator.alloc(libcontainer.Namespace, namespaces.len);
     for (namespaces, result) |namespace, *prepared| prepared.* = .{
         .kind = namespaceKind(namespace.type),
-        .path = namespace.path,
+        .path = namespace.joinPath(),
     };
     return result;
 }
@@ -228,6 +228,7 @@ fn applyCreateSpec(allocator: std.mem.Allocator, options: *libcontainer.CreateOp
     options.uid_mappings = try oci.containerIDMappings(allocator, settings.uidMappings orelse &.{});
     options.gid_mappings = try oci.containerIDMappings(allocator, settings.gidMappings orelse &.{});
     options.hostname = spec.hostname;
+    options.domainname = spec.domainname;
     if (settings.timeOffsets) |offsets| options.time_offsets = .{
         .monotonic = if (offsets.monotonic) |value| .{ .secs = value.secs, .nanosecs = value.nanosecs } else null,
         .boottime = if (offsets.boottime) |value| .{ .secs = value.secs, .nanosecs = value.nanosecs } else null,

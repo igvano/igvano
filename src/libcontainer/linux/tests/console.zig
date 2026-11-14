@@ -58,7 +58,7 @@ test "linux console setup binds its replica to dev console and sends its control
         checkResult(linux.mkdir("/dev/pts", 0o755)) catch linux.exit_group(1);
         checkResult(linux.mount("devpts", "/dev/pts", "devpts", linux.MS.NOSUID | linux.MS.NOEXEC, @intFromPtr("newinstance,ptmxmode=666,mode=620"))) catch linux.exit_group(1);
         checkResult(linux.symlink("pts/ptmx", "/dev/ptmx")) catch linux.exit_group(1);
-        setupConsole(sockets[1], true) catch linux.exit_group(1);
+        setupConsole(sockets[1], true, null) catch linux.exit_group(1);
         closeFd(sockets[1]);
         var console_stat: linux.Statx = undefined;
         var replica_stat: linux.Statx = undefined;

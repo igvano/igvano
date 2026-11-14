@@ -127,7 +127,7 @@ test "linux init rejects missing directory and non-executable args before create
         if (pid == 0) {
             closeFd(ready[0]);
             checkResult(linux.unshare(linux.CLONE.NEWNS)) catch linux.exit_group(2);
-            runInit(process, null, false, null, &.{}, linux.CLONE.NEWNS, rootfs_z, &.{}, &.{}, &.{}, "/", -1, -1, &argv, &envp, ready[1], .{}, &.{}, "", null, null);
+            runInit(process, .{}, false, null, &.{}, linux.CLONE.NEWNS, rootfs_z, &.{}, &.{}, &.{}, "/", -1, -1, &argv, &envp, ready[1], .{}, &.{}, "", null, null);
         }
         closeFd(ready[1]);
         var response: CreateResponse = .{};

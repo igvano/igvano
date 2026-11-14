@@ -118,7 +118,7 @@ fn readStartFifo(fd: std.posix.fd_t, writer_seen: *bool, acked: *bool) !?bool {
             if (result == 0) return try startReadComplete(writer_seen.*, acked.*, 0, 0);
             for (bytes[0..result], 0..) |byte, i| {
                 if (byte == 0 and i + 1 < result)
-                    return oci.validationError(error.StartFailed, "{s}", .{bytes[i + 1 .. result]});
+                    return oci.validationError(error.ProcessExecFailed, "{s}", .{bytes[i + 1 .. result]});
                 if (try startReadComplete(writer_seen.*, acked.*, 1, byte)) return true;
                 acked.* = true;
             }

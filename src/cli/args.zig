@@ -329,9 +329,9 @@ fn applyExecOption(args: []const []const u8, index: *usize, config: *Config, opt
         .user => config.exec_user = try parseUser(try optionValue(args, index, error.MissingUser)),
         .env => try oci.validateEnv(try optionValue(args, index, error.MissingEnv)),
         .additional_gids => _ = try numericId(try optionValue(args, index, error.MissingExecValue)),
-        .cap, .process_label => _ = try optionValue(args, index, error.MissingExecValue),
+        // --cgroup is parsed later from exec_flags (see exec.subCgroups).
+        .cap, .process_label, .cgroup => _ = try optionValue(args, index, error.MissingExecValue),
         .apparmor => config.exec_apparmor = try optionValue(args, index, error.MissingExecValue),
-        .cgroup => _ = try optionValue(args, index, error.MissingExecValue),
         .preserve_fds => {
             const value = try optionValue(args, index, error.MissingExecValue);
             config.preserve_fds = std.fmt.parseUnsigned(u16, value, 10) catch

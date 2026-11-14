@@ -14,7 +14,7 @@ const prepareProcess = @import("process.zig").prepareProcess;
 const processEnv = @import("process.zig").processEnv;
 const connectConsoleSocket = @import("process.zig").connectConsoleSocket;
 const writePidFile = @import("process.zig").writePidFile;
-const sendPidfd = @import("process.zig").sendPidfd;
+const connectPidfdSocket = @import("process.zig").connectPidfdSocket;
 const openContainerLock = @import("state.zig").openContainerLock;
 const lockContainer = @import("state.zig").lockContainer;
 const requireLinkedLock = @import("state.zig").requireLinkedLock;
@@ -168,6 +168,7 @@ fn prepareExecOptions(process_allocator: std.mem.Allocator, io: std.Io, state: L
     options.debug = config.debug_log;
     options.sub_cgroups = try subCgroups(process_allocator, config.exec_flags);
     options.preserve_fds = config.preserve_fds;
+    options.umask = savedUmask(saved_spec);
     if (process.env != null) {
         const root = try std.fmt.allocPrint(process_allocator, "/proc/{d}/root", .{state.parsed.value.pid orelse 0});
         options.envp = try processEnv(process_allocator, options.envp, root, options.uid);
@@ -184,6 +185,13 @@ fn loadExecSpec(process_allocator: std.mem.Allocator, io: std.Io, saved_bundle: 
         },
         else => return err,
     };
+}
+
+/// runc exec applies the container's umask, not one from --process.
+fn savedUmask(saved_spec: ?std.json.Parsed(oci.Spec)) ?u32 {
+    const spec = saved_spec orelse return null;
+    const init = spec.value.process orelse return null;
+    return init.user.umask;
 }
 
 fn loadExecProcess(process_allocator: std.mem.Allocator, io: std.Io, saved_spec: ?std.json.Parsed(oci.Spec), config: Config) !oci.Spec.Process {
@@ -241,7 +249,13 @@ fn runExec(allocator: std.mem.Allocator, io: std.Io, container: libcontainer.Con
     defer if (!config.detach) restoreExecSubreaper(was_subreaper);
     var signals: ?attached.Signals = if (!config.detach) try attached.Signals.init() else null;
     defer if (signals) |*handler| handler.deinit();
-    const pid = try containerResult(container, container.exec(options));
+    var exec_options = options;
+    // Connected before exec; the process itself sends its pidfd, like runc.
+    exec_options.pidfd_socket = if (config.pidfd_socket) |path| try connectPidfdSocket(path) else null;
+    defer if (exec_options.pidfd_socket) |fd| {
+        _ = linux.close(fd);
+    };
+    const pid = try containerResult(container, container.exec(exec_options));
     var reaped = false;
     errdefer if (!reaped) {
         _ = linux.kill(pid, .KILL);
@@ -250,10 +264,6 @@ fn runExec(allocator: std.mem.Allocator, io: std.Io, container: libcontainer.Con
     const controller = try receiveExecConsole(options.console_fds, config.console_socket);
     defer if (controller) |fd| {
         _ = linux.close(fd);
-    };
-    if (config.pidfd_socket) |path| sendPidfd(path, pid, "setns") catch |err| {
-        _ = linux.kill(pid, .KILL);
-        return err;
     };
     if (config.pid_file) |path| try writePidFile(allocator, io, path, pid);
     // Do not hold the container lock while waiting for a long-running command.

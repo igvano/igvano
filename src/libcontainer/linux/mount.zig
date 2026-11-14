@@ -684,6 +684,8 @@ pub fn applyMount(rootfs: [:0]const u8, root_fd: posix.fd_t, mount: PreparedMoun
     var source_buffer: [64]u8 = undefined;
     const source = mountSource(&source_buffer, source_fd, mount);
     var attach = mount;
+    var data_buffer: [4096]u8 = undefined;
+    if (isTmpfs(mount)) attach.data = try tmpfsData(&data_buffer, target_fd, mount.data, step);
     // A read-only copy-up tmpfs is filled first and made read-only after.
     if (copy_up) attach.flags &= ~@as(u32, linux.MS.RDONLY);
     const cgroup2_bound = try attachMount(attach, source, target_fd, step);
@@ -719,6 +721,24 @@ fn openMountTarget(root_fd: posix.fd_t, mount: PreparedMount, is_file: bool, ste
     }
     try requireBelowRootfs(root_fd, target_fd, step);
     return target_fd;
+}
+
+fn isTmpfs(mount: PreparedMount) bool {
+    return mount.flags & linux.MS.BIND == 0 and std.mem.eql(u8, mount.type orelse return false, "tmpfs");
+}
+
+/// Like runc, a tmpfs takes the covered directory's mode unless the
+/// options set one: "mode=<dir mode>" comes first, so a later mode= wins.
+fn tmpfsData(buffer: []u8, target_fd: posix.fd_t, data: [:0]const u8, step: *RootfsStep) libcontainer.Error![:0]const u8 {
+    step.operation = "check tmpfs destination mode";
+    var stat: linux.Statx = undefined;
+    try checkResult(linux.statx(target_fd, "", linux.AT.EMPTY_PATH, .{ .MODE = true }, &stat));
+    if (!stat.mask.MODE) return error.CreateFailed;
+    const mode = stat.mode & 0o7777;
+    return (if (data.len == 0)
+        std.fmt.bufPrintZ(buffer, "mode={o:0>4}", .{mode})
+    else
+        std.fmt.bufPrintZ(buffer, "mode={o:0>4},{s}", .{ mode, data })) catch error.InvalidConfig;
 }
 
 fn isCopyUp(mount: PreparedMount) bool {

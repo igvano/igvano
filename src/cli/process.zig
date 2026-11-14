@@ -17,6 +17,7 @@ pub fn prepareProcess(allocator: std.mem.Allocator, process: oci.Spec.Process, h
         .capabilities = if (process.capabilities) |caps| try oci.processCapabilities(caps) else null,
         .rlimits = try oci.processRlimits(allocator, process.rlimits),
         .no_new_privileges = config.no_new_privileges,
+        .console_size = config.console_size,
         .apparmor_profile = process.apparmorProfile,
         .oom_score_adj = process.oomScoreAdj,
         .cpu_affinity = try oci.cpuAffinity(process.execCPUAffinity),
@@ -46,15 +47,19 @@ pub fn connectConsoleSocket(path: []const u8) !std.posix.fd_t {
     return fd;
 }
 
+pub fn connectPidfdSocket(path: []const u8) !std.posix.fd_t {
+    return connectConsoleSocket(path) catch |err| switch (err) {
+        error.InvalidPath => oci.validationError(error.InvalidPath, "--pidfd-socket: path is empty, too long or contains NUL", .{}),
+        else => err,
+    };
+}
+
 /// runc's --pidfd-socket: send a pidfd of `pid`, with runc's init type
 /// ("standard" or "setns") as the message, like setupPidfd.
 pub fn sendPidfd(path: []const u8, pid: i32, kind: []const u8) !void {
     if (comptime builtin.os.tag != .linux) return error.NotImplemented;
     const linux = std.os.linux;
-    const socket = connectConsoleSocket(path) catch |err| switch (err) {
-        error.InvalidPath => return oci.validationError(error.InvalidPath, "--pidfd-socket: path is empty, too long or contains NUL", .{}),
-        else => return err,
-    };
+    const socket = try connectPidfdSocket(path);
     defer _ = linux.close(socket);
     const opened = linux.pidfd_open(pid, 0);
     if (linux.errno(opened) != .SUCCESS) return oci.validationError(error.PidfdFailed, "failed to pidfd_open: {s}", .{@tagName(linux.errno(opened))});

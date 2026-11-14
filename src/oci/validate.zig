@@ -42,7 +42,7 @@ fn validateNamespaces(settings: Spec.Linux) !void {
         if (namespace.type == .mount) has_mount = true;
         if (namespace.type == .user) {
             has_user = true;
-            joined_user = namespace.path != null;
+            joined_user = namespace.joinPath() != null;
         }
     }
     try validateUserMappings(settings, has_user, joined_user);

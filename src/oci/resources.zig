@@ -125,6 +125,7 @@ fn prepareHugepageResources(allocator: std.mem.Allocator, resources: *libcontain
     const translated_pages = try allocator.alloc(libcontainer.Resources.HugepageLimit, hugepages.len);
     resources.hugepage_limits = translated_pages;
     for (hugepages, translated_pages, 0..) |entry, *page, i| {
+        if (entry.pageSize != null and entry.pagesize != null) return invalidConfig("linux.resources.hugepageLimits[{d}]: pageSize given twice", .{i});
         if (entry.size().len == 0) return invalidConfig("linux.resources.hugepageLimits[{d}].pageSize: must not be empty", .{i});
         page.* = .{ .page_size = entry.size(), .limit = entry.limit };
     }

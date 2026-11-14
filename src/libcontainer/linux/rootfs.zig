@@ -262,6 +262,7 @@ pub const RootfsOptions = struct {
     rootless: bool = false,
     /// linux.resources.cpu.cpus is set (see applySchedulerAndIOPriority).
     cpuset: bool = false,
+    console_size: ?libcontainer.ConsoleSize = null,
     /// runc --no-pivot (see moveRoot).
     no_pivot: bool = false,
 };
@@ -370,7 +371,7 @@ pub fn setupRootfs(rootfs: [:0]const u8, mounts: []const PreparedMount, devices:
     try enterRootfs(rootfs, old_root, new_root, options.private_mount_namespace and options.no_pivot, &step);
     if (options.console_fd) |socket| {
         defer closeFd(socket);
-        setupConsole(socket, true) catch |err| {
+        setupConsole(socket, true, options.console_size) catch |err| {
             childError("cannot set up console (requires devpts mounted at /dev/pts): ", err);
             if (options.runtime_sync) |sync| failCreate(sync.ready_fd, err);
             linux.exit_group(1);

@@ -8,7 +8,7 @@ const requireCreate = @import("validate.zig").requireCreate;
 fn sysctlNamespace(config: Spec.Linux, kind: @FieldType(Spec.Namespace, "type")) bool {
     for (config.namespaces orelse &.{}) |namespace| {
         if (namespace.type != kind) continue;
-        const path = namespace.path orelse return true;
+        const path = namespace.joinPath() orelse return true;
         if (comptime @import("builtin").os.tag == .linux) {
             const linux = std.os.linux;
             var buffer: [std.fs.max_path_bytes]u8 = undefined;

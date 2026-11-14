@@ -478,6 +478,7 @@ fn runExecChild(context: *const ExecContext) noreturn {
     const apparmor_command = context.process.apparmor_command;
     closeFd(report[1]);
     closeFd(ready[0]);
+    if (options.umask) |mask| _ = linux.syscall1(.umask, mask);
     // setns(mnt) changes mount visibility, not our inherited root
     // and cwd. Use init's pinned root from the joined mount tree;
     // fchdir + chroot(".") avoids resolving a host PID in container /proc.
@@ -491,10 +492,11 @@ fn runExecChild(context: *const ExecContext) noreturn {
     closeExecHostFds(context, fd_dir);
     changeExecCwd(context);
     // Exec shares init's mount namespace; preserve its /dev/console.
-    if (options.console_fds) |fds| setupConsole(fds[1], false) catch |err| {
+    if (options.console_fds) |fds| setupConsole(fds[1], false, options.console_size) catch |err| {
         childError("cannot set up exec console: ", err);
         failCreate(ready[1], err);
     };
+    if (options.pidfd_socket) |socket| sendOwnPidfd(socket) catch |err| failCreate(ready[1], err);
     applyAppArmor(apparmor_command) catch |err| failCreate(ready[1], err);
     applyRlimits(process.rlimits) catch |err| failCreate(ready[1], err);
     finishExecProcess(context);
@@ -507,7 +509,7 @@ fn closeExecHostFds(context: *const ExecContext, fd_dir: posix.fd_t) void {
     // Keep stdio, the sync pipe, console socket and the fd scan handle.
     const console_fd = if (options.console_fds) |fds| fds[1] else ready[1];
     const ack_fd = if (context.seccomp_ack) |fds| fds[0] else ready[1];
-    var keep = [_]posix.fd_t{ ready[1], console_fd, fd_dir, ack_fd, context.gate[0] };
+    var keep = [_]posix.fd_t{ ready[1], console_fd, fd_dir, ack_fd, context.gate[0], options.pidfd_socket orelse ready[1] };
     std.mem.sort(posix.fd_t, &keep, {}, std.sort.asc(posix.fd_t));
     var next_fd: u32 = 3 + options.preserve_fds;
     for (keep) |fd| {
@@ -571,6 +573,22 @@ fn finishExecProcess(context: *const ExecContext) noreturn {
     waitHelperExit(context.gate[0]);
     execResolved(executable, argv.ptr, envp.ptr) catch {
         failCreate(ready[1], error.CreateFailed);
+    };
+}
+
+/// Before seccomp and exec, so the pidfd names this process and nothing else.
+fn sendOwnPidfd(socket: posix.fd_t) libcontainer.Error!void {
+    defer closeFd(socket);
+    const opened = linux.pidfd_open(linux.getpid(), 0);
+    checkResult(opened) catch |err| {
+        reportDiagnostic("failed to pidfd_open: {s}", .{@tagName(linux.errno(opened))});
+        return err;
+    };
+    const pidfd: posix.fd_t = @intCast(opened);
+    defer closeFd(pidfd);
+    @import("console.zig").console.sendFdWithData(socket, pidfd, "setns") catch |err| {
+        reportDiagnostic("failed to send pidfd on socket", .{});
+        return err;
     };
 }
 

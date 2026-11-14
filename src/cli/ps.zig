@@ -50,8 +50,11 @@ pub fn psContainer(allocator: std.mem.Allocator, io: std.Io, injected: ?Containe
     defer state.deinit();
     var instance: ContainerInstance = undefined;
     const container = if (state.container_state) |value| bindContainer(&instance, injected, value) else null;
-    if (state.parsed.value.status == .stopped) return oci.validationError(error.InvalidStatus, "ps: container is stopped", .{});
-    const pids = try containerResult(container.?, container.?.pids(allocator));
+    // Like runc, a stopped container has no processes, which is not an error.
+    const pids = if (state.parsed.value.status == .stopped)
+        try allocator.alloc(i32, 0)
+    else
+        try containerResult(container.?, container.?.pids(allocator));
     defer allocator.free(pids);
     if (config.ps_format == .json) {
         const json = try std.json.Stringify.valueAlloc(allocator, pids, .{});

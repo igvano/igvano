@@ -17,20 +17,10 @@ mounts_sshfs::runc run [mount(8)-unlike behaviour: --bind with clearing flag]
 mounts_sshfs::runc run [ro,symfollow bind mount of a rw,nodev,nosymfollow fuse sshfs mount]
 personality::runc run personality for i686
 personality::runc run personality with exec for i686
-ps::ps after the container stopped
 run::runc run [/proc/self/exe clone]
-run::runc run [execve error]
-run::runc run [hostname domainname]
-run::runc run [joining existing container namespaces]
-run::runc run with tmpfs
-run::runc run with tmpfs perms
 seccomp::runc run [seccomp] (SECCOMP_FILTER_FLAG_*)
 seccomp::runc run [seccomp] (startContainer hook)
 start_hello::runc run as user with no exec bit but CAP_DAC_OVERRIDE set
-tty::runc exec [tty consolesize]
-tty::runc exec [tty owner] ({u,g}id != 0)
-tty::runc run [tty owner] ({u,g}id != 0)
-umask::umask
 userns::userns join external namespaces [wrong userns owner]
 
 # Host-dependent ("? " prefix): may pass or fail. blkio/bfq need the BFQ scheduler; spec validator needs proxy.golang.org (go mod tidy), blocked on some networks.

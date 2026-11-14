@@ -276,6 +276,7 @@ pub fn applyProcessSettings(process: ProcessSettings) libcontainer.Error!void {
             try dropBoundingCapabilities(caps.bounding);
             try checkResult(linux.prctl(@intFromEnum(linux.PR.SET_KEEPCAPS), 1, 0, 0, 0));
         }
+        try fixStdioOwner(process.uid);
         // With a user namespace, additional_gids (like uid/gid) are namespace IDs.
         const groups = process.additional_gids;
         // Like runc, skip it only in a user namespace with setgroups "deny"
@@ -287,6 +288,24 @@ pub fn applyProcessSettings(process: ProcessSettings) libcontainer.Error!void {
         if (process.capabilities) |caps| try applyCapabilities(caps);
     } else {
         return error.NotImplemented;
+    }
+}
+
+/// runc's fixStdioPermissions: stdio (a console, or pipes made by the
+/// runtime) belongs to the process user, so it can use them. Only the
+/// owner changes; /dev/null is left alone, and like runc only EINVAL,
+/// EPERM and EROFS are ignored.
+fn fixStdioOwner(uid: u32) libcontainer.Error!void {
+    for (0..3) |fd| {
+        var stat: linux.Statx = undefined;
+        if (linux.errno(linux.statx(@intCast(fd), "", linux.AT.EMPTY_PATH, .{ .UID = true, .GID = true, .TYPE = true }, &stat)) != .SUCCESS) continue;
+        if (stat.uid == uid) continue;
+        if (stat.mode & linux.S.IFMT == linux.S.IFCHR and stat.rdev_major == 1 and stat.rdev_minor == 3) continue;
+        const result = linux.fchown(@intCast(fd), uid, stat.gid);
+        switch (linux.errno(result)) {
+            .SUCCESS, .INVAL, .PERM, .ROFS => {},
+            else => try checkResult(result),
+        }
     }
 }
 

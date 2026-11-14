@@ -130,7 +130,15 @@ pub const console = struct {
     }
 };
 
-pub fn setupConsole(socket: posix.fd_t, mount_console: bool) libcontainer.Error!void {
+/// Like runc, only a size with both dimensions set is applied.
+fn resizeConsole(controller: posix.fd_t, size: ?libcontainer.ConsoleSize) libcontainer.Error!void {
+    const value = size orelse return;
+    if (value.height == 0 or value.width == 0) return;
+    const winsize: posix.winsize = .{ .row = value.height, .col = value.width, .xpixel = 0, .ypixel = 0 };
+    try checkResult(linux.ioctl(controller, linux.T.IOCSWINSZ, @intFromPtr(&winsize)));
+}
+
+pub fn setupConsole(socket: posix.fd_t, mount_console: bool, size: ?libcontainer.ConsoleSize) libcontainer.Error!void {
     const pts = consolePath("/dev/pts", .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true }) catch
         return error.MissingDevpts;
     defer closeFd(pts);
@@ -141,6 +149,7 @@ pub fn setupConsole(socket: posix.fd_t, mount_console: bool) libcontainer.Error!
     defer closeFd(controller);
     var unlock: i32 = 0;
     try checkResult(linux.ioctl(controller, linux.T.IOCSPTLCK, @intFromPtr(&unlock)));
+    try resizeConsole(controller, size);
     const replica_flags: linux.O = .{ .ACCMODE = .RDWR, .NOCTTY = true, .CLOEXEC = true };
     var replica_path_buffer: [32]u8 = undefined;
     var replica_path: ?[:0]const u8 = null;

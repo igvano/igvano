@@ -176,6 +176,8 @@ fn reportError(allocator: std.mem.Allocator, io: std.Io, diagnostic: ?[]const u8
     };
     defer allocator.free(message);
     const detail = diagnostic orelse oci.diagnosticFor(err);
+    // Like runc run, the process's own exec error is printed alone.
+    if (err == error.ProcessExecFailed) if (detail) |text| return emitError(allocator, io, config.log, config.log_format, text, null, null);
     emitError(allocator, io, config.log, config.log_format, message, detail, detail);
 }
 

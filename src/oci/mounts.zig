@@ -291,7 +291,7 @@ fn mountMappingOptions(mount: Spec.Mount) struct { bind: bool, recursive: ?bool 
 fn inheritMountMappings(config: *MountMappingConfig, settings: Spec.Linux) void {
     for (settings.namespaces orelse &.{}) |namespace| {
         if (namespace.type != .user) continue;
-        if (namespace.path) |path| {
+        if (namespace.joinPath()) |path| {
             config.userns_path = path;
             return;
         }

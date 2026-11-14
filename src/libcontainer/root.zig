@@ -53,6 +53,7 @@ pub const CreateOptions = struct {
     uid_mappings: []const IDMapping = &.{},
     gid_mappings: []const IDMapping = &.{},
     hostname: ?[]const u8 = null,
+    domainname: ?[]const u8 = null,
     readonly_rootfs: bool = false,
     /// Borrowed socketpair: init sends its PTY controller on [1]; the caller
     /// receives on [0]. Both ends are CLOEXEC and remain caller-owned.
@@ -109,15 +110,21 @@ pub const Process = struct {
     env: []const []const u8 = &.{},
     cwd: []const u8,
     terminal: bool = false,
+    /// process.consoleSize; applied like runc only when both are non-zero.
+    console_size: ?ConsoleSize = null,
     uid: u32,
     gid: u32,
     additional_gids: []const u32 = &.{},
+    /// process.user.umask; init falls back to 0o022, like runc.
+    umask: ?u32 = null,
     no_new_privileges: bool = false,
     scheduler: ?Scheduler = null,
     io_priority: ?IOPriority = null,
 };
 
 /// sched_setattr(2) values; the frontend has validated them like runc.
+pub const ConsoleSize = struct { height: u16, width: u16 };
+
 pub const Scheduler = struct {
     policy: u32,
     flags: u64 = 0,
@@ -175,6 +182,12 @@ pub const ExecOptions = struct {
     /// runc exec --cgroup: paths below the container's cgroup to join.
     /// One entry with no controller applies to every controller.
     sub_cgroups: []const SubCgroup = &.{},
+    console_size: ?ConsoleSize = null,
+    /// runc exec --pidfd-socket: a connected socket; the process sends a
+    /// pidfd of itself on it before exec, like runc's setupPidfd.
+    pidfd_socket: ?std.posix.fd_t = null,
+    /// The container's process.user.umask, which runc exec also applies.
+    umask: ?u32 = null,
     /// runc exec --preserve-fds: fds 3..3+N-1 reach the process.
     preserve_fds: u32 = 0,
 };
@@ -232,6 +245,8 @@ pub const Symlink = struct {
     target: [:0]const u8,
 };
 
+/// The new UTS namespace's names.
+pub const Uts = struct { hostname: ?[]const u8 = null, domainname: ?[]const u8 = null };
 pub const Sysctl = struct { key: []const u8, value: []const u8 };
 /// An empty name keeps the host name.
 pub const NetDevice = struct { host_name: []const u8, name: []const u8 = "" };

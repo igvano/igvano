@@ -207,7 +207,7 @@ fn validateCreate(ctx: *CreateContext) libcontainer.Error!void {
         reportDiagnostic("time offsets require a new time namespace", .{});
         return error.InvalidConfig;
     }
-    if (ctx.options.hostname != null and ctx.namespaces.isolation_flags & linux.CLONE.NEWUTS == 0)
+    if ((ctx.options.hostname != null or ctx.options.domainname != null) and ctx.namespaces.isolation_flags & linux.CLONE.NEWUTS == 0)
         return error.InvalidConfig;
     try validateCreateProcess(ctx);
     try validateDeviceMounts(ctx.options.mounts, ctx.options.devices);
@@ -624,7 +624,7 @@ fn runCreateChild(ctx: *const CreateContext) noreturn {
     // Set with host privileges before entering user namespaces.
     // Child2 inherits the adjustment across fork and exec.
     applyOomScoreAdj(ctx.proc_dir, ctx.options.oom_score_adj) catch |err| failCreate(ctx.sync.report[1], err);
-    joinNamespacesWithUser(ctx.namespaces.joins.items, ctx.namespaces.joined_user_fd) catch |err| failCreate(ctx.sync.report[1], err);
+    const time_fd = joinCreateNamespaces(ctx);
     // NEWUSER is unshared together with the others so it owns them.
     const early_flags = if (ctx.options.systemd) ctx.namespaces.flags & ~@as(usize, linux.CLONE.NEWCGROUP) else ctx.namespaces.flags;
     if (early_flags != 0) checkResult(linux.unshare(early_flags)) catch |err| failCreate(ctx.sync.report[1], err);
@@ -636,7 +636,8 @@ fn runCreateChild(ctx: *const CreateContext) noreturn {
     if (ctx.namespaces.rootless_dumpable) setDumpable(ctx, true);
     // NEWPID affects the next fork, making child2 pid 1 inside the namespace.
     const child2 = forkProcess() catch |err| failCreate(ctx.sync.report[1], err);
-    if (child2 == 0) runInitChild(ctx);
+    if (child2 == 0) runInitChild(ctx, time_fd);
+    if (time_fd) |fd| closeFd(fd);
     if (ctx.namespaces.rootless_dumpable) setDumpable(ctx, false);
     reportCreatedInit(ctx, child2);
 }
@@ -680,7 +681,48 @@ fn joinCreateCgroups(ctx: *const CreateContext) void {
     }
 }
 
-fn runInitChild(ctx: *const CreateContext) noreturn {
+/// setns(CLONE_NEWTIME) also moves the caller, and /proc/<pid>/stat shows
+/// start times in the reader's time namespace. So child1 stays in the host
+/// time namespace to read init's start time, and init joins it itself.
+/// Returns the opened time namespace; `joins` gets the other joins.
+fn joinCreateNamespaces(ctx: *const CreateContext) ?posix.fd_t {
+    var joins: [8]NamespaceJoin = undefined;
+    const time_fd = splitTimeJoin(ctx, &joins);
+    const count = ctx.namespaces.joins.items.len - @intFromBool(time_fd != null);
+    joinNamespacesWithUser(joins[0..count], ctx.namespaces.joined_user_fd) catch |err| failCreate(ctx.sync.report[1], err);
+    return time_fd;
+}
+
+/// With a new user namespace, init could no longer join a time namespace
+/// owned elsewhere, so child1 joins it before the unshare.
+// ponytail: that case still reads init's start time inside the joined time
+// namespace; pass the start time through a host-side helper if it matters.
+fn splitTimeJoin(ctx: *const CreateContext, joins: *[8]NamespaceJoin) ?posix.fd_t {
+    var time_fd: ?posix.fd_t = null;
+    var count: usize = 0;
+    const defer_time = ctx.namespaces.flags & linux.CLONE.NEWUSER == 0;
+    for (ctx.namespaces.joins.items) |join| {
+        if (join.flag != linux.CLONE.NEWTIME or !defer_time) {
+            if (count == joins.len) failCreate(ctx.sync.report[1], error.InvalidConfig);
+            joins[count] = join;
+            count += 1;
+            continue;
+        }
+        const fd = openPath(linux.AT.FDCWD, join.path, .{ .ACCMODE = .RDONLY, .NONBLOCK = true, .CLOEXEC = true }) catch |err| failCreate(ctx.sync.report[1], err);
+        validateNamespaceFd(fd, linux.CLONE.NEWTIME) catch |err| failCreate(ctx.sync.report[1], err);
+        time_fd = fd;
+    }
+    return time_fd;
+}
+
+fn joinInitTime(time_fd: ?posix.fd_t) void {
+    const fd = time_fd orelse return;
+    checkResult(linux.setns(fd, linux.CLONE.NEWTIME)) catch linux.exit_group(1);
+    closeFd(fd);
+}
+
+fn runInitChild(ctx: *const CreateContext, time_fd: ?posix.fd_t) noreturn {
+    joinInitTime(time_fd);
     closeFd(ctx.sync.pid_pipe[1]);
     var host_pid: i32 = undefined;
     if (!readAll(ctx.sync.pid_pipe[0], std.mem.asBytes(&host_pid))) linux.exit_group(1);
@@ -704,7 +746,11 @@ fn runInitChild(ctx: *const CreateContext) noreturn {
     const start_input = std.fmt.bufPrint(ctx.init.start_state, "{s}{d}{s}", .{
         ctx.options.start_hook_state.prefix, host_pid, ctx.options.start_hook_state.suffix,
     }) catch linux.exit_group(1);
-    runInit(ctx.options.process, ctx.options.hostname, ctx.options.readonly_rootfs, ctx.init.capabilities, ctx.options.rlimits, ctx.namespaces.isolation_flags, ctx.init.rootfs, ctx.init.mounts, ctx.init.devices, ctx.options.device_symlinks, ctx.init.cwd, ctx.fifo_fd, fd_dir, ctx.init.argv.ptr, ctx.init.envp.ptr, ctx.sync.ready[1], .{
+    runInit(ctx.options.process, .{ .hostname = ctx.options.hostname, .domainname = ctx.options.domainname }, ctx.options.readonly_rootfs, ctx.init.capabilities, ctx.options.rlimits, ctx.namespaces.isolation_flags, ctx.init.rootfs, ctx.init.mounts, ctx.init.devices, ctx.options.device_symlinks, ctx.init.cwd, ctx.fifo_fd, fd_dir, ctx.init.argv.ptr, ctx.init.envp.ptr, ctx.sync.ready[1], initRootfsOptions(ctx, create_input), ctx.init.start_hooks, start_input, ctx.init.apparmor_command, ctx.init.seccomp_program);
+}
+
+fn initRootfsOptions(ctx: *const CreateContext, create_input: []const u8) RootfsOptions {
+    return .{
         .private_mount_namespace = ctx.namespaces.private_mount_namespace,
         .propagation = ctx.options.rootfs_propagation orelse (linux.MS.PRIVATE | linux.MS.REC),
         .create_hooks = ctx.init.create_hooks,
@@ -719,7 +765,8 @@ fn runInitChild(ctx: *const CreateContext) noreturn {
         .rootless = ctx.namespaces.rootless_dumpable,
         .cpuset = if (ctx.options.resources.cpu) |cpu| cpu.cpus != null else false,
         .no_pivot = ctx.options.no_pivot,
-    }, ctx.init.start_hooks, start_input, ctx.init.apparmor_command, ctx.init.seccomp_program);
+        .console_size = if (ctx.options.process) |process| process.console_size else null,
+    };
 }
 
 fn sendInitNamespace(ctx: *const CreateContext, socket: posix.fd_t, path: [*:0]const u8) void {
@@ -1050,7 +1097,7 @@ fn awaitInitializedInit(ctx: *CreateContext) libcontainer.Error!CreateResponse {
 
 const InitContext = struct {
     process: ?libcontainer.Process,
-    hostname: ?[]const u8,
+    uts: libcontainer.Uts,
     readonly_rootfs: bool,
     capabilities: ?libcontainer.Capabilities,
     rlimits: []const libcontainer.Rlimit,
@@ -1074,7 +1121,7 @@ const InitContext = struct {
 
 pub fn runInit(
     process: ?libcontainer.Process,
-    hostname: ?[]const u8,
+    uts: libcontainer.Uts,
     readonly_rootfs: bool,
     capabilities: ?libcontainer.Capabilities,
     rlimits: []const libcontainer.Rlimit,
@@ -1097,7 +1144,7 @@ pub fn runInit(
 ) noreturn {
     const init: InitContext = .{
         .process = process,
-        .hostname = hostname,
+        .uts = uts,
         .readonly_rootfs = readonly_rootfs,
         .capabilities = capabilities,
         .rlimits = rlimits,
@@ -1152,15 +1199,19 @@ fn runPreparedInit(init: *const InitContext) noreturn {
 fn setInitHostname(init: *const InitContext) void {
     // Sysctls in setupRootfs may override the configured hostname.
     if (init.flags & linux.CLONE.NEWUTS != 0) {
-        if (init.hostname) |hostname| {
+        if (init.uts.hostname) |hostname| {
             // Zig 0.16 has no sethostname wrapper.
             checkResult(linux.syscall2(.sethostname, @intFromPtr(hostname.ptr), hostname.len)) catch |err| failCreate(init.ready_fd, err);
         }
+        if (init.uts.domainname) |domainname|
+            checkResult(linux.syscall2(.setdomainname, @intFromPtr(domainname.ptr), domainname.len)) catch |err| failCreate(init.ready_fd, err);
     }
 }
 
 fn applyInitProcess(init: *const InitContext, fifo_name: [:0]const u8) void {
     if (init.process) |process| {
+        // Like runc's finalizeRootfs.
+        _ = linux.syscall1(.umask, process.umask orelse 0o022);
         // Allow write-only reopen after setuid while keeping readers root-only.
         if (process.uid != 0)
             checkResult(linux.fchmodat(init.fd_dir, fifo_name, 0o622)) catch |err| failCreate(init.ready_fd, err);
@@ -1206,7 +1257,9 @@ fn exitOnSignal(signal: linux.SIG) callconv(.c) void {
 
 fn catchTerminatingSignals() void {
     const action: linux.Sigaction = .{ .handler = .{ .handler = exitOnSignal }, .mask = linux.sigemptyset(), .flags = 0 };
-    for ([_]linux.SIG{ .HUP, .INT, .QUIT, .TERM, .USR1, .USR2 }) |signal|
+    // Asynchronous signals whose default ends the process. SIGPIPE stays
+    // as is, so a failed pipe write still returns EPIPE here.
+    for ([_]linux.SIG{ .HUP, .INT, .QUIT, .ABRT, .USR1, .USR2, .ALRM, .TERM, .STKFLT, .XCPU, .XFSZ, .VTALRM, .PROF, .IO, .PWR, .SYS }) |signal|
         _ = linux.sigaction(signal, &action, null);
 }
 

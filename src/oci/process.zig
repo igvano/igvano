@@ -10,9 +10,11 @@ pub fn processConfig(process: Spec.Process) libcontainer.Process {
         .env = process.env orelse &.{},
         .cwd = process.cwd,
         .terminal = process.terminal orelse false,
+        .console_size = if (process.consoleSize) |size| .{ .height = size.height, .width = size.width } else null,
         .uid = process.user.uid,
         .gid = process.user.gid,
         .additional_gids = process.user.additionalGids orelse &.{},
+        .umask = process.user.umask,
         .no_new_privileges = process.noNewPrivileges,
     };
 }

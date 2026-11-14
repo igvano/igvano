@@ -18,6 +18,7 @@ pub const Spec = struct {
     root: Root,
     process: ?Process = null,
     hostname: ?[]const u8 = null,
+    domainname: ?[]const u8 = null,
     mounts: ?[]const Mount = null,
     hooks: ?Hooks = null,
     linux: ?Linux = null,
@@ -33,6 +34,7 @@ pub const Spec = struct {
         env: ?[]const []const u8 = null,
         cwd: []const u8,
         terminal: ?bool = null,
+        consoleSize: ?struct { height: u16 = 0, width: u16 = 0 } = null,
         noNewPrivileges: bool = false,
         apparmorProfile: ?[]const u8 = null,
         oomScoreAdj: ?i32 = null,
@@ -84,6 +86,7 @@ pub const Spec = struct {
         uid: u32 = 0,
         gid: u32 = 0,
         additionalGids: ?[]const u32 = null,
+        umask: ?u32 = null,
     };
 
     pub const Mount = struct {
@@ -241,6 +244,13 @@ pub const Spec = struct {
     pub const Namespace = struct {
         type: enum { pid, network, mount, ipc, uts, user, cgroup, time },
         path: ?[]const u8 = null,
+
+        /// The namespace to join. Like Go's omitempty, an empty path asks
+        /// for a new namespace.
+        pub fn joinPath(self: Namespace) ?[]const u8 {
+            const path = self.path orelse return null;
+            return if (path.len == 0) null else path;
+        }
     };
 
     pub const IDMapping = struct {
