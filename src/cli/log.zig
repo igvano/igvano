@@ -53,18 +53,49 @@ pub fn stderrErrorLine(allocator: std.mem.Allocator, io: std.Io, log_format: Log
     return line.toOwnedSlice();
 }
 
-/// Go's strconv.Quote for the bytes logrus quotes: \\, \", and control bytes.
+/// Go's strconv.Quote, as logrus writes text values: \\, \", ASCII
+/// controls, invalid UTF-8 as \xNN and non-printable runes as \uNNNN.
+// ponytail: the non-printable set covers C1 controls, line/paragraph
+// separators and invisible format runes, not all of Go's unicode.IsPrint.
 fn writeQuoted(writer: *std.Io.Writer, text: []const u8) !void {
     try writer.writeByte('"');
-    for (text) |byte| switch (byte) {
+    var i: usize = 0;
+    while (i < text.len) {
+        const byte = text[i];
+        if (byte < 0x80) {
+            try writeQuotedAscii(writer, byte);
+            i += 1;
+            continue;
+        }
+        const len = std.unicode.utf8ByteSequenceLength(byte) catch 0;
+        const rune: ?u21 = if (len != 0 and i + len <= text.len) std.unicode.utf8Decode(text[i .. i + len]) catch null else null;
+        if (rune) |value| {
+            if (printableRune(value)) try writer.writeAll(text[i .. i + len]) else try writer.print("\\u{x:0>4}", .{value});
+            i += len;
+        } else {
+            try writer.print("\\x{x:0>2}", .{byte});
+            i += 1;
+        }
+    }
+    try writer.writeByte('"');
+}
+
+fn writeQuotedAscii(writer: *std.Io.Writer, byte: u8) !void {
+    switch (byte) {
         '"', '\\' => try writer.print("\\{c}", .{byte}),
         '\n' => try writer.writeAll("\\n"),
         '\t' => try writer.writeAll("\\t"),
         '\r' => try writer.writeAll("\\r"),
         0...8, 11, 12, 14...31, 127 => try writer.print("\\x{x:0>2}", .{byte}),
         else => try writer.writeByte(byte),
+    }
+}
+
+fn printableRune(rune: u21) bool {
+    return switch (rune) {
+        0x80...0x9f, 0xad, 0x200b...0x200f, 0x2028...0x202e, 0x2060...0x2064, 0xfeff => false,
+        else => true,
     };
-    try writer.writeByte('"');
 }
 
 pub fn appendErrorLog(allocator: std.mem.Allocator, io: std.Io, path: []const u8, log_format: LogFormat, message: []const u8) !void {
@@ -161,6 +192,13 @@ test "text error logs append the stderr line without changing existing permissio
     defer std.testing.allocator.free(bytes);
     try std.testing.expectEqualStrings("existing\nigvano: an error\n", bytes);
     try std.testing.expectEqual(permissions, (try file.stat(std.testing.io)).permissions);
+}
+
+test "text quoting escapes invalid UTF-8 and line separators like Go" {
+    var buffer: [64]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    try writeQuoted(&writer, "a\xffb\u{2028}c\u{85}d\u{e9}");
+    try std.testing.expectEqualStrings("\"a\\xffb\\u2028c\\u0085d\u{e9}\"", writer.buffered());
 }
 
 test "stderr errors use logrus's text line with Go quoting" {

@@ -75,32 +75,37 @@ pub fn createCgroupDirectory(parent: posix.fd_t, name: [:0]const u8, path: []con
     return false;
 }
 
-/// runc's create checks: no processes, and not frozen.
-// ponytail: counts only the leaf's own cgroup.procs, while runc counts the
-// whole subtree; walk children if a nested member ever matters.
+/// runc's create checks: no process anywhere in the subtree, and not
+/// frozen. Read failures fail closed.
 fn requireUsableLeaf(parent: posix.fd_t, name: [:0]const u8) libcontainer.Error!void {
     const dir = try openPath(parent, name, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .NOFOLLOW = true, .CLOEXEC = true });
     defer closeFd(dir);
-    var scratch: [16384]u8 = undefined;
-    var fixed: std.heap.FixedBufferAllocator = .init(&scratch);
-    if (readCgroupFile(fixed.allocator(), dir, "cgroup.procs")) |procs| {
-        const count = std.mem.count(u8, procs, "\n");
-        if (count != 0) {
-            reportDiagnostic("container's cgroup is not empty: {d} process(es) found", .{count});
-            return error.CreateFailed;
-        }
-    } else |_| {}
-    fixed.reset();
-    const frozen = if (readCgroupFile(fixed.allocator(), dir, "cgroup.freeze")) |text|
-        std.mem.eql(u8, std.mem.trim(u8, text, " \n"), "1")
-    else |_| if (readCgroupFile(fixed.allocator(), dir, "freezer.state")) |text|
-        std.mem.eql(u8, std.mem.trim(u8, text, " \n"), "FROZEN")
-    else |_|
-        false;
-    if (frozen) {
+    const allocator = std.heap.page_allocator;
+    var pids: std.ArrayList(i32) = .empty;
+    defer pids.deinit(allocator);
+    try collectCgroupPids(allocator, dir, &pids);
+    if (pids.items.len != 0) {
+        reportDiagnostic("container's cgroup is not empty: {d} process(es) found", .{pids.items.len});
+        return error.CreateFailed;
+    }
+    if (try leafFrozen(allocator, dir)) {
         reportDiagnostic("container's cgroup unexpectedly frozen", .{});
         return error.CreateFailed;
     }
+}
+
+/// cgroup v2's cgroup.freeze, or v1's freezer.state; neither file means
+/// no freezer here.
+fn leafFrozen(allocator: std.mem.Allocator, dir: posix.fd_t) libcontainer.Error!bool {
+    const file: [:0]const u8, const frozen: []const u8 = if (!fileMissing(dir, "cgroup.freeze"))
+        .{ "cgroup.freeze", "1" }
+    else if (!fileMissing(dir, "freezer.state"))
+        .{ "freezer.state", "FROZEN" }
+    else
+        return false;
+    const text = try readCgroupFile(allocator, dir, file);
+    defer allocator.free(text);
+    return std.mem.eql(u8, std.mem.trim(u8, text, " \n"), frozen);
 }
 
 fn cgroupMode(fs_type: usize) libcontainer.Error!CgroupMode {

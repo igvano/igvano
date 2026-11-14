@@ -19,6 +19,8 @@ test "linux cgroup creation reuses parents and existing empty leaves" {
     defer tmp.cleanup();
     try tmp.dir.createDirPath(std.testing.io, "parent/foreign");
     try tmp.dir.createDir(std.testing.io, "foreign", .default_dir);
+    for ([_][]const u8{ "foreign/cgroup.procs", "parent/foreign/cgroup.procs" }) |path|
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = path, .data = "" });
     const base = try std.fmt.allocPrintSentinel(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path}, 0);
     defer std.testing.allocator.free(base);
     const root = try openPath(linux.AT.FDCWD, base, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true });
@@ -32,6 +34,25 @@ test "linux cgroup creation reuses parents and existing empty leaves" {
     closeFd(owned);
     try removeCgroup(root, "parent/owned");
     try std.testing.expectEqual(@as(?posix.fd_t, null), try walkCgroup(root, "parent/owned", false, &.{}));
+}
+
+test "linux cgroup creation refuses an existing leaf with processes below it" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "leaf/child");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "leaf/cgroup.procs", .data = "" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "leaf/child/cgroup.procs", .data = "123\n" });
+    const base = try std.fmt.allocPrintSentinel(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path}, 0);
+    defer std.testing.allocator.free(base);
+    const root = try openPath(linux.AT.FDCWD, base, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true });
+    defer closeFd(root);
+    defer @import("../diagnostic.zig").last_diagnostic_len = 0;
+    try std.testing.expectError(error.CreateFailed, walkCgroup(root, "leaf", true, &.{}));
+    try std.testing.expectEqualStrings("container's cgroup is not empty: 1 process(es) found", @import("../diagnostic.zig").diagnostic().?);
+    // An unreadable cgroup.procs fails closed.
+    try tmp.dir.deleteFile(std.testing.io, "leaf/cgroup.procs");
+    try std.testing.expectError(error.CreateFailed, walkCgroup(root, "leaf", true, &.{}));
 }
 
 test "linux cgroup creation enables requested controllers and ordinary lookups leave them alone" {
