@@ -683,11 +683,8 @@ pub fn applyMount(rootfs: [:0]const u8, root_fd: posix.fd_t, mount: PreparedMoun
     defer if (covered) |fd| closeFd(fd);
     var source_buffer: [64]u8 = undefined;
     const source = mountSource(&source_buffer, source_fd, mount);
-    var attach = mount;
     var data_buffer: [4096]u8 = undefined;
-    if (isTmpfs(mount)) attach.data = try tmpfsData(&data_buffer, target_fd, mount.data, step);
-    // A read-only copy-up tmpfs is filled first and made read-only after.
-    if (copy_up) attach.flags &= ~@as(u32, linux.MS.RDONLY);
+    const attach = try attachOptions(mount, target_fd, &data_buffer, step);
     const cgroup2_bound = try attachMount(attach, source, target_fd, step);
     // The original fd pins the covered mount. Reopen to address the new mount
     // for remount and propagation changes, with symlinks still scoped to rootfs.
@@ -721,6 +718,36 @@ fn openMountTarget(root_fd: posix.fd_t, mount: PreparedMount, is_file: bool, ste
     }
     try requireBelowRootfs(root_fd, target_fd, step);
     return target_fd;
+}
+
+/// runc mounts tmpfs and /dev read-write first: devices, the console and
+/// modes still have to be set up in them.
+fn delaysReadonly(mount: PreparedMount) bool {
+    if (mount.flags & linux.MS.RDONLY == 0 or mount.flags & linux.MS.BIND != 0 or isCopyUp(mount)) return false;
+    return isTmpfs(mount) or std.mem.eql(u8, mount.destination, "/dev");
+}
+
+/// runc's finalizeRootfs: remount the delayed mounts read-only, after
+/// pivot_root, through `root_fd` so symlinks stay inside the rootfs.
+pub fn finishReadonlyMounts(root_fd: posix.fd_t, mounts: []const PreparedMount, step: *RootfsStep) libcontainer.Error!void {
+    for (mounts) |mount| {
+        if (!delaysReadonly(mount)) continue;
+        step.* = .{ .operation = "remount read-only", .path = mount.destination };
+        const fd = try mountDestinationStep(root_fd, mount.destination, false, false, step);
+        defer closeFd(fd);
+        var buffer: [64]u8 = undefined;
+        try checkResult(linux.mount(null, fdPath(&buffer, fd), null, (mount.flags & ~@as(u32, linux.MS.REC)) | linux.MS.REMOUNT, 0));
+    }
+}
+
+/// The mount as first attached: a tmpfs gets its directory's mode, and a
+/// read-only copy-up tmpfs is filled first, then made read-only; other
+/// delayed mounts are made read-only by finishReadonlyMounts.
+fn attachOptions(mount: PreparedMount, target_fd: posix.fd_t, data_buffer: []u8, step: *RootfsStep) libcontainer.Error!PreparedMount {
+    var attach = mount;
+    if (isTmpfs(mount)) attach.data = try tmpfsData(data_buffer, target_fd, mount.data, step);
+    if (isCopyUp(mount) or delaysReadonly(mount)) attach.flags &= ~@as(u32, linux.MS.RDONLY);
+    return attach;
 }
 
 fn isTmpfs(mount: PreparedMount) bool {

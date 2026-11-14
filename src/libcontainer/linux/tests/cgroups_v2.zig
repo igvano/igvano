@@ -13,7 +13,7 @@ const removeCgroup = @import("../cgroup.zig").removeCgroup;
 const removeCgroupChildren = @import("../cgroup.zig").removeCgroupChildren;
 const removeV1Cgroup = @import("../cgroup_v1.zig").removeV1Cgroup;
 
-test "linux cgroup creation reuses parents but rejects existing leaves" {
+test "linux cgroup creation reuses parents and existing empty leaves" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -23,14 +23,10 @@ test "linux cgroup creation reuses parents but rejects existing leaves" {
     defer std.testing.allocator.free(base);
     const root = try openPath(linux.AT.FDCWD, base, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true });
     defer closeFd(root);
+    // Like runc, an existing leaf with no processes is used, not refused.
     for ([_][]const u8{ "foreign", "parent/foreign" }) |path| {
-        const result = walkCgroup(root, path, true, &.{});
-        if (result) |fd| {
-            if (fd) |opened| closeFd(opened);
-        } else |_| {}
-        try std.testing.expectError(error.CreateFailed, result);
-        const existing = (try walkCgroup(root, path, false, &.{})).?;
-        closeFd(existing);
+        const reused = (try walkCgroup(root, path, true, &.{})).?;
+        closeFd(reused);
     }
     const owned = (try walkCgroup(root, "parent/owned", true, &.{})).?;
     closeFd(owned);

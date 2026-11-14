@@ -50,9 +50,12 @@ pub fn killContainer(allocator: std.mem.Allocator, io: std.Io, injected: ?Contai
     var state = try readLiveState(allocator, io, injected, config, persist_recovery);
     defer state.deinit();
     var instance: ContainerInstance = undefined;
-    if (!config.all or state.parsed.value.status != .stopped)
+    // Like runc, SIGKILL for a container in the host PID namespace kills
+    // every cgroup member: killing init alone would leave the others.
+    const kill_all = config.all or (signal == 9 and sharesHostPids(allocator, io, config));
+    if (!kill_all or state.parsed.value.status != .stopped)
         oci.requireKill(state.parsed.value.status) catch return oci.validationError(error.ContainerNotRunning, "kill: container is not running", .{});
-    if (config.all) {
+    if (kill_all) {
         if (state.container_state == null)
             state.container_state = try containerState(allocator, io, config.root, state.parsed.value, false);
         const container = bindContainer(&instance, injected, state.container_state.?);
@@ -61,6 +64,20 @@ pub fn killContainer(allocator: std.mem.Allocator, io: std.Io, injected: ?Contai
         const container = bindContainer(&instance, injected, state.container_state.?);
         try containerResult(container, container.kill(signal));
     }
+}
+
+/// The saved config has no pid namespace entry. Unreadable configs fall back
+/// to signalling init only.
+fn sharesHostPids(allocator: std.mem.Allocator, io: std.Io, config: Config) bool {
+    const saved = std.fs.path.join(allocator, &.{ config.root, config.id }) catch return false;
+    defer allocator.free(saved);
+    const spec = oci.loadSpec(allocator, io, saved) catch return false;
+    defer spec.deinit();
+    const linux = spec.value.linux orelse return true;
+    for (linux.namespaces orelse &.{}) |namespace| {
+        if (namespace.type == .pid) return false;
+    }
+    return true;
 }
 
 test "kill reuses the handle loaded during the liveness check" {

@@ -122,8 +122,8 @@ const max_reordered_args = 128;
 /// arguments. exec and ps keep runc's SkipArgReorder; the rest take no flags.
 fn commandFlagNames(subcommand: Subcommand) []const []const u8 {
     return switch (subcommand) {
-        .create => &.{ "bundle", "b", "pid-file", "console-socket", "pidfd-socket", "no-pivot" },
-        .run => &.{ "bundle", "b", "pid-file", "console-socket", "pidfd-socket", "no-pivot", "detach", "d", "keep" },
+        .create => &.{ "bundle", "b", "pid-file", "console-socket", "pidfd-socket", "no-pivot", "preserve-fds" },
+        .run => &.{ "bundle", "b", "pid-file", "console-socket", "pidfd-socket", "no-pivot", "preserve-fds", "detach", "d", "keep" },
         .spec => &.{ "bundle", "b", "rootless" },
         .list => &.{ "quiet", "q", "format", "f" },
         .events => &.{ "stats", "interval" },
@@ -332,15 +332,16 @@ fn applyExecOption(args: []const []const u8, index: *usize, config: *Config, opt
         // --cgroup is parsed later from exec_flags (see exec.subCgroups).
         .cap, .process_label, .cgroup => _ = try optionValue(args, index, error.MissingExecValue),
         .apparmor => config.exec_apparmor = try optionValue(args, index, error.MissingExecValue),
-        .preserve_fds => {
-            const value = try optionValue(args, index, error.MissingExecValue);
-            config.preserve_fds = std.fmt.parseUnsigned(u16, value, 10) catch
-                return oci.validationError(error.InvalidExecValue, "--preserve-fds: expected a number", .{});
-        },
+        .preserve_fds => config.preserve_fds = try preserveFds(try optionValue(args, index, error.MissingExecValue)),
     }
 }
 
-const CreateOption = enum { bundle, pid_file, console_socket, pidfd_socket, no_pivot, detach, keep, rootless };
+fn preserveFds(value: []const u8) !u16 {
+    return std.fmt.parseUnsigned(u16, value, 10) catch
+        oci.validationError(error.InvalidExecValue, "--preserve-fds: expected a number", .{});
+}
+
+const CreateOption = enum { bundle, pid_file, console_socket, pidfd_socket, no_pivot, preserve_fds, detach, keep, rootless };
 
 // spec takes only the bundle; detach and keep are run-only booleans.
 fn createOptionAllowed(subcommand: Subcommand, option: CreateOption, flag: []const u8) bool {
@@ -353,9 +354,9 @@ fn createOptionAllowed(subcommand: Subcommand, option: CreateOption, flag: []con
 
 fn parseCreateOptions(args: []const []const u8, index: *usize, config: *Config) !void {
     const options = std.StaticStringMap(CreateOption).initComptime(.{
-        .{ "--bundle", .bundle },             .{ "-b", .bundle },           .{ "--pid-file", .pid_file }, .{ "--console-socket", .console_socket },
-        .{ "--detach", .detach },             .{ "-d", .detach },           .{ "--keep", .keep },         .{ "--rootless", .rootless },
-        .{ "--pidfd-socket", .pidfd_socket }, .{ "--no-pivot", .no_pivot },
+        .{ "--bundle", .bundle },             .{ "-b", .bundle },           .{ "--pid-file", .pid_file },         .{ "--console-socket", .console_socket },
+        .{ "--detach", .detach },             .{ "-d", .detach },           .{ "--keep", .keep },                 .{ "--rootless", .rootless },
+        .{ "--pidfd-socket", .pidfd_socket }, .{ "--no-pivot", .no_pivot }, .{ "--preserve-fds", .preserve_fds },
     });
     while (index.* < args.len and std.mem.startsWith(u8, args[index.*], "-")) : (index.* += 1) {
         const flag = args[index.*];
@@ -368,6 +369,7 @@ fn parseCreateOptions(args: []const []const u8, index: *usize, config: *Config) 
             .console_socket => config.console_socket = try longOptionValue(args, index, error.MissingConsoleSocket, false),
             .pidfd_socket => config.pidfd_socket = try longOptionValue(args, index, error.MissingPidfdSocket, false),
             .no_pivot => config.no_pivot = true,
+            .preserve_fds => config.preserve_fds = try preserveFds(try optionValue(args, index, error.MissingExecValue)),
             .detach => config.detach = true,
             .keep => config.keep = true,
             .rootless => config.rootless = true,

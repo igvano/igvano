@@ -96,6 +96,7 @@ pub fn createContainerFor(allocator: std.mem.Allocator, io: std.Io, injected: ?C
         .seccomp = seccomp_config,
         .debug = config.debug_log,
         .no_pivot = config.no_pivot,
+        .preserve_fds = config.preserve_fds,
     };
     try applyCreateSpec(mount_allocator, &options, parsed.value);
     applyCreateProcess(&options, process_options, init_env);
@@ -466,7 +467,8 @@ pub const CreateContext = struct {
 fn prepareRestrictionPaths(allocator: std.mem.Allocator, configured: ?[]const []const u8) ![]const []const u8 {
     const paths = configured orelse &.{};
     const prepared = try allocator.alloc([]const u8, paths.len);
-    for (paths, prepared) |path, *value| value.* = try oci.resolveMountDestination(allocator, path);
+    // Like runc, a relative path is taken from /, the cwd after pivot_root.
+    for (paths, prepared) |path, *value| value.* = try std.fs.path.resolvePosix(allocator, &.{ "/", path });
     return prepared;
 }
 

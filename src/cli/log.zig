@@ -15,25 +15,63 @@ pub fn openDebugLog(path: ?[]const u8, log_format: LogFormat) !@import("libconta
     return .{ .fd = fd, .json = log_format == .json };
 }
 
+/// RFC3339 UTC with seconds, as logrus prints it.
+fn logTime(io: std.Io, buffer: *[20]u8) ![]const u8 {
+    const seconds = std.math.cast(u64, std.Io.Clock.real.now(io).toSeconds()) orelse return oci.validationError(error.InvalidTimestamp, "log timestamp: predates the Unix epoch", .{});
+    const epoch: std.time.epoch.EpochSeconds = .{ .secs = seconds };
+    const year_day = epoch.getEpochDay().calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+    const day_seconds = epoch.getDaySeconds();
+    return std.fmt.bufPrint(buffer, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{
+        year_day.year,
+        @intFromEnum(month_day.month),
+        @as(u8, month_day.day_index) + 1,
+        day_seconds.getHoursIntoDay(),
+        day_seconds.getMinutesIntoHour(),
+        day_seconds.getSecondsIntoMinute(),
+    });
+}
+
+fn writeJsonError(io: std.Io, writer: *std.Io.Writer, message: []const u8) !void {
+    var time_buffer: [20]u8 = undefined;
+    const time = try logTime(io, &time_buffer);
+    try std.json.Stringify.value(.{ .level = "error", .msg = message, .time = time }, .{}, writer);
+}
+
+/// runc's error on stderr when there is no --log: one logrus line,
+/// `time="..." level=error msg="..."` (or JSON), without a trailing newline.
+pub fn stderrErrorLine(allocator: std.mem.Allocator, io: std.Io, log_format: LogFormat, message: []const u8) ![]u8 {
+    var line: std.Io.Writer.Allocating = .init(allocator);
+    errdefer line.deinit();
+    if (log_format == .json) {
+        try writeJsonError(io, &line.writer, message);
+    } else {
+        var time_buffer: [20]u8 = undefined;
+        try line.writer.print("time=\"{s}\" level=error msg=", .{try logTime(io, &time_buffer)});
+        try writeQuoted(&line.writer, message);
+    }
+    return line.toOwnedSlice();
+}
+
+/// Go's strconv.Quote for the bytes logrus quotes: \\, \", and control bytes.
+fn writeQuoted(writer: *std.Io.Writer, text: []const u8) !void {
+    try writer.writeByte('"');
+    for (text) |byte| switch (byte) {
+        '"', '\\' => try writer.print("\\{c}", .{byte}),
+        '\n' => try writer.writeAll("\\n"),
+        '\t' => try writer.writeAll("\\t"),
+        '\r' => try writer.writeAll("\\r"),
+        0...8, 11, 12, 14...31, 127 => try writer.print("\\x{x:0>2}", .{byte}),
+        else => try writer.writeByte(byte),
+    };
+    try writer.writeByte('"');
+}
+
 pub fn appendErrorLog(allocator: std.mem.Allocator, io: std.Io, path: []const u8, log_format: LogFormat, message: []const u8) !void {
     var line: std.Io.Writer.Allocating = .init(allocator);
     defer line.deinit();
     if (log_format == .json) {
-        const seconds = std.math.cast(u64, std.Io.Clock.real.now(io).toSeconds()) orelse return oci.validationError(error.InvalidTimestamp, "log timestamp: predates the Unix epoch", .{});
-        const epoch: std.time.epoch.EpochSeconds = .{ .secs = seconds };
-        const year_day = epoch.getEpochDay().calculateYearDay();
-        const month_day = year_day.calculateMonthDay();
-        const day_seconds = epoch.getDaySeconds();
-        var time_buffer: [20]u8 = undefined;
-        const time = try std.fmt.bufPrint(&time_buffer, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{
-            year_day.year,
-            @intFromEnum(month_day.month),
-            @as(u8, month_day.day_index) + 1,
-            day_seconds.getHoursIntoDay(),
-            day_seconds.getMinutesIntoHour(),
-            day_seconds.getSecondsIntoMinute(),
-        });
-        try std.json.Stringify.value(.{ .level = "error", .msg = message, .time = time }, .{}, &line.writer);
+        try writeJsonError(io, &line.writer, message);
     } else {
         try line.writer.writeAll(message);
     }
@@ -123,4 +161,12 @@ test "text error logs append the stderr line without changing existing permissio
     defer std.testing.allocator.free(bytes);
     try std.testing.expectEqualStrings("existing\nigvano: an error\n", bytes);
     try std.testing.expectEqual(permissions, (try file.stat(std.testing.io)).permissions);
+}
+
+test "stderr errors use logrus's text line with Go quoting" {
+    const line = try stderrErrorLine(std.testing.allocator, std.testing.io, .text, "kill: \"x\"\n\x01");
+    defer std.testing.allocator.free(line);
+    try std.testing.expect(std.mem.startsWith(u8, line, "time=\""));
+    try std.testing.expect(std.mem.endsWith(u8, line, "\" level=error msg=\"kill: \\\"x\\\"\\n\\x01\""));
+    try expectLogTimeFormat(line[6..26]);
 }

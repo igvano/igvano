@@ -10,6 +10,7 @@ const parseArgsWithLog = @import("cli/args.zig").parseArgsWithLog;
 const ParseArgsError = @typeInfo(@typeInfo(@TypeOf(parseArgsWithLog)).@"fn".return_type.?).error_union.error_set;
 const LogFormat = @import("cli/log.zig").LogFormat;
 const appendErrorLog = @import("cli/log.zig").appendErrorLog;
+const stderrErrorLine = @import("cli/log.zig").stderrErrorLine;
 const updateContainer = @import("cli/update.zig").updateContainer;
 const createContainer = @import("cli/create.zig").createContainer;
 const startContainer = @import("cli/start.zig").startContainer;
@@ -67,7 +68,7 @@ fn helpOrVersion(io: std.Io, args: []const []const u8) !?u8 {
 fn setupConfig(allocator: std.mem.Allocator, init: std.process.Init, config: *Config) ?u8 {
     config.path_env = init.minimal.environ.getPosix("PATH");
     // Before igvano opens any fd of its own, which could take a free slot.
-    if (config.subcommand == .exec) for (3..3 + @as(usize, config.preserve_fds)) |fd| {
+    if (config.subcommand == .exec or config.subcommand == .create or config.subcommand == .run) for (3..3 + @as(usize, config.preserve_fds)) |fd| {
         if (std.os.linux.errno(std.os.linux.fcntl(@intCast(fd), std.os.linux.F.GETFD, 0)) != .SUCCESS) {
             std.debug.print("igvano: --preserve-fds: fd {d} is not open\n", .{fd});
             return 255;
@@ -193,7 +194,11 @@ fn reportError(allocator: std.mem.Allocator, io: std.Io, diagnostic: ?[]const u8
     defer allocator.free(message);
     const detail = diagnostic orelse oci.diagnosticFor(err);
     // Like runc run, the process's own exec error is printed alone.
-    if (err == error.ProcessExecFailed) if (detail) |text| return emitError(allocator, io, config.log, config.log_format, text, null, null);
+    if (err == error.ProcessExecFailed) if (detail) |text| {
+        std.debug.print("{s}\n", .{text});
+        if (config.log) |path| appendErrorLog(allocator, io, path, config.log_format, text) catch {};
+        return;
+    };
     emitError(allocator, io, config.log, config.log_format, message, detail, detail);
 }
 
@@ -224,11 +229,22 @@ fn commandErrorMessage(allocator: std.mem.Allocator, config: Config, err: anyerr
         std.fmt.allocPrint(allocator, "igvano: {s} for '{s}' failed: {s}", .{ @tagName(config.subcommand), config.id, @errorName(err) });
 }
 
-fn emitError(allocator: std.mem.Allocator, io: std.Io, log: ?[]const u8, log_format: LogFormat, message: []const u8, stderr_detail: ?[]const u8, log_detail: ?[]const u8) void {
-    if (stderr_detail) |detail|
-        std.debug.print("{s}: {s}\n", .{ message, detail })
+/// Like runc: with no --log the error goes to stderr as a logrus line,
+/// which tools and tests match on "error"; with --log it is plain.
+fn printError(allocator: std.mem.Allocator, io: std.Io, logrus: bool, log_format: LogFormat, text: []const u8) void {
+    const line = if (logrus)
+        stderrErrorLine(allocator, io, log_format, if (std.mem.startsWith(u8, text, "igvano: ")) text["igvano: ".len..] else text) catch null
     else
-        std.debug.print("{s}\n", .{message});
+        null;
+    defer if (line) |bytes| allocator.free(bytes);
+    std.debug.print("{s}\n", .{line orelse text});
+}
+
+fn emitError(allocator: std.mem.Allocator, io: std.Io, log: ?[]const u8, log_format: LogFormat, message: []const u8, stderr_detail: ?[]const u8, log_detail: ?[]const u8) void {
+    const joined = if (stderr_detail) |detail| std.fmt.allocPrint(allocator, "{s}: {s}", .{ message, detail }) catch null else null;
+    defer if (joined) |bytes| allocator.free(bytes);
+    const text = joined orelse message;
+    printError(allocator, io, log == null, log_format, text);
     if (log) |path| {
         const detailed = if (log_detail) |detail|
             std.fmt.allocPrint(allocator, "{s}: {s}", .{ message, detail }) catch null

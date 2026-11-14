@@ -11,26 +11,7 @@ memory_policy::preferred_relative
 update::update_pids_limit_test
 
 # igvano gaps found by contest, not yet triaged. Fix them and delete the lines.
-cgroup_v2_cpu::test_cpu_period_unspecified_unchanged
-cgroup_v2_cpu::test_cpu_period_valid_set
-cgroup_v2_cpu::test_cpu_quota_negative_value_default_set
-cgroup_v2_cpuset::test_cpuset_cpus_and_mems_set
-cgroup_v2_cpuset::test_cpuset_cpus_set
-cgroup_v2_cpuset::test_cpuset_mems_set
-delete::delete_non_existed_container
-delete::delete_running_container_test
-fd_control::closes_fd
-fd_control::pass_single_fd
-kill_container::kill_non_existed_container
-kill_container::kill_stopped_container_test
-kill_container::kill_with_empty_id_test
-kill_no_effect::kill_no_effect_test
-mount_propagation::mount_propagation_private_test
-mount_propagation::mount_propagation_rslave_test
-mount_propagation::mount_propagation_slave_test
 personality::personality_for_linux32
-process_capabilities_bounding::bounding_unset_with_other_caps_fails_test
-readonly_paths::readonly_rel_paths
 
 # Host-dependent ("? " prefix): may pass or fail. io.bfq.weight needs the BFQ scheduler.
 ? update::update_blkio_weight_test

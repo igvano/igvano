@@ -5,7 +5,7 @@ const libcontainer = @import("libcontainer");
 const Config = @import("../args.zig").Config;
 const deleteContainer = @import("../delete.zig").deleteContainer;
 
-test "delete requires stopped containers unless forced and waits after SIGKILL" {
+test "delete requires stopped or created containers unless forced and waits after SIGKILL" {
     const TestContainer = struct {
         state: libcontainer.State = undefined,
         is_alive: bool,
@@ -58,7 +58,9 @@ test "delete requires stopped containers unless forced and waits after SIGKILL" 
                 });
                 var implementation: TestContainer = .{ .is_alive = is_alive, .fail_freezer = force };
                 const container: libcontainer.Container = .{ .ptr = &implementation, .vtable = &TestContainer.vtable };
-                if (!force and is_alive and status != .stopped) {
+                // Like runc, a created container is killed and deleted without --force.
+                const stops = force or status == .created;
+                if (!stops and is_alive and status != .stopped) {
                     const before = try tmp.dir.readFileAlloc(std.testing.io, "example/state.json", std.testing.allocator, .limited(4096));
                     defer std.testing.allocator.free(before);
                     try std.testing.expectError(error.InvalidStatus, deleteContainer(std.testing.allocator, std.testing.io, overrideContainer(&implementation, container), config));
@@ -74,7 +76,7 @@ test "delete requires stopped containers unless forced and waits after SIGKILL" 
                 } else {
                     try deleteContainer(std.testing.allocator, std.testing.io, overrideContainer(&implementation, container), config);
                     try std.testing.expect(implementation.deleted);
-                    if (force and is_alive and status != .stopped) {
+                    if (stops and is_alive and status != .stopped) {
                         try std.testing.expectEqual(@as(?i32, 9), implementation.signal);
                         try std.testing.expectEqual(@as(usize, 2), implementation.polls_after_kill);
                     } else {

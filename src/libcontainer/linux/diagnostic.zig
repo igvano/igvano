@@ -69,7 +69,9 @@ pub fn printDiagnostic() void {
 }
 
 pub fn childError(message: []const u8, err: anyerror) void {
-    reportDiagnostic("{s}{s}", .{ message, @errorName(err) });
+    // Like runc's errors, name a refused permission with strerror's words.
+    const text = if (err == error.PermissionDenied) "operation not permitted" else @errorName(err);
+    reportDiagnostic("{s}{s}", .{ message, text });
 }
 
 pub fn failCreate(fd: posix.fd_t, err: libcontainer.Error) noreturn {

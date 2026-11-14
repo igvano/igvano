@@ -121,7 +121,9 @@ fn appendV1CpuWrites(allocator: std.mem.Allocator, writes: *std.ArrayList(V1Writ
         .{ "realtime_period", "cpu.rt_period_us" },
         .{ "realtime_runtime", "cpu.rt_runtime_us" },
     }) |field| {
-        if (@field(cpu, field[0])) |value| {
+        if (@field(cpu, field[0])) |raw| {
+            // The kernel takes any negative quota as no limit; send -1.
+            const value = if (comptime std.mem.eql(u8, field[0], "quota")) @max(raw, -1) else raw;
             if (value < 0 and value != -1) return error.InvalidConfig;
             if (value != 0)
                 try appendV1Write(allocator, writes, "cpu", field[1], try std.fmt.allocPrint(allocator, "{d}", .{value}), null, false);
@@ -544,7 +546,6 @@ test "v1 mapping rejects unified and malformed resources and preserves wildcard 
         .{ .memory = .{ .limit = -2 } },
         .{ .memory = .{ .limit = 128, .swap = 64 } },
         .{ .memory = .{ .swappiness = 101 } },
-        .{ .cpu = .{ .quota = -2 } },
         .{ .block_io = .{ .weight = 9 } },
         .{ .hugepage_limits = &.{.{ .page_size = "../2MB", .limit = 1 }} },
         .{ .network = .{ .priorities = &.{.{ .name = "eth0\n1", .priority = 1 }} } },

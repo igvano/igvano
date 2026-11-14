@@ -99,8 +99,8 @@ fn appendV2CpuWrites(allocator: std.mem.Allocator, writes: *std.ArrayList(Write)
     // Like runc, cpu.idle goes first; the kernel validates the value.
     if (cpu.idle) |idle|
         try appendWrite(allocator, writes, "cpu.idle", try std.fmt.allocPrint(allocator, "{d}", .{idle}));
+    // Like runc's fs2 setCPU, any quota below 1 means "max".
     const quota = cpu.quota orelse -1;
-    if (quota < -1) return error.InvalidConfig;
     const period = if ((cpu.period orelse 0) == 0) 100000 else cpu.period.?;
     const writes_max = cpu.quota != null or cpu.period != null;
     // Like runc, burst goes first, then again after cpu.max if refused.

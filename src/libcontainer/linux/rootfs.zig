@@ -7,6 +7,7 @@ const needsSetupDev = @import("mount.zig").needsSetupDev;
 const PreparedMount = @import("mount.zig").PreparedMount;
 const bindRemount = @import("mount.zig").bindRemount;
 const applyMount = @import("mount.zig").applyMount;
+const finishReadonlyMounts = @import("mount.zig").finishReadonlyMounts;
 const checkResult = @import("syscall.zig").checkResult;
 const closeFd = @import("syscall.zig").closeFd;
 const readAll = @import("syscall.zig").readAll;
@@ -245,7 +246,7 @@ pub const RootfsStep = struct {
 pub const RootfsOptions = struct {
     private_mount_namespace: bool = true,
     console_fd: ?posix.fd_t = null,
-    propagation: u32 = linux.MS.PRIVATE | linux.MS.REC,
+    propagation: u32 = linux.MS.SLAVE | linux.MS.REC,
     create_hooks: []const hooks.Prepared = &.{},
     create_hook_state: []const u8 = "",
     masked_paths: []const [:0]const u8 = &.{},
@@ -263,6 +264,7 @@ pub const RootfsOptions = struct {
     /// linux.resources.cpu.cpus is set (see applySchedulerAndIOPriority).
     cpuset: bool = false,
     console_size: ?libcontainer.ConsoleSize = null,
+    preserve_fds: u32 = 0,
     /// runc --no-pivot (see moveRoot).
     no_pivot: bool = false,
 };
@@ -381,6 +383,7 @@ pub fn setupRootfs(rootfs: [:0]const u8, mounts: []const PreparedMount, devices:
     step.operation = "";
     try applySysctls(options.sysctls);
     try applyPathRestrictions(options.masked_paths, options.readonly_paths, &step);
+    try finishReadonlyMounts(new_root, mounts, &step);
     if (readonly) {
         step = .{ .operation = "remount readonly root", .path = "/" };
         try bindRemount(new_root, "/", ms.BIND | ms.REMOUNT | ms.RDONLY);

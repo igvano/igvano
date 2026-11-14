@@ -20,8 +20,10 @@ const LiveState = @import("state.zig").LiveState;
 const recoverLiveState = @import("state.zig").recoverLiveState;
 const runHooks = @import("hooks.zig").runHooks;
 
+/// Like runc, a created container is also deleted without --force: its
+/// init only waits for start, so it is killed.
 fn requireDelete(status: oci.Status, force: bool) !void {
-    if (!force) try oci.requireDelete(status);
+    if (!force and status != .created) try oci.requireDelete(status);
 }
 
 pub fn stopContainer(io: std.Io, container: ?libcontainer.Container) !void {
@@ -77,7 +79,7 @@ pub fn deleteContainer(allocator: std.mem.Allocator, io: std.Io, injected: ?Cont
     try requireDelete(state.parsed.value.status, config.force);
     var instance: ContainerInstance = undefined;
     const container = if (state.container_state) |value| bindContainer(&instance, injected, value) else null;
-    if (config.force) try stopContainer(io, container);
+    if (config.force or state.parsed.value.status == .created) try stopContainer(io, container);
     const hooks = loadSavedHooks(allocator, io, config) catch |err| hooks: {
         std.debug.print("igvano: warning: cannot load poststop hooks: {s}\n", .{@errorName(err)});
         oci.clearDiagnostic();
@@ -154,10 +156,10 @@ fn deleteLibraryContainer(injected: ?ContainerOverride, handle: libcontainer.Sta
     };
 }
 
-test "forced delete accepts every lifecycle status while ordinary delete requires stopped" {
+test "forced delete accepts every lifecycle status while ordinary delete requires stopped or created" {
     for ([_]oci.Status{ .creating, .created, .running, .paused, .stopped }) |status| {
         try requireDelete(status, true);
-        if (status == .stopped) {
+        if (status == .stopped or status == .created) {
             try requireDelete(status, false);
         } else {
             try std.testing.expectError(error.InvalidStatus, requireDelete(status, false));

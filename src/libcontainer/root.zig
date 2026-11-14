@@ -82,11 +82,13 @@ pub const CreateOptions = struct {
     masked_paths: []const []const u8 = &.{},
     readonly_paths: []const []const u8 = &.{},
     sysctls: []const Sysctl = &.{},
+    /// runc --preserve-fds: fds 3..3+N-1 reach the container process.
+    preserve_fds: u32 = 0,
     /// runc --no-pivot: move the rootfs onto / and chroot, not pivot_root.
     no_pivot: bool = false,
     /// Host interfaces to move into the container's network namespace.
     net_devices: []const NetDevice = &.{},
-    /// Null preserves the default propagation in a private mount namespace.
+    /// Null means runc's default, rslave, in a private mount namespace.
     rootfs_propagation: ?u32 = null,
     apparmor_profile: ?[]const u8 = null,
     seccomp: ?seccomp.Config = null,

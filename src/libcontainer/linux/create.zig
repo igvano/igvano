@@ -752,7 +752,7 @@ fn runInitChild(ctx: *const CreateContext, time_fd: ?posix.fd_t) noreturn {
 fn initRootfsOptions(ctx: *const CreateContext, create_input: []const u8) RootfsOptions {
     return .{
         .private_mount_namespace = ctx.namespaces.private_mount_namespace,
-        .propagation = ctx.options.rootfs_propagation orelse (linux.MS.PRIVATE | linux.MS.REC),
+        .propagation = ctx.options.rootfs_propagation orelse (linux.MS.SLAVE | linux.MS.REC),
         .create_hooks = ctx.init.create_hooks,
         .create_hook_state = create_input,
         .masked_paths = ctx.init.masked_paths,
@@ -765,6 +765,7 @@ fn initRootfsOptions(ctx: *const CreateContext, create_input: []const u8) Rootfs
         .rootless = ctx.namespaces.rootless_dumpable,
         .cpuset = if (ctx.options.resources.cpu) |cpu| cpu.cpus != null else false,
         .no_pivot = ctx.options.no_pivot,
+        .preserve_fds = ctx.options.preserve_fds,
         .console_size = if (ctx.options.process) |process| process.console_size else null,
     };
 }
@@ -1181,7 +1182,10 @@ fn runPreparedInit(init: *const InitContext) noreturn {
     const retry_cwd = linux.errno(cwd_result) == .ACCES;
     if (!retry_cwd) checkResult(cwd_result) catch |err| failCreate(init.ready_fd, err);
     applyAppArmor(init.apparmor_command) catch |err| failCreate(init.ready_fd, err);
-    closeExecFrom(3, init.fd_dir) catch |err| failCreate(init.ready_fd, err);
+    // Like runc's ExtraFiles, preserved fds reach the process without CLOEXEC.
+    const first_closed: u32 = 3 + init.rootfs_options.preserve_fds;
+    for (3..first_closed) |fd| _ = linux.fcntl(@intCast(fd), linux.F.SETFD, 0);
+    closeExecFrom(first_closed, init.fd_dir) catch |err| failCreate(init.ready_fd, err);
     applyInitProcess(init, fifo_name);
     if (retry_cwd) checkResult(linux.chdir(init.cwd)) catch |err| failCreate(init.ready_fd, err);
     var executable_buffer: [std.fs.max_path_bytes]u8 = undefined;

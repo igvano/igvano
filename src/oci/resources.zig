@@ -71,7 +71,7 @@ fn resourceMemory(memory: Spec.Resources.Memory) !libcontainer.Resources.Memory 
 }
 
 fn resourceCpu(cpu: Spec.Resources.Cpu) !libcontainer.Resources.Cpu {
-    try validateResourceLimit(cpu.quota, "linux.resources.cpu.quota");
+    // Like runc, any negative quota means no limit.
     try validateResourceLimit(cpu.realtimeRuntime, "linux.resources.cpu.realtimeRuntime");
     return .{
         .shares = cpu.shares,
@@ -296,7 +296,6 @@ test "cgroup resource validation rejects invalid signed limits and cpu shares" {
     for ([_]Spec.Resources{
         .{ .memory = .{ .limit = -2 } },
         .{ .pids = .{ .limit = -2 } },
-        .{ .cpu = .{ .quota = -2 } },
         .{ .memory = .{ .reservation = -2 } },
         .{ .memory = .{ .swap = -2 } },
         .{ .memory = .{ .kernel = -2 } },

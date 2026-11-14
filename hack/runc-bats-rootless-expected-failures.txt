@@ -2,9 +2,6 @@
 # of hack/runc-bats-expected-failures.txt.
 
 # Also expected as root (hack/runc-bats-expected-failures.txt).
-kill::kill KILL [host pidns + init gone]
-kill::kill KILL [host pidns]
-mounts::runc run [ro /dev mount]
 personality::runc run personality for i686
 personality::runc run personality with exec for i686
 seccomp::runc run [seccomp] (SECCOMP_FILTER_FLAG_*)

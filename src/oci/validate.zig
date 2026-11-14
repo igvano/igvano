@@ -74,7 +74,10 @@ fn validateUserMappings(settings: Spec.Linux, has_user: bool, joined_user: bool)
 fn validateRestrictionPaths(configured: ?[]const []const u8, comptime field: []const u8) !void {
     for (configured orelse &.{}, 0..) |path, i| {
         errdefer diagnosticContext(field ++ "[{d}]", .{i});
-        try validateMountDestination(path);
+        // runc does not require these to be absolute: a relative path is
+        // taken from / (see cli/create.zig prepareRestrictionPaths).
+        try validateMountDestination(if (path.len != 0 and path[0] != '/') "/" else path);
+        if (std.mem.indexOfScalar(u8, path, 0) != null) return invalidConfig("container path: must be NUL-free", .{});
     }
 }
 

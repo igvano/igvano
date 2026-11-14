@@ -7,9 +7,6 @@
 
 # igvano gaps found by the suite. Delete lines as they pass.
 hooks_so::runc run (hooks library tests)
-kill::kill KILL [host pidns + init gone]
-kill::kill KILL [host pidns]
-mounts::runc run [ro /dev mount]
 mounts_sshfs::runc run [bind mount {no,rel,strict}atime semantics]
 mounts_sshfs::runc run [dev,exec,suid,atime bind mount of a nodev,nosuid,noexec,noatime fuse sshfs mount]
 mounts_sshfs::runc run [explicit-rw bind mount of a ro fuse sshfs mount]
