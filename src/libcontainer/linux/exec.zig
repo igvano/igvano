@@ -43,6 +43,7 @@ const setCpuAffinity = @import("process.zig").setCpuAffinity;
 const resetCpuAffinity = @import("process.zig").resetCpuAffinity;
 const ProcessSettings = @import("process.zig").ProcessSettings;
 const applyProcessSettings = @import("process.zig").applyProcessSettings;
+const applySchedulerAndIOPriority = @import("process.zig").applySchedulerAndIOPriority;
 const applyRlimits = @import("process.zig").applyRlimits;
 const resolveExecutable = @import("process.zig").resolveExecutable;
 const execResolved = @import("process.zig").execResolved;
@@ -79,6 +80,8 @@ const ExecContext = struct {
 
 pub fn exec(handle: libcontainer.State, options: libcontainer.ExecOptions) libcontainer.Error!i32 {
     diagnostics.last_diagnostic_len = 0;
+    diagnostics.from_child = false;
+    errdefer diagnostics.relayChildDiagnostic(options.console_fds != null);
     if (comptime builtin.os.tag != .linux) return error.NotImplemented;
     if (!try alive(handle)) return error.ProcessNotFound;
     if (options.argv.len == 0 or options.argv[0].len == 0 or !std.fs.path.isAbsolute(options.cwd))
@@ -431,6 +434,8 @@ fn finishExecProcess(context: *const ExecContext) noreturn {
     // Retain CAP_SYS_ADMIN for installation when NNP is false,
     // matching init's ordering before dropping process privileges.
     const ack_fd = if (context.seccomp_ack) |fds| fds[0] else null;
+    // Like runc: before seccomp and the credential change, with privileges.
+    applySchedulerAndIOPriority(context.options.scheduler, context.options.io_priority, false) catch |err| failCreate(ready[1], err);
     if (!process.no_new_privileges) {
         if (seccomp_program) |program|
             installSeccompFor(program, ready[1], ack_fd, false) catch |err| failCreate(ready[1], err);

@@ -25,7 +25,6 @@ hooks::runc create [second createRuntime hook fails]
 hooks::runc run [hook fails]
 hooks::runc run [hook's argv is preserved]
 hooks::runc run [startContainer hook should inherit process environment]
-ioprio::ioprio_set is applied to process group
 kill::kill KILL [host pidns + init gone]
 kill::kill KILL [host pidns]
 mounts::runc run [ro /dev mount]

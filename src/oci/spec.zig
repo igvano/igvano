@@ -41,6 +41,23 @@ pub const Spec = struct {
         capabilities: ?Capabilities = null,
         rlimits: ?[]const Rlimit = null,
         execCPUAffinity: ?CPUAffinity = null,
+        scheduler: ?Scheduler = null,
+        ioPriority: ?IOPriority = null,
+    };
+
+    pub const Scheduler = struct {
+        policy: []const u8,
+        nice: i32 = 0,
+        priority: i32 = 0,
+        flags: ?[]const []const u8 = null,
+        runtime: u64 = 0,
+        deadline: u64 = 0,
+        period: u64 = 0,
+    };
+
+    pub const IOPriority = struct {
+        class: []const u8,
+        priority: i32 = 0,
     };
 
     pub const CPUAffinity = struct {

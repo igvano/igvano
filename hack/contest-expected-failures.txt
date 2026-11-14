@@ -48,11 +48,6 @@ process_capabilities_fail::process_capabilities_fail_test
 process_user::process_user_duplicate_gids_test
 process_user::process_user_unique_gids_test
 readonly_paths::readonly_rel_paths
-set_io_priority::io_priority_class_be
-set_io_priority::io_priority_class_idle
-set_io_priority::io_priority_class_rt
-set_scheduler_policy::policy_batch
-set_scheduler_policy::policy_other
 start_container_hook_env_inherit::start_container_env_inherit
 terminal::terminal_console_size
 

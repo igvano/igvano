@@ -260,6 +260,8 @@ pub const RootfsOptions = struct {
     /// Init is dumpable by design: a non-root runtime that created the user
     /// namespace (see installSeccompListener).
     rootless: bool = false,
+    /// linux.resources.cpu.cpus is set (see applySchedulerAndIOPriority).
+    cpuset: bool = false,
 };
 
 /// Paths now resolve entirely inside the container rootfs. Missing targets are

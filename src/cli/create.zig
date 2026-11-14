@@ -222,6 +222,10 @@ fn applyCreateProcess(options: *libcontainer.CreateOptions, process: ?libcontain
         options.rlimits = value.rlimits;
         options.oom_score_adj = value.oom_score_adj;
         options.apparmor_profile = value.apparmor_profile;
+        if (options.process) |*init| {
+            init.scheduler = value.scheduler;
+            init.io_priority = value.io_priority;
+        }
     }
 }
 

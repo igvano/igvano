@@ -55,11 +55,24 @@ pub const CreateResponse = extern struct {
 
     pub fn failureError(self: *const CreateResponse) ?libcontainer.Error {
         if (self.failure == 0) return null;
+        from_child = self.message_len != 0;
         last_diagnostic_len = @min(self.message_len, last_diagnostic.len);
         @memcpy(last_diagnostic[0..last_diagnostic_len], self.message[0..last_diagnostic_len]);
         return @errorCast(@errorFromInt(@as(u16, @intCast(self.failure))));
     }
 };
+
+/// The last diagnostic came from a child's failure response.
+pub threadlocal var from_child: bool = false;
+
+/// A child whose stderr is the container console printed its diagnostic
+/// there, out of the caller's sight. Print it again on our stderr.
+pub fn relayChildDiagnostic(console: bool) void {
+    if (!console or !from_child or last_diagnostic_len == 0) return;
+    _ = writeAll(2, "igvano: ");
+    _ = writeAll(2, last_diagnostic[0..last_diagnostic_len]);
+    _ = writeAll(2, "\n");
+}
 
 pub fn childError(message: []const u8, err: anyerror) void {
     reportDiagnostic("{s}{s}", .{ message, @errorName(err) });

@@ -72,6 +72,7 @@ const deliverSeccompListener = @import("process.zig").deliverSeccompListener;
 const applyOomScoreAdj = @import("process.zig").applyOomScoreAdj;
 const resetCpuAffinity = @import("process.zig").resetCpuAffinity;
 const applyProcess = @import("process.zig").applyProcess;
+const applySchedulerAndIOPriority = @import("process.zig").applySchedulerAndIOPriority;
 const applyRlimits = @import("process.zig").applyRlimits;
 const resolveExecutable = @import("process.zig").resolveExecutable;
 const closeMountFds = @import("mount_sources.zig").closeMountFds;
@@ -177,6 +178,8 @@ const CreateContext = struct {
 // Each step owns a defer scope that stays active through the following steps.
 pub fn create(options: libcontainer.CreateOptions) libcontainer.Error!libcontainer.State {
     diagnostics.last_diagnostic_len = 0;
+    diagnostics.from_child = false;
+    errdefer diagnostics.relayChildDiagnostic(options.console_fds != null);
     if (comptime builtin.os.tag == .linux) {
         var context: CreateContext = .{ .options = options, .allocator = options.allocator };
         try validateCreate(&context);
@@ -718,6 +721,7 @@ fn runInitChild(ctx: *const CreateContext) noreturn {
         .mount_source_socket = ctx.mount_source_socket,
         .seccomp_ack_fd = if (ctx.sync.seccomp_ack) |fds| fds[0] else null,
         .rootless = ctx.namespaces.rootless_dumpable,
+        .cpuset = if (ctx.options.resources.cpu) |cpu| cpu.cpus != null else false,
     }, ctx.init.start_hooks, start_input, ctx.init.apparmor_command, ctx.init.seccomp_program);
 }
 
@@ -1163,6 +1167,8 @@ fn applyInitProcess(init: *const InitContext, fifo_name: [:0]const u8) void {
         if (process.uid != 0)
             checkResult(linux.fchmodat(init.fd_dir, fifo_name, 0o622)) catch |err| failCreate(init.ready_fd, err);
         applyRlimits(init.rlimits) catch |err| failCreate(init.ready_fd, err);
+        // Like runc: before seccomp and the credential change, with privileges.
+        applySchedulerAndIOPriority(process.scheduler, process.io_priority, init.rootfs_options.cpuset) catch |err| failCreate(init.ready_fd, err);
         // Without NNP the kernel requires CAP_SYS_ADMIN, which applyProcess
         // may drop. Do not change the no_new_privileges setting.
         // With NNP=true, install after startContainer hooks (unfiltered); NNP=false hooks run filtered, intentionally.

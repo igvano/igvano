@@ -17,6 +17,79 @@ pub fn processConfig(process: Spec.Process) libcontainer.Process {
     };
 }
 
+/// runc's ToSchedAttr plus its scheduler validation.
+pub fn processScheduler(scheduler: ?Spec.Scheduler) error{InvalidConfig}!?libcontainer.Scheduler {
+    const value = scheduler orelse return null;
+    const policies = [_][]const u8{ "SCHED_OTHER", "SCHED_FIFO", "SCHED_RR", "SCHED_BATCH", "SCHED_ISO", "SCHED_IDLE", "SCHED_DEADLINE" };
+    if (value.policy.len == 0) return invalidConfig("process.scheduler.policy: is required", .{});
+    const policy = for (policies, 0..) |name, i| {
+        if (std.mem.eql(u8, name, value.policy)) break i;
+    } else return invalidConfig("process.scheduler.policy: invalid scheduler policy: {s}", .{value.policy});
+    try validateSchedulerFields(value, policy);
+    return .{
+        .policy = @intCast(policy),
+        .flags = try schedulerFlags(value.flags orelse &.{}),
+        .nice = value.nice,
+        .priority = @intCast(value.priority),
+        .runtime = value.runtime,
+        .deadline = value.deadline,
+        .period = value.period,
+    };
+}
+
+fn validateSchedulerFields(value: Spec.Scheduler, policy: usize) error{InvalidConfig}!void {
+    const other_or_batch = policy == 0 or policy == 3;
+    if (other_or_batch and (value.nice < -20 or value.nice > 19))
+        return invalidConfig("process.scheduler.nice: invalid scheduler.nice: {d} when scheduler.policy is {s}", .{ value.nice, value.policy });
+    if (value.priority != 0 and policy != 1 and policy != 2)
+        return invalidConfig("process.scheduler.priority: can only be specified for SchedFIFO or SchedRR policy", .{});
+    if (value.priority < 0) return invalidConfig("process.scheduler.priority: must not be negative", .{});
+    if (policy != 6 and (value.runtime != 0 or value.deadline != 0 or value.period != 0))
+        return invalidConfig("process.scheduler: runtime/deadline/period can only be specified for SchedDeadline policy", .{});
+}
+
+fn schedulerFlags(names: []const []const u8) error{InvalidConfig}!u64 {
+    const flag_names = [_][]const u8{ "SCHED_FLAG_RESET_ON_FORK", "SCHED_FLAG_RECLAIM", "SCHED_FLAG_DL_OVERRUN", "SCHED_FLAG_KEEP_POLICY", "SCHED_FLAG_KEEP_PARAMS", "SCHED_FLAG_UTIL_CLAMP_MIN", "SCHED_FLAG_UTIL_CLAMP_MAX" };
+    var flags: u64 = 0;
+    for (names) |flag| {
+        const bit = for (flag_names, 0..) |name, i| {
+            if (std.mem.eql(u8, name, flag)) break i;
+        } else return invalidConfig("process.scheduler.flags: invalid scheduler flag: {s}", .{flag});
+        flags |= @as(u64, 1) << @intCast(bit);
+    }
+    return flags;
+}
+
+/// runc's ioPriority validation.
+pub fn processIOPriority(priority: ?Spec.IOPriority) error{InvalidConfig}!?libcontainer.IOPriority {
+    const value = priority orelse return null;
+    if (value.priority < 0 or value.priority > 7) return invalidConfig("process.ioPriority.priority: invalid ioPriority.Priority: {d}", .{value.priority});
+    const classes = [_][]const u8{ "IOPRIO_CLASS_RT", "IOPRIO_CLASS_BE", "IOPRIO_CLASS_IDLE" };
+    for (classes, 1..) |name, class| {
+        if (std.mem.eql(u8, name, value.class)) return .{ .class = @intCast(class), .priority = @intCast(value.priority) };
+    }
+    return invalidConfig("process.ioPriority.class: invalid ioPriority.Class: \"{s}\"", .{value.class});
+}
+
+test "scheduler and I/O priority follow runc's conversion and validation" {
+    defer @import("diagnostic.zig").clearDiagnostic();
+    const deadline = (try processScheduler(.{ .policy = "SCHED_DEADLINE", .flags = &.{"SCHED_FLAG_RESET_ON_FORK"}, .nice = 19, .runtime = 42000, .deadline = 100000, .period = 1000000 })).?;
+    try std.testing.expectEqual(libcontainer.Scheduler{ .policy = 6, .flags = 1, .nice = 19, .runtime = 42000, .deadline = 100000, .period = 1000000 }, deadline);
+    try std.testing.expectEqual(@as(u32, 3), (try processScheduler(.{ .policy = "SCHED_BATCH", .nice = 19 })).?.policy);
+    for ([_]Spec.Scheduler{
+        .{ .policy = "" },
+        .{ .policy = "SCHED_NOPE" },
+        .{ .policy = "SCHED_OTHER", .nice = 20 },
+        .{ .policy = "SCHED_BATCH", .priority = 1 },
+        .{ .policy = "SCHED_FIFO", .runtime = 1 },
+        .{ .policy = "SCHED_RR", .flags = &.{"nope"} },
+    }) |bad| try std.testing.expectError(error.InvalidConfig, processScheduler(bad));
+    try std.testing.expectEqual(libcontainer.IOPriority{ .class = 2, .priority = 4 }, (try processIOPriority(.{ .class = "IOPRIO_CLASS_BE", .priority = 4 })).?);
+    try std.testing.expectEqual(libcontainer.IOPriority{ .class = 3, .priority = 0 }, (try processIOPriority(.{ .class = "IOPRIO_CLASS_IDLE" })).?);
+    try std.testing.expectError(error.InvalidConfig, processIOPriority(.{ .class = "IOPRIO_CLASS_BE", .priority = 8 }));
+    try std.testing.expectError(error.InvalidConfig, processIOPriority(.{ .class = "best-effort" }));
+}
+
 /// Like runc, an affinity with neither list set is no affinity at all.
 pub fn cpuAffinity(affinity: ?Spec.CPUAffinity) error{InvalidConfig}!?libcontainer.CPUAffinity {
     const value = affinity orelse return null;

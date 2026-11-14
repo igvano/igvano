@@ -109,6 +109,25 @@ pub const Process = struct {
     gid: u32,
     additional_gids: []const u32 = &.{},
     no_new_privileges: bool = false,
+    scheduler: ?Scheduler = null,
+    io_priority: ?IOPriority = null,
+};
+
+/// sched_setattr(2) values; the frontend has validated them like runc.
+pub const Scheduler = struct {
+    policy: u32,
+    flags: u64 = 0,
+    nice: i32 = 0,
+    priority: u32 = 0,
+    runtime: u64 = 0,
+    deadline: u64 = 0,
+    period: u64 = 0,
+};
+
+/// ioprio_set(2) class (1 rt, 2 be, 3 idle) and level 0..7, like runc.
+pub const IOPriority = struct {
+    class: u2,
+    priority: u3,
 };
 
 pub const TimeOffsets = struct {
@@ -146,6 +165,8 @@ pub const ExecOptions = struct {
     on_seccomp_listener: ?SeccompListenerCallback = null,
     /// Null resets the affinity to every CPU the cgroup allows, like runc.
     cpu_affinity: ?CPUAffinity = null,
+    scheduler: ?Scheduler = null,
+    io_priority: ?IOPriority = null,
     debug: ?DebugLog = null,
 };
 

@@ -229,6 +229,44 @@ pub fn applyProcess(process: libcontainer.Process, capabilities: ?libcontainer.C
     });
 }
 
+const SchedAttr = extern struct {
+    size: u32 = @sizeOf(SchedAttr),
+    policy: u32,
+    flags: u64,
+    nice: i32,
+    priority: u32,
+    runtime: u64,
+    deadline: u64,
+    period: u64,
+};
+
+/// Like runc, before seccomp and the credential change. `cpuset`:
+/// the cgroup restricts CPUs, so sched_setattr's EPERM gets runc's message.
+pub fn applySchedulerAndIOPriority(scheduler: ?libcontainer.Scheduler, io_priority: ?libcontainer.IOPriority, cpuset: bool) libcontainer.Error!void {
+    if (scheduler) |value| {
+        const attr: SchedAttr = .{ .policy = value.policy, .flags = value.flags, .nice = value.nice, .priority = value.priority, .runtime = value.runtime, .deadline = value.deadline, .period = value.period };
+        const result = linux.syscall3(.sched_setattr, 0, @intFromPtr(&attr), 0);
+        if (linux.errno(result) == .PERM and cpuset) {
+            reportDiagnostic("process scheduler can't be used together with AllowedCPUs", .{});
+            return error.PermissionDenied;
+        }
+        if (linux.errno(result) != .SUCCESS) {
+            reportDiagnostic("error setting scheduler: E{s}", .{@tagName(linux.errno(result))});
+            return checkResult(result);
+        }
+    }
+    if (io_priority) |value| {
+        // runc names this ioprioWhoPgrp, but 1 is IOPRIO_WHO_PROCESS: only
+        // this process (and its children) change, never the caller's group.
+        const ioprio_who_process = 1;
+        const result = linux.syscall3(.ioprio_set, ioprio_who_process, 0, (@as(usize, value.class) << 13) | value.priority);
+        if (linux.errno(result) != .SUCCESS) {
+            reportDiagnostic("failed to set io priority: E{s}", .{@tagName(linux.errno(result))});
+            return checkResult(result);
+        }
+    }
+}
+
 pub fn applyProcessSettings(process: ProcessSettings) libcontainer.Error!void {
     if (comptime builtin.os.tag == .linux) {
         try applyRlimits(process.rlimits);

@@ -180,6 +180,9 @@ fn inheritExecProfile(process: *oci.Spec.Process, saved_spec: ?std.json.Parsed(o
         process.apparmorProfile = inherited.apparmorProfile;
     // config.json's execCPUAffinity is the default for every exec.
     if (process.execCPUAffinity == null) process.execCPUAffinity = inherited.execCPUAffinity;
+    // So are the scheduler and I/O priority, as in runc.
+    if (process.scheduler == null) process.scheduler = inherited.scheduler;
+    if (process.ioPriority == null) process.ioPriority = inherited.ioPriority;
 }
 
 pub fn enableExecSubreaper() !u32 {
