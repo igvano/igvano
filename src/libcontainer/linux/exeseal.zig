@@ -153,6 +153,7 @@ test "overlayfs lowerdir paths escape colons and backslashes" {
 }
 
 test "statfs flags come from the f_flags field" {
+    if (comptime @import("builtin").os.tag != .linux) return error.SkipZigTest;
     // procfs is mounted nosuid,nodev,noexec on hosts and in containers.
     const fd = try openPath(linux.AT.FDCWD, "/proc/self", .{ .PATH = true, .CLOEXEC = true });
     defer closeFd(fd);
@@ -165,6 +166,7 @@ test "statfs flags come from the f_flags field" {
 }
 
 test "the marker alone does not count as sealed" {
+    if (comptime @import("builtin").os.tag != .linux) return error.SkipZigTest;
     // This test binary runs from a plain file, never a sealed clone.
     try std.testing.expect(!isSealed());
     try std.testing.expect(hasMarker(&.{ "A=1", marker }));
