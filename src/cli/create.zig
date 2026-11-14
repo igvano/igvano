@@ -231,6 +231,14 @@ fn applyCreateSpec(allocator: std.mem.Allocator, options: *libcontainer.CreateOp
         .boottime = if (offsets.boottime) |value| .{ .secs = value.secs, .nanosecs = value.nanosecs } else null,
     };
     options.readonly_rootfs = spec.root.readonly;
+    options.net_devices = try netDevices(allocator, settings.netDevices);
+}
+
+fn netDevices(allocator: std.mem.Allocator, devices: ?std.json.ArrayHashMap(oci.Spec.NetDevice)) ![]const libcontainer.NetDevice {
+    const map = (devices orelse return &.{}).map;
+    const result = try allocator.alloc(libcontainer.NetDevice, map.count());
+    for (map.keys(), map.values(), result) |host_name, device, *out| out.* = .{ .host_name = host_name, .name = device.name orelse "" };
+    return result;
 }
 
 fn applyCreateProcess(options: *libcontainer.CreateOptions, process: ?libcontainer.ExecOptions, init_env: ?[]const []const u8) void {

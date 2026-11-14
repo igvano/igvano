@@ -8,11 +8,6 @@
 memory_policy::bind_static
 memory_policy::interleave_without_flags
 memory_policy::preferred_relative
-net_devices::address
-net_devices::back_device
-net_devices::net_device
-net_devices::net_device_rename
-net_devices::net_devices
 update::update_pids_limit_test
 
 # igvano gaps found by contest, not yet triaged. Fix them and delete the lines.

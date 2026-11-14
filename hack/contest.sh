@@ -41,6 +41,10 @@ if [ "${1-}" = "--inside" ]; then
         printf '%s\n' "$all_groups" | grep -Fxq -e "$group" || { echo "Unknown contest group: $group" >&2; exit 1; }
     done
     printf '%s\n' $groups > /outputs/groups
+    # net_devices drives ip(8) to create dummy devices and netns.
+    if printf '%s\n' $groups | grep -Fxq net_devices && ! command -v ip > /dev/null; then
+        apt-get update -qq > /dev/null && apt-get install -y -qq --no-install-recommends iproute2 > /dev/null
+    fi
     : > results
     for group in $groups; do
         printf '\n===== %s =====\n' "$group"

@@ -81,6 +81,8 @@ pub const CreateOptions = struct {
     masked_paths: []const []const u8 = &.{},
     readonly_paths: []const []const u8 = &.{},
     sysctls: []const Sysctl = &.{},
+    /// Host interfaces to move into the container's network namespace.
+    net_devices: []const NetDevice = &.{},
     /// Null preserves the default propagation in a private mount namespace.
     rootfs_propagation: ?u32 = null,
     apparmor_profile: ?[]const u8 = null,
@@ -226,6 +228,8 @@ pub const Symlink = struct {
 };
 
 pub const Sysctl = struct { key: []const u8, value: []const u8 };
+/// An empty name keeps the host name.
+pub const NetDevice = struct { host_name: []const u8, name: []const u8 = "" };
 
 /// Capability names and rlimit types have been translated by the frontend.
 pub const Capabilities = struct {

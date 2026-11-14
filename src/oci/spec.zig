@@ -108,7 +108,10 @@ pub const Spec = struct {
         rootfsPropagation: ?Propagation = null,
         seccomp: ?Seccomp = null,
         timeOffsets: ?TimeOffsets = null,
+        netDevices: ?std.json.ArrayHashMap(NetDevice) = null,
     };
+
+    pub const NetDevice = struct { name: ?[]const u8 = null };
 
     pub const TimeOffsets = struct {
         monotonic: ?TimeOffset = null,

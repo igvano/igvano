@@ -24,6 +24,7 @@ const writeAll = @import("syscall.zig").writeAll;
 const openPath = @import("syscall.zig").openPath;
 const fdPath = @import("syscall.zig").fdPath;
 const reportDiagnostic = @import("diagnostic.zig").reportDiagnostic;
+const netdev = @import("netdev.zig");
 const debugLog = @import("diagnostic.zig").debugLog;
 const CreateResponse = @import("diagnostic.zig").CreateResponse;
 const childError = @import("diagnostic.zig").childError;
@@ -311,6 +312,7 @@ fn prepareCreatePaths(ctx: *CreateContext) libcontainer.Error!void {
     ctx.init.cwd = try processString(ctx.allocator, if (ctx.options.process) |process| process.cwd else "/");
     if (!std.fs.path.isAbsolute(ctx.init.cwd)) return error.InvalidProcess;
     if (!std.fs.path.isAbsolute(ctx.init.rootfs)) return error.InvalidPath;
+    try netdev.validate(ctx.options.net_devices, ctx.options.namespaces);
     try probeInheritedRootfs(ctx);
 }
 
@@ -986,6 +988,7 @@ fn finishCreateParent(ctx: *CreateContext) libcontainer.Error!libcontainer.State
     errdefer killReportedInit(reported, handle);
     if (!reported) return error.CreateFailed;
     try validateInitResponse(response);
+    try netdev.moveNetDevices(ctx.options.net_devices, response.pid);
     if (ctx.options.on_create) |callback| try callback.run(callback.ptr, handle);
     if (!writeAll(ctx.sync.create_writer.?, &.{1})) return error.CreateFailed;
     closeFd(ctx.sync.create_writer.?);

@@ -120,6 +120,7 @@ pub const Container = struct {
 test {
     _ = @import("devicefilter.zig");
     _ = @import("devices.zig");
+    _ = @import("linux/netdev.zig");
     _ = @import("dbus.zig");
     _ = @import("linux/cgroup.zig");
     _ = @import("linux/cgroup_ops.zig");
