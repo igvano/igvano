@@ -17,16 +17,17 @@ pub fn main(init: std.process.Init.Minimal) void {
     if (std.mem.eql(u8, mode, "runtime-tools") or std.mem.eql(u8, mode, "runtime-tools-hook")) {
         // faccessat2 is above the fixture's native maximum. An unpatched
         // ERRNO filter returns EPERM before the kernel sees this syscall.
-        if (std.mem.eql(u8, mode, "runtime-tools") or nnp == 0) {
+        // Like runc, startContainer hooks run filtered whatever NNP is.
+        {
             const result = linux.syscall4(.faccessat2, @bitCast(@as(isize, linux.AT.FDCWD)), @intFromPtr(@as([*:0]const u8, "/")), linux.F_OK, 0);
             if (linux.errno(result) != .NOSYS) linux.exit_group(28);
         }
         if (std.mem.eql(u8, mode, "runtime-tools"))
             linux.exit_group(0);
-        // A filtered NNP=false hook still cannot call close_range; NNP=true
-        // hooks run before the filter. The hook runner must not need this call.
+        // A filtered hook cannot call close_range; the hook runner must not
+        // need this call.
         const sweep = linux.syscall3(.close_range, 3, 2, 1 << 2);
-        linux.exit_group(if (linux.errno(sweep) == (if (nnp == 0) linux.E.NOSYS else linux.E.INVAL)) 0 else 29);
+        linux.exit_group(if (linux.errno(sweep) == .NOSYS) 0 else 29);
     }
     if (std.mem.eql(u8, mode, "apparmor")) {
         const profile = args.next() orelse linux.exit_group(20);
@@ -57,10 +58,10 @@ pub fn main(init: std.process.Init.Minimal) void {
         linux.exit_group(if (linux.errno(flag) == .SUCCESS) 0 else 27);
     }
     if (std.mem.eql(u8, mode, "hook")) {
-        // The NNP=true filter must wait until startContainer hooks finish.
+        // Like runc, the filter is on before startContainer hooks, with or
+        // without NNP.
         const result = linux.syscall3(.mkdirat, @bitCast(@as(isize, linux.AT.FDCWD)), @intFromPtr(@as([*:0]const u8, "/tmp/hook")), 0o755);
-        const expected: linux.E = if (nnp == 1) .SUCCESS else .PERM;
-        linux.exit_group(if (linux.errno(result) == expected) 0 else 18);
+        linux.exit_group(if (linux.errno(result) == .PERM) 0 else 18);
     }
     if (linux.errno(linux.syscall1(.personality, 0)) != .SUCCESS) linux.exit_group(12);
     if (linux.errno(linux.syscall1(.personality, 1)) != .PERM) linux.exit_group(13);
