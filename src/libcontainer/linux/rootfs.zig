@@ -450,7 +450,7 @@ fn runCreateHooks(options: RootfsOptions, step: *RootfsStep) libcontainer.Error!
     // Runtime paths are still reachable; the hook already runs in the new
     // mount namespace and sees all configured mounts before pivot_root.
     step.* = .{ .operation = "create hooks" };
-    hooks.run(options.create_hooks, options.create_hook_state) catch |err| {
+    hooks.run(options.create_hooks, options.create_hook_state, "createContainer") catch |err| {
         // The hook runner already recorded its captured output.
         step.operation = "";
         return @as(libcontainer.Error!void, err);

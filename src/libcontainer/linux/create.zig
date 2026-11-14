@@ -1214,18 +1214,26 @@ fn waitInitStart(init: *const InitContext, fifo_name: [:0]const u8) posix.fd_t {
 }
 
 fn startInitProcess(init: *const InitContext, executable: ?[*:0]const u8, fd: posix.fd_t) noreturn {
-    // Opening the writer unblocks start. Acknowledge after hooks pass, then
-    // retain the CLOEXEC writer so EOF confirms exec before start succeeds.
-    hooks.runWithCloexecFds(init.start_hooks, init.start_hook_state) catch {
-        _ = writeAll(fd, &.{0});
-        linux.exit_group(1);
-    };
+    // Opening the writer unblocks start. Like runc, acknowledge before the
+    // startContainer hooks: a failing hook only stops init, with the error on
+    // its stderr. The CLOEXEC writer makes EOF confirm exec or that exit.
     if (!writeAll(fd, &.{1})) linux.exit_group(1);
+    hooks.runWithCloexecFds(init.start_hooks, init.start_hook_state, "startContainer") catch linux.exit_group(1);
     // A notify filter was already installed during create.
     const late_program = if (listenerProgram(init.seccomp_program) == null) init.seccomp_program else null;
     runProcess(init.process, executable, init.argv, init.envp, late_program) catch |err| {
         if (err != error.ExecFailed) childError("cannot execute process: ", err);
-        _ = writeAll(fd, &.{0});
-        linux.exit_group(1);
+        startFailed(fd);
     };
+}
+
+/// A 0 byte, then the diagnostic, in one write below PIPE_BUF, so start can
+/// report why the process could not be executed.
+fn startFailed(fd: posix.fd_t) noreturn {
+    var buffer: [1 + diagnostics.last_diagnostic.len]u8 = undefined;
+    buffer[0] = 0;
+    const len = diagnostics.last_diagnostic_len;
+    @memcpy(buffer[1..][0..len], diagnostics.last_diagnostic[0..len]);
+    _ = writeAll(fd, buffer[0 .. 1 + len]);
+    linux.exit_group(1);
 }

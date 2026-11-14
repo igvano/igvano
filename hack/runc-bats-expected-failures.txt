@@ -19,24 +19,15 @@ cgroups::runc run (per-device multiple iops via unified)
 cgroups::runc run/create should error for a non-empty cgroup
 cgroups::runc run/create should refuse pre-existing frozen cgroup
 delete::runc delete --force in cgroupv2 with subcgroups
-env::empty HOME env var is overridden
-env::empty HOME env var is overridden with multiple overrides
-env::env var with new-line is honored
 exec::runc exec --additional-gids
 exec::runc exec --cgroup subcgroup [v2]
 exec::runc exec --preserve-fds
-exec::runc exec --user
 exec::runc exec [execve error]
-exec::runc exec [exit codes]
 exec::runc exec check default home
+exec::runc exec [exit codes]
 help::runc -h
 help::runc command -h
 help::runc foo -h
-hooks::runc create [hook fails]
-hooks::runc create [second createRuntime hook fails]
-hooks::runc run [hook fails]
-hooks::runc run [hook's argv is preserved]
-hooks::runc run [startContainer hook should inherit process environment]
 hooks_so::runc run (hooks library tests)
 kill::kill KILL [host pidns + init gone]
 kill::kill KILL [host pidns]
@@ -58,7 +49,6 @@ run::runc run [/proc/self/exe clone]
 run::runc run [execve error]
 run::runc run [hostname domainname]
 run::runc run [joining existing container namespaces]
-run::runc run check default home
 run::runc run with tmpfs
 run::runc run with tmpfs perms
 seccomp::runc run [seccomp] (SECCOMP_FILTER_FLAG_*)

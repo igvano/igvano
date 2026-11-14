@@ -16,7 +16,9 @@ pub fn stateContainer(allocator: std.mem.Allocator, io: std.Io, injected: ?Conta
     }
     const state = try readLiveState(allocator, io, injected, config, persist_recovery);
     defer state.deinit();
-    const json = try oci.stateJson(allocator, state.parsed.value);
+    // Indented like runc's json.MarshalIndent(state, "", "  ").
+    const json = try std.json.Stringify.valueAlloc(allocator, state.parsed.value, .{ .emit_null_optional_fields = false, .whitespace = .indent_2 });
     defer allocator.free(json);
     try std.Io.File.stdout().writeStreamingAll(io, json);
+    try std.Io.File.stdout().writeStreamingAll(io, "\n");
 }

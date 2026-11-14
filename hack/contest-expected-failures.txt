@@ -29,26 +29,20 @@ domainname_test::set_domainname_test
 exec::*
 fd_control::closes_fd
 fd_control::pass_single_fd
-hooks::hooks
 kill_container::kill_non_existed_container
 kill_container::kill_stopped_container_test
 kill_container::kill_with_empty_id_test
 kill_no_effect::kill_no_effect_test
-lifecycle::state
 mount_propagation::mount_propagation_private_test
 mount_propagation::mount_propagation_rslave_test
 mount_propagation::mount_propagation_slave_test
 no_pivot::no_pivot_test
 personality::personality_for_linux32
-poststop_fail::poststop_fail
-prestart::prestart
-prestart_fail::prestart_fail
 process_capabilities_bounding::bounding_unset_with_other_caps_fails_test
 process_capabilities_fail::process_capabilities_fail_test
 process_user::process_user_duplicate_gids_test
 process_user::process_user_unique_gids_test
 readonly_paths::readonly_rel_paths
-start_container_hook_env_inherit::start_container_env_inherit
 terminal::terminal_console_size
 
 # Host-dependent ("? " prefix): may pass or fail. io.bfq.weight needs the BFQ scheduler.

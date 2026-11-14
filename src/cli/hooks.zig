@@ -16,7 +16,7 @@ pub fn hookStateTemplate(allocator: std.mem.Allocator, state: oci.State) !libcon
     return .{ .prefix = prefix, .suffix = try allocator.dupe(u8, json[index + field.len ..]) };
 }
 
-pub fn runHooks(allocator: std.mem.Allocator, configured: ?[]const oci.Spec.Hook, state: oci.State) !void {
+pub fn runHooks(allocator: std.mem.Allocator, configured: ?[]const oci.Spec.Hook, state: oci.State, name: []const u8) !void {
     const entries = configured orelse return;
     if (entries.len == 0) return;
     var arena: std.heap.ArenaAllocator = .init(allocator);
@@ -25,13 +25,13 @@ pub fn runHooks(allocator: std.mem.Allocator, configured: ?[]const oci.Spec.Hook
     const hooks = try oci.prepareHooks(hook_allocator, entries);
     const prepared = try libcontainer.hooks.prepare(hook_allocator, hooks);
     const json = try oci.stateJson(hook_allocator, state);
-    try libcontainer.hooks.run(prepared, json);
+    try libcontainer.hooks.run(prepared, json, name);
 }
 
 pub fn warnHooks(allocator: std.mem.Allocator, configured: ?[]const oci.Spec.Hook, state: oci.State, stage: []const u8) void {
     // Best-effort hooks remain ordered even if an earlier hook failed.
     for (configured orelse &.{}) |hook| {
-        runHooks(allocator, &.{hook}, state) catch |err|
+        runHooks(allocator, &.{hook}, state, stage) catch |err|
             std.debug.print("igvano: warning: {s} hook '{s}' failed: {s}\n", .{ stage, hook.path, @errorName(err) });
     }
 }

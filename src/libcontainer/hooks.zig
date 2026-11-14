@@ -52,26 +52,28 @@ pub fn timeoutExpired(timeout_seconds: ?u64, elapsed_ns: u128) bool {
 
 /// No allocator or std.Io calls after fork. Memfds supply stdin and capture
 /// output without blocking the deadline on a full pipe or inheriting closed stdio.
-pub fn run(entries: []const Prepared, state: []const u8) Error!void {
-    return runHooks(entries, state, true);
+/// `name` is the lifecycle stage for diagnostics, as in runc's
+/// "error running createRuntime hook #1: ...".
+pub fn run(entries: []const Prepared, state: []const u8, name: []const u8) Error!void {
+    return runHooks(entries, state, name, true);
 }
 
 /// Init has already swept inherited descriptors before seccomp. Every fd
 /// created below is CLOEXEC except the hook child's intentional stdio copies.
 /// NNP=false start hooks must avoid sweeping under the installed filter.
-pub fn runWithCloexecFds(entries: []const Prepared, state: []const u8) Error!void {
-    return runHooks(entries, state, false);
+pub fn runWithCloexecFds(entries: []const Prepared, state: []const u8, name: []const u8) Error!void {
+    return runHooks(entries, state, name, false);
 }
 
-fn runHooks(entries: []const Prepared, state: []const u8, sweep: bool) Error!void {
+fn runHooks(entries: []const Prepared, state: []const u8, name: []const u8, sweep: bool) Error!void {
     if (entries.len == 0) return;
     if (comptime builtin.os.tag != .linux) return error.NotImplemented;
     for (entries, 0..) |hook, index| {
         var reported = false;
-        runOne(hook, state, index, &reported, sweep) catch |err| {
+        runOne(hook, state, .{ .name = name, .index = index }, &reported, sweep) catch |err| {
             // Only memfd setup can fail before runOne's diagnostic errdefer.
             if (!reported)
-                reportDiagnostic("error running hook #{d}: {s}, stdout: , stderr: ", .{ index, @errorName(err) });
+                reportDiagnostic("error running {s} hook #{d}: {s}, stdout: , stderr: ", .{ name, index, @errorName(err) });
             return err;
         };
     }
@@ -109,7 +111,9 @@ fn capturedOutput(fd: std.posix.fd_t, buffer: []u8) []const u8 {
     }
 }
 
-fn reportFailure(index: usize, err: Error, status: u32, output: std.posix.fd_t, errors: std.posix.fd_t) void {
+const Position = struct { name: []const u8, index: usize };
+
+fn reportFailure(position: Position, err: Error, status: u32, output: std.posix.fd_t, errors: std.posix.fd_t) void {
     // Reserve room for both labels and the failure reason in the 512-byte detail.
     var stdout_buffer: [192]u8 = undefined;
     var stderr_buffer: [192]u8 = undefined;
@@ -128,10 +132,10 @@ fn reportFailure(index: usize, err: Error, status: u32, output: std.posix.fd_t, 
         std.fmt.bufPrint(&reason_buffer, "exit status {d}", .{linux.W.EXITSTATUS(status)}) catch unreachable
     else
         @errorName(err);
-    reportDiagnostic("error running hook #{d}: {s}, stdout: {s}, stderr: {s}", .{ index, reason, stdout, stderr });
+    reportDiagnostic("error running {s} hook #{d}: {s}, stdout: {s}, stderr: {s}", .{ position.name, position.index, reason, stdout, stderr });
 }
 
-fn runOne(hook: Prepared, state: []const u8, index: usize, reported: *bool, sweep: bool) Error!void {
+fn runOne(hook: Prepared, state: []const u8, position: Position, reported: *bool, sweep: bool) Error!void {
     const input = try createMemfd("igvano-hook-stdin");
     defer _ = linux.close(input);
     // ponytail: Captured hook output is unbounded, like runc's buffers; the
@@ -142,7 +146,7 @@ fn runOne(hook: Prepared, state: []const u8, index: usize, reported: *bool, swee
     defer _ = linux.close(errors);
     var status: u32 = 0;
     errdefer |err| {
-        reportFailure(index, err, status, output, errors);
+        reportFailure(position, err, status, output, errors);
         reported.* = true;
     }
     try writeHookState(input, state);
@@ -234,7 +238,7 @@ test "linux hooks close inherited fds at exec without changing caller flags" {
         .args = &.{ "sh", "-c", command },
         .timeout_seconds = 2,
     }});
-    try run(entries, "{}\n");
+    try run(entries, "{}\n", "test");
     try std.testing.expectEqual(@as(usize, 0), linux.fcntl(fd, linux.F.GETFD, 0));
 }
 
@@ -248,29 +252,29 @@ test "linux hook execution uses explicit argv environment and state stdin" {
         .env = &.{"ONLY=hook"},
         .timeout_seconds = 2,
     }});
-    try run(entries, "expected\n");
+    try run(entries, "expected\n", "test");
     const forked = std.posix.system.fork();
     if (std.posix.errno(forked) != .SUCCESS) return error.SystemResources;
     const pid: i32 = @intCast(forked);
     if (pid == 0) {
         _ = linux.close(0);
-        run(entries, "expected\n") catch linux.exit_group(1);
+        run(entries, "expected\n", "test") catch linux.exit_group(1);
         linux.exit_group(0);
     }
     var status: u32 = undefined;
     while (linux.errno(linux.waitpid(pid, &status, 0)) == .INTR) {}
     try std.testing.expectEqual(@as(u32, 0), status);
     const defaults = try prepare(arena.allocator(), &.{.{ .path = "/bin/true" }});
-    try run(defaults, "{}\n");
+    try run(defaults, "{}\n", "test");
     const failing = try prepare(arena.allocator(), &.{
         .{ .path = "/bin/true" },
         .{ .path = "/bin/sh", .args = &.{ "sh", "-c", "exit 7" } },
     });
-    try std.testing.expectError(error.HookFailed, run(failing, "{}\n"));
+    try std.testing.expectError(error.HookFailed, run(failing, "{}\n", "test"));
 
     try std.testing.expect(std.mem.indexOf(u8, @import("linux.zig").diagnostic().?, "hook #1: exit status 7") != null);
     const missing = try prepare(arena.allocator(), &.{.{ .path = "/igvano-missing-hook" }});
-    try std.testing.expectError(error.HookFailed, run(missing, "{}\n"));
+    try std.testing.expectError(error.HookFailed, run(missing, "{}\n", "test"));
 }
 
 test "linux hook timeout kills a hook that never reads large stdin" {
@@ -284,7 +288,7 @@ test "linux hook timeout kills a hook that never reads large stdin" {
     }});
     const state = try arena.allocator().alloc(u8, 1 << 20);
     @memset(state, 'x');
-    try std.testing.expectError(error.HookTimeout, run(entries, state));
+    try std.testing.expectError(error.HookTimeout, run(entries, state, "test"));
 
     const detail = @import("linux.zig").diagnostic() orelse return error.TestUnexpectedResult;
     try std.testing.expect(std.mem.indexOf(u8, detail, "timeout") != null);
@@ -326,13 +330,13 @@ test "linux hooks capture both output streams with closed runtime stdio" {
 fn checkCapturedHookOutput(entries: []const Prepared, failure: ?Error, reason: []const u8) noreturn {
     _ = linux.close(1);
     if (failure != null) _ = linux.close(2);
-    run(entries, "{}\n") catch |err| {
+    run(entries, "{}\n", "test") catch |err| {
         const expected = failure orelse linux.exit_group(1);
         if (expected != err) linux.exit_group(1);
 
         const detail = @import("linux.zig").diagnostic() orelse linux.exit_group(2);
         if (detail.len > 512 or
-            std.mem.indexOf(u8, detail, "error running hook #0:") == null or
+            std.mem.indexOf(u8, detail, "error running test hook #0:") == null or
             std.mem.indexOf(u8, detail, reason) == null or
             std.mem.indexOf(u8, detail, "stdout: hook-out") == null or
             std.mem.indexOf(u8, detail, "stderr: hook-err") == null) linux.exit_group(3);

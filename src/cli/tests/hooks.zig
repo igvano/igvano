@@ -11,7 +11,7 @@ const startContainer = @import("../start.zig").startContainer;
 const deleteContainer = @import("../delete.zig").deleteContainer;
 const saveTestStarttime = @import("helpers.zig").saveTestStarttime;
 
-test "linux create callback runs only createRuntime with creating state" {
+test "linux create callback runs prestart then createRuntime with creating state" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -49,7 +49,7 @@ test "linux create callback runs only createRuntime with creating state" {
     try CreateContext.run(&context, .{ .id = "example", .pid = 1234, .starttime = "12345" });
     const order = try tmp.dir.readFileAlloc(std.testing.io, "order", std.testing.allocator, .limited(128));
     defer std.testing.allocator.free(order);
-    try std.testing.expectEqualStrings("createRuntime", order);
+    try std.testing.expectEqualStrings("prestartcreateRuntime", order);
     const saved = try oci.loadState(std.testing.allocator, std.testing.io, root, "example");
     defer saved.deinit();
     try std.testing.expectEqual(oci.Status.creating, saved.value.status);
@@ -143,7 +143,7 @@ test "linux failed create runs poststop after removing runtime state" {
     }
 }
 
-test "linux poststop runs after stopped-container deletion despite a missing bundle and earlier hook failure" {
+test "linux poststop runs after stopped-container deletion despite a missing bundle, and a failure fails delete" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const TestContainer = struct {
         state: libcontainer.State = undefined,
@@ -175,13 +175,13 @@ test "linux poststop runs after stopped-container deletion despite a missing bun
     const state_env = try std.fmt.allocPrint(std.testing.allocator, "STATE_DIR={s}/example", .{root});
     defer std.testing.allocator.free(state_env);
     const configured: oci.Spec.Hooks = .{ .poststop = &.{
-        .{ .path = "/igvano-missing-hook" },
         .{
             .path = "/bin/sh",
             .args = &.{ "sh", "-c", "test ! -e \"$STATE_DIR\" && /bin/cat > \"$OUT\"" },
             .env = &.{ output_env, state_env },
             .timeout = 2,
         },
+        .{ .path = "/igvano-missing-hook" },
     } };
     const json = try std.json.Stringify.valueAlloc(std.testing.allocator, configured, .{ .emit_null_optional_fields = false });
     defer std.testing.allocator.free(json);
@@ -194,10 +194,12 @@ test "linux poststop runs after stopped-container deletion despite a missing bun
         .bundle = "/igvano-missing-bundle",
     });
     var implementation: TestContainer = .{};
-    try deleteContainer(std.testing.allocator, std.testing.io, overrideContainer(&implementation, .{
+    // Like runc: state is gone, the failing poststop hook fails delete.
+    try std.testing.expectError(error.HookFailed, deleteContainer(std.testing.allocator, std.testing.io, overrideContainer(&implementation, .{
         .ptr = &implementation,
         .vtable = &TestContainer.vtable,
-    }), .{ .root = root, .id = "example", .subcommand = .delete });
+    }), .{ .root = root, .id = "example", .subcommand = .delete }));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.openDir(std.testing.io, "example", .{}));
     const input = try tmp.dir.readFileAlloc(std.testing.io, "hook-state", std.testing.allocator, .limited(4096));
     defer std.testing.allocator.free(input);
     const state = try std.json.parseFromSlice(oci.State, std.testing.allocator, input, .{});
@@ -208,7 +210,7 @@ test "linux poststop runs after stopped-container deletion despite a missing bun
     try std.testing.expectError(error.FileNotFound, tmp.dir.openDir(std.testing.io, "example", .{}));
 }
 
-test "linux prestart receives created state before init unblocks and poststart runs" {
+test "linux start unblocks init and then runs poststart with running state" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const linux = std.os.linux;
     const posix = std.posix;
@@ -268,12 +270,6 @@ test "linux prestart receives created state before init unblocks and poststart r
     const pid_env = try std.fmt.allocPrint(std.testing.allocator, "PID={d}", .{pid});
     defer std.testing.allocator.free(pid_env);
     const configured: oci.Spec.Hooks = .{
-        .prestart = &.{.{
-            .path = "/bin/sh",
-            .args = &.{ "sh", "-c", "IFS= read -r state; case \"$state\" in *'\"status\":\"created\"'*'\"pid\":'\"$PID\"*) test ! -e \"$OUT\" && printf prestart > \"$OUT\";; *) exit 1;; esac" },
-            .env = &.{ output_env, pid_env },
-            .timeout = 2,
-        }},
         .poststart = &.{.{
             .path = "/bin/sh",
             .args = &.{ "sh", "-c", "IFS= read -r state; case \"$state\" in *'\"status\":\"running\"'*'\"pid\":'\"$PID\"*) printf ' poststart' >> \"$OUT\";; *) exit 1;; esac" },
@@ -302,113 +298,6 @@ test "linux prestart receives created state before init unblocks and poststart r
     try std.testing.expectEqual(@as(@TypeOf(status), 0), status);
     const order = try tmp.dir.readFileAlloc(std.testing.io, "order", std.testing.allocator, .limited(128));
     defer std.testing.allocator.free(order);
-    try std.testing.expectEqualStrings("prestart init poststart", order);
+    try std.testing.expectEqualStrings(" init poststart", order);
     try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, "example/exec.fifo", .{}));
-}
-
-test "prestart failure kills init and destroys runtime state" {
-    const TestContainer = struct {
-        state: libcontainer.State = undefined,
-        checks: usize = 0,
-        killed: bool = false,
-        signal: ?i32 = null,
-        deleted: bool = false,
-        const vtable: libcontainer.Container.VTable = .{ .alive = alive, .kill = kill, .killAll = kill, .delete = delete };
-        pub fn create(_: *anyopaque, _: libcontainer.CreateOptions) libcontainer.Error!libcontainer.State {
-            return error.NotImplemented;
-        }
-        fn alive(ptr: *anyopaque) libcontainer.Error!bool {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.checks += 1;
-            return !self.killed;
-        }
-        fn kill(ptr: *anyopaque, signal: i32) libcontainer.Error!void {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.killed = true;
-            self.signal = signal;
-            // A cleanup error must not replace the hook failure.
-            return error.KillFailed;
-        }
-        fn delete(ptr: *anyopaque) libcontainer.Error!void {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            const handle = self.state;
-            if (!self.killed or handle.pid != 1234 or
-                !std.mem.eql(u8, handle.cgroup_path orelse return error.InvalidPath, "custom/persisted"))
-                return error.CgroupDeleteFailed;
-            self.deleted = true;
-        }
-    };
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDir(std.testing.io, "bundle", .default_dir);
-    try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = "bundle/config.json",
-        .data =
-        \\{"ociVersion":"1.0.2","root":{"path":"/"},"process":{"args":["/bin/sh"],"cwd":"/","user":{"uid":0,"gid":0}}}
-        ,
-    });
-    const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
-    defer std.testing.allocator.free(root);
-    const bundle = try std.fs.path.join(std.testing.allocator, &.{ root, "bundle" });
-    defer std.testing.allocator.free(bundle);
-    const output_env = try std.fmt.allocPrint(std.testing.allocator, "OUT={s}/poststop-state", .{root});
-    defer std.testing.allocator.free(output_env);
-    const state_env = try std.fmt.allocPrint(std.testing.allocator, "STATE_DIR={s}/example", .{root});
-    defer std.testing.allocator.free(state_env);
-    for ([_]struct { json: []const u8, failure: anyerror }{
-        .{ .json = "{\"prestart\":[{\"path\":\"relative-hook\"}]}", .failure = error.InvalidConfig },
-        .{ .json = "{\"prestart\":[{\"path\":\"/igvano-missing-hook\"}]}", .failure = if (builtin.os.tag == .linux) error.HookFailed else error.NotImplemented },
-    }) |case| {
-        try tmp.dir.createDir(std.testing.io, "example", .default_dir);
-        try oci.saveState(std.testing.allocator, std.testing.io, root, .{
-            .id = "example",
-            .status = .created,
-            .pid = 1234,
-            .bundle = bundle,
-        });
-        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "example/starttime", .data = "12345" });
-        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "example/cgroup", .data = "custom/persisted" });
-        // A buffered acknowledgement makes an accidental start succeed on Linux.
-        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "example/exec.fifo", .data = "\x01" });
-        const hooks = try std.json.parseFromSlice(oci.Spec.Hooks, std.testing.allocator, case.json, .{});
-        defer hooks.deinit();
-        var configured = hooks.value;
-        configured.poststop = &.{.{
-            .path = "/bin/sh",
-            .args = &.{ "sh", "-c", "test ! -e \"$STATE_DIR\" && /bin/cat > \"$OUT\"" },
-            .env = &.{ output_env, state_env },
-            .timeout = 2,
-        }};
-        const json = try std.json.Stringify.valueAlloc(std.testing.allocator, configured, .{ .emit_null_optional_fields = false });
-        defer std.testing.allocator.free(json);
-        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "example/hooks.json", .data = json });
-        var implementation: TestContainer = .{};
-        const container: libcontainer.Container = .{
-            .ptr = &implementation,
-            .vtable = &TestContainer.vtable,
-        };
-        try std.testing.expectError(case.failure, startContainer(std.testing.allocator, std.testing.io, overrideContainer(&implementation, container), .{
-            .root = root,
-            .id = "example",
-            .subcommand = .start,
-        }));
-        try std.testing.expect(implementation.killed);
-        try std.testing.expectEqual(@as(?i32, 9), implementation.signal);
-        try std.testing.expect(implementation.deleted);
-        try std.testing.expectError(error.FileNotFound, tmp.dir.openDir(std.testing.io, "example", .{}));
-        try std.testing.expectError(error.FileNotFound, readLiveState(std.testing.allocator, std.testing.io, overrideContainer(&implementation, container), .{
-            .root = root,
-            .id = "example",
-            .subcommand = .state,
-        }, true));
-        if (comptime builtin.os.tag == .linux) {
-            const input = try tmp.dir.readFileAlloc(std.testing.io, "poststop-state", std.testing.allocator, .limited(4096));
-            defer std.testing.allocator.free(input);
-            const stopped = try std.json.parseFromSlice(oci.State, std.testing.allocator, input, .{});
-            defer stopped.deinit();
-            try std.testing.expectEqual(oci.Status.stopped, stopped.value.status);
-            try std.testing.expectEqual(@as(?i32, 1234), stopped.value.pid);
-            try tmp.dir.deleteFile(std.testing.io, "poststop-state");
-        }
-    }
 }

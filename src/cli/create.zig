@@ -10,6 +10,7 @@ const createInstance = @import("state.zig").createInstance;
 const createDiagnostic = @import("state.zig").createDiagnostic;
 const Config = @import("args.zig").Config;
 const prepareProcess = @import("process.zig").prepareProcess;
+const processEnv = @import("process.zig").processEnv;
 const validateConsoleSocket = @import("process.zig").validateConsoleSocket;
 const connectConsoleSocket = @import("process.zig").connectConsoleSocket;
 const writePidFile = @import("process.zig").writePidFile;
@@ -55,7 +56,8 @@ pub fn createContainerFor(allocator: std.mem.Allocator, io: std.Io, injected: ?C
     const sysctls = try oci.prepareSysctls(mount_allocator, settings);
     const configured_hooks: oci.Spec.Hooks = parsed.value.hooks orelse .{};
     const create_hooks = try oci.prepareHooks(mount_allocator, configured_hooks.createContainer);
-    const start_hooks = try oci.prepareHooks(mount_allocator, configured_hooks.startContainer);
+    const init_env = try initEnv(mount_allocator, parsed.value.process, rootfs);
+    const start_hooks = try startHooks(mount_allocator, configured_hooks.startContainer, init_env);
     const masked_paths = try prepareRestrictionPaths(mount_allocator, settings.maskedPaths);
     const readonly_paths = try prepareRestrictionPaths(mount_allocator, settings.readonlyPaths);
     const devices = try oci.prepareDevices(allocator, settings.devices);
@@ -94,7 +96,7 @@ pub fn createContainerFor(allocator: std.mem.Allocator, io: std.Io, injected: ?C
         .debug = config.debug_log,
     };
     try applyCreateSpec(mount_allocator, &options, parsed.value);
-    applyCreateProcess(&options, process_options);
+    applyCreateProcess(&options, process_options, init_env);
     return createPreparedContainer(allocator, mount_allocator, io, injected, config, bundle, parsed.value, options, local_console);
 }
 
@@ -128,6 +130,21 @@ fn rootlessCgroups() bool {
     const expected = [_][]const u8{ "0", "0", "4294967295" };
     for (expected) |field| if (!std.mem.eql(u8, fields.next() orelse "", field)) return true;
     return fields.next() != null;
+}
+
+fn initEnv(allocator: std.mem.Allocator, process: ?oci.Spec.Process, rootfs: []const u8) !?[]const []const u8 {
+    const value = process orelse return null;
+    const env = value.env orelse return null;
+    return try processEnv(allocator, env, rootfs, value.user.uid);
+}
+
+/// Like runc, a startContainer hook without env inherits the process env.
+fn startHooks(allocator: std.mem.Allocator, configured: ?[]const oci.Spec.Hook, init_env: ?[]const []const u8) ![]libcontainer.Hook {
+    const hooks = try oci.prepareHooks(allocator, configured);
+    for (hooks, configured orelse &.{}) |*hook, entry| {
+        if (entry.env == null) hook.env = init_env orelse &.{};
+    }
+    return hooks;
 }
 
 fn createHasConsole(spec: oci.Spec, config: Config, local: bool) bool {
@@ -216,7 +233,8 @@ fn applyCreateSpec(allocator: std.mem.Allocator, options: *libcontainer.CreateOp
     options.readonly_rootfs = spec.root.readonly;
 }
 
-fn applyCreateProcess(options: *libcontainer.CreateOptions, process: ?libcontainer.ExecOptions) void {
+fn applyCreateProcess(options: *libcontainer.CreateOptions, process: ?libcontainer.ExecOptions, init_env: ?[]const []const u8) void {
+    if (init_env) |env| options.process.?.env = env;
     if (process) |value| {
         options.capabilities = value.capabilities;
         options.rlimits = value.rlimits;
@@ -426,7 +444,9 @@ pub const CreateContext = struct {
         }
         try saveRootfsMount(self.allocator, self.io, self.state_dir, handle);
         try oci.saveState(self.allocator, self.io, self.root, self.state.*);
-        try runHooks(self.allocator, self.hooks.createRuntime, self.state.*);
+        // Like runc, the deprecated prestart hooks run with createRuntime.
+        try runHooks(self.allocator, self.hooks.prestart, self.state.*, "prestart");
+        try runHooks(self.allocator, self.hooks.createRuntime, self.state.*, "createRuntime");
     }
 };
 

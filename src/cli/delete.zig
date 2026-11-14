@@ -18,7 +18,7 @@ const RootfsMount = @import("state.zig").RootfsMount;
 const loadRootfsMount = @import("state.zig").loadRootfsMount;
 const LiveState = @import("state.zig").LiveState;
 const recoverLiveState = @import("state.zig").recoverLiveState;
-const warnHooks = @import("hooks.zig").warnHooks;
+const runHooks = @import("hooks.zig").runHooks;
 
 fn requireDelete(status: oci.Status, force: bool) !void {
     if (!force) try oci.requireDelete(status);
@@ -114,7 +114,8 @@ pub fn destroyContainer(allocator: std.mem.Allocator, io: std.Io, injected: ?Con
         file.close(io);
         lock.* = null;
     }
-    warnHooks(allocator, poststop, state.parsed.value, "poststop");
+    // Like runc, delete fails when a poststop hook fails, after cleanup.
+    try runHooks(allocator, poststop, state.parsed.value, "poststop");
 }
 
 fn stateRootfsMount(handle: libcontainer.State) ?RootfsMount {

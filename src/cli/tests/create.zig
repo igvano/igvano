@@ -24,7 +24,7 @@ test "create uses private state directories and preserves existing root permissi
             if (self.configured) {
                 std.testing.expectEqualDeep(@as(?libcontainer.Process, .{
                     .args = &.{"/bin/sh"},
-                    .env = &.{"PATH=/bin"},
+                    .env = &.{ "PATH=/bin", "HOME=/work" },
                     .cwd = "/work",
                     .uid = 1000,
                     .gid = 1001,
@@ -96,7 +96,7 @@ test "create uses private state directories and preserves existing root permissi
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "bundle/config.json",
         .data =
-        \\{"ociVersion":"1.0.2","root":{"path":"/","readonly":true},"hostname":"container","process":{"args":["/bin/sh"],"env":["PATH=/bin"],"cwd":"/work","user":{"uid":1000,"gid":1001,"additionalGids":[42]},"noNewPrivileges":true},"linux":{"namespaces":[{"type":"pid"},{"type":"network","path":"/proc/1234/ns/net"},{"type":"mount"},{"type":"ipc"},{"type":"uts"},{"type":"user"},{"type":"cgroup"},{"type":"time"}],"uidMappings":[{"containerID":0,"hostID":100000,"size":65536}],"gidMappings":[{"containerID":0,"hostID":200000,"size":65536}]}}
+        \\{"ociVersion":"1.0.2","root":{"path":"/","readonly":true},"hostname":"container","process":{"args":["/bin/sh"],"env":["PATH=/bin","HOME=/work"],"cwd":"/work","user":{"uid":1000,"gid":1001,"additionalGids":[42]},"noNewPrivileges":true},"linux":{"namespaces":[{"type":"pid"},{"type":"network","path":"/proc/1234/ns/net"},{"type":"mount"},{"type":"ipc"},{"type":"uts"},{"type":"user"},{"type":"cgroup"},{"type":"time"}],"uidMappings":[{"containerID":0,"hostID":100000,"size":65536}],"gidMappings":[{"containerID":0,"hostID":200000,"size":65536}]}}
         ,
     });
     const configured_root = try std.fs.path.join(std.testing.allocator, &.{ base, "configured" });

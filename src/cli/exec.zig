@@ -11,6 +11,7 @@ const Config = @import("args.zig").Config;
 const parseArgs = @import("args.zig").parseArgs;
 const optionValue = @import("args.zig").optionValue;
 const prepareProcess = @import("process.zig").prepareProcess;
+const processEnv = @import("process.zig").processEnv;
 const connectConsoleSocket = @import("process.zig").connectConsoleSocket;
 const writePidFile = @import("process.zig").writePidFile;
 const openContainerLock = @import("state.zig").openContainerLock;
@@ -138,6 +139,10 @@ fn prepareExecOptions(process_allocator: std.mem.Allocator, io: std.Io, state: L
     options.cgroup_path = state.container_state.?.cgroup_path orelse "";
     options.console_fds = if (process.terminal orelse false) try libcontainer.linux.console.socketpair() else null;
     options.debug = config.debug_log;
+    if (process.env != null) {
+        const root = try std.fmt.allocPrint(process_allocator, "/proc/{d}/root", .{state.parsed.value.pid orelse 0});
+        options.envp = try processEnv(process_allocator, options.envp, root, options.uid);
+    }
     return options;
 }
 

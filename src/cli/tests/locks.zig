@@ -243,8 +243,6 @@ test "linux busy owners preserve a recreated id after forced delete" {
     for ([_]struct { subcommand: Subcommand, fail: bool, failure: anyerror }{
         .{ .subcommand = .create, .fail = true, .failure = error.CreateFailed },
         .{ .subcommand = .create, .fail = false, .failure = error.FileNotFound },
-        .{ .subcommand = .start, .fail = true, .failure = error.HookFailed },
-        .{ .subcommand = .start, .fail = false, .failure = error.FileNotFound },
     }) |case| {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();

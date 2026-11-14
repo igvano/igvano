@@ -480,7 +480,7 @@ test "linux create retains the init child's rootfs diagnostic" {
     options.mounts = &.{};
     options.create_hooks = &.{.{ .path = "/igvano-missing-create-hook" }};
     try expectCreateError(error.HookFailed, options);
-    try std.testing.expectEqualStrings("error running hook #0: exit status 1, stdout: , stderr: ", libcontainer.linux.diagnostic().?);
+    try std.testing.expectEqualStrings("error running createContainer hook #0: exit status 1, stdout: , stderr: ", libcontainer.linux.diagnostic().?);
 }
 
 test "linux create accepts a prepared executable or process-less rootfs and returns a live blocked init" {

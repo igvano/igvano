@@ -13,12 +13,9 @@ const lockContainer = @import("state.zig").lockContainer;
 const requireLinkedLock = @import("state.zig").requireLinkedLock;
 const loadSavedHooks = @import("state.zig").loadSavedHooks;
 const loadHasProcess = @import("state.zig").loadHasProcess;
-const LiveState = @import("state.zig").LiveState;
 const readLiveState = @import("state.zig").readLiveState;
 const runHooks = @import("hooks.zig").runHooks;
-const warnHooks = @import("hooks.zig").warnHooks;
 const stopContainer = @import("delete.zig").stopContainer;
-const destroyContainer = @import("delete.zig").destroyContainer;
 
 pub fn startContainer(allocator: std.mem.Allocator, io: std.Io, injected: ?ContainerOverride, config: Config) !void {
     var lock = try openContainerLock(allocator, config, false);
@@ -37,7 +34,6 @@ pub fn startContainer(allocator: std.mem.Allocator, io: std.Io, injected: ?Conta
     defer if (saved_hooks) |entries| entries.deinit();
     const path = try std.fs.path.join(allocator, &.{ config.root, config.id, oci.exec_fifo_name });
     defer allocator.free(path);
-    try runPrestartHooks(allocator, io, injected, config, &state, &lock, saved_hooks);
     if (lock) |file| try requireLinkedLock(io, file);
     try waitForStart(allocator, io, container.?, path);
     state.parsed.value.status = .running;
@@ -48,20 +44,11 @@ pub fn startContainer(allocator: std.mem.Allocator, io: std.Io, injected: ?Conta
         file.close(io);
         lock = null;
     }
-    warnHooks(allocator, if (saved_hooks) |entries| entries.value.poststart else null, state.parsed.value, "poststart");
-}
-
-fn runPrestartHooks(allocator: std.mem.Allocator, io: std.Io, injected: ?ContainerOverride, config: Config, state: *LiveState, lock: *?std.Io.File, saved_hooks: ?std.json.Parsed(oci.Spec.Hooks)) !void {
-    runHooks(allocator, if (saved_hooks) |entries| entries.value.prestart else null, state.parsed.value) catch |err| {
-        // Cleanup failures must not add container detail to this frontend failure.
+    // Like runc, a failed poststart hook stops the container and fails start.
+    runHooks(allocator, if (saved_hooks) |entries| entries.value.poststart else null, state.parsed.value, "poststart") catch |err| {
         defer diagnostics.last_container_detail = null;
-        if (lock.*) |file| requireLinkedLock(io, file) catch return err;
-        var instance: ContainerInstance = undefined;
-        const container = if (state.container_state) |value| bindContainer(&instance, injected, value) else null;
         stopContainer(io, container) catch |cleanup_err|
-            std.debug.print("igvano: warning: cannot stop container after prestart failure: {s}\n", .{@errorName(cleanup_err)});
-        destroyContainer(allocator, io, injected, config, state, lock, if (saved_hooks) |entries| entries.value.poststop else null) catch |cleanup_err|
-            std.debug.print("igvano: warning: cannot destroy container after prestart failure: {s}\n", .{@errorName(cleanup_err)});
+            std.debug.print("igvano: warning: cannot stop container after poststart failure: {s}\n", .{@errorName(cleanup_err)});
         return err;
     };
 }
@@ -121,12 +108,18 @@ fn openStartFifo(io: std.Io, container: libcontainer.Container, path_z: [:0]cons
 
 fn readStartFifo(fd: std.posix.fd_t, writer_seen: *bool, acked: *bool) !?bool {
     const linux = std.os.linux;
-    var byte: [1]u8 = undefined;
-    const result = linux.read(fd, &byte, byte.len);
+    // An ack byte, or a 0 byte followed by init's diagnostic (one write).
+    var bytes: [1 + 512]u8 = undefined;
+    const result = linux.read(fd, &bytes, bytes.len);
     switch (linux.errno(result)) {
         .SUCCESS => {
-            if (try startReadComplete(writer_seen.*, acked.*, result, if (result == 1) byte[0] else 0)) return true;
-            if (result == 1) acked.* = true;
+            if (result == 0) return try startReadComplete(writer_seen.*, acked.*, 0, 0);
+            for (bytes[0..result], 0..) |byte, i| {
+                if (byte == 0 and i + 1 < result)
+                    return oci.validationError(error.StartFailed, "{s}", .{bytes[i + 1 .. result]});
+                if (try startReadComplete(writer_seen.*, acked.*, 1, byte)) return true;
+                acked.* = true;
+            }
         },
         .AGAIN => writer_seen.* = true,
         .INTR => return null,

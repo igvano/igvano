@@ -38,10 +38,8 @@ test "linux lifecycle waits for exec FIFO EOF and persists running then stopped"
     defer std.testing.allocator.free(fifo);
     const fifo_z = try std.testing.allocator.dupeZ(u8, fifo);
     defer std.testing.allocator.free(fifo_z);
-    const prestart_input = try std.fs.path.join(std.testing.allocator, &.{ root, "prestart-input" });
-    defer std.testing.allocator.free(prestart_input);
-    const prestart_input_z = try std.testing.allocator.dupeZ(u8, prestart_input);
-    defer std.testing.allocator.free(prestart_input_z);
+    const poststart_input = try std.fs.path.join(std.testing.allocator, &.{ root, "poststart-input" });
+    defer std.testing.allocator.free(poststart_input);
     try makeExecFifo(std.testing.allocator, fifo);
     const result = posix.system.fork();
     if (posix.errno(result) != .SUCCESS) return error.ForkFailed;
@@ -51,10 +49,6 @@ test "linux lifecycle waits for exec FIFO EOF and persists running then stopped"
         const opened = linux.open(fifo_z, .{ .ACCMODE = .WRONLY, .CLOEXEC = true }, 0);
         if (linux.errno(opened) != .SUCCESS) linux.exit_group(1);
         const fd: posix.fd_t = @intCast(opened);
-        // Prestart must have finished before opening the FIFO releases init.
-        const input = linux.open(prestart_input_z, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
-        if (linux.errno(input) != .SUCCESS) linux.exit_group(1);
-        _ = linux.close(@intCast(input));
         if (posix.system.write(fd, &[_]u8{1}, 1) != 1) linux.exit_group(1);
         const argv = [_:null]?[*:0]const u8{ "/bin/sleep", "60" };
         const envp = [_:null]?[*:0]const u8{};
@@ -80,19 +74,13 @@ test "linux lifecycle waits for exec FIFO EOF and persists running then stopped"
     try killContainer(std.testing.allocator, std.testing.io, null, .{ .root = root, .subcommand = .kill, .id = "example", .signal = "0" });
     const output_env = try std.fmt.allocPrint(std.testing.allocator, "OUT={s}/poststart-source", .{root});
     defer std.testing.allocator.free(output_env);
-    const prestart_env = try std.fmt.allocPrint(std.testing.allocator, "PRESTART={s}", .{prestart_input});
-    defer std.testing.allocator.free(prestart_env);
+    const input_env = try std.fmt.allocPrint(std.testing.allocator, "INPUT={s}", .{poststart_input});
+    defer std.testing.allocator.free(input_env);
     const saved_hooks: oci.Spec.Hooks = .{
-        .prestart = &.{.{
-            .path = "/bin/sh",
-            .args = &.{ "sh", "-c", "/bin/cat > \"$PRESTART\"" },
-            .env = &.{prestart_env},
-            .timeout = 2,
-        }},
         .poststart = &.{.{
             .path = "/bin/sh",
-            .args = &.{ "sh", "-c", "test -s \"$PRESTART\" && printf saved > \"$OUT\"" },
-            .env = &.{ output_env, prestart_env },
+            .args = &.{ "sh", "-c", "/bin/cat > \"$INPUT\" && printf saved > \"$OUT\"" },
+            .env = &.{ output_env, input_env },
         }},
     };
     const hook_json = try std.json.Stringify.valueAlloc(std.testing.allocator, saved_hooks, .{ .emit_null_optional_fields = false });
@@ -106,11 +94,11 @@ test "linux lifecycle waits for exec FIFO EOF and persists running then stopped"
         ,
     });
     try startContainer(std.testing.allocator, std.testing.io, null, config);
-    const input = try tmp.dir.readFileAlloc(std.testing.io, "prestart-input", std.testing.allocator, .limited(4096));
+    const input = try tmp.dir.readFileAlloc(std.testing.io, "poststart-input", std.testing.allocator, .limited(4096));
     defer std.testing.allocator.free(input);
     const hook_state = try std.json.parseFromSlice(oci.State, std.testing.allocator, input, .{});
     defer hook_state.deinit();
-    try std.testing.expectEqual(oci.Status.created, hook_state.value.status);
+    try std.testing.expectEqual(oci.Status.running, hook_state.value.status);
     try std.testing.expectEqual(@as(?i32, pid), hook_state.value.pid);
     const hook_output = try tmp.dir.readFileAlloc(std.testing.io, "poststart-source", std.testing.allocator, .limited(32));
     defer std.testing.allocator.free(hook_output);
