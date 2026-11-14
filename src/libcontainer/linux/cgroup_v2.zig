@@ -688,6 +688,7 @@ pub fn walkCgroup(root: posix.fd_t, path: []const u8, create: bool, writes: []co
             .SUCCESS => {
                 closeFd(current);
                 current = @intCast(result);
+                if (create) try checkCgroupType(current, writes, path);
             },
             .NOENT => {
                 if (create) return error.CreateFailed;
@@ -706,6 +707,9 @@ pub fn walkCgroup(root: posix.fd_t, path: []const u8, create: bool, writes: []co
 fn enableAllControllers(dir: posix.fd_t) void {
     var scratch: [4096]u8 = undefined;
     var fixed: std.heap.FixedBufferAllocator = .init(&scratch);
+    // Unlike runc, skip a non-root cgroup with member processes: its
+    // thread-aware controllers would leave new children "domain invalid".
+    if (hasInternalProcesses(dir)) return;
     const available = readCgroupFile(fixed.allocator(), dir, "cgroup.controllers") catch return;
     var all: [4096]u8 = undefined;
     var used: usize = 0;
@@ -720,6 +724,44 @@ fn enableAllControllers(dir: posix.fd_t) void {
         var one: [64]u8 = undefined;
         _ = tryV1Write(dir, "cgroup.subtree_control", std.fmt.bufPrint(&one, "+{s}", .{name}) catch continue);
     }
+}
+
+/// runc's CreateCgroupPath: a cgroup made under one with processes is
+/// "domain invalid". It can still serve thread-aware controllers in
+/// threaded mode; domain controllers (memory, io, cpu, hugetlb) cannot.
+fn checkCgroupType(dir: posix.fd_t, writes: []const Write, path: []const u8) libcontainer.Error!void {
+    var scratch: [1024]u8 = undefined;
+    var fixed: std.heap.FixedBufferAllocator = .init(&scratch);
+    const text = readCgroupFile(fixed.allocator(), dir, "cgroup.type") catch return;
+    const kind = std.mem.trim(u8, text, " \n");
+    const invalid = std.mem.eql(u8, kind, "domain invalid");
+    if (!invalid and !std.mem.eql(u8, kind, "threaded") and !std.mem.eql(u8, kind, "domain threaded")) return;
+    if (needsDomainController(writes)) {
+        reportDiagnostic("cannot enter cgroupv2 \"{s}\" with domain controllers -- it is in {s}", .{ path, if (invalid) "an invalid state" else kind });
+        return error.CgroupWriteFailed;
+    }
+    if (invalid) _ = tryV1Write(dir, "cgroup.type", "threaded");
+}
+
+fn needsDomainController(writes: []const Write) bool {
+    for (writes) |write| {
+        const dot = std.mem.indexOfScalar(u8, write.name, '.') orelse continue;
+        const controller = write.name[0..dot];
+        for ([_][]const u8{ "memory", "io", "cpu", "hugetlb" }) |name| {
+            if (std.mem.eql(u8, controller, name)) return true;
+        }
+    }
+    return false;
+}
+
+/// The real root has no cgroup.type and may mix processes and controllers.
+fn hasInternalProcesses(dir: posix.fd_t) bool {
+    if (linux.errno(linux.faccessat(dir, "cgroup.type", linux.F_OK, 0)) != .SUCCESS) return false;
+    var buffer: [1]u8 = undefined;
+    const fd = openPath(dir, "cgroup.procs", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }) catch return false;
+    defer closeFd(fd);
+    const result = linux.read(fd, &buffer, 1);
+    return linux.errno(result) == .SUCCESS and result == 1;
 }
 
 fn needsCgroupController(writes: []const Write) bool {

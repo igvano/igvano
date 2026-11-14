@@ -216,7 +216,7 @@ fn skipByMode(dir: posix.fd_t, write: Write, bfq_missing: *bool) bool {
 /// runc's bfqDeviceWeightSupported: kernels before 5.4 read back only the
 /// default weight, a single number.
 fn bfqDeviceWeights(dir: posix.fd_t) bool {
-    var scratch: [256]u8 = undefined;
+    var scratch: [4096]u8 = undefined;
     var fixed: std.heap.FixedBufferAllocator = .init(&scratch);
     const text = readCgroupFile(fixed.allocator(), dir, "io.bfq.weight") catch return false;
     _ = std.fmt.parseInt(i64, std.mem.trim(u8, text, " \t\r\n"), 10) catch return true;

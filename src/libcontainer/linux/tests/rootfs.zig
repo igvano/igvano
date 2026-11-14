@@ -233,8 +233,11 @@ test "linux rootfs diagnostics preserve errors and name the failed mount and bin
             checkResult(linux.dup2(report[1], 2)) catch linux.exit_group(1);
             closeFd(report[1]);
             checkResult(linux.unshare(linux.CLONE.NEWNS)) catch linux.exit_group(2);
-            setupRootfs(rootfs, &.{case.mount}, &.{}, &.{}, false, .{}) catch |err|
+            setupRootfs(rootfs, &.{case.mount}, &.{}, &.{}, false, .{}) catch |err| {
+                // Diagnostics are reported, not printed; print as init's parent would.
+                @import("../diagnostic.zig").printDiagnostic();
                 linux.exit_group(if (err == error.CreateFailed) 0 else 3);
+            };
             linux.exit_group(4);
         }
         closeFd(report[1]);
