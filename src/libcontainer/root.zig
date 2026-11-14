@@ -170,11 +170,14 @@ pub const ExecOptions = struct {
     scheduler: ?Scheduler = null,
     io_priority: ?IOPriority = null,
     debug: ?DebugLog = null,
-    /// runc exec --cgroup: a path below the container's cgroup to join.
-    sub_cgroup: ?[]const u8 = null,
+    /// runc exec --cgroup: paths below the container's cgroup to join.
+    /// One entry with no controller applies to every controller.
+    sub_cgroups: []const SubCgroup = &.{},
     /// runc exec --preserve-fds: fds 3..3+N-1 reach the process.
     preserve_fds: u32 = 0,
 };
+
+pub const SubCgroup = struct { controller: []const u8 = "", path: []const u8 };
 
 /// Where --debug lines go: an O_APPEND log file or stderr.
 pub const DebugLog = struct {

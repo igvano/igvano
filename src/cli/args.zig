@@ -68,7 +68,6 @@ pub const Config = struct {
     exec_no_new_privs: ?bool = null,
     exec_apparmor: ?[]const u8 = null,
     /// --cgroup: a sub-cgroup of the container's to join.
-    exec_cgroup: ?[]const u8 = null,
     ignore_paused: bool = false,
     /// --preserve-fds: pass fds 3..3+N-1 through to the process.
     preserve_fds: u16 = 0,
@@ -327,7 +326,7 @@ fn applyExecOption(args: []const []const u8, index: *usize, config: *Config, opt
         .additional_gids => _ = try numericId(try optionValue(args, index, error.MissingExecValue)),
         .cap, .process_label => _ = try optionValue(args, index, error.MissingExecValue),
         .apparmor => config.exec_apparmor = try optionValue(args, index, error.MissingExecValue),
-        .cgroup => config.exec_cgroup = try optionValue(args, index, error.MissingExecValue),
+        .cgroup => _ = try optionValue(args, index, error.MissingExecValue),
         .preserve_fds => {
             const value = try optionValue(args, index, error.MissingExecValue);
             config.preserve_fds = std.fmt.parseUnsigned(u16, value, 10) catch

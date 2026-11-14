@@ -165,7 +165,7 @@ fn prepareExecOptions(process_allocator: std.mem.Allocator, io: std.Io, state: L
     options.cgroup_path = state.container_state.?.cgroup_path orelse "";
     options.console_fds = if (process.terminal orelse false) try libcontainer.linux.console.socketpair() else null;
     options.debug = config.debug_log;
-    options.sub_cgroup = config.exec_cgroup;
+    options.sub_cgroups = try subCgroups(process_allocator, config.exec_flags);
     options.preserve_fds = config.preserve_fds;
     if (process.env != null) {
         const root = try std.fmt.allocPrint(process_allocator, "/proc/{d}/root", .{state.parsed.value.pid orelse 0});
@@ -344,4 +344,44 @@ test "exec command overrides inherit process settings and replace environment ke
     try std.testing.expect(!no_tty.terminal.?);
     try std.testing.expectEqual(@as(u32, 99), no_tty.user.uid);
     try std.testing.expectEqual(@as(u32, 1002), no_tty.user.gid);
+}
+
+/// runc's getSubCgroupPaths: one plain path (cgroup v2), or
+/// controller[,controller]:path entries (cgroup v1), each controller once.
+fn subCgroups(allocator: std.mem.Allocator, flags: []const []const u8) ![]const libcontainer.SubCgroup {
+    var count: usize = 0;
+    var values: ExecValues = .{ .flags = flags, .option = .cgroup };
+    while (values.next()) |_| count += 1;
+    var result: std.ArrayList(libcontainer.SubCgroup) = .empty;
+    values = .{ .flags = flags, .option = .cgroup };
+    while (values.next()) |value| {
+        const colon = std.mem.indexOfScalar(u8, value, ':') orelse {
+            if (count != 1) return oci.validationError(error.InvalidExecValue, "invalid --cgroup argument: {s} (missing <controller>: prefix)", .{value});
+            try result.append(allocator, .{ .path = value });
+            continue;
+        };
+        var controllers = std.mem.splitScalar(u8, value[0..colon], ',');
+        while (controllers.next()) |controller| {
+            if (controller.len == 0) return oci.validationError(error.InvalidExecValue, "invalid --cgroup argument: {s} (empty <controller> prefix)", .{value});
+            for (result.items) |seen| if (std.mem.eql(u8, seen.controller, controller))
+                return oci.validationError(error.InvalidExecValue, "invalid --cgroup argument(s): controller {s} specified multiple times", .{controller});
+            try result.append(allocator, .{ .controller = controller, .path = value[colon + 1 ..] });
+        }
+    }
+    return result.items;
+}
+
+test "exec --cgroup parses like runc's getSubCgroupPaths" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const plain = try subCgroups(a, &.{ "--cgroup", "sub" });
+    try std.testing.expectEqual(@as(usize, 1), plain.len);
+    try std.testing.expectEqualStrings("", plain[0].controller);
+    const split = try subCgroups(a, &.{ "--cgroup=cpu,memory:a", "--cgroup", "pids:b" });
+    try std.testing.expectEqual(@as(usize, 3), split.len);
+    try std.testing.expectEqualStrings("memory", split[1].controller);
+    try std.testing.expectEqualStrings("b", split[2].path);
+    for ([_][]const []const u8{ &.{ "--cgroup", "a", "--cgroup", "cpu:b" }, &.{ "--cgroup", ":a" }, &.{ "--cgroup", "cpu:a", "--cgroup", "cpu:b" } }) |flags|
+        try std.testing.expectError(error.InvalidExecValue, subCgroups(a, flags));
 }

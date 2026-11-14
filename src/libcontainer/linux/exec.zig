@@ -145,6 +145,22 @@ pub fn subCgroupPath(allocator: std.mem.Allocator, base: []const u8, sub: []cons
     return joined[1..];
 }
 
+test "exec per-controller sub-cgroups pick each v1 hierarchy's path" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    defer diagnostics.last_diagnostic_len = 0;
+    const subs = [_]libcontainer.SubCgroup{ .{ .controller = "memory", .path = "m" }, .{ .controller = "cpuacct", .path = "c" } };
+    const memory: V1Hierarchy = .{ .mountpoint = "", .mount_root = "/", .controllers = &.{"memory"} };
+    const cpu: V1Hierarchy = .{ .mountpoint = "", .mount_root = "/", .controllers = &.{ "cpu", "cpuacct" } };
+    const pids: V1Hierarchy = .{ .mountpoint = "", .mount_root = "/", .controllers = &.{"pids"} };
+    try requireKnownControllers(&subs, &.{ memory, cpu, pids });
+    try std.testing.expectEqualStrings("b/m", try v1SubCgroupPath(a, "b", &subs, memory));
+    try std.testing.expectEqualStrings("b/c", try v1SubCgroupPath(a, "b", &subs, cpu));
+    try std.testing.expectEqualStrings("b", try v1SubCgroupPath(a, "b", &subs, pids));
+    try std.testing.expectError(error.InvalidConfig, requireKnownControllers(&.{.{ .controller = "whaaat", .path = "/" }}, &.{memory}));
+}
+
 test "exec sub-cgroups stay below the container cgroup, like runc" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
@@ -160,24 +176,63 @@ test "exec sub-cgroups stay below the container cgroup, like runc" {
 fn execWithCgroups(handle: libcontainer.State, base_options: libcontainer.ExecOptions, allocator: std.mem.Allocator, prepared: ExecProcess, proc_dir: posix.fd_t, root: posix.fd_t) libcontainer.Error!i32 {
     var options = base_options;
     if (options.cgroup_path.len == 0) return execWithNamespacesOf(handle, options, allocator, prepared, proc_dir, root, .{}, &.{});
-    if (options.sub_cgroup) |sub| options.cgroup_path = try subCgroupPath(allocator, options.cgroup_path, sub);
-    errdefer |err| if (err == error.ProcessNotFound and options.sub_cgroup != null)
+    const base = options.cgroup_path;
+    // One plain --cgroup path applies to every controller, like runc.
+    const all = plainSubCgroup(options.sub_cgroups);
+    if (all) |sub| options.cgroup_path = try subCgroupPath(allocator, base, sub);
+    errdefer |err| if (err == error.ProcessNotFound and options.sub_cgroups.len != 0)
         reportDiagnostic("error adding pid to cgroups: /sys/fs/cgroup/{s}/cgroup.procs: no such file or directory", .{options.cgroup_path});
     const cgroup_root = try openCgroupRoot();
     defer closeFd(cgroup_root.fd);
     const cgroup: ?posix.fd_t = if (cgroup_root.mode == .unified)
-        (try walkCgroup(cgroup_root.fd, options.cgroup_path, false, &.{})) orelse return error.ProcessNotFound
+        try openV2ExecCgroup(cgroup_root.fd, if (all == null) options.sub_cgroups else &.{}, options.cgroup_path)
     else
         null;
     defer if (cgroup) |fd| closeFd(fd);
     const hierarchies: []V1Hierarchy = if (cgroup_root.mode == .legacy) try openV1Hierarchies(allocator, handle.systemd) else &.{};
     defer if (cgroup_root.mode == .legacy) freeV1Hierarchies(allocator, hierarchies);
-    for (hierarchies) |*hierarchy|
-        hierarchy.leaf = (try walkV1Cgroup(allocator, hierarchy.root.?, hierarchy.mount_root, options.cgroup_path, false, false)) orelse return error.ProcessNotFound;
+    try openV1ExecLeaves(allocator, hierarchies, base, if (all == null) options.sub_cgroups else &.{}, options.cgroup_path);
     // runc: --cgroup disables the fallback to init's cgroup.
-    const init_cgroup = if (cgroup != null and options.sub_cgroup == null) try openInitCgroup(allocator, cgroup_root.fd, handle.pid, options.cgroup_path) else null;
+    const init_cgroup = if (cgroup != null and options.sub_cgroups.len == 0) try openInitCgroup(allocator, cgroup_root.fd, handle.pid, options.cgroup_path) else null;
     defer if (init_cgroup) |fd| closeFd(fd);
     return execWithNamespacesOf(handle, options, allocator, prepared, proc_dir, root, .{ .cgroup = cgroup, .init_cgroup = init_cgroup }, hierarchies);
+}
+
+fn plainSubCgroup(subs: []const libcontainer.SubCgroup) ?[]const u8 {
+    return if (subs.len == 1 and subs[0].controller.len == 0) subs[0].path else null;
+}
+
+/// runc's cgroup v2 paths have only the "" key, so any controller is unknown.
+fn openV2ExecCgroup(root: posix.fd_t, subs: []const libcontainer.SubCgroup, path: []const u8) libcontainer.Error!posix.fd_t {
+    if (subs.len != 0) try unknownController(subs[0].controller);
+    return (try walkCgroup(root, path, false, &.{})) orelse error.ProcessNotFound;
+}
+
+/// Per-controller subs pick each hierarchy's path; otherwise all use `path`.
+fn openV1ExecLeaves(allocator: std.mem.Allocator, hierarchies: []V1Hierarchy, base: []const u8, subs: []const libcontainer.SubCgroup, path: []const u8) libcontainer.Error!void {
+    try requireKnownControllers(subs, hierarchies);
+    for (hierarchies) |*hierarchy| {
+        const leaf = if (subs.len != 0) try v1SubCgroupPath(allocator, base, subs, hierarchy.*) else path;
+        hierarchy.leaf = (try walkV1Cgroup(allocator, hierarchy.root.?, hierarchy.mount_root, leaf, false, false)) orelse return error.ProcessNotFound;
+    }
+}
+
+fn unknownController(controller: []const u8) libcontainer.Error!noreturn {
+    reportDiagnostic("unknown controller {s} in SubCgroupPaths", .{controller});
+    return error.InvalidConfig;
+}
+
+fn requireKnownControllers(subs: []const libcontainer.SubCgroup, hierarchies: []const V1Hierarchy) libcontainer.Error!void {
+    outer: for (subs) |sub| {
+        for (hierarchies) |hierarchy| if (hierarchy.has(sub.controller)) continue :outer;
+        try unknownController(sub.controller);
+    }
+}
+
+/// A v1 hierarchy joins the sub-cgroup of the first controller it mounts.
+fn v1SubCgroupPath(allocator: std.mem.Allocator, base: []const u8, subs: []const libcontainer.SubCgroup, hierarchy: V1Hierarchy) libcontainer.Error![]const u8 {
+    for (subs) |sub| if (hierarchy.has(sub.controller)) return subCgroupPath(allocator, base, sub.path);
+    return base;
 }
 
 /// Init's cgroup v2 path from /proc/<pid>/cgroup, if it is below `base`.
