@@ -213,7 +213,17 @@ pub const Spec = struct {
             leafWeight: ?u16 = null,
         };
         pub const ThrottleDevice = struct { major: i64, minor: i64, rate: u64 };
-        pub const HugepageLimit = struct { pageSize: []const u8, limit: u64 };
+        /// Go's encoding/json matches keys case-insensitively, so runc also
+        /// takes "pagesize" (its own tests write it); accept that spelling.
+        pub const HugepageLimit = struct {
+            pageSize: ?[]const u8 = null,
+            pagesize: ?[]const u8 = null,
+            limit: u64,
+
+            pub fn size(self: HugepageLimit) []const u8 {
+                return self.pageSize orelse self.pagesize orelse "";
+            }
+        };
         pub const Network = struct {
             classID: ?u32 = null,
             priorities: ?[]const Priority = null,

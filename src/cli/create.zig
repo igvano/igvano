@@ -14,6 +14,7 @@ const processEnv = @import("process.zig").processEnv;
 const validateConsoleSocket = @import("process.zig").validateConsoleSocket;
 const connectConsoleSocket = @import("process.zig").connectConsoleSocket;
 const writePidFile = @import("process.zig").writePidFile;
+const sendPidfd = @import("process.zig").sendPidfd;
 const openContainerLock = @import("state.zig").openContainerLock;
 const lockContainer = @import("state.zig").lockContainer;
 const requireLinkedLock = @import("state.zig").requireLinkedLock;
@@ -94,6 +95,7 @@ pub fn createContainerFor(allocator: std.mem.Allocator, io: std.Io, injected: ?C
         .rootfs_propagation = if (settings.rootfsPropagation) |mode| oci.rootfsPropagation(mode) else null,
         .seccomp = seccomp_config,
         .debug = config.debug_log,
+        .no_pivot = config.no_pivot,
     };
     try applyCreateSpec(mount_allocator, &options, parsed.value);
     applyCreateProcess(&options, process_options, init_env);
@@ -318,6 +320,7 @@ fn createPreparedContainer(allocator: std.mem.Allocator, mount_allocator: std.me
     try saveRootfsMount(allocator, io, state_dir, handle);
 
     try reportCreateConsole(options.console_fds, config.console_socket, local_console);
+    if (config.pidfd_socket) |path| try sendPidfd(path, handle.pid, "standard");
     state.status = .created;
     if (lock) |file| try requireLinkedLock(io, file);
     try oci.saveState(allocator, io, root, state);

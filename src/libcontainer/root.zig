@@ -81,6 +81,8 @@ pub const CreateOptions = struct {
     masked_paths: []const []const u8 = &.{},
     readonly_paths: []const []const u8 = &.{},
     sysctls: []const Sysctl = &.{},
+    /// runc --no-pivot: move the rootfs onto / and chroot, not pivot_root.
+    no_pivot: bool = false,
     /// Host interfaces to move into the container's network namespace.
     net_devices: []const NetDevice = &.{},
     /// Null preserves the default propagation in a private mount namespace.

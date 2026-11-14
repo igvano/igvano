@@ -262,6 +262,8 @@ pub const RootfsOptions = struct {
     rootless: bool = false,
     /// linux.resources.cpu.cpus is set (see applySchedulerAndIOPriority).
     cpuset: bool = false,
+    /// runc --no-pivot (see moveRoot).
+    no_pivot: bool = false,
 };
 
 /// Paths now resolve entirely inside the container rootfs. Missing targets are
@@ -354,7 +356,7 @@ pub fn setupRootfs(rootfs: [:0]const u8, mounts: []const PreparedMount, devices:
     // directory. Detach it and close both handles before any container exec.
     // Keep them above stdio, which console setup replaces before they close.
     step = .{ .operation = "open old root", .path = "/" };
-    const old_root = if (options.private_mount_namespace)
+    const old_root = if (options.private_mount_namespace and !options.no_pivot)
         try consolePath("/", .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true })
     else
         null;
@@ -365,7 +367,7 @@ pub fn setupRootfs(rootfs: [:0]const u8, mounts: []const PreparedMount, devices:
     // Populate rootfs /dev even without tmpfs, but leave a bind-mounted /dev
     // untouched: device nodes and symlinks there would mutate the host source.
     if (needsSetupDev(mounts)) try setupDevices(new_root, devices, symlinks, options.private_mount_namespace, &step);
-    try enterRootfs(rootfs, old_root, new_root, &step);
+    try enterRootfs(rootfs, old_root, new_root, options.private_mount_namespace and options.no_pivot, &step);
     if (options.console_fd) |socket| {
         defer closeFd(socket);
         setupConsole(socket, true) catch |err| {
@@ -457,11 +459,74 @@ fn runCreateHooks(options: RootfsOptions, step: *RootfsStep) libcontainer.Error!
     };
 }
 
-fn enterRootfs(rootfs: [:0]const u8, old_root: ?posix.fd_t, new_root: posix.fd_t, step: *RootfsStep) libcontainer.Error!void {
+/// runc's msMoveRoot for --no-pivot. With chroot the host's full procfs and
+/// sysfs mounts stay in the mount namespace, and the kernel would then allow
+/// a fresh procfs mount inside the container. Detach them first, or cover
+/// them with tmpfs when detaching is refused; then move the rootfs onto /.
+fn moveRoot(rootfs: [:0]const u8, step: *RootfsStep) libcontainer.Error!void {
+    step.* = .{ .operation = "read mountinfo" };
+    const text = try readMountinfo(std.heap.page_allocator);
+    defer std.heap.page_allocator.free(text);
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        var buffer: [std.fs.max_path_bytes]u8 = undefined;
+        const path = hostPseudoMount(line, rootfs, &buffer) orelse continue;
+        step.* = .{ .operation = "mount slave propagation", .path = path };
+        switch (linux.errno(linux.mount(null, path, null, linux.MS.SLAVE | linux.MS.REC, 0))) {
+            .SUCCESS => {},
+            // A parent was already detached.
+            .NOENT => continue,
+            else => |err| return errnoError(err),
+        }
+        step.* = .{ .operation = "umount", .path = path };
+        switch (linux.errno(linux.umount2(path, linux.MNT.DETACH))) {
+            .SUCCESS => {},
+            .INVAL, .PERM => {
+                step.* = .{ .operation = "cover with tmpfs", .path = path };
+                try checkResult(linux.mount("tmpfs", path, "tmpfs", 0, 0));
+            },
+            else => |err| return errnoError(err),
+        }
+    }
+    step.* = .{ .operation = "move rootfs onto /", .path = rootfs };
+    try checkResult(linux.mount(rootfs, "/", null, linux.MS.MOVE, 0));
+    step.* = .{ .operation = "chroot", .path = rootfs };
+    try checkResult(linux.chroot("."));
+}
+
+fn errnoError(err: linux.E) libcontainer.Error {
+    return if (err == .PERM or err == .ACCES) error.PermissionDenied else error.CreateFailed;
+}
+
+/// The mountpoint of a full (root "/") procfs or sysfs mount outside rootfs.
+fn hostPseudoMount(line: []const u8, rootfs: []const u8, buffer: []u8) ?[:0]const u8 {
+    const separator = std.mem.indexOf(u8, line, " - ") orelse return null;
+    const info = MountInfo.parse(line[0..separator]) catch return null;
+    var tail = std.mem.tokenizeScalar(u8, line[separator + 3 ..], ' ');
+    const fstype = tail.next() orelse return null;
+    if (!std.mem.eql(u8, info.root, "/") or !(std.mem.eql(u8, fstype, "proc") or std.mem.eql(u8, fstype, "sysfs"))) return null;
+    const path = mountinfoPath(buffer[0 .. buffer.len - 1], info.mountpoint) catch return null;
+    if (std.mem.startsWith(u8, path, rootfs)) return null;
+    buffer[path.len] = 0;
+    return buffer[0..path.len :0];
+}
+
+test "no-pivot masks only full host procfs and sysfs mounts" {
+    var buffer: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("/proc", hostPseudoMount("22 1 0:5 / /proc rw,nosuid - proc proc rw", "/bundle/rootfs", &buffer).?);
+    try std.testing.expectEqualStrings("/s y", hostPseudoMount("23 1 0:6 / /s\\040y rw - sysfs sysfs rw", "/bundle/rootfs", &buffer).?);
+    try std.testing.expect(hostPseudoMount("24 1 0:5 /sys /x rw - proc proc rw", "/bundle/rootfs", &buffer) == null);
+    try std.testing.expect(hostPseudoMount("25 1 0:5 / /bundle/rootfs/proc rw - proc proc rw", "/bundle/rootfs", &buffer) == null);
+    try std.testing.expect(hostPseudoMount("26 1 0:7 / /tmp rw - tmpfs tmpfs rw", "/bundle/rootfs", &buffer) == null);
+}
+
+fn enterRootfs(rootfs: [:0]const u8, old_root: ?posix.fd_t, new_root: posix.fd_t, move_root: bool, step: *RootfsStep) libcontainer.Error!void {
     const ms = linux.MS;
     step.* = .{ .operation = "fchdir rootfs", .path = rootfs };
     try checkResult(linux.fchdir(new_root));
-    if (old_root) |fd| {
+    if (move_root) {
+        try moveRoot(rootfs, step);
+    } else if (old_root) |fd| {
         step.* = .{ .operation = "pivot_root" };
         try checkResult(linux.pivot_root(".", "."));
         step.* = .{ .operation = "fchdir old root" };

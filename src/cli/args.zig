@@ -39,6 +39,10 @@ pub const Config = struct {
     bundle: ?[]const u8 = null,
     pid_file: ?[]const u8 = null,
     console_socket: ?[]const u8 = null,
+    /// --pidfd-socket: receives a pidfd of the container or exec process.
+    pidfd_socket: ?[]const u8 = null,
+    /// create/run --no-pivot: chroot into the rootfs instead of pivot_root.
+    no_pivot: bool = false,
     signal: ?[]const u8 = null,
     systemd: bool = false,
     /// spec --rootless.
@@ -118,8 +122,8 @@ const max_reordered_args = 128;
 /// arguments. exec and ps keep runc's SkipArgReorder; the rest take no flags.
 fn commandFlagNames(subcommand: Subcommand) []const []const u8 {
     return switch (subcommand) {
-        .create => &.{ "bundle", "b", "pid-file", "console-socket" },
-        .run => &.{ "bundle", "b", "pid-file", "console-socket", "detach", "d", "keep" },
+        .create => &.{ "bundle", "b", "pid-file", "console-socket", "pidfd-socket", "no-pivot" },
+        .run => &.{ "bundle", "b", "pid-file", "console-socket", "pidfd-socket", "no-pivot", "detach", "d", "keep" },
         .spec => &.{ "bundle", "b", "rootless" },
         .list => &.{ "quiet", "q", "format", "f" },
         .events => &.{ "stats", "interval" },
@@ -187,7 +191,7 @@ fn optionName(flag: []const u8) []const u8 {
     return flag[0 .. std.mem.indexOfScalar(u8, flag, '=') orelse flag.len];
 }
 
-fn longOptionValue(args: []const []const u8, index: *usize, comptime missing: error{ MissingRoot, MissingLog, MissingLogFormat, MissingBundle, MissingPidFile, MissingConsoleSocket }, allow_dash_value: bool) ![]const u8 {
+fn longOptionValue(args: []const []const u8, index: *usize, comptime missing: error{ MissingRoot, MissingLog, MissingLogFormat, MissingBundle, MissingPidFile, MissingConsoleSocket, MissingPidfdSocket }, allow_dash_value: bool) ![]const u8 {
     const flag = optionName(args[index.*]);
     const value = if (std.mem.indexOfScalar(u8, args[index.*], '=')) |equals|
         args[index.*][equals + 1 ..]
@@ -249,7 +253,7 @@ fn parseCommandOptions(args: []const []const u8, index: *usize, config: *Config)
     }
 }
 
-pub const ExecOption = enum { detach, tty, process, pid_file, console_socket, cwd, user, env, additional_gids, cap, no_new_privs, apparmor, process_label, preserve_fds, cgroup, ignore_paused };
+pub const ExecOption = enum { detach, tty, process, pid_file, console_socket, pidfd_socket, cwd, user, env, additional_gids, cap, no_new_privs, apparmor, process_label, preserve_fds, cgroup, ignore_paused };
 
 /// runc exec's flags, short aliases included.
 pub const exec_options = std.StaticStringMap(ExecOption).initComptime(.{
@@ -258,7 +262,7 @@ pub const exec_options = std.StaticStringMap(ExecOption).initComptime(.{
     .{ "--cwd", .cwd },                   .{ "--user", .user },                       .{ "-u", .user },                       .{ "--env", .env },
     .{ "-e", .env },                      .{ "--additional-gids", .additional_gids }, .{ "-g", .additional_gids },            .{ "--cap", .cap },
     .{ "-c", .cap },                      .{ "--no-new-privs", .no_new_privs },       .{ "--apparmor", .apparmor },           .{ "--process-label", .process_label },
-    .{ "--preserve-fds", .preserve_fds }, .{ "--cgroup", .cgroup },                   .{ "--ignore-paused", .ignore_paused },
+    .{ "--preserve-fds", .preserve_fds }, .{ "--cgroup", .cgroup },                   .{ "--ignore-paused", .ignore_paused }, .{ "--pidfd-socket", .pidfd_socket },
 });
 
 pub fn execOptionIsBool(option: ExecOption) bool {
@@ -320,6 +324,7 @@ fn applyExecOption(args: []const []const u8, index: *usize, config: *Config, opt
         .process => config.process_file = try optionValue(args, index, error.MissingProcessFile),
         .pid_file => config.pid_file = try optionValue(args, index, error.MissingPidFile),
         .console_socket => config.console_socket = try optionValue(args, index, error.MissingConsoleSocket),
+        .pidfd_socket => config.pidfd_socket = try optionValue(args, index, error.MissingPidfdSocket),
         .cwd => config.exec_cwd = try optionValue(args, index, error.MissingCwd),
         .user => config.exec_user = try parseUser(try optionValue(args, index, error.MissingUser)),
         .env => try oci.validateEnv(try optionValue(args, index, error.MissingEnv)),
@@ -335,20 +340,22 @@ fn applyExecOption(args: []const []const u8, index: *usize, config: *Config, opt
     }
 }
 
-const CreateOption = enum { bundle, pid_file, console_socket, detach, keep, rootless };
+const CreateOption = enum { bundle, pid_file, console_socket, pidfd_socket, no_pivot, detach, keep, rootless };
 
 // spec takes only the bundle; detach and keep are run-only booleans.
 fn createOptionAllowed(subcommand: Subcommand, option: CreateOption, flag: []const u8) bool {
     if (subcommand == .spec) return option == .bundle or (option == .rootless and std.mem.indexOfScalar(u8, flag, '=') == null);
     if (option == .rootless) return false;
+    if (option == .no_pivot) return std.mem.indexOfScalar(u8, flag, '=') == null;
     if (option != .detach and option != .keep) return true;
     return subcommand == .run and std.mem.indexOfScalar(u8, flag, '=') == null;
 }
 
 fn parseCreateOptions(args: []const []const u8, index: *usize, config: *Config) !void {
     const options = std.StaticStringMap(CreateOption).initComptime(.{
-        .{ "--bundle", .bundle }, .{ "-b", .bundle }, .{ "--pid-file", .pid_file }, .{ "--console-socket", .console_socket },
-        .{ "--detach", .detach }, .{ "-d", .detach }, .{ "--keep", .keep },         .{ "--rootless", .rootless },
+        .{ "--bundle", .bundle },             .{ "-b", .bundle },           .{ "--pid-file", .pid_file }, .{ "--console-socket", .console_socket },
+        .{ "--detach", .detach },             .{ "-d", .detach },           .{ "--keep", .keep },         .{ "--rootless", .rootless },
+        .{ "--pidfd-socket", .pidfd_socket }, .{ "--no-pivot", .no_pivot },
     });
     while (index.* < args.len and std.mem.startsWith(u8, args[index.*], "-")) : (index.* += 1) {
         const flag = args[index.*];
@@ -359,6 +366,8 @@ fn parseCreateOptions(args: []const []const u8, index: *usize, config: *Config) 
             .bundle => config.bundle = try longOptionValue(args, index, error.MissingBundle, false),
             .pid_file => config.pid_file = try longOptionValue(args, index, error.MissingPidFile, false),
             .console_socket => config.console_socket = try longOptionValue(args, index, error.MissingConsoleSocket, false),
+            .pidfd_socket => config.pidfd_socket = try longOptionValue(args, index, error.MissingPidfdSocket, false),
+            .no_pivot => config.no_pivot = true,
             .detach => config.detach = true,
             .keep => config.keep = true,
             .rootless => config.rootless = true,
@@ -577,6 +586,7 @@ fn memoryMultiplier(suffix: []const u8) !f64 {
 
 pub fn optionValue(args: []const []const u8, index: *usize, comptime missing: error{
     MissingProcessFile,
+    MissingPidfdSocket,
     MissingResources,
     MissingResourceValue,
     MissingPidFile,

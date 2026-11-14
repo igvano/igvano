@@ -180,8 +180,17 @@ fn appendV2HugepageWrites(allocator: std.mem.Allocator, writes: *std.ArrayList(W
 
 fn appendV2UnifiedWrites(allocator: std.mem.Allocator, writes: *std.ArrayList(Write), entries: []const Resources.Unified) libcontainer.Error!void {
     // Raw settings are last so they override any typed resource mapping.
-    for (entries) |entry|
-        try appendWrite(allocator, writes, entry.key, try allocator.dupe(u8, entry.value));
+    // Like runc's WriteFileByLine, a multi-line value is written line by
+    // line: files such as io.max take one device per write.
+    for (entries) |entry| {
+        var rest = entry.value;
+        while (true) {
+            const end = if (std.mem.indexOfScalar(u8, rest, '\n')) |i| i + 1 else rest.len;
+            try appendWrite(allocator, writes, entry.key, try allocator.dupe(u8, rest[0..end]));
+            rest = rest[end..];
+            if (rest.len == 0) break;
+        }
+    }
 }
 
 pub fn cgroupLimit(allocator: std.mem.Allocator, limit: i64) libcontainer.Error![]u8 {
@@ -473,6 +482,15 @@ test "v2 writes map each block IO throttle device and kind separately" {
         .{ .name = "io.max", .value = "8:0 wbps=3000" },
         .{ .name = "io.max", .value = "8:0 riops=40" },
         .{ .name = "io.max", .value = "8:1 wiops=50" },
+    }, writes);
+}
+
+test "v2 unified values with several lines are written line by line" {
+    const writes = try v2Writes(std.testing.allocator, .{ .unified = &.{.{ .key = "io.max", .value = "8:0 riops=1\n8:16 riops=2\n" }} });
+    defer freeWrites(std.testing.allocator, writes);
+    try std.testing.expectEqualDeep(&[_]Write{
+        .{ .name = "io.max", .value = "8:0 riops=1\n" },
+        .{ .name = "io.max", .value = "8:16 riops=2\n" },
     }, writes);
 }
 

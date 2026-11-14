@@ -69,13 +69,37 @@ pub fn createCgroupDirectory(parent: posix.fd_t, name: [:0]const u8, path: []con
         .SUCCESS => return true,
         .EXIST => {
             if (leaf) {
-                reportDiagnostic("cgroup '{s}' already exists", .{path});
+                reportExistingLeaf(parent, name, path);
                 return error.CreateFailed;
             }
         },
         else => try checkResult(result),
     }
     return false;
+}
+
+/// igvano only creates new leaves; still name runc's reasons first, so a
+/// shared or frozen cgroup gets runc's error.
+// ponytail: counts only the leaf's own cgroup.procs, while runc counts the
+// whole subtree; walk children if a nested member ever matters.
+fn reportExistingLeaf(parent: posix.fd_t, name: [:0]const u8, path: []const u8) void {
+    reportDiagnostic("cgroup '{s}' already exists", .{path});
+    const dir = openPath(parent, name, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .NOFOLLOW = true, .CLOEXEC = true }) catch return;
+    defer closeFd(dir);
+    var scratch: [16384]u8 = undefined;
+    var fixed: std.heap.FixedBufferAllocator = .init(&scratch);
+    if (readCgroupFile(fixed.allocator(), dir, "cgroup.procs")) |procs| {
+        const count = std.mem.count(u8, procs, "\n");
+        if (count != 0) return reportDiagnostic("container's cgroup is not empty: {d} process(es) found", .{count});
+    } else |_| {}
+    fixed.reset();
+    const frozen = if (readCgroupFile(fixed.allocator(), dir, "cgroup.freeze")) |text|
+        std.mem.eql(u8, std.mem.trim(u8, text, " \n"), "1")
+    else |_| if (readCgroupFile(fixed.allocator(), dir, "freezer.state")) |text|
+        std.mem.eql(u8, std.mem.trim(u8, text, " \n"), "FROZEN")
+    else |_|
+        false;
+    if (frozen) reportDiagnostic("container's cgroup unexpectedly frozen", .{});
 }
 
 fn cgroupMode(fs_type: usize) libcontainer.Error!CgroupMode {

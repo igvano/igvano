@@ -6,13 +6,6 @@
 # Also fail with runc v1.3.3 in the same container (environment, not igvano).
 
 # igvano gaps found by the suite. Delete lines as they pass.
-cgroups::runc run (hugetlb limits)
-cgroups::runc run (per-device multiple iops via unified)
-cgroups::runc run/create should error for a non-empty cgroup
-cgroups::runc run/create should refuse pre-existing frozen cgroup
-help::runc -h
-help::runc command -h
-help::runc foo -h
 hooks_so::runc run (hooks library tests)
 kill::kill KILL [host pidns + init gone]
 kill::kill KILL [host pidns]
@@ -22,12 +15,8 @@ mounts_sshfs::runc run [dev,exec,suid,atime bind mount of a nodev,nosuid,noexec,
 mounts_sshfs::runc run [explicit-rw bind mount of a ro fuse sshfs mount]
 mounts_sshfs::runc run [mount(8)-unlike behaviour: --bind with clearing flag]
 mounts_sshfs::runc run [ro,symfollow bind mount of a rw,nodev,nosymfollow fuse sshfs mount]
-no_pivot::runc run --no-pivot must not expose bare /proc
 personality::runc run personality for i686
 personality::runc run personality with exec for i686
-pidfd-socket::runc create [ --pidfd-socket ] 
-pidfd-socket::runc exec [ --pidfd-socket ] [cgroups_v2] 
-pidfd-socket::runc run [ --pidfd-socket ] 
 ps::ps after the container stopped
 run::runc run [/proc/self/exe clone]
 run::runc run [execve error]
@@ -43,7 +32,6 @@ tty::runc exec [tty owner] ({u,g}id != 0)
 tty::runc run [tty owner] ({u,g}id != 0)
 umask::umask
 userns::userns join external namespaces [wrong userns owner]
-version::runc version
 
 # Host-dependent ("? " prefix): may pass or fail. blkio/bfq need the BFQ scheduler; spec validator needs proxy.golang.org (go mod tidy), blocked on some networks.
 ? cgroups::runc run (blkio weight)

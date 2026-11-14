@@ -14,6 +14,7 @@ const prepareProcess = @import("process.zig").prepareProcess;
 const processEnv = @import("process.zig").processEnv;
 const connectConsoleSocket = @import("process.zig").connectConsoleSocket;
 const writePidFile = @import("process.zig").writePidFile;
+const sendPidfd = @import("process.zig").sendPidfd;
 const openContainerLock = @import("state.zig").openContainerLock;
 const lockContainer = @import("state.zig").lockContainer;
 const requireLinkedLock = @import("state.zig").requireLinkedLock;
@@ -249,6 +250,10 @@ fn runExec(allocator: std.mem.Allocator, io: std.Io, container: libcontainer.Con
     const controller = try receiveExecConsole(options.console_fds, config.console_socket);
     defer if (controller) |fd| {
         _ = linux.close(fd);
+    };
+    if (config.pidfd_socket) |path| sendPidfd(path, pid, "setns") catch |err| {
+        _ = linux.kill(pid, .KILL);
+        return err;
     };
     if (config.pid_file) |path| try writePidFile(allocator, io, path, pid);
     // Do not hold the container lock while waiting for a long-running command.

@@ -46,6 +46,24 @@ pub fn connectConsoleSocket(path: []const u8) !std.posix.fd_t {
     return fd;
 }
 
+/// runc's --pidfd-socket: send a pidfd of `pid`, with runc's init type
+/// ("standard" or "setns") as the message, like setupPidfd.
+pub fn sendPidfd(path: []const u8, pid: i32, kind: []const u8) !void {
+    if (comptime builtin.os.tag != .linux) return error.NotImplemented;
+    const linux = std.os.linux;
+    const socket = connectConsoleSocket(path) catch |err| switch (err) {
+        error.InvalidPath => return oci.validationError(error.InvalidPath, "--pidfd-socket: path is empty, too long or contains NUL", .{}),
+        else => return err,
+    };
+    defer _ = linux.close(socket);
+    const opened = linux.pidfd_open(pid, 0);
+    if (linux.errno(opened) != .SUCCESS) return oci.validationError(error.PidfdFailed, "failed to pidfd_open: {s}", .{@tagName(linux.errno(opened))});
+    const pidfd: std.posix.fd_t = @intCast(opened);
+    defer _ = linux.close(pidfd);
+    libcontainer.linux.console.sendFdWithData(socket, pidfd, kind) catch
+        return oci.validationError(error.PidfdFailed, "failed to send pidfd on socket", .{});
+}
+
 fn connectConsoleSocketFd(fd: std.posix.fd_t, address: *const std.os.linux.sockaddr.un, length: std.os.linux.socklen_t, comptime system: type) !void {
     const linux = std.os.linux;
     while (true) {

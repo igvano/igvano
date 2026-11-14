@@ -30,6 +30,7 @@ pub fn main(init: std.process.Init) !u8 {
     oci.clearDiagnostic();
     const allocator = init.arena.allocator();
     const args = try init.minimal.args.toSlice(allocator);
+    if (try helpOrVersion(init.io, args)) |status| return status;
 
     var log: ?[]const u8 = null;
     var log_format: LogFormat = .text;
@@ -49,6 +50,17 @@ pub fn main(init: std.process.Init) !u8 {
         // process's own status.
         return if (config.subcommand == .exec) 255 else 1;
     };
+}
+
+fn helpOrVersion(io: std.Io, args: []const []const u8) !?u8 {
+    var out_buffer: [8192]u8 = undefined;
+    var err_buffer: [256]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buffer);
+    var errors: std.Io.Writer = .fixed(&err_buffer);
+    const status = try @import("cli/help.zig").handle(args, &out, &errors) orelse return null;
+    try std.Io.File.stdout().writeStreamingAll(io, out.buffered());
+    try std.Io.File.stderr().writeStreamingAll(io, errors.buffered());
+    return status;
 }
 
 /// Process-wide setup after parsing; a status means exit with it.
@@ -106,6 +118,7 @@ fn argumentErrorMessage(err: ParseArgsError) []const u8 {
         .{ "MissingBundle", "missing value for --bundle" },
         .{ "MissingPidFile", "missing value for --pid-file" },
         .{ "MissingConsoleSocket", "missing value for --console-socket" },
+        .{ "MissingPidfdSocket", "missing value for --pidfd-socket" },
         .{ "MissingProcessFile", "missing value for --process" },
         .{ "MissingResources", "update requires --resources <file|-> or resource flags" },
         .{ "MissingResourceValue", "missing value for resource flag" },
@@ -219,6 +232,7 @@ comptime {
         _ = @import("cli/events.zig");
         _ = @import("cli/exec.zig");
         _ = @import("cli/features.zig");
+        _ = @import("cli/help.zig");
         _ = @import("cli/hooks.zig");
         _ = @import("cli/kill.zig");
         _ = @import("cli/list.zig");

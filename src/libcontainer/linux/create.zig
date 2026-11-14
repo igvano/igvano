@@ -718,6 +718,7 @@ fn runInitChild(ctx: *const CreateContext) noreturn {
         .seccomp_ack_fd = if (ctx.sync.seccomp_ack) |fds| fds[0] else null,
         .rootless = ctx.namespaces.rootless_dumpable,
         .cpuset = if (ctx.options.resources.cpu) |cpu| cpu.cpus != null else false,
+        .no_pivot = ctx.options.no_pivot,
     }, ctx.init.start_hooks, start_input, ctx.init.apparmor_command, ctx.init.seccomp_program);
 }
 
@@ -1195,7 +1196,22 @@ fn listenerProgram(program: ?seccomp.Program) ?seccomp.Program {
     return if (value.flags & seccomp.filter_flag_new_listener != 0) value else null;
 }
 
+/// runc's Go init has a handler for every signal, so a terminating signal
+/// from the host (kill SIGTERM, or one sent through a --pidfd-socket pidfd)
+/// ends a created container. A PID namespace init without a handler would
+/// drop it. execve resets these handlers to the default.
+fn exitOnSignal(signal: linux.SIG) callconv(.c) void {
+    linux.exit_group(128 + @as(u8, @intCast(@intFromEnum(signal))));
+}
+
+fn catchTerminatingSignals() void {
+    const action: linux.Sigaction = .{ .handler = .{ .handler = exitOnSignal }, .mask = linux.sigemptyset(), .flags = 0 };
+    for ([_]linux.SIG{ .HUP, .INT, .QUIT, .TERM, .USR1, .USR2 }) |signal|
+        _ = linux.sigaction(signal, &action, null);
+}
+
 fn waitInitStart(init: *const InitContext, fifo_name: [:0]const u8) posix.fd_t {
+    catchTerminatingSignals();
     // O_WRONLY blocks until start opens a reader; the byte acknowledges that start.
     const fd: posix.fd_t = open: while (true) {
         const result = linux.openat(init.fd_dir, fifo_name, .{ .ACCMODE = .WRONLY, .CLOEXEC = true }, 0);
