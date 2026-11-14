@@ -25,6 +25,11 @@ pub const Write = struct {
     /// Like runc: the kernel may refuse this write (EINVAL) until the named
     /// later write lands, e.g. a burst above the old quota. Retry after it.
     retry_after: ?[]const u8 = null,
+    /// `optional` skips a file the kernel lacks (hugetlb rsvd). runc's setIo:
+    /// a `bfq` weight goes to io.bfq.weight when the file exists; a
+    /// `fallback` io.weight write lands only when it does not; a
+    /// `bfq_device` weight needs per-device BFQ support (Linux 5.4+).
+    mode: enum { plain, optional, bfq, fallback, bfq_device } = .plain,
 };
 
 /// Pure cgroup v2 mapping. The caller owns the slice and both strings.
@@ -131,14 +136,20 @@ fn appendV2PidsWrites(allocator: std.mem.Allocator, writes: *std.ArrayList(Write
 fn appendV2BlockIOWrites(allocator: std.mem.Allocator, writes: *std.ArrayList(Write), block: Resources.BlockIO) libcontainer.Error!void {
     if (block.weight) |weight| {
         const converted = try ioWeight(weight);
-        if (converted != 0)
+        if (converted != 0) {
+            try appendWrite(allocator, writes, "io.bfq.weight", try std.fmt.allocPrint(allocator, "{d}", .{weight}));
+            writes.items[writes.items.len - 1].mode = .bfq;
             try appendWrite(allocator, writes, "io.weight", try std.fmt.allocPrint(allocator, "{d}", .{converted}));
+            writes.items[writes.items.len - 1].mode = .fallback;
+        }
     }
+    // Like runc, per-device weights need BFQ device support; else they are skipped.
     for (block.weight_device) |device| {
         if (device.weight) |weight| {
-            const converted = try ioWeight(weight);
-            if (converted != 0)
-                try appendWrite(allocator, writes, "io.weight", try std.fmt.allocPrint(allocator, "{d}:{d} {d}", .{ device.major, device.minor, converted }));
+            if (try ioWeight(weight) != 0) {
+                try appendWrite(allocator, writes, "io.bfq.weight", try std.fmt.allocPrint(allocator, "{d}:{d} {d}", .{ device.major, device.minor, weight }));
+                writes.items[writes.items.len - 1].mode = .bfq_device;
+            }
         }
     }
     inline for (.{
@@ -159,6 +170,11 @@ fn appendV2HugepageWrites(allocator: std.mem.Allocator, writes: *std.ArrayList(W
         const name = try std.fmt.allocPrint(allocator, "hugetlb.{s}.max", .{page.page_size});
         defer allocator.free(name);
         try appendWrite(allocator, writes, name, try std.fmt.allocPrint(allocator, "{d}", .{page.limit}));
+        // Like runc, the reservation limit follows when the kernel has it.
+        const rsvd = try std.fmt.allocPrint(allocator, "hugetlb.{s}.rsvd.max", .{page.page_size});
+        defer allocator.free(rsvd);
+        try appendWrite(allocator, writes, rsvd, try std.fmt.allocPrint(allocator, "{d}", .{page.limit}));
+        writes.items[writes.items.len - 1].mode = .optional;
     }
 }
 
@@ -341,7 +357,7 @@ test "v2 resource mapping frees partially allocated writes on allocation failure
                 .unified = &.{.{ .key = "memory.high", .value = "32" }},
             });
             defer freeWrites(allocator, writes);
-            try std.testing.expectEqual(@as(usize, 16), writes.len);
+            try std.testing.expectEqual(@as(usize, 18), writes.len);
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, AllocationTest.run, .{});
@@ -414,10 +430,14 @@ test "v2 writes convert global and per-device block IO weights" {
         .{ .weight = 500, .expected = "4950" },
         .{ .weight = 1000, .expected = "10000" },
     };
+    var weight_buffer: [8]u8 = undefined;
     for (cases) |case| {
         const writes = try v2Writes(std.testing.allocator, .{ .block_io = .{ .weight = case.weight } });
         defer freeWrites(std.testing.allocator, writes);
-        try std.testing.expectEqualDeep(&[_]Write{.{ .name = "io.weight", .value = case.expected }}, writes);
+        try std.testing.expectEqualDeep(&[_]Write{
+            .{ .name = "io.bfq.weight", .value = try std.fmt.bufPrint(&weight_buffer, "{d}", .{case.weight}), .mode = .bfq },
+            .{ .name = "io.weight", .value = case.expected, .mode = .fallback },
+        }, writes);
     }
     const writes = try v2Writes(std.testing.allocator, .{ .block_io = .{
         .weight = 0,
@@ -430,8 +450,8 @@ test "v2 writes convert global and per-device block IO weights" {
     } });
     defer freeWrites(std.testing.allocator, writes);
     try std.testing.expectEqualDeep(&[_]Write{
-        .{ .name = "io.weight", .value = "8:0 1" },
-        .{ .name = "io.weight", .value = "8:1 10000" },
+        .{ .name = "io.bfq.weight", .value = "8:0 10", .mode = .bfq_device },
+        .{ .name = "io.bfq.weight", .value = "8:1 1000", .mode = .bfq_device },
     }, writes);
     for ([_]u16{ 1, 9, 1001, std.math.maxInt(u16) }) |weight|
         try std.testing.expectError(error.InvalidConfig, v2Writes(std.testing.allocator, .{ .block_io = .{ .weight = weight } }));
@@ -470,7 +490,9 @@ test "v2 writes generate hugepage filenames and apply unified entries last" {
     try std.testing.expectEqualDeep(&[_]Write{
         .{ .name = "memory.max", .value = "64" },
         .{ .name = "hugetlb.2MB.max", .value = "4194304" },
+        .{ .name = "hugetlb.2MB.rsvd.max", .value = "4194304", .mode = .optional },
         .{ .name = "hugetlb.1GB.max", .value = "0" },
+        .{ .name = "hugetlb.1GB.rsvd.max", .value = "0", .mode = .optional },
         .{ .name = "memory.max", .value = "128" },
         .{ .name = "hugetlb.2MB.max", .value = "8388608" },
         .{ .name = "custom.file", .value = "verbatim\n" },

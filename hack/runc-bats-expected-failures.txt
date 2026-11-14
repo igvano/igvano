@@ -10,7 +10,6 @@ cgroups::runc run (hugetlb limits)
 cgroups::runc run (per-device multiple iops via unified)
 cgroups::runc run/create should error for a non-empty cgroup
 cgroups::runc run/create should refuse pre-existing frozen cgroup
-delete::runc delete --force in cgroupv2 with subcgroups
 help::runc -h
 help::runc command -h
 help::runc foo -h

@@ -6,6 +6,7 @@ const Config = @import("args.zig").Config;
 const ContainerOverride = @import("state.zig").ContainerOverride;
 const createContainerFor = @import("create.zig").createContainerFor;
 const startContainer = @import("start.zig").startContainer;
+const diagnostics = @import("diagnostic.zig");
 const deleteContainer = @import("delete.zig").deleteContainer;
 const reserveStdio = @import("exec.zig").reserveStdio;
 const enableExecSubreaper = @import("exec.zig").enableExecSubreaper;
@@ -56,6 +57,9 @@ pub fn runContainer(allocator: std.mem.Allocator, io: std.Io, injected: ?Contain
 }
 
 fn removeContainer(allocator: std.mem.Allocator, io: std.Io, injected: ?ContainerOverride, config: Config, force: bool) void {
+    // Keep the failure's detail for the error report.
+    const saved: diagnostics.SavedDetail = .save();
+    defer saved.restore();
     var delete = config;
     delete.subcommand = .delete;
     delete.force = force;

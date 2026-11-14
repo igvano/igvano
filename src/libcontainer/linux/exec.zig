@@ -78,6 +78,9 @@ const ExecContext = struct {
     ns_fds: [8]posix.fd_t,
     report: [2]posix.fd_t = undefined,
     ready: [2]posix.fd_t = undefined,
+    /// Held only by the helper: its EOF tells the child the helper has
+    /// left the container cgroup, so exec cannot race the helper's exit.
+    gate: [2]posix.fd_t = .{ -1, -1 },
     /// Runtime -> exec child: "seccomp listener copied"; only with notify rules.
     seccomp_ack: ?[2]posix.fd_t = null,
 };
@@ -247,17 +250,25 @@ fn execWithNamespaces(context: *ExecContext) libcontainer.Error!i32 {
     const helper = try forkProcess();
     if (helper == 0) runExecHelper(context);
     debugLog(context.options.debug, "nsexec[{d}]: nsexec container setup", .{helper});
-    for (ready) |fd| closeFd(fd);
+    closeFd(ready[1]);
     owns_ready = false;
+    defer closeFd(ready[0]);
     closeFd(report_writer.?);
     report_writer = null;
     closeAckEnd(context, 0);
     var response: CreateResponse = .{};
-    const reported = try readExecReport(context, report[0], helper, &response);
+    const reported = readAll(report[0], std.mem.asBytes(&response));
     const status = try waitChild(helper);
     if (!reported) return error.CreateFailed;
     if (response.failureError()) |err| return err;
     if (status != 0 or response.pid <= 0) return error.CreateFailed;
+    // Like runc's parent: the setup helper is gone before the process execs.
+    awaitExecReady(context, ready[0], response.pid) catch |err| {
+        _ = linux.kill(response.pid, .KILL);
+        // A subreaper caller adopted the child when the helper exited.
+        _ = waitChild(response.pid) catch {};
+        return err;
+    };
     debugLog(context.options.debug, "child process in init()", .{});
     debugLog(context.options.debug, "setns_init: about to exec", .{});
     return response.pid;
@@ -282,23 +293,6 @@ fn closeAckEnd(context: *ExecContext, end: usize) void {
     }
 }
 
-/// Reads the helper's final report, first serving any seccomp listener reports.
-fn readExecReport(context: *ExecContext, report: posix.fd_t, helper: i32, response: *CreateResponse) libcontainer.Error!bool {
-    var reported = readAll(report, std.mem.asBytes(response));
-    while (reported and response.failure == 0 and response.seccomp_fd >= 0) {
-        const ack = if (context.seccomp_ack) |fds| fds[1] else -1;
-        deliverSeccompListener(response.pid, response.seccomp_fd, ack, context.options.on_seccomp_listener) catch |err| {
-            _ = linux.kill(response.pid, .KILL);
-            closeAckEnd(context, 1);
-            _ = waitChild(helper) catch {};
-            return err;
-        };
-        response.* = .{};
-        reported = readAll(report, std.mem.asBytes(response));
-    }
-    return reported;
-}
-
 fn runExecHelper(context: *ExecContext) noreturn {
     const options = context.options;
     const handle = context.handle;
@@ -320,8 +314,12 @@ fn runExecHelper(context: *ExecContext) noreturn {
     // namespace. Set it here; the grandchild inherits it across fork.
     applyOomScoreAdj(proc_dir, options.oom_score_adj) catch |err| failCreate(report[1], err);
     joinNamespaceFds(&joins, &context.ns_fds) catch |err| failCreate(report[1], err);
+    context.gate = makePipe() catch |err| failCreate(report[1], err);
     const child = forkProcess() catch |err| failCreate(report[1], err);
-    if (child == 0) runExecChild(context);
+    if (child == 0) {
+        closeFd(context.gate[1]);
+        runExecChild(context);
+    }
     finishExecHelper(context, child);
 }
 
@@ -454,7 +452,7 @@ fn closeExecHostFds(context: *const ExecContext, fd_dir: posix.fd_t) void {
     // Keep stdio, the sync pipe, console socket and the fd scan handle.
     const console_fd = if (options.console_fds) |fds| fds[1] else ready[1];
     const ack_fd = if (context.seccomp_ack) |fds| fds[0] else ready[1];
-    var keep = [_]posix.fd_t{ ready[1], console_fd, fd_dir, ack_fd };
+    var keep = [_]posix.fd_t{ ready[1], console_fd, fd_dir, ack_fd, context.gate[0] };
     std.mem.sort(posix.fd_t, &keep, {}, std.sort.asc(posix.fd_t));
     var next_fd: u32 = 3 + options.preserve_fds;
     for (keep) |fd| {
@@ -515,37 +513,37 @@ fn finishExecProcess(context: *const ExecContext) noreturn {
         if (seccomp_program) |program|
             installSeccompFor(program, ready[1], ack_fd, false) catch |err| failCreate(ready[1], err);
     }
+    waitHelperExit(context.gate[0]);
     execResolved(executable, argv.ptr, envp.ptr) catch {
         failCreate(ready[1], error.CreateFailed);
     };
 }
 
 fn finishExecHelper(context: *const ExecContext, child: i32) noreturn {
-    const report = context.report;
-    const ready = context.ready;
-    closeFd(ready[1]);
-    // EOF on this CLOEXEC pipe means execve succeeded or the child died
-    // before execve without reporting an error. runc's setnsProcess.start
-    // similarly accepts sync-socket EOF after procReady (parseSync).
-    // Leave either child for the caller to reap.
-    waitExecReady(ready[0], report[1], child) catch |err| {
-        _ = linux.kill(child, .KILL);
-        _ = waitChild(child) catch {};
-        failCreate(report[1], err);
-    };
-    // Leave even an already-exited child for the frontend or shim to reap.
+    closeFd(context.ready[0]);
+    closeFd(context.ready[1]);
+    closeFd(context.gate[0]);
+    // The frontend waits for the child's exec; leave the child to the
+    // nearest subreaper (the shim for detached exec, else the frontend).
+    // Exiting closes gate[1], which releases the child.
     var response: CreateResponse = .{ .pid = child };
-    if (!writeAll(report[1], std.mem.asBytes(&response))) {
+    if (!writeAll(context.report[1], std.mem.asBytes(&response))) {
         _ = linux.kill(child, .KILL);
-        _ = waitChild(child) catch {};
         linux.exit_group(1);
     }
-    // Adoption is by the nearest subreaper: the shim for detached exec,
-    // or the frontend (which enables subreaping) for an attached exec.
     linux.exit_group(0);
 }
 
-fn waitExecReady(fd: posix.fd_t, report_fd: posix.fd_t, child: i32) libcontainer.Error!void {
+fn waitHelperExit(gate: posix.fd_t) void {
+    var byte: u8 = undefined;
+    while (posix.errno(posix.system.read(gate, @ptrCast(&byte), 1)) == .INTR) {}
+    closeFd(gate);
+}
+
+/// EOF on the CLOEXEC ready pipe means execve succeeded or the child died
+/// before execve without reporting an error, as runc's parseSync accepts.
+/// Seccomp listener reports are delivered on the way.
+fn awaitExecReady(context: *ExecContext, fd: posix.fd_t, child: i32) libcontainer.Error!void {
     var response: CreateResponse = .{};
     const bytes = std.mem.asBytes(&response);
     while (true) {
@@ -556,9 +554,8 @@ fn waitExecReady(fd: posix.fd_t, report_fd: posix.fd_t, child: i32) libcontainer
                 if (!readAll(fd, bytes[1..])) return error.CreateFailed;
                 if (response.failureError()) |err| return err;
                 if (response.seccomp_fd < 0) return error.CreateFailed;
-                // Forward the listener report with the child's host PID; keep waiting.
-                response.pid = child;
-                if (!writeAll(report_fd, bytes)) return error.CreateFailed;
+                const ack = if (context.seccomp_ack) |fds| fds[1] else -1;
+                try deliverSeccompListener(child, response.seccomp_fd, ack, context.options.on_seccomp_listener);
                 response = .{};
             },
             .INTR => continue,

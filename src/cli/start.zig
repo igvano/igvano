@@ -46,7 +46,9 @@ pub fn startContainer(allocator: std.mem.Allocator, io: std.Io, injected: ?Conta
     }
     // Like runc, a failed poststart hook stops the container and fails start.
     runHooks(allocator, if (saved_hooks) |entries| entries.value.poststart else null, state.parsed.value, "poststart") catch |err| {
-        defer diagnostics.last_container_detail = null;
+        // Stopping may replace the detail; keep the hook's.
+        const saved: diagnostics.SavedDetail = .save();
+        defer saved.restore();
         stopContainer(io, container) catch |cleanup_err|
             std.debug.print("igvano: warning: cannot stop container after poststart failure: {s}\n", .{@errorName(cleanup_err)});
         return err;

@@ -1,6 +1,7 @@
 const std = @import("std");
 const oci = @import("igvano").oci;
 const libcontainer = @import("libcontainer");
+const diagnostics = @import("diagnostic.zig");
 
 /// State stays frontend-owned. The container only inserts a decimal host PID
 /// into these opaque fragments, using a buffer allocated before fork.
@@ -25,14 +26,18 @@ pub fn runHooks(allocator: std.mem.Allocator, configured: ?[]const oci.Spec.Hook
     const hooks = try oci.prepareHooks(hook_allocator, entries);
     const prepared = try libcontainer.hooks.prepare(hook_allocator, hooks);
     const json = try oci.stateJson(hook_allocator, state);
-    try libcontainer.hooks.run(prepared, json, name);
+    // Keep "error running <name> hook #N" for the frontend's error report.
+    const result = libcontainer.hooks.run(prepared, json, name);
+    try diagnostics.resultWithDetail(libcontainer.linux.diagnostic(), result);
 }
 
 pub fn warnHooks(allocator: std.mem.Allocator, configured: ?[]const oci.Spec.Hook, state: oci.State, stage: []const u8) void {
     // Best-effort hooks remain ordered even if an earlier hook failed.
     for (configured orelse &.{}) |hook| {
-        runHooks(allocator, &.{hook}, state, stage) catch |err|
+        runHooks(allocator, &.{hook}, state, stage) catch |err| {
             std.debug.print("igvano: warning: {s} hook '{s}' failed: {s}\n", .{ stage, hook.path, @errorName(err) });
+            diagnostics.last_container_detail = null;
+        };
     }
 }
 

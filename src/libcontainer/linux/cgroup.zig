@@ -176,11 +176,13 @@ test "backend cgroup paths must name a normalized child directory" {
 pub fn writeV2List(dir: posix.fd_t, writes: []const Write, path: []const u8, skip: ?[]const u8) libcontainer.Error!void {
     var pending: ?Write = null;
     var skipping = skip;
+    var bfq_missing = false;
     for (writes) |write| {
         if (skipping) |name| if (std.mem.eql(u8, name, write.name)) {
             skipping = null;
             continue;
         };
+        if (skipByMode(dir, write, &bfq_missing)) continue;
         if (write.retry_after != null) switch (tryV1Write(dir, write.name, write.value)) {
             .SUCCESS => continue,
             .INVAL => {
@@ -195,6 +197,36 @@ pub fn writeV2List(dir: posix.fd_t, writes: []const Write, path: []const u8, ski
             pending = null;
         };
     }
+}
+
+/// See Write.mode. `bfq_missing` remembers the first io.bfq.weight probe.
+fn skipByMode(dir: posix.fd_t, write: Write, bfq_missing: *bool) bool {
+    return switch (write.mode) {
+        .plain => false,
+        .optional => fileMissing(dir, write.name),
+        .fallback => !bfq_missing.*,
+        .bfq => bfq: {
+            if (!bfq_missing.*) bfq_missing.* = fileMissing(dir, "io.bfq.weight");
+            break :bfq bfq_missing.*;
+        },
+        .bfq_device => !bfqDeviceWeights(dir),
+    };
+}
+
+/// runc's bfqDeviceWeightSupported: kernels before 5.4 read back only the
+/// default weight, a single number.
+fn bfqDeviceWeights(dir: posix.fd_t) bool {
+    var scratch: [256]u8 = undefined;
+    var fixed: std.heap.FixedBufferAllocator = .init(&scratch);
+    const text = readCgroupFile(fixed.allocator(), dir, "io.bfq.weight") catch return false;
+    _ = std.fmt.parseInt(i64, std.mem.trim(u8, text, " \t\r\n"), 10) catch return true;
+    return false;
+}
+
+fn fileMissing(dir: posix.fd_t, name: []const u8) bool {
+    var buffer: [256]u8 = undefined;
+    const path = std.fmt.bufPrintZ(&buffer, "{s}", .{name}) catch return false;
+    return linux.errno(linux.faccessat(dir, path, linux.F_OK, 0)) == .NOENT;
 }
 
 fn missingFileIsFine(filename: []const u8, value: []const u8) bool {

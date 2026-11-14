@@ -337,7 +337,8 @@ fn createStateDirectory(io: std.Io, state_dir: []const u8) !void {
 fn createdContainer(detail: ?[]const u8, created: libcontainer.Error!libcontainer.Container, failure: ?anyerror) !libcontainer.Container {
     return diagnostics.resultWithDetail(detail, created) catch |err| {
         if (failure) |reason| {
-            diagnostics.last_container_detail = null;
+            // A failed hook reported its own detail; other frontend errors did not.
+            if (reason != error.HookFailed) diagnostics.last_container_detail = null;
             return reason;
         }
         return err;
