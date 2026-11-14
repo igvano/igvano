@@ -168,6 +168,10 @@ pub const ExecOptions = struct {
     scheduler: ?Scheduler = null,
     io_priority: ?IOPriority = null,
     debug: ?DebugLog = null,
+    /// runc exec --cgroup: a path below the container's cgroup to join.
+    sub_cgroup: ?[]const u8 = null,
+    /// runc exec --preserve-fds: fds 3..3+N-1 reach the process.
+    preserve_fds: u32 = 0,
 };
 
 /// Where --debug lines go: an O_APPEND log file or stderr.

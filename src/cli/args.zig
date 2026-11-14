@@ -65,6 +65,13 @@ pub const Config = struct {
     exec_user: ?ExecUser = null,
     /// Borrowed option tokens, scanned again to collect repeated --env values.
     exec_flags: []const []const u8 = &.{},
+    exec_no_new_privs: ?bool = null,
+    exec_apparmor: ?[]const u8 = null,
+    /// --cgroup: a sub-cgroup of the container's to join.
+    exec_cgroup: ?[]const u8 = null,
+    ignore_paused: bool = false,
+    /// --preserve-fds: pass fds 3..3+N-1 through to the process.
+    preserve_fds: u16 = 0,
     exec_args: []const []const u8 = &.{},
 };
 
@@ -243,27 +250,89 @@ fn parseCommandOptions(args: []const []const u8, index: *usize, config: *Config)
     }
 }
 
+pub const ExecOption = enum { detach, tty, process, pid_file, console_socket, cwd, user, env, additional_gids, cap, no_new_privs, apparmor, process_label, preserve_fds, cgroup, ignore_paused };
+
+/// runc exec's flags, short aliases included.
+pub const exec_options = std.StaticStringMap(ExecOption).initComptime(.{
+    .{ "--detach", .detach },             .{ "-d", .detach },                         .{ "--tty", .tty },                     .{ "-t", .tty },
+    .{ "--process", .process },           .{ "-p", .process },                        .{ "--pid-file", .pid_file },           .{ "--console-socket", .console_socket },
+    .{ "--cwd", .cwd },                   .{ "--user", .user },                       .{ "-u", .user },                       .{ "--env", .env },
+    .{ "-e", .env },                      .{ "--additional-gids", .additional_gids }, .{ "-g", .additional_gids },            .{ "--cap", .cap },
+    .{ "-c", .cap },                      .{ "--no-new-privs", .no_new_privs },       .{ "--apparmor", .apparmor },           .{ "--process-label", .process_label },
+    .{ "--preserve-fds", .preserve_fds }, .{ "--cgroup", .cgroup },                   .{ "--ignore-paused", .ignore_paused },
+});
+
+pub fn execOptionIsBool(option: ExecOption) bool {
+    return switch (option) {
+        .detach, .tty, .no_new_privs, .ignore_paused => true,
+        else => false,
+    };
+}
+
+/// The values of a repeatable exec flag (--env, --additional-gids, --cap),
+/// in order, from the already validated exec_flags.
+pub const ExecValues = struct {
+    flags: []const []const u8,
+    option: ExecOption,
+    index: usize = 0,
+
+    pub fn next(self: *ExecValues) ?[]const u8 {
+        while (self.index < self.flags.len) {
+            const flag = self.flags[self.index];
+            const option = exec_options.get(optionName(flag)).?;
+            const inline_value = std.mem.indexOfScalar(u8, flag, '=');
+            self.index += 1;
+            if (execOptionIsBool(option)) continue;
+            const value = if (inline_value) |equals| flag[equals + 1 ..] else value: {
+                self.index += 1;
+                break :value self.flags[self.index - 1];
+            };
+            if (option == self.option) return value;
+        }
+        return null;
+    }
+};
+
+fn applyExecBool(config: *Config, option: ExecOption, value: bool) void {
+    switch (option) {
+        .detach => config.detach = value,
+        .tty => config.tty = value,
+        .no_new_privs => config.exec_no_new_privs = value,
+        .ignore_paused => config.ignore_paused = value,
+        else => unreachable,
+    }
+}
+
 fn parseExecOptions(args: []const []const u8, index: *usize, config: *Config) !void {
-    const options = std.StaticStringMap(enum { detach, tty, process, pid_file, console_socket, cwd, user, env }).initComptime(.{
-        .{ "--detach", .detach },   .{ "-d", .detach },           .{ "--tty", .tty },                       .{ "-t", .tty },
-        .{ "--process", .process }, .{ "--pid-file", .pid_file }, .{ "--console-socket", .console_socket }, .{ "--cwd", .cwd },
-        .{ "--user", .user },       .{ "--env", .env },
-    });
     while (index.* < args.len and std.mem.startsWith(u8, args[index.*], "-")) : (index.* += 1) {
         const flag = args[index.*];
+        const option = exec_options.get(optionName(flag)) orelse return oci.validationError(error.UnknownOption, "unknown option '{s}'", .{flag});
         // Short boolean flags accept only their bare form.
-        if (std.mem.startsWith(u8, flag, "-d=") or std.mem.startsWith(u8, flag, "-t="))
+        if (execOptionIsBool(option) and flag.len > 1 and flag[1] != '-' and std.mem.indexOfScalar(u8, flag, '=') != null)
             return oci.validationError(error.UnknownOption, "unknown option '{s}'", .{flag});
-        switch (options.get(optionName(flag)) orelse return oci.validationError(error.UnknownOption, "unknown option '{s}'", .{flag})) {
-            .detach => config.detach = try boolOption(flag),
-            .tty => config.tty = try boolOption(flag),
-            .process => config.process_file = try optionValue(args, index, error.MissingProcessFile),
-            .pid_file => config.pid_file = try optionValue(args, index, error.MissingPidFile),
-            .console_socket => config.console_socket = try optionValue(args, index, error.MissingConsoleSocket),
-            .cwd => config.exec_cwd = try optionValue(args, index, error.MissingCwd),
-            .user => config.exec_user = try parseUser(try optionValue(args, index, error.MissingUser)),
-            .env => try oci.validateEnv(try optionValue(args, index, error.MissingEnv)),
-        }
+        try applyExecOption(args, index, config, option, flag);
+    }
+}
+
+fn applyExecOption(args: []const []const u8, index: *usize, config: *Config, option: ExecOption, flag: []const u8) !void {
+    if (execOptionIsBool(option)) return applyExecBool(config, option, try boolOption(flag));
+    switch (option) {
+        .detach, .tty, .no_new_privs, .ignore_paused => unreachable,
+        .process => config.process_file = try optionValue(args, index, error.MissingProcessFile),
+        .pid_file => config.pid_file = try optionValue(args, index, error.MissingPidFile),
+        .console_socket => config.console_socket = try optionValue(args, index, error.MissingConsoleSocket),
+        .cwd => config.exec_cwd = try optionValue(args, index, error.MissingCwd),
+        .user => config.exec_user = try parseUser(try optionValue(args, index, error.MissingUser)),
+        .env => try oci.validateEnv(try optionValue(args, index, error.MissingEnv)),
+        .additional_gids => _ = try numericId(try optionValue(args, index, error.MissingExecValue)),
+        .cap, .process_label => _ = try optionValue(args, index, error.MissingExecValue),
+        .apparmor => config.exec_apparmor = try optionValue(args, index, error.MissingExecValue),
+        .cgroup => config.exec_cgroup = try optionValue(args, index, error.MissingExecValue),
+        .preserve_fds => {
+            const value = try optionValue(args, index, error.MissingExecValue);
+            config.preserve_fds = std.fmt.parseUnsigned(u16, value, 10) catch
+                return oci.validationError(error.InvalidExecValue, "--preserve-fds: expected a number", .{});
+        },
     }
 }
 
@@ -518,6 +587,7 @@ pub fn optionValue(args: []const []const u8, index: *usize, comptime missing: er
     MissingUser,
     MissingFormat,
     MissingInterval,
+    MissingExecValue,
 }) ![]const u8 {
     const token = args[index.*];
     const flag = token[0 .. std.mem.indexOfScalar(u8, token, '=') orelse token.len];

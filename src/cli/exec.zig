@@ -9,7 +9,7 @@ const ContainerOverride = @import("state.zig").ContainerOverride;
 const bindContainer = @import("state.zig").bindContainer;
 const Config = @import("args.zig").Config;
 const parseArgs = @import("args.zig").parseArgs;
-const optionValue = @import("args.zig").optionValue;
+const ExecValues = @import("args.zig").ExecValues;
 const prepareProcess = @import("process.zig").prepareProcess;
 const processEnv = @import("process.zig").processEnv;
 const connectConsoleSocket = @import("process.zig").connectConsoleSocket;
@@ -30,24 +30,40 @@ fn execProcessConfig(allocator: std.mem.Allocator, inherited: oci.Spec.Process, 
         process.user.uid = value.uid;
         if (value.gid) |gid| process.user.gid = gid;
     }
+    if (config.exec_no_new_privs) |value| process.noNewPrivileges = value;
+    if (config.exec_apparmor) |value| process.apparmorProfile = value;
     var env: std.ArrayList([]const u8) = .empty;
     errdefer env.deinit(allocator);
     try env.appendSlice(allocator, process.env orelse &.{});
-    var index: usize = 0;
-    while (index < config.exec_flags.len) : (index += 1) {
-        const flag = config.exec_flags[index];
-        if (std.mem.eql(u8, flag, "--env") or std.mem.startsWith(u8, flag, "--env=")) {
-            const value = try optionValue(config.exec_flags, &index, error.MissingEnv);
-            try replaceExecEnv(allocator, &env, value);
-        } else if (std.mem.indexOfScalar(u8, flag, '=') == null and
-            !std.mem.eql(u8, flag, "--detach") and !std.mem.eql(u8, flag, "-d") and
-            !std.mem.eql(u8, flag, "--tty") and !std.mem.eql(u8, flag, "-t"))
-        {
-            index += 1; // Skip the value of another parsed option.
+    var envs: ExecValues = .{ .flags = config.exec_flags, .option = .env };
+    while (envs.next()) |value| try replaceExecEnv(allocator, &env, value);
+    process.env = try env.toOwnedSlice(allocator);
+    var gids: std.ArrayList(u32) = .empty;
+    try gids.appendSlice(allocator, process.user.additionalGids orelse &.{});
+    var gid_values: ExecValues = .{ .flags = config.exec_flags, .option = .additional_gids };
+    while (gid_values.next()) |value| try gids.append(allocator, try std.fmt.parseUnsigned(u32, value, 10));
+    process.user.additionalGids = try gids.toOwnedSlice(allocator);
+    try addExecCapabilities(allocator, &process, config.exec_flags);
+    return process;
+}
+
+/// runc exec --cap: add to bounding, effective and permitted, and to ambient
+/// only when the spec already sets inheritable.
+fn addExecCapabilities(allocator: std.mem.Allocator, process: *oci.Spec.Process, flags: []const []const u8) !void {
+    var caps: ExecValues = .{ .flags = flags, .option = .cap };
+    if (caps.next() == null) return;
+    caps.index = 0;
+    var current = process.capabilities orelse oci.Spec.Capabilities{};
+    inline for (.{ "bounding", "effective", "permitted", "ambient" }) |field| {
+        if (!std.mem.eql(u8, field, "ambient") or current.inheritable != null) {
+            var list: std.ArrayList([]const u8) = .empty;
+            try list.appendSlice(allocator, @field(current, field) orelse &.{});
+            var values: ExecValues = .{ .flags = flags, .option = .cap };
+            while (values.next()) |value| try list.append(allocator, value);
+            @field(current, field) = try list.toOwnedSlice(allocator);
         }
     }
-    process.env = try env.toOwnedSlice(allocator);
-    return process;
+    process.capabilities = current;
 }
 
 fn replaceExecEnv(allocator: std.mem.Allocator, env: *std.ArrayList([]const u8), value: []const u8) !void {
@@ -79,7 +95,7 @@ pub fn execContainer(allocator: std.mem.Allocator, io: std.Io, injected: ?Contai
     defer state.deinit();
     var instance: ContainerInstance = undefined;
     const container = if (state.container_state) |value| bindContainer(&instance, injected, value) else null;
-    if (state.parsed.value.status != .created and state.parsed.value.status != .running) return oci.validationError(error.InvalidStatus, "exec: requires created or running state", .{});
+    try requireExecStatus(state.parsed.value.status, config.ignore_paused);
 
     var arena: std.heap.ArenaAllocator = .init(allocator);
     defer arena.deinit();
@@ -94,6 +110,16 @@ pub fn execContainer(allocator: std.mem.Allocator, io: std.Io, injected: ?Contai
         if (agent) |value| if (value.failure) |reason| return reason;
         return err;
     };
+}
+
+/// runc's messages; a paused container needs --ignore-paused.
+fn requireExecStatus(status: oci.Status, ignore_paused: bool) !void {
+    switch (status) {
+        .created, .running => {},
+        .paused => if (!ignore_paused) return oci.validationError(error.InvalidStatus, "cannot exec in a paused container (use --ignore-paused to override)", .{}),
+        .stopped => return oci.validationError(error.InvalidStatus, "cannot exec in a stopped container", .{}),
+        else => return oci.validationError(error.InvalidStatus, "exec: requires created or running state", .{}),
+    }
 }
 
 pub fn reserveStdio() !void {
@@ -139,6 +165,8 @@ fn prepareExecOptions(process_allocator: std.mem.Allocator, io: std.Io, state: L
     options.cgroup_path = state.container_state.?.cgroup_path orelse "";
     options.console_fds = if (process.terminal orelse false) try libcontainer.linux.console.socketpair() else null;
     options.debug = config.debug_log;
+    options.sub_cgroup = config.exec_cgroup;
+    options.preserve_fds = config.preserve_fds;
     if (process.env != null) {
         const root = try std.fmt.allocPrint(process_allocator, "/proc/{d}/root", .{state.parsed.value.pid orelse 0});
         options.envp = try processEnv(process_allocator, options.envp, root, options.uid);
@@ -270,8 +298,13 @@ pub fn waitExec(pid: i32) !u8 {
 }
 
 test "exec command overrides inherit process settings and replace environment keys" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
     const config = try parseArgs(&.{
-        "igvano", "exec", "--cwd", "/work", "--env", "A=first", "--env=A=last", "--env", "NEW=x=y", "--user=1000:1001", "-t", "example", "sh", "-c", "exit 7",
+        "igvano", "exec",           "--cwd", "/work", "-e",                  "A=first", "--env=A=last", "--env",   "NEW=x=y", "--user=1000:1001",
+        "-t",     "--no-new-privs", "-g",    "7",     "--additional-gids=8", "--cap",   "CAP_KILL",     "example", "sh",      "-c",
+        "exit 7",
     });
     const original: oci.Spec.Process = .{
         .args = &.{"sleep"},
@@ -284,18 +317,20 @@ test "exec command overrides inherit process settings and replace environment ke
         .capabilities = .{ .bounding = &.{"CAP_CHOWN"} },
         .rlimits = &.{.{ .type = "RLIMIT_NOFILE", .hard = 1024, .soft = 512 }},
     };
-    const process = try execProcessConfig(std.testing.allocator, original, config);
-    defer std.testing.allocator.free(process.env.?);
+    const process = try execProcessConfig(allocator, original, config);
     try std.testing.expectEqualSlices([]const u8, config.exec_args, process.args);
     try std.testing.expectEqualStrings("/work", process.cwd);
     try std.testing.expect(process.terminal.?);
     try std.testing.expectEqual(@as(u32, 1000), process.user.uid);
     try std.testing.expectEqual(@as(u32, 1001), process.user.gid);
-    try std.testing.expectEqual(@as(u32, 42), process.user.additionalGids.?[0]);
+    try std.testing.expectEqualSlices(u32, &.{ 42, 7, 8 }, process.user.additionalGids.?);
     try std.testing.expect(process.noNewPrivileges);
     try std.testing.expectEqualStrings("igvano-default", process.apparmorProfile.?);
     try std.testing.expectEqual(original.oomScoreAdj, process.oomScoreAdj);
     try std.testing.expectEqualStrings("CAP_CHOWN", process.capabilities.?.bounding.?[0]);
+    try std.testing.expectEqualStrings("CAP_KILL", process.capabilities.?.bounding.?[1]);
+    try std.testing.expectEqualStrings("CAP_KILL", process.capabilities.?.permitted.?[0]);
+    try std.testing.expect(process.capabilities.?.ambient == null);
     try std.testing.expectEqual(original.rlimits.?[0].hard, process.rlimits.?[0].hard);
     try std.testing.expectEqual(@as(usize, 3), process.env.?.len);
     try std.testing.expectEqualStrings("KEEP=value", process.env.?[0]);
@@ -305,8 +340,7 @@ test "exec command overrides inherit process settings and replace environment ke
     try std.testing.expectEqual(@as(?u32, null), uid_only.exec_user.?.gid);
     var terminal_init = original;
     terminal_init.terminal = true;
-    const no_tty = try execProcessConfig(std.testing.allocator, terminal_init, uid_only);
-    defer std.testing.allocator.free(no_tty.env.?);
+    const no_tty = try execProcessConfig(allocator, terminal_init, uid_only);
     try std.testing.expect(!no_tty.terminal.?);
     try std.testing.expectEqual(@as(u32, 99), no_tty.user.uid);
     try std.testing.expectEqual(@as(u32, 1002), no_tty.user.gid);

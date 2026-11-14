@@ -321,10 +321,29 @@ fn applyCapabilities(caps: libcontainer.Capabilities) libcontainer.Error!void {
     try checkResult(linux.prctl(@intFromEnum(linux.PR.SET_KEEPCAPS), 0, 0, 0, 0));
     // Discard inherited ambient caps even when the configured set is empty.
     try checkResult(linux.prctl(@intFromEnum(linux.PR.CAP_AMBIENT), linux.PR.CAP_AMBIENT_CLEAR_ALL, 0, 0, 0));
+    // Like runc, raise ambient caps one by one and only warn on failure
+    // (an ambient cap must also be permitted and inheritable).
     for (0..64) |cap| {
-        if (caps.ambient & (@as(u64, 1) << @intCast(cap)) != 0)
-            try checkResult(linux.prctl(@intFromEnum(linux.PR.CAP_AMBIENT), linux.PR.CAP_AMBIENT_RAISE, cap, 0, 0));
+        if (caps.ambient & (@as(u64, 1) << @intCast(cap)) == 0) continue;
+        const result = linux.prctl(@intFromEnum(linux.PR.CAP_AMBIENT), linux.PR.CAP_AMBIENT_RAISE, cap, 0, 0);
+        if (linux.errno(result) == .SUCCESS) continue;
+        var buffer: [128]u8 = undefined;
+        const line = std.fmt.bufPrint(&buffer, "igvano: warning: can't raise ambient capability {s}: {s}\n", .{ capabilityName(cap), errnoText(linux.errno(result)) orelse @tagName(linux.errno(result)) }) catch continue;
+        _ = writeAll(2, line);
     }
+}
+
+const capability_names = names: {
+    var result: [linux.CAP.LAST_CAP + 1][]const u8 = @splat("CAP_UNKNOWN");
+    for (std.meta.declarations(linux.CAP)) |decl| {
+        if (!std.mem.eql(u8, decl.name, "LAST_CAP") and @TypeOf(@field(linux.CAP, decl.name)) == comptime_int)
+            result[@field(linux.CAP, decl.name)] = "CAP_" ++ decl.name;
+    }
+    break :names result;
+};
+
+fn capabilityName(cap: usize) []const u8 {
+    return if (cap < capability_names.len) capability_names[cap] else "CAP_UNKNOWN";
 }
 
 pub fn applyRlimits(rlimits: []const libcontainer.Rlimit) libcontainer.Error!void {
@@ -370,12 +389,32 @@ pub fn resolveExecutable(argv: [*:null]const ?[*:0]const u8, envp: [*:null]const
 
 pub fn execResolved(executable: [*:0]const u8, argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*:0]const u8) error{ExecFailed}!noreturn {
     const err = linux.errno(linux.execve(executable, argv, envp));
-    // Linux's errno tags omit the E prefix used by runtime diagnostics.
-    var errno_buffer: [16]u8 = undefined;
-    const errno_name = std.enums.tagName(linux.E, err) orelse
-        (std.fmt.bufPrint(&errno_buffer, "{d}", .{@intFromEnum(err)}) catch unreachable);
-    reportDiagnostic("cannot execute process: E{s}", .{errno_name});
+    // runc's wording: "exec <args[0]>: <strerror>".
+    var errno_buffer: [24]u8 = undefined;
+    const text = errnoText(err) orelse if (std.enums.tagName(linux.E, err)) |name|
+        std.fmt.bufPrint(&errno_buffer, "E{s}", .{name}) catch unreachable
+    else
+        std.fmt.bufPrint(&errno_buffer, "errno {d}", .{@intFromEnum(err)}) catch unreachable;
+    reportDiagnostic("exec {s}: {s}", .{ std.mem.span(argv[0] orelse executable), text });
     return error.ExecFailed;
+}
+
+/// Go's syscall.Errno text for the errors execve commonly returns.
+fn errnoText(err: linux.E) ?[]const u8 {
+    return switch (err) {
+        .NOENT => "no such file or directory",
+        .ACCES => "permission denied",
+        .NOEXEC => "exec format error",
+        .PERM => "operation not permitted",
+        .NOTDIR => "not a directory",
+        .LOOP => "too many levels of symbolic links",
+        .@"2BIG" => "argument list too long",
+        .TXTBSY => "text file busy",
+        .NOMEM => "cannot allocate memory",
+        .ISDIR => "is a directory",
+        .INVAL => "invalid argument",
+        else => null,
+    };
 }
 
 pub fn execProcess(argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*:0]const u8) error{ExecFailed}!noreturn {

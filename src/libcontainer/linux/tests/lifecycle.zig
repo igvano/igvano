@@ -292,17 +292,6 @@ test "linux create rejects a cwd missing from the resolved rootfs" {
     );
 }
 
-test "linux create reports the frontend ambient capability validation error" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
-    try expectCreateError(error.AmbientCapabilitiesRequirePermittedAndInheritable, .{
-        .allocator = std.testing.allocator,
-        .id = "example",
-        .rootfs = "/",
-        .exec_fifo = "/dev/null",
-        .capabilities = .{ .ambient = 1 },
-    });
-}
-
 test "linux init reopens its root-owned pinned FIFO only for writing after dropping uid" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     if (linux.geteuid() != 0) return error.SkipZigTest;

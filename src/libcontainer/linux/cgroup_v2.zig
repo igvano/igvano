@@ -10,6 +10,7 @@ const openPath = @import("syscall.zig").openPath;
 const reportDiagnostic = @import("diagnostic.zig").reportDiagnostic;
 const createCgroupDirectory = @import("cgroup.zig").createCgroupDirectory;
 const validateCgroupPath = @import("cgroup.zig").validateCgroupPath;
+const tryV1Write = @import("cgroup_v1.zig").tryV1Write;
 const readCgroupFile = @import("cgroup.zig").readCgroupFile;
 const writeCgroupFile = @import("cgroup.zig").writeCgroupFile;
 const killV1Members = @import("cgroup_v1.zig").killV1Members;
@@ -656,7 +657,10 @@ pub fn walkCgroup(root: posix.fd_t, path: []const u8, create: bool, writes: []co
         var buffer: [256]u8 = undefined;
         const name = std.fmt.bufPrintZ(&buffer, "{s}", .{component}) catch return error.InvalidPath;
         if (needs_controller) try enableRequestedControllers(current, writes, path);
-        if (create) _ = try createCgroupDirectory(current, name, path, components.peek() == null);
+        if (create) {
+            enableAllControllers(current);
+            _ = try createCgroupDirectory(current, name, path, components.peek() == null);
+        }
         const result = linux.openat(current, name, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .NOFOLLOW = true, .CLOEXEC = true }, 0);
         switch (linux.errno(result)) {
             .SUCCESS => {
@@ -672,6 +676,28 @@ pub fn walkCgroup(root: posix.fd_t, path: []const u8, create: bool, writes: []co
         }
     }
     return current;
+}
+
+/// Like runc's CreateCgroupPath: offer every available controller to the
+/// new cgroup, best effort (all at once, then one by one), so a later
+/// update or a nested runtime can use them. Errors are ignored, as in runc.
+fn enableAllControllers(dir: posix.fd_t) void {
+    var scratch: [4096]u8 = undefined;
+    var fixed: std.heap.FixedBufferAllocator = .init(&scratch);
+    const available = readCgroupFile(fixed.allocator(), dir, "cgroup.controllers") catch return;
+    var all: [4096]u8 = undefined;
+    var used: usize = 0;
+    var names = std.mem.tokenizeAny(u8, available, " \n");
+    while (names.next()) |name| {
+        const entry = std.fmt.bufPrint(all[used..], "{s}+{s}", .{ if (used == 0) "" else " ", name }) catch return;
+        used += entry.len;
+    }
+    if (used == 0 or tryV1Write(dir, "cgroup.subtree_control", all[0..used]) == .SUCCESS) return;
+    names.reset();
+    while (names.next()) |name| {
+        var one: [64]u8 = undefined;
+        _ = tryV1Write(dir, "cgroup.subtree_control", std.fmt.bufPrint(&one, "+{s}", .{name}) catch continue);
+    }
 }
 
 fn needsCgroupController(writes: []const Write) bool {

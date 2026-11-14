@@ -178,8 +178,6 @@ const CreateContext = struct {
 // Each step owns a defer scope that stays active through the following steps.
 pub fn create(options: libcontainer.CreateOptions) libcontainer.Error!libcontainer.State {
     diagnostics.last_diagnostic_len = 0;
-    diagnostics.from_child = false;
-    errdefer diagnostics.relayChildDiagnostic(options.console_fds != null);
     if (comptime builtin.os.tag == .linux) {
         var context: CreateContext = .{ .options = options, .allocator = options.allocator };
         try validateCreate(&context);
@@ -223,10 +221,6 @@ fn validateCreateProcess(ctx: *CreateContext) libcontainer.Error!void {
     }
     const terminal = if (ctx.options.process) |process| process.terminal else false;
     if (terminal != (ctx.options.console_fds != null)) return error.InvalidConfig;
-    if (ctx.options.capabilities) |caps| {
-        if (caps.ambient & ~(caps.permitted & caps.inheritable) != 0)
-            return error.AmbientCapabilitiesRequirePermittedAndInheritable;
-    }
     ctx.init.capabilities = if (ctx.options.capabilities) |caps| try kernelCapabilities(caps) else null;
     for (ctx.options.rlimits) |limit| {
         if (limit.soft > limit.hard) return error.InvalidConfig;
@@ -1218,7 +1212,10 @@ fn startInitProcess(init: *const InitContext, executable: ?[*:0]const u8, fd: po
     // startContainer hooks: a failing hook only stops init, with the error on
     // its stderr. The CLOEXEC writer makes EOF confirm exec or that exit.
     if (!writeAll(fd, &.{1})) linux.exit_group(1);
-    hooks.runWithCloexecFds(init.start_hooks, init.start_hook_state, "startContainer") catch linux.exit_group(1);
+    hooks.runWithCloexecFds(init.start_hooks, init.start_hook_state, "startContainer") catch {
+        diagnostics.printDiagnostic();
+        linux.exit_group(1);
+    };
     // A notify filter was already installed during create.
     const late_program = if (listenerProgram(init.seccomp_program) == null) init.seccomp_program else null;
     runProcess(init.process, executable, init.argv, init.envp, late_program) catch |err| {

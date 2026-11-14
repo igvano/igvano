@@ -24,6 +24,8 @@ const walkCgroup = @import("cgroup_v2.zig").walkCgroup;
 const validateCgroupPath = @import("cgroup.zig").validateCgroupPath;
 const openCgroupRoot = @import("cgroup.zig").openCgroupRoot;
 const writeCgroupFile = @import("cgroup.zig").writeCgroupFile;
+const tryV1Write = @import("cgroup_v1.zig").tryV1Write;
+const readCgroupFile = @import("cgroup.zig").readCgroupFile;
 const V1Hierarchy = @import("cgroup_v1.zig").V1Hierarchy;
 const freeV1Hierarchies = @import("cgroup_v1.zig").freeV1Hierarchies;
 const openV1Hierarchies = @import("cgroup_v1.zig").openV1Hierarchies;
@@ -69,6 +71,8 @@ const ExecContext = struct {
     proc_dir: posix.fd_t,
     root: posix.fd_t,
     cgroup: ?posix.fd_t,
+    /// cgroup v2: init's current cgroup, when it moved below the container's.
+    init_cgroup: ?posix.fd_t = null,
     hierarchies: []V1Hierarchy,
     joins: [8]NamespaceJoin,
     ns_fds: [8]posix.fd_t,
@@ -80,8 +84,6 @@ const ExecContext = struct {
 
 pub fn exec(handle: libcontainer.State, options: libcontainer.ExecOptions) libcontainer.Error!i32 {
     diagnostics.last_diagnostic_len = 0;
-    diagnostics.from_child = false;
-    errdefer diagnostics.relayChildDiagnostic(options.console_fds != null);
     if (comptime builtin.os.tag != .linux) return error.NotImplemented;
     if (!try alive(handle)) return error.ProcessNotFound;
     if (options.argv.len == 0 or options.argv[0].len == 0 or !std.fs.path.isAbsolute(options.cwd))
@@ -123,16 +125,41 @@ fn prepareExecProcess(allocator: std.mem.Allocator, options: libcontainer.ExecOp
         .capabilities = if (options.capabilities) |caps| try kernelCapabilities(caps) else null,
         .rlimits = options.rlimits,
     };
-    if (process.capabilities) |caps| {
-        if (caps.ambient & ~(caps.permitted & caps.inheritable) != 0)
-            return error.AmbientCapabilitiesRequirePermittedAndInheritable;
-    }
     for (options.rlimits) |limit| if (limit.soft > limit.hard) return error.InvalidConfig;
     return .{ .apparmor_command = apparmor_command, .seccomp_program = seccomp_program, .cwd = cwd, .argv = argv, .envp = envp, .settings = process };
 }
 
-fn execWithCgroups(handle: libcontainer.State, options: libcontainer.ExecOptions, allocator: std.mem.Allocator, prepared: ExecProcess, proc_dir: posix.fd_t, root: posix.fd_t) libcontainer.Error!i32 {
-    if (options.cgroup_path.len == 0) return execWithNamespacesOf(handle, options, allocator, prepared, proc_dir, root, null, &.{});
+/// runc's SubCgroupPaths check: path.Join(base, sub) must stay below base.
+/// Returns the joined path, without the leading slash.
+pub fn subCgroupPath(allocator: std.mem.Allocator, base: []const u8, sub: []const u8) libcontainer.Error![]const u8 {
+    // Like Go's path.Join, an absolute sub is still below base.
+    const joined = try std.fs.path.resolvePosix(allocator, &.{try std.fmt.allocPrint(allocator, "/{s}/{s}", .{ base, sub })});
+    const prefix = try std.fs.path.resolvePosix(allocator, &.{ "/", base });
+    if (!std.mem.startsWith(u8, joined, prefix) or (joined.len > prefix.len and joined[prefix.len] != '/')) {
+        reportDiagnostic("{s} is not a sub cgroup path", .{sub});
+        return error.InvalidConfig;
+    }
+    return joined[1..];
+}
+
+test "exec sub-cgroups stay below the container cgroup, like runc" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    defer diagnostics.last_diagnostic_len = 0;
+    try std.testing.expectEqualStrings("c/x", try subCgroupPath(a, "c", "x"));
+    try std.testing.expectEqualStrings("c", try subCgroupPath(a, "c", "/"));
+    try std.testing.expectEqualStrings("c/y", try subCgroupPath(a, "c", "x/../y"));
+    try std.testing.expectError(error.InvalidConfig, subCgroupPath(a, "c", ".."));
+    try std.testing.expectError(error.InvalidConfig, subCgroupPath(a, "a/c", "../cc"));
+}
+
+fn execWithCgroups(handle: libcontainer.State, base_options: libcontainer.ExecOptions, allocator: std.mem.Allocator, prepared: ExecProcess, proc_dir: posix.fd_t, root: posix.fd_t) libcontainer.Error!i32 {
+    var options = base_options;
+    if (options.cgroup_path.len == 0) return execWithNamespacesOf(handle, options, allocator, prepared, proc_dir, root, .{}, &.{});
+    if (options.sub_cgroup) |sub| options.cgroup_path = try subCgroupPath(allocator, options.cgroup_path, sub);
+    errdefer |err| if (err == error.ProcessNotFound and options.sub_cgroup != null)
+        reportDiagnostic("error adding pid to cgroups: /sys/fs/cgroup/{s}/cgroup.procs: no such file or directory", .{options.cgroup_path});
     const cgroup_root = try openCgroupRoot();
     defer closeFd(cgroup_root.fd);
     const cgroup: ?posix.fd_t = if (cgroup_root.mode == .unified)
@@ -144,10 +171,29 @@ fn execWithCgroups(handle: libcontainer.State, options: libcontainer.ExecOptions
     defer if (cgroup_root.mode == .legacy) freeV1Hierarchies(allocator, hierarchies);
     for (hierarchies) |*hierarchy|
         hierarchy.leaf = (try walkV1Cgroup(allocator, hierarchy.root.?, hierarchy.mount_root, options.cgroup_path, false, false)) orelse return error.ProcessNotFound;
-    return execWithNamespacesOf(handle, options, allocator, prepared, proc_dir, root, cgroup, hierarchies);
+    // runc: --cgroup disables the fallback to init's cgroup.
+    const init_cgroup = if (cgroup != null and options.sub_cgroup == null) try openInitCgroup(allocator, cgroup_root.fd, handle.pid, options.cgroup_path) else null;
+    defer if (init_cgroup) |fd| closeFd(fd);
+    return execWithNamespacesOf(handle, options, allocator, prepared, proc_dir, root, .{ .cgroup = cgroup, .init_cgroup = init_cgroup }, hierarchies);
 }
 
-fn execWithNamespacesOf(handle: libcontainer.State, options: libcontainer.ExecOptions, allocator: std.mem.Allocator, prepared: ExecProcess, proc_dir: posix.fd_t, root: posix.fd_t, cgroup: ?posix.fd_t, hierarchies: []V1Hierarchy) libcontainer.Error!i32 {
+/// Init's cgroup v2 path from /proc/<pid>/cgroup, if it is below `base`.
+fn openInitCgroup(allocator: std.mem.Allocator, cgroup_root: posix.fd_t, pid: i32, base: []const u8) libcontainer.Error!?posix.fd_t {
+    var path_buffer: [32]u8 = undefined;
+    const proc = std.fmt.bufPrintZ(&path_buffer, "/proc/{d}", .{pid}) catch unreachable;
+    const dir = openPath(linux.AT.FDCWD, proc, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true }) catch return null;
+    defer closeFd(dir);
+    const text = readCgroupFile(allocator, dir, "cgroup") catch return null;
+    const line = std.mem.trim(u8, text, " \n");
+    if (!std.mem.startsWith(u8, line, "0::/")) return null;
+    const current = line["0::/".len..];
+    if (std.mem.eql(u8, current, base) or !std.mem.startsWith(u8, current, base) or current.len <= base.len or current[base.len] != '/') return null;
+    return walkCgroup(cgroup_root, current, false, &.{}) catch null;
+}
+
+const ExecCgroups = struct { cgroup: ?posix.fd_t = null, init_cgroup: ?posix.fd_t = null };
+
+fn execWithNamespacesOf(handle: libcontainer.State, options: libcontainer.ExecOptions, allocator: std.mem.Allocator, prepared: ExecProcess, proc_dir: posix.fd_t, root: posix.fd_t, cgroups: ExecCgroups, hierarchies: []V1Hierarchy) libcontainer.Error!i32 {
     var joins: [8]NamespaceJoin = undefined;
     var ns_fds: [8]posix.fd_t = @splat(-1);
     defer for (ns_fds) |fd| if (fd >= 0) closeFd(fd);
@@ -160,7 +206,8 @@ fn execWithNamespacesOf(handle: libcontainer.State, options: libcontainer.ExecOp
         .process = prepared,
         .proc_dir = proc_dir,
         .root = root,
-        .cgroup = cgroup,
+        .cgroup = cgroups.cgroup,
+        .init_cgroup = cgroups.init_cgroup,
         .hierarchies = hierarchies,
         .joins = joins,
         .ns_fds = ns_fds,
@@ -326,11 +373,23 @@ fn joinExecCgroups(context: *const ExecContext) void {
     const report = context.report;
     // Membership must be established while still in the host cgroup
     // namespace; the grandchild inherits it across the second fork.
-    if (cgroup) |fd| {
-        writeCgroupFile(fd, "cgroup.procs", "0", options.cgroup_path) catch |err| failCreate(report[1], err);
-    }
+    if (cgroup) |fd| switch (tryV1Write(fd, "cgroup.procs", "0")) {
+        .SUCCESS => {},
+        // Like runc: a cgroup with domain controllers and a moved init
+        // refuses new members; join init's own cgroup instead.
+        .BUSY => if (context.init_cgroup) |init_fd|
+            writeCgroupFile(init_fd, "cgroup.procs", "0", options.cgroup_path) catch |err| failCreate(report[1], err)
+        else
+            cgroupJoinFailed(report[1], options.cgroup_path, "device or resource busy"),
+        else => |errno| cgroupJoinFailed(report[1], options.cgroup_path, @tagName(errno)),
+    };
     for (hierarchies) |hierarchy|
         writeCgroupFile(hierarchy.leaf.?, "cgroup.procs", "0", options.cgroup_path) catch |err| failCreate(report[1], err);
+}
+
+fn cgroupJoinFailed(report: posix.fd_t, path: []const u8, reason: []const u8) noreturn {
+    reportDiagnostic("error adding pid {d} to cgroups: write /sys/fs/cgroup/{s}/cgroup.procs: {s}", .{ linux.getpid(), path, reason });
+    failCreate(report, error.CgroupWriteFailed);
 }
 
 fn skipCurrentNamespaces(context: *ExecContext) void {
@@ -372,7 +431,10 @@ fn runExecChild(context: *const ExecContext) noreturn {
     checkResult(linux.fchdir(root)) catch |err| failCreate(ready[1], err);
     checkResult(linux.chroot(".")) catch |err| failCreate(ready[1], err);
     const fd_dir = openPath(proc_dir, "self/fd", .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true }) catch |err| failCreate(ready[1], err);
-    closeExecFrom(3, fd_dir) catch |err| failCreate(ready[1], err);
+    const first_closed: u32 = 3 + context.options.preserve_fds;
+    // Like runc's ExtraFiles, preserved fds are inherited without CLOEXEC.
+    for (3..first_closed) |fd| _ = linux.fcntl(@intCast(fd), linux.F.SETFD, 0);
+    closeExecFrom(first_closed, fd_dir) catch |err| failCreate(ready[1], err);
     closeExecHostFds(context, fd_dir);
     changeExecCwd(context);
     // Exec shares init's mount namespace; preserve its /dev/console.
@@ -394,7 +456,7 @@ fn closeExecHostFds(context: *const ExecContext, fd_dir: posix.fd_t) void {
     const ack_fd = if (context.seccomp_ack) |fds| fds[0] else ready[1];
     var keep = [_]posix.fd_t{ ready[1], console_fd, fd_dir, ack_fd };
     std.mem.sort(posix.fd_t, &keep, {}, std.sort.asc(posix.fd_t));
-    var next_fd: u32 = 3;
+    var next_fd: u32 = 3 + options.preserve_fds;
     for (keep) |fd| {
         const keep_fd: u32 = @intCast(fd);
         if (keep_fd < next_fd) continue;

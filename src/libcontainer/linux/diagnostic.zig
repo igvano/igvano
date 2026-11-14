@@ -13,7 +13,6 @@ fn diagnosticWrite(bytes: []const u8) void {
     const len = @min(bytes.len, last_diagnostic.len - last_diagnostic_len);
     @memcpy(last_diagnostic[last_diagnostic_len..][0..len], bytes[0..len]);
     last_diagnostic_len += len;
-    _ = writeAll(2, bytes);
 }
 
 fn diagnosticDrain(_: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
@@ -23,12 +22,12 @@ fn diagnosticDrain(_: *std.Io.Writer, data: []const []const u8, splat: usize) st
 }
 
 /// Formatting and raw writes need neither allocator nor inherited debug locks.
+/// Records the reason for the next error; the frontend shows it once, with
+/// the error, like runc (forked children's stderr is often the container's).
 pub fn reportDiagnostic(comptime fmt: []const u8, args: anytype) void {
     last_diagnostic_len = 0;
-    _ = writeAll(2, "igvano: ");
     var writer: std.Io.Writer = .{ .vtable = &.{ .drain = diagnosticDrain }, .buffer = &.{} };
     writer.print(fmt, args) catch {};
-    _ = writeAll(2, "\n");
     if (last_diagnostic_len == last_diagnostic.len) {
         // Avoid ending a truncated JSON diagnostic halfway through a codepoint.
         var start = last_diagnostic_len - 1;
@@ -55,20 +54,15 @@ pub const CreateResponse = extern struct {
 
     pub fn failureError(self: *const CreateResponse) ?libcontainer.Error {
         if (self.failure == 0) return null;
-        from_child = self.message_len != 0;
         last_diagnostic_len = @min(self.message_len, last_diagnostic.len);
         @memcpy(last_diagnostic[0..last_diagnostic_len], self.message[0..last_diagnostic_len]);
         return @errorCast(@errorFromInt(@as(u16, @intCast(self.failure))));
     }
 };
 
-/// The last diagnostic came from a child's failure response.
-pub threadlocal var from_child: bool = false;
-
-/// A child whose stderr is the container console printed its diagnostic
-/// there, out of the caller's sight. Print it again on our stderr.
-pub fn relayChildDiagnostic(console: bool) void {
-    if (!console or !from_child or last_diagnostic_len == 0) return;
+/// For a child with nobody to report to: print the diagnostic on stderr.
+pub fn printDiagnostic() void {
+    if (last_diagnostic_len == 0) return;
     _ = writeAll(2, "igvano: ");
     _ = writeAll(2, last_diagnostic[0..last_diagnostic_len]);
     _ = writeAll(2, "\n");

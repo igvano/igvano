@@ -83,9 +83,9 @@ test "linux exec failure diagnostics name the errno" {
     const base = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     defer std.testing.allocator.free(base);
     const cases = [_]struct { name: []const u8, data: []const u8, mode: posix.mode_t, expected: []const u8 }{
-        .{ .name = "denied", .data = "exit 0\n", .mode = 0o644, .expected = "cannot execute process: EACCES" },
-        .{ .name = "bad-format", .data = "not an executable\n", .mode = 0o755, .expected = "cannot execute process: ENOEXEC" },
-        .{ .name = "missing-interpreter", .data = "#!/igvano-no-such-interpreter\n", .mode = 0o755, .expected = "cannot execute process: ENOENT" },
+        .{ .name = "denied", .data = "exit 0\n", .mode = 0o644, .expected = "permission denied" },
+        .{ .name = "bad-format", .data = "not an executable\n", .mode = 0o755, .expected = "exec format error" },
+        .{ .name = "missing-interpreter", .data = "#!/igvano-no-such-interpreter\n", .mode = 0o755, .expected = "no such file or directory" },
     };
     const envp = [_:null]?[*:0]const u8{};
     for (cases) |case| {
@@ -94,7 +94,9 @@ test "linux exec failure diagnostics name the errno" {
         defer std.testing.allocator.free(path);
         const argv = [_:null]?[*:0]const u8{path};
         try std.testing.expectError(error.ExecFailed, execResolved(path, &argv, &envp));
-        try std.testing.expectEqualStrings(case.expected, diagnostics.last_diagnostic[0..diagnostics.last_diagnostic_len]);
+        const expected = try std.fmt.allocPrint(std.testing.allocator, "exec {s}: {s}", .{ path, case.expected });
+        defer std.testing.allocator.free(expected);
+        try std.testing.expectEqualStrings(expected, diagnostics.last_diagnostic[0..diagnostics.last_diagnostic_len]);
     }
 }
 

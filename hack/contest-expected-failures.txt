@@ -26,7 +26,6 @@ cgroup_v2_unified::test_unified_io_max_multi_device
 delete::delete_non_existed_container
 delete::delete_running_container_test
 domainname_test::set_domainname_test
-exec::*
 fd_control::closes_fd
 fd_control::pass_single_fd
 kill_container::kill_non_existed_container
@@ -39,7 +38,6 @@ mount_propagation::mount_propagation_slave_test
 no_pivot::no_pivot_test
 personality::personality_for_linux32
 process_capabilities_bounding::bounding_unset_with_other_caps_fails_test
-process_capabilities_fail::process_capabilities_fail_test
 process_user::process_user_duplicate_gids_test
 process_user::process_user_unique_gids_test
 readonly_paths::readonly_rel_paths

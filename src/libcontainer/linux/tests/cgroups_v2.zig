@@ -131,7 +131,8 @@ test "linux cgroup activation refuses populated non-root parents even for thread
     closeFd(owned);
     const enabled = try tmp.dir.readFileAlloc(std.testing.io, "parent/cgroup.subtree_control", std.testing.allocator, .limited(64));
     defer std.testing.allocator.free(enabled);
-    try std.testing.expectEqualStrings("+pids ", enabled);
+    // The requested controller, then (best effort) all available ones.
+    try std.testing.expectEqualStrings("+pids +cpu", enabled);
     const procs = try tmp.dir.readFileAlloc(std.testing.io, "parent/cgroup.procs", std.testing.allocator, .limited(64));
     defer std.testing.allocator.free(procs);
     try std.testing.expectEqualStrings("1\n", procs);

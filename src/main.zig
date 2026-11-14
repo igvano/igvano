@@ -42,7 +42,25 @@ pub fn main(init: std.process.Init) !u8 {
         return 1;
     };
     diagnostics.last_container_detail = null;
+    if (setupConfig(allocator, init, &config)) |status| return status;
+    return dispatchCommand(allocator, init.io, config) catch |err| {
+        reportError(allocator, init.io, diagnostics.last_container_detail, config, err);
+        // Like runc, a failed exec exits 255 so callers can tell it from the
+        // process's own status.
+        return if (config.subcommand == .exec) 255 else 1;
+    };
+}
+
+/// Process-wide setup after parsing; a status means exit with it.
+fn setupConfig(allocator: std.mem.Allocator, init: std.process.Init, config: *Config) ?u8 {
     config.path_env = init.minimal.environ.getPosix("PATH");
+    // Before igvano opens any fd of its own, which could take a free slot.
+    if (config.subcommand == .exec) for (3..3 + @as(usize, config.preserve_fds)) |fd| {
+        if (std.os.linux.errno(std.os.linux.fcntl(@intCast(fd), std.os.linux.F.GETFD, 0)) != .SUCCESS) {
+            std.debug.print("igvano: --preserve-fds: fd {d} is not open\n", .{fd});
+            return 255;
+        }
+    };
     if (config.root.ptr == default_root.ptr) {
         const root = xdgRoot(allocator, init.minimal.environ.getPosix("XDG_RUNTIME_DIR")) catch |err| {
             std.debug.print("igvano: the path in $XDG_RUNTIME_DIR must be writable by the user: {s}\n", .{@errorName(err)});
@@ -54,10 +72,7 @@ pub fn main(init: std.process.Init) !u8 {
         std.debug.print("igvano: cannot open log '{s}': {s}\n", .{ config.log orelse "", @errorName(err) });
         return 1;
     };
-    return dispatchCommand(allocator, init.io, config) catch |err| {
-        reportError(allocator, init.io, diagnostics.last_container_detail, config, err);
-        return 1;
-    };
+    return null;
 }
 
 /// Like runc, a non-root runtime keeps state in $XDG_RUNTIME_DIR/igvano,
@@ -103,6 +118,8 @@ fn argumentErrorMessage(err: ParseArgsError) []const u8 {
         .{ "InvalidBoolean", "invalid boolean; expected true or false" },
         .{ "MissingFormat", "missing value for --format" },
         .{ "MissingInterval", "missing value for --interval" },
+        .{ "MissingExecValue", "missing value for an exec option" },
+        .{ "InvalidExecValue", "invalid value for an exec option" },
         .{ "InvalidDuration", "invalid --interval; expected a positive duration such as 5s" },
         .{ "InvalidFormat", "invalid --format; expected table or json" },
         .{ "InvalidProcess", "invalid process environment; expected K=V" },
@@ -110,6 +127,7 @@ fn argumentErrorMessage(err: ParseArgsError) []const u8 {
         .{ "InvalidId", "invalid container id" },
     });
     comptime {
+        @setEvalBranchQuota(4000);
         for (@typeInfo(ParseArgsError).error_set.?) |parse_error| {
             if (messages.get(parse_error.name) == null)
                 @compileError("missing argument error message for " ++ parse_error.name);
@@ -144,8 +162,8 @@ fn reportError(allocator: std.mem.Allocator, io: std.Io, diagnostic: ?[]const u8
         return;
     };
     defer allocator.free(message);
-    const frontend_detail = if (diagnostic == null) oci.diagnosticFor(err) else null;
-    emitError(allocator, io, config.log, config.log_format, message, frontend_detail, diagnostic orelse frontend_detail);
+    const detail = diagnostic orelse oci.diagnosticFor(err);
+    emitError(allocator, io, config.log, config.log_format, message, detail, detail);
 }
 
 fn errorMessage(allocator: std.mem.Allocator, config: Config, err: anyerror) ![]u8 {
@@ -371,7 +389,7 @@ test "frontend failure after successful liveness does not log stale backend deta
     try std.testing.expectEqualStrings("igvano: start for 'example' failed: MissingProcess: start: container has no process\n", bytes);
 }
 
-test "error reporting prints frontend detail once and keeps backend detail only in the log" {
+test "error reporting prints backend and frontend detail once, on stderr and in the log" {
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -390,7 +408,7 @@ test "error reporting prints frontend detail once and keeps backend detail only 
     if (std.posix.errno(std.posix.system.dup2(capture[1], 2)) != .SUCCESS) return error.SystemResources;
     {
         defer _ = std.posix.system.dup2(saved_fd, 2);
-        reportError(std.testing.allocator, std.testing.io, "container detail already printed", config, error.Unsupported);
+        reportError(std.testing.allocator, std.testing.io, "container detail", config, error.Unsupported);
         oci.recordDiagnostic(error.InvalidConfig, "frontend detail", .{});
         defer oci.clearDiagnostic();
         reportError(std.testing.allocator, std.testing.io, null, config, error.InvalidConfig);
@@ -400,12 +418,12 @@ test "error reporting prints frontend detail once and keeps backend detail only 
     if (std.posix.errno(read) != .SUCCESS) return error.ReadFailed;
     const count: usize = @intCast(read);
     try std.testing.expectEqualStrings(
-        "igvano: create for 'example' failed: Unsupported\n" ++
+        "igvano: create for 'example' failed: Unsupported: container detail\n" ++
             "igvano: create for 'example' failed: InvalidConfig: frontend detail\n",
         bytes[0..count],
     );
     const log = try tmp.dir.readFileAlloc(std.testing.io, "runtime.log", std.testing.allocator, .limited(4096));
     defer std.testing.allocator.free(log);
-    try std.testing.expect(std.mem.indexOf(u8, log, "Unsupported: container detail already printed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, log, "Unsupported: container detail") != null);
     try std.testing.expect(std.mem.indexOf(u8, log, "InvalidConfig: frontend detail") != null);
 }

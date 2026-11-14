@@ -6,25 +6,11 @@
 # Also fail with runc v1.3.3 in the same container (environment, not igvano).
 
 # igvano gaps found by the suite. Delete lines as they pass.
-capabilities::runc exec --cap
-capabilities::runc exec --cap [ambient is set from spec]
-capabilities::runc run [ambient caps not set in inheritable result in a warning]
-capabilities::runc run with unknown capability
-cgroups::runc create (limits + cgrouppath + permission on the cgroup dir) succeeds
-cgroups::runc exec (cgroup v2 + init process in non-root cgroup) succeeds
-cgroups::runc exec --ignore-paused
-cgroups::runc exec should refuse a paused container
 cgroups::runc run (hugetlb limits)
 cgroups::runc run (per-device multiple iops via unified)
 cgroups::runc run/create should error for a non-empty cgroup
 cgroups::runc run/create should refuse pre-existing frozen cgroup
 delete::runc delete --force in cgroupv2 with subcgroups
-exec::runc exec --additional-gids
-exec::runc exec --cgroup subcgroup [v2]
-exec::runc exec --preserve-fds
-exec::runc exec [execve error]
-exec::runc exec check default home
-exec::runc exec [exit codes]
 help::runc -h
 help::runc command -h
 help::runc foo -h
@@ -44,7 +30,6 @@ pidfd-socket::runc create [ --pidfd-socket ]
 pidfd-socket::runc exec [ --pidfd-socket ] [cgroups_v2] 
 pidfd-socket::runc run [ --pidfd-socket ] 
 ps::ps after the container stopped
-run::runc run --keep (check cgroup exists)
 run::runc run [/proc/self/exe clone]
 run::runc run [execve error]
 run::runc run [hostname domainname]

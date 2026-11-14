@@ -172,18 +172,20 @@ pub fn rlimitResource(name: []const u8) error{InvalidConfig}!std.os.linux.rlimit
     return std.meta.stringToEnum(std.os.linux.rlimit_resource, name["RLIMIT_".len..]) orelse invalidConfig("process.rlimits.type: unknown name '{s}'", .{name});
 }
 
+/// Like runc, unknown capability names are ignored with a warning, and
+/// ambient caps that cannot be raised only warn at exec time.
 pub fn processCapabilities(config: Spec.Capabilities) !libcontainer.Capabilities {
     var result: libcontainer.Capabilities = .{};
     inline for (std.meta.fields(libcontainer.Capabilities)) |field| {
         for (@field(config, field.name) orelse &.{}) |name| {
-            const number = try capabilityNumber(name) orelse {
-                return invalidConfig("process.capabilities.{s}: unknown capability {s}", .{ field.name, name });
+            const number = (capabilityNumber(name) catch null) orelse {
+                if (!@import("builtin").is_test)
+                    std.debug.print("igvano: warning: ignoring unknown or unavailable capabilities: [{s}]\n", .{name});
+                continue;
             };
             @field(result, field.name) |= @as(u64, 1) << number;
         }
     }
-    if (result.ambient & ~(result.permitted & result.inheritable) != 0)
-        return validationError(error.AmbientCapabilitiesRequirePermittedAndInheritable, "process.capabilities.ambient: must be permitted and inheritable", .{});
     return result;
 }
 
@@ -256,7 +258,7 @@ test "rlimit names map every Linux resource and reject unknown names" {
         try std.testing.expectError(error.InvalidConfig, rlimitResource(name));
 }
 
-test "ambient capabilities require membership in both permitted and inheritable" {
+test "ambient capabilities convert like the other sets" {
     const cap: u64 = @as(u64, 1) << std.os.linux.CAP.NET_BIND_SERVICE;
     const valid = try processCapabilities(.{
         .bounding = &.{"CAP_NET_BIND_SERVICE"},
@@ -273,28 +275,20 @@ test "ambient capabilities require membership in both permitted and inheritable"
         .ambient = cap,
     }, valid);
     try std.testing.expectEqual(libcontainer.Capabilities{}, try processCapabilities(.{}));
-    for ([_]Spec.Capabilities{
-        .{ .ambient = &.{"CAP_NET_BIND_SERVICE"} },
-        .{ .ambient = &.{"CAP_NET_BIND_SERVICE"}, .permitted = &.{"CAP_NET_BIND_SERVICE"} },
-        .{ .ambient = &.{"CAP_NET_BIND_SERVICE"}, .inheritable = &.{"CAP_NET_BIND_SERVICE"} },
-        .{ .ambient = &.{"CAP_NET_BIND_SERVICE"}, .permitted = &.{"CAP_NET_BIND_SERVICE"}, .inheritable = &.{"CAP_CHOWN"} },
-    }) |config| {
-        try std.testing.expectError(error.AmbientCapabilitiesRequirePermittedAndInheritable, processCapabilities(config));
-    }
-    inline for (std.meta.fields(Spec.Capabilities)) |field| {
-        var config: Spec.Capabilities = .{};
-        @field(config, field.name) = &.{"not-a-capability"};
-        try std.testing.expectError(error.InvalidConfig, processCapabilities(config));
-    }
+    // Like runc, an ambient cap outside permitted or inheritable is kept and
+    // only warns when it cannot be raised.
+    try std.testing.expectEqual(cap, (try processCapabilities(.{ .ambient = &.{"CAP_NET_BIND_SERVICE"} })).ambient);
     const upper = try processCapabilities(.{ .bounding = &.{ "CAP_CHECKPOINT_RESTORE", "CAP_CHECKPOINT_RESTORE" } });
     try std.testing.expectEqual(@as(u64, 1) << 40, upper.bounding);
 }
 
-test "process capabilities reject unknown names in every set" {
+test "process capabilities ignore unknown names in every set, like runc" {
     inline for (std.meta.fields(Spec.Capabilities)) |field| {
         var config: Spec.Capabilities = .{};
-        @field(config, field.name) = &.{ "CAP_CHOWN", "CAP_FUTURE" };
-        try std.testing.expectError(error.InvalidConfig, processCapabilities(config));
+        @field(config, field.name) = &.{ "CAP_CHOWN", "CAP_FUTURE", "NOT_A_CAP" };
+        var expected: libcontainer.Capabilities = .{};
+        @field(expected, field.name) = 1;
+        try std.testing.expectEqual(expected, try processCapabilities(config));
     }
 }
 
