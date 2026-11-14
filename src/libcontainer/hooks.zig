@@ -113,6 +113,18 @@ fn capturedOutput(fd: std.posix.fd_t, buffer: []u8) []const u8 {
 
 const Position = struct { name: []const u8, index: usize };
 
+/// Go's Linux signal strings, as runc's "signal: ..." hook errors show them.
+const signal_names = [_][]const u8{
+    "",                         "hangup",                   "interrupt",             "quit",
+    "illegal instruction",      "trace/breakpoint trap",    "aborted",               "bus error",
+    "floating point exception", "killed",                   "user defined signal 1", "segmentation fault",
+    "user defined signal 2",    "broken pipe",              "alarm clock",           "terminated",
+    "stack fault",              "child exited",             "continued",             "stopped (signal)",
+    "stopped",                  "stopped (tty input)",      "stopped (tty output)",  "urgent I/O condition",
+    "CPU time limit exceeded",  "file size limit exceeded", "virtual timer expired", "profiling timer expired",
+    "window changed",           "I/O possible",             "power failure",         "bad system call",
+};
+
 fn reportFailure(position: Position, err: Error, status: u32, output: std.posix.fd_t, errors: std.posix.fd_t) void {
     // Reserve room for both labels and the failure reason in the 512-byte detail.
     var stdout_buffer: [192]u8 = undefined;
@@ -123,11 +135,11 @@ fn reportFailure(position: Position, err: Error, status: u32, output: std.posix.
     const reason = if (err == error.HookTimeout)
         "timeout"
     else if (linux.W.IFSIGNALED(status)) signal: {
-        const sig = linux.W.TERMSIG(status);
-        break :signal if (std.enums.tagName(linux.SIG, sig)) |name|
-            std.fmt.bufPrint(&reason_buffer, "signal: {s}", .{name}) catch unreachable
+        const sig: u32 = @intFromEnum(linux.W.TERMSIG(status));
+        break :signal if (sig >= 1 and sig < signal_names.len)
+            std.fmt.bufPrint(&reason_buffer, "signal: {s}", .{signal_names[sig]}) catch unreachable
         else
-            std.fmt.bufPrint(&reason_buffer, "signal: {d}", .{@intFromEnum(sig)}) catch unreachable;
+            std.fmt.bufPrint(&reason_buffer, "signal: {d}", .{sig}) catch unreachable;
     } else if (status != 0 and linux.W.IFEXITED(status))
         std.fmt.bufPrint(&reason_buffer, "exit status {d}", .{linux.W.EXITSTATUS(status)}) catch unreachable
     else
@@ -307,7 +319,7 @@ test "linux hooks capture both output streams with closed runtime stdio" {
     }{
         .{ .command = "printf '  hook-out\\n'; printf ' hook-err\\n' >&2; exit 7", .failure = error.HookFailed, .reason = "exit status 7" },
         .{ .command = "printf hook-out; printf hook-err >&2; i=0; while test \"$i\" -lt 10000; do printf xxxxxxxxxx; printf xxxxxxxxxx >&2; i=$((i+1)); done; exit 1", .failure = error.HookFailed, .reason = "exit status 1" },
-        .{ .command = "printf hook-out; printf hook-err >&2; kill -KILL $$", .failure = error.HookFailed, .reason = "signal: KILL" },
+        .{ .command = "printf hook-out; printf hook-err >&2; kill -KILL $$", .failure = error.HookFailed, .reason = "signal: killed" },
         .{ .command = "printf hook-out; printf hook-err >&2; kill -64 $$", .failure = error.HookFailed, .reason = "signal: 64" },
         .{ .command = "i=0; while test \"$i\" -lt 10000; do printf 'hook output'; i=$((i+1)); done", .failure = null },
     };

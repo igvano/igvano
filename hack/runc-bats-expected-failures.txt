@@ -12,10 +12,6 @@ mounts_sshfs::runc run [dev,exec,suid,atime bind mount of a nodev,nosuid,noexec,
 mounts_sshfs::runc run [explicit-rw bind mount of a ro fuse sshfs mount]
 mounts_sshfs::runc run [mount(8)-unlike behaviour: --bind with clearing flag]
 mounts_sshfs::runc run [ro,symfollow bind mount of a rw,nodev,nosymfollow fuse sshfs mount]
-personality::runc run personality for i686
-personality::runc run personality with exec for i686
-seccomp::runc run [seccomp] (SECCOMP_FILTER_FLAG_*)
-seccomp::runc run [seccomp] (startContainer hook)
 start_hello::runc run as user with no exec bit but CAP_DAC_OVERRIDE set
 userns::userns join external namespaces [wrong userns owner]
 

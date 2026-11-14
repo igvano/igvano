@@ -112,7 +112,12 @@ pub const Spec = struct {
         seccomp: ?Seccomp = null,
         timeOffsets: ?TimeOffsets = null,
         netDevices: ?std.json.ArrayHashMap(NetDevice) = null,
+        memoryPolicy: ?MemoryPolicy = null,
+        personality: ?Personality = null,
     };
+
+    pub const MemoryPolicy = struct { mode: []const u8, nodes: ?[]const u8 = null, flags: ?[]const []const u8 = null };
+    pub const Personality = struct { domain: []const u8, flags: ?[]const []const u8 = null };
 
     pub const NetDevice = struct { name: ?[]const u8 = null };
 

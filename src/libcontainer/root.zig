@@ -122,9 +122,23 @@ pub const Process = struct {
     no_new_privileges: bool = false,
     scheduler: ?Scheduler = null,
     io_priority: ?IOPriority = null,
+    /// linux.memoryPolicy and linux.personality, applied before exec.
+    memory_policy: ?MemoryPolicy = null,
+    personality: ?u32 = null,
 };
 
 /// sched_setattr(2) values; the frontend has validated them like runc.
+/// set_mempolicy(2) arguments; the frontend has validated them like youki.
+pub const MemoryPolicy = struct {
+    /// MPOL_* mode with MPOL_F_* flags.
+    mode: i32,
+    nodemask: [max_numa_nodes / @bitSizeOf(usize)]usize = @splat(0),
+    /// Bits in nodemask plus one: the kernel ignores the last bit.
+    maxnode: usize = 0,
+
+    pub const max_numa_nodes = 1024;
+};
+
 pub const ConsoleSize = struct { height: u16, width: u16 };
 
 pub const Scheduler = struct {
@@ -180,6 +194,9 @@ pub const ExecOptions = struct {
     cpu_affinity: ?CPUAffinity = null,
     scheduler: ?Scheduler = null,
     io_priority: ?IOPriority = null,
+    /// linux.memoryPolicy and linux.personality, applied before exec.
+    memory_policy: ?MemoryPolicy = null,
+    personality: ?u32 = null,
     debug: ?DebugLog = null,
     /// runc exec --cgroup: paths below the container's cgroup to join.
     /// One entry with no controller applies to every controller.

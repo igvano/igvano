@@ -168,7 +168,7 @@ fn prepareExecOptions(process_allocator: std.mem.Allocator, io: std.Io, state: L
     options.debug = config.debug_log;
     options.sub_cgroups = try subCgroups(process_allocator, config.exec_flags);
     options.preserve_fds = config.preserve_fds;
-    options.umask = savedUmask(saved_spec);
+    try applySavedSettings(&options, saved_spec);
     if (process.env != null) {
         const root = try std.fmt.allocPrint(process_allocator, "/proc/{d}/root", .{state.parsed.value.pid orelse 0});
         options.envp = try processEnv(process_allocator, options.envp, root, options.uid);
@@ -185,6 +185,16 @@ fn loadExecSpec(process_allocator: std.mem.Allocator, io: std.Io, saved_bundle: 
         },
         else => return err,
     };
+}
+
+/// Like runc, exec applies the container's umask and personality (youki
+/// also its memory policy), not ones from --process.
+fn applySavedSettings(options: *libcontainer.ExecOptions, saved_spec: ?std.json.Parsed(oci.Spec)) !void {
+    options.umask = savedUmask(saved_spec);
+    const spec = saved_spec orelse return;
+    const settings = spec.value.linux orelse return;
+    options.memory_policy = try oci.memoryPolicy(settings.memoryPolicy);
+    options.personality = try oci.personality(settings.personality);
 }
 
 /// runc exec applies the container's umask, not one from --process.

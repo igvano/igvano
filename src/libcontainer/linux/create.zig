@@ -73,6 +73,7 @@ const deliverSeccompListener = @import("process.zig").deliverSeccompListener;
 const applyOomScoreAdj = @import("process.zig").applyOomScoreAdj;
 const resetCpuAffinity = @import("process.zig").resetCpuAffinity;
 const applyProcess = @import("process.zig").applyProcess;
+const applyMemoryPolicy = @import("process.zig").applyMemoryPolicy;
 const applySchedulerAndIOPriority = @import("process.zig").applySchedulerAndIOPriority;
 const applyRlimits = @import("process.zig").applyRlimits;
 const resolveExecutable = @import("process.zig").resolveExecutable;
@@ -238,6 +239,8 @@ fn prepareCreate(ctx: *CreateContext) libcontainer.Error!libcontainer.State {
         }
     else
         null;
+    // runc's debug line; its tests read the flags from it.
+    if (ctx.init.seccomp_program) |program| debugLog(ctx.options.debug, "seccomp filter flags: {d}", .{program.flags});
     for (ctx.options.namespaces) |namespace| {
         if (namespace.path) |path| try ctx.namespaces.joins.append(ctx.allocator, .{
             .flag = namespaceFlag(namespace.kind),
@@ -1212,6 +1215,12 @@ fn setInitHostname(init: *const InitContext) void {
     }
 }
 
+/// Like runc: before seccomp and the credential change, with privileges.
+fn applyInitScheduling(init: *const InitContext, process: libcontainer.Process) void {
+    applySchedulerAndIOPriority(process.scheduler, process.io_priority, init.rootfs_options.cpuset) catch |err| failCreate(init.ready_fd, err);
+    applyMemoryPolicy(process.memory_policy) catch |err| failCreate(init.ready_fd, err);
+}
+
 fn applyInitProcess(init: *const InitContext, fifo_name: [:0]const u8) void {
     if (init.process) |process| {
         // Like runc's finalizeRootfs.
@@ -1220,11 +1229,11 @@ fn applyInitProcess(init: *const InitContext, fifo_name: [:0]const u8) void {
         if (process.uid != 0)
             checkResult(linux.fchmodat(init.fd_dir, fifo_name, 0o622)) catch |err| failCreate(init.ready_fd, err);
         applyRlimits(init.rlimits) catch |err| failCreate(init.ready_fd, err);
-        // Like runc: before seccomp and the credential change, with privileges.
-        applySchedulerAndIOPriority(process.scheduler, process.io_priority, init.rootfs_options.cpuset) catch |err| failCreate(init.ready_fd, err);
+        applyInitScheduling(init, process);
         // Without NNP the kernel requires CAP_SYS_ADMIN, which applyProcess
-        // may drop. Do not change the no_new_privileges setting.
-        // With NNP=true, install after startContainer hooks (unfiltered); NNP=false hooks run filtered, intentionally.
+        // may drop. Do not change the no_new_privileges setting. With NNP,
+        // the filter goes on late (see startInitProcess); start hooks still
+        // run filtered, like runc.
         if (!process.no_new_privileges) {
             if (init.seccomp_program) |program|
                 installSeccompFor(program, init.ready_fd, init.rootfs_options.seccomp_ack_fd, init.rootfs_options.rootless) catch |err| failCreate(init.ready_fd, err);
@@ -1288,12 +1297,23 @@ fn startInitProcess(init: *const InitContext, executable: ?[*:0]const u8, fd: po
     // startContainer hooks: a failing hook only stops init, with the error on
     // its stderr. The CLOEXEC writer makes EOF confirm exec or that exit.
     if (!writeAll(fd, &.{1})) linux.exit_group(1);
+    // A notify filter was already installed during create; without NNP the
+    // filter is already on too.
+    const nnp = if (init.process) |process| process.no_new_privileges else false;
+    var late_program = if (nnp and listenerProgram(init.seccomp_program) == null) init.seccomp_program else null;
+    // Like runc, startContainer hooks run with the container's filter.
+    if (late_program != null and init.start_hooks.len != 0) {
+        installSeccomp(late_program.?) catch |err| {
+            childError("cannot install seccomp filter: ", err);
+            diagnostics.printDiagnostic();
+            linux.exit_group(1);
+        };
+        late_program = null;
+    }
     hooks.runWithCloexecFds(init.start_hooks, init.start_hook_state, "startContainer") catch {
         diagnostics.printDiagnostic();
         linux.exit_group(1);
     };
-    // A notify filter was already installed during create.
-    const late_program = if (listenerProgram(init.seccomp_program) == null) init.seccomp_program else null;
     runProcess(init.process, executable, init.argv, init.envp, late_program) catch |err| {
         if (err != error.ExecFailed) childError("cannot execute process: ", err);
         startFailed(fd);

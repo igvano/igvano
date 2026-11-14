@@ -225,6 +225,12 @@ fn prepareCreateMounts(mount_allocator: std.mem.Allocator, bundle: []const u8, r
 fn applyCreateSpec(allocator: std.mem.Allocator, options: *libcontainer.CreateOptions, spec: oci.Spec) !void {
     const settings: oci.Spec.Linux = spec.linux orelse .{};
     options.process = if (spec.process) |process| oci.processConfig(process) else null;
+    const memory_policy = try oci.memoryPolicy(settings.memoryPolicy);
+    const personality = try oci.personality(settings.personality);
+    if (options.process) |*process| {
+        process.memory_policy = memory_policy;
+        process.personality = personality;
+    }
     options.namespaces = try prepareCreateNamespaces(allocator, settings.namespaces);
     options.uid_mappings = try oci.containerIDMappings(allocator, settings.uidMappings orelse &.{});
     options.gid_mappings = try oci.containerIDMappings(allocator, settings.gidMappings orelse &.{});

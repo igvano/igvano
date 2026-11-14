@@ -340,3 +340,113 @@ test "process user retains supplementary groups from JSON" {
     defer std.testing.allocator.free(output);
     try std.testing.expectEqualStrings(json, output);
 }
+
+const mpol_f_numa_balancing = 1 << 13;
+const mpol_f_relative_nodes = 1 << 14;
+const mpol_f_static_nodes = 1 << 15;
+
+/// linux.memoryPolicy, checked like youki's validate_memory_policy.
+pub fn memoryPolicy(policy: ?Spec.MemoryPolicy) error{InvalidConfig}!?libcontainer.MemoryPolicy {
+    const value = policy orelse return null;
+    const modes = [_][]const u8{ "MPOL_DEFAULT", "MPOL_PREFERRED", "MPOL_BIND", "MPOL_INTERLEAVE", "MPOL_LOCAL", "MPOL_PREFERRED_MANY", "MPOL_WEIGHTED_INTERLEAVE" };
+    const mode: i32 = for (modes, 0..) |name, i| {
+        if (std.mem.eql(u8, name, value.mode)) break @intCast(i);
+    } else return invalidConfig("linux.memoryPolicy.mode: invalid mode {s}", .{value.mode});
+    const flags = try memoryPolicyFlags(value.flags orelse &.{}, mode);
+    var result: libcontainer.MemoryPolicy = .{ .mode = mode | flags };
+    const nodes = std.mem.trim(u8, value.nodes orelse "", " ");
+    const has_nodes = try parseNodes(nodes, &result);
+    switch (mode) {
+        0, 4 => {
+            if (has_nodes) return invalidConfig("linux.memoryPolicy.nodes: {s} takes no nodes", .{value.mode});
+            if (flags != 0) return invalidConfig("linux.memoryPolicy.flags: {s} takes no flags", .{value.mode});
+        },
+        1 => if (!has_nodes and flags & (mpol_f_relative_nodes | mpol_f_static_nodes) != 0)
+            return invalidConfig("linux.memoryPolicy.flags: MPOL_PREFERRED with no nodes cannot use MPOL_F_STATIC_NODES or MPOL_F_RELATIVE_NODES", .{}),
+        else => if (!has_nodes) return invalidConfig("linux.memoryPolicy.nodes: {s} needs nodes", .{value.mode}),
+    }
+    return result;
+}
+
+fn memoryPolicyFlags(names: []const []const u8, mode: i32) error{InvalidConfig}!i32 {
+    var flags: i32 = 0;
+    for (names) |name| {
+        flags |= if (std.mem.eql(u8, name, "MPOL_F_NUMA_BALANCING"))
+            mpol_f_numa_balancing
+        else if (std.mem.eql(u8, name, "MPOL_F_RELATIVE_NODES"))
+            mpol_f_relative_nodes
+        else if (std.mem.eql(u8, name, "MPOL_F_STATIC_NODES"))
+            mpol_f_static_nodes
+        else
+            return invalidConfig("linux.memoryPolicy.flags: invalid flag {s}", .{name});
+    }
+    if (flags & mpol_f_numa_balancing != 0 and mode != 2) return invalidConfig("linux.memoryPolicy.flags: MPOL_F_NUMA_BALANCING needs MPOL_BIND", .{});
+    if (flags & mpol_f_relative_nodes != 0 and flags & mpol_f_static_nodes != 0) return invalidConfig("linux.memoryPolicy.flags: MPOL_F_STATIC_NODES and MPOL_F_RELATIVE_NODES exclude each other", .{});
+    return flags;
+}
+
+/// "0-3,7" into the nodemask; returns whether any node was set.
+fn parseNodes(nodes: []const u8, policy: *libcontainer.MemoryPolicy) error{InvalidConfig}!bool {
+    var highest: ?u32 = null;
+    var ranges = std.mem.splitScalar(u8, nodes, ',');
+    while (ranges.next()) |raw| {
+        const range = std.mem.trim(u8, raw, " ");
+        if (range.len == 0) continue;
+        const dash = std.mem.indexOfScalar(u8, range, '-');
+        const first = nodeNumber(if (dash) |i| range[0..i] else range) orelse return invalidConfig("linux.memoryPolicy.nodes: invalid node {s}", .{range});
+        const last = if (dash) |i| nodeNumber(range[i + 1 ..]) orelse return invalidConfig("linux.memoryPolicy.nodes: invalid node {s}", .{range}) else first;
+        if (first > last) return invalidConfig("linux.memoryPolicy.nodes: invalid range {s}", .{range});
+        for (first..last + 1) |node| policy.nodemask[node / @bitSizeOf(usize)] |= @as(usize, 1) << @intCast(node % @bitSizeOf(usize));
+        highest = @max(highest orelse 0, last);
+    }
+    const top = highest orelse return false;
+    policy.maxnode = (top / @bitSizeOf(usize) + 1) * @bitSizeOf(usize) + 1;
+    return true;
+}
+
+fn nodeNumber(text: []const u8) ?u32 {
+    const node = std.fmt.parseUnsigned(u32, std.mem.trim(u8, text, " "), 10) catch return null;
+    return if (node < libcontainer.MemoryPolicy.max_numa_nodes) node else null;
+}
+
+/// runc's getLinuxPersonalityFromStr: PER_LINUX or PER_LINUX32.
+pub fn personality(value: ?Spec.Personality) error{InvalidConfig}!?u32 {
+    const domain = (value orelse return null).domain;
+    if (std.mem.eql(u8, domain, "LINUX")) return 0;
+    if (std.mem.eql(u8, domain, "LINUX32")) return 8;
+    return invalidConfig("linux.personality.domain: invalid personality domain {s}", .{domain});
+}
+
+test "memory policies parse modes, flags and node ranges like youki" {
+    defer @import("diagnostic.zig").clearDiagnostic();
+    const bind = (try memoryPolicy(.{ .mode = "MPOL_BIND", .nodes = "0-2,65", .flags = &.{"MPOL_F_STATIC_NODES"} })).?;
+    try std.testing.expectEqual(@as(i32, 2 | mpol_f_static_nodes), bind.mode);
+    try std.testing.expectEqual(@as(usize, 0b111), bind.nodemask[0]);
+    try std.testing.expectEqual(@as(usize, 2), bind.nodemask[1]);
+    try std.testing.expectEqual(@as(usize, 129), bind.maxnode);
+    // The kernel drops the last of maxnode bits, so maxnode is one past a
+    // whole number of words and the mask is never read past its end.
+    for ([_]struct { []const u8, usize }{ .{ "63", 65 }, .{ "64", 129 }, .{ "1023", 1025 } }) |case| {
+        const policy = (try memoryPolicy(.{ .mode = "MPOL_BIND", .nodes = case[0] })).?;
+        try std.testing.expectEqual(case[1], policy.maxnode);
+        try std.testing.expect((policy.maxnode - 1) / @bitSizeOf(usize) <= policy.nodemask.len);
+    }
+    try std.testing.expectEqual(@as(usize, 0), (try memoryPolicy(.{ .mode = "MPOL_DEFAULT", .nodes = "" })).?.maxnode);
+    for ([_]Spec.MemoryPolicy{
+        .{ .mode = "INTERLEAVE", .nodes = "0" },
+        .{ .mode = "MPOL_BIND" },
+        .{ .mode = "MPOL_DEFAULT", .nodes = "0-7" },
+        .{ .mode = "MPOL_BIND", .nodes = "0-9876543210" },
+        .{ .mode = "MPOL_BIND", .nodes = "3-1" },
+        .{ .mode = "MPOL_INTERLEAVE", .nodes = "0", .flags = &.{"MPOL_F_NUMA_BALANCING"} },
+        .{ .mode = "MPOL_BIND", .nodes = "0", .flags = &.{ "MPOL_F_STATIC_NODES", "MPOL_F_RELATIVE_NODES" } },
+        .{ .mode = "MPOL_BIND", .nodes = "0", .flags = &.{"MPOL_F_BOGUS"} },
+    }) |policy| try std.testing.expectError(error.InvalidConfig, memoryPolicy(policy));
+}
+
+test "personality domains map to runc's values" {
+    defer @import("diagnostic.zig").clearDiagnostic();
+    try std.testing.expectEqual(@as(?u32, 8), try personality(.{ .domain = "LINUX32" }));
+    try std.testing.expectEqual(@as(?u32, 0), try personality(.{ .domain = "LINUX" }));
+    try std.testing.expectError(error.InvalidConfig, personality(.{ .domain = "SOLARIS" }));
+}

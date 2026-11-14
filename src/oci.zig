@@ -63,6 +63,8 @@ pub const processCapabilities = @import("oci/process.zig").processCapabilities;
 pub const processRlimits = @import("oci/process.zig").processRlimits;
 pub const cpuAffinity = @import("oci/process.zig").cpuAffinity;
 pub const processScheduler = @import("oci/process.zig").processScheduler;
+pub const memoryPolicy = @import("oci/process.zig").memoryPolicy;
+pub const personality = @import("oci/process.zig").personality;
 pub const processIOPriority = @import("oci/process.zig").processIOPriority;
 pub const processConfig = @import("oci/process.zig").processConfig;
 

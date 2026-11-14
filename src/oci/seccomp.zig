@@ -36,7 +36,22 @@ pub fn prepareSeccomp(allocator: std.mem.Allocator, configured: ?Spec.Seccomp) !
     };
 }
 
+/// runc's FlagSupported: with a NULL program, a known flag fails with
+/// EFAULT and an unknown one with EINVAL.
+fn flagSupported(flag: u32) bool {
+    if (comptime @import("builtin").os.tag != .linux) return false;
+    const linux = std.os.linux;
+    const SECCOMP_SET_MODE_FILTER = 1;
+    return linux.errno(linux.syscall3(.seccomp, SECCOMP_SET_MODE_FILTER, flag, 0)) == .FAULT;
+}
+
 fn seccompFlags(configured: ?[]const []const u8) !u32 {
+    // Like runc, no flags field means SECCOMP_FILTER_FLAG_SPEC_ALLOW when
+    // the kernel has it (Linux 4.17+); an empty list means none.
+    if (configured == null) {
+        const spec_allow = seccomp_flags.get("SECCOMP_FILTER_FLAG_SPEC_ALLOW").?;
+        return if (flagSupported(spec_allow)) spec_allow else 0;
+    }
     var flags: u32 = 0;
     for (configured orelse &.{}) |flag|
         flags |= seccomp_flags.get(flag) orelse
@@ -186,9 +201,6 @@ pub const seccomp_ops = std.StaticStringMap(libcontainer.seccomp.Op).initComptim
 pub const seccomp_flags = std.StaticStringMap(u32).initComptime(.{
     .{ "SECCOMP_FILTER_FLAG_LOG", 2 },
     .{ "SECCOMP_FILTER_FLAG_SPEC_ALLOW", 4 },
-    // ponytail: accepted but not set; needs Linux 5.19 and changes only how
-    // a notified task reacts to non-fatal signals.
-    .{ "SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV", 0 },
     // Like runc, init/exec are single-threaded at installation.
     .{ "SECCOMP_FILTER_FLAG_TSYNC", 0 },
 });
@@ -298,7 +310,7 @@ test "seccomp translation resolves syscall numbers per ABI and skips unknown nam
     const parsed = try std.json.parseFromSlice(Spec.Seccomp, std.testing.allocator,
         \\{"defaultAction":"SCMP_ACT_ERRNO","defaultErrnoRet":13,
         \\ "architectures":["SCMP_ARCH_X86_64","SCMP_ARCH_X86","SCMP_ARCH_X32"],
-        \\ "flags":["SECCOMP_FILTER_FLAG_LOG","SECCOMP_FILTER_FLAG_SPEC_ALLOW","SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV","SECCOMP_FILTER_FLAG_TSYNC"],
+        \\ "flags":["SECCOMP_FILTER_FLAG_LOG","SECCOMP_FILTER_FLAG_SPEC_ALLOW","SECCOMP_FILTER_FLAG_TSYNC"],
         \\ "syscalls":[{"names":["mkdir","not_a_syscall"],"action":"SCMP_ACT_ALLOW",
         \\ "args":[{"index":0,"value":4294967296,"valueTwo":1,"op":"SCMP_CMP_MASKED_EQ"}]}]}
     , .{});

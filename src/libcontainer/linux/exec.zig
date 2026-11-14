@@ -45,6 +45,8 @@ const setCpuAffinity = @import("process.zig").setCpuAffinity;
 const resetCpuAffinity = @import("process.zig").resetCpuAffinity;
 const ProcessSettings = @import("process.zig").ProcessSettings;
 const applyProcessSettings = @import("process.zig").applyProcessSettings;
+const applyMemoryPolicy = @import("process.zig").applyMemoryPolicy;
+const applyPersonality = @import("process.zig").applyPersonality;
 const applySchedulerAndIOPriority = @import("process.zig").applySchedulerAndIOPriority;
 const applyRlimits = @import("process.zig").applyRlimits;
 const resolveExecutable = @import("process.zig").resolveExecutable;
@@ -115,6 +117,7 @@ fn prepareExecProcess(allocator: std.mem.Allocator, options: libcontainer.ExecOp
         }
     else
         null;
+    if (seccomp_program) |program| debugLog(options.debug, "seccomp filter flags: {d}", .{program.flags});
     const cwd = try pathString(allocator, options.cwd);
     const argv = try allocator.allocSentinel(?[*:0]const u8, options.argv.len, null);
     for (options.argv, 0..) |arg, i| argv[i] = (try processString(allocator, arg)).ptr;
@@ -553,6 +556,7 @@ fn finishExecProcess(context: *const ExecContext) noreturn {
     const ack_fd = if (context.seccomp_ack) |fds| fds[0] else null;
     // Like runc: before seccomp and the credential change, with privileges.
     applySchedulerAndIOPriority(context.options.scheduler, context.options.io_priority, false) catch |err| failCreate(ready[1], err);
+    applyMemoryPolicy(context.options.memory_policy) catch |err| failCreate(ready[1], err);
     if (!process.no_new_privileges) {
         if (seccomp_program) |program|
             installSeccompFor(program, ready[1], ack_fd, false) catch |err| failCreate(ready[1], err);
@@ -570,6 +574,7 @@ fn finishExecProcess(context: *const ExecContext) noreturn {
         if (seccomp_program) |program|
             installSeccompFor(program, ready[1], ack_fd, false) catch |err| failCreate(ready[1], err);
     }
+    applyPersonality(context.options.personality) catch |err| failCreate(ready[1], err);
     waitHelperExit(context.gate[0]);
     execResolved(executable, argv.ptr, envp.ptr) catch {
         failCreate(ready[1], error.CreateFailed);

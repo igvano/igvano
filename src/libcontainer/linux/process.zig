@@ -108,6 +108,7 @@ pub fn runProcess(configured: ?libcontainer.Process, executable: ?[*:0]const u8,
     if (process.no_new_privileges) {
         if (seccomp_program) |program| try installSeccomp(program);
     }
+    try applyPersonality(process.personality);
     return execResolved(executable orelse return error.InvalidProcess, argv, envp);
 }
 
@@ -242,6 +243,31 @@ const SchedAttr = extern struct {
 
 /// Like runc, before seccomp and the credential change. `cpuset`:
 /// the cgroup restricts CPUs, so sched_setattr's EPERM gets runc's message.
+/// youki's setup_memory_policy.
+pub fn applyMemoryPolicy(policy: ?libcontainer.MemoryPolicy) libcontainer.Error!void {
+    if (policy) |value| {
+        // No nodes: a NULL mask, which the kernel takes as empty.
+        const mask: usize = if (value.maxnode == 0) 0 else @intFromPtr(&value.nodemask);
+        const result = linux.syscall3(.set_mempolicy, @as(usize, @bitCast(@as(isize, value.mode))), mask, value.maxnode);
+        checkResult(result) catch |err| {
+            reportDiagnostic("set_mempolicy: {s}", .{@tagName(linux.errno(result))});
+            return err;
+        };
+    }
+}
+
+/// runc's setupPersonality. Called after every seccomp filter is in place,
+/// so the container's filter also governs personality(2).
+pub fn applyPersonality(personality: ?u32) libcontainer.Error!void {
+    if (personality) |value| {
+        const result = linux.syscall1(.personality, value);
+        checkResult(result) catch |err| {
+            reportDiagnostic("set_personality: {s}", .{@tagName(linux.errno(result))});
+            return err;
+        };
+    }
+}
+
 pub fn applySchedulerAndIOPriority(scheduler: ?libcontainer.Scheduler, io_priority: ?libcontainer.IOPriority, cpuset: bool) libcontainer.Error!void {
     if (scheduler) |value| {
         const attr: SchedAttr = .{ .policy = value.policy, .flags = value.flags, .nice = value.nice, .priority = value.priority, .runtime = value.runtime, .deadline = value.deadline, .period = value.period };

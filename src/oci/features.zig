@@ -115,8 +115,8 @@ fn expectFeatureSeccomp(allocator: std.mem.Allocator, seccomp: std.json.ObjectMa
         .{ .name = "actions", .count = 9 },
         .{ .name = "operators", .count = 7 },
         .{ .name = "archs", .count = 24 },
-        .{ .name = "knownFlags", .count = 4 },
-        .{ .name = "supportedFlags", .count = 4 },
+        .{ .name = "knownFlags", .count = 3 },
+        .{ .name = "supportedFlags", .count = 3 },
     };
     for (lists) |list| {
         const reported = seccomp.get(list.name).?.array.items;

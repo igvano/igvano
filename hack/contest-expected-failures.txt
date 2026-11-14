@@ -5,13 +5,9 @@
 
 # Also fail with runc v1.3.3 in the same container (environment or contest
 # expectations, not igvano).
-memory_policy::bind_static
-memory_policy::interleave_without_flags
-memory_policy::preferred_relative
 update::update_pids_limit_test
 
 # igvano gaps found by contest, not yet triaged. Fix them and delete the lines.
-personality::personality_for_linux32
 
 # Host-dependent ("? " prefix): may pass or fail. io.bfq.weight needs the BFQ scheduler.
 ? update::update_blkio_weight_test
