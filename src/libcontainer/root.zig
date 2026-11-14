@@ -376,6 +376,9 @@ pub const Mount = struct {
     mappings: ?MountMappings = null,
     /// For tmpfs: copy the directory it covers into it first (runc's tmpcopyup).
     copy_up: bool = false,
+    /// Flags the options asked to clear ("dev", "rw", ...), like runc's
+    /// ClearedFlags; a bind mount is remounted when any are set.
+    cleared_flags: u32 = 0,
 };
 
 pub const IDMapping = struct {

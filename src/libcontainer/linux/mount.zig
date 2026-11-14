@@ -45,7 +45,11 @@ pub fn lockedMountFlags(requested: u32, fs_flags: usize) libcontainer.Error!u32 
         (if (fs_flags & ST_RELATIME != 0) @as(u32, ms.RELATIME) else 0) |
         (if (fs_flags & (ST_NOATIME | ST_RELATIME) == 0) @as(u32, ms.STRICTATIME) else 0);
     const requested_atime = requested & atime_mask;
-    if (requested_atime != 0 and requested_atime != atime) return error.InvalidConfig;
+    // Like runc: any requested atime flag, nodiratime included, must match
+    // the mount's locked atime flags, or the kernel's EPERM stands.
+    const locked_atime = atime | @as(u32, @intCast(fs_flags & ms.NODIRATIME));
+    const asked_atime = requested & (atime_mask | ms.NODIRATIME);
+    if (asked_atime != 0 and asked_atime != locked_atime) return error.PermissionDenied;
     return requested | @as(u32, @intCast(fs_flags & common)) |
         (if (requested_atime == 0) atime else 0);
 }
@@ -75,9 +79,13 @@ test "locked atime modes are inherited only when absent and conflicts are reject
     try std.testing.expectEqual(@as(u32, ms.RELATIME), try lockedMountFlags(ms.RELATIME, 4096));
     try std.testing.expectEqual(@as(u32, ms.NOATIME), try lockedMountFlags(ms.NOATIME, 1024));
     try std.testing.expectEqual(@as(u32, ms.STRICTATIME), try lockedMountFlags(ms.STRICTATIME, 0));
-    try std.testing.expectError(error.InvalidConfig, lockedMountFlags(ms.STRICTATIME, 4096));
-    try std.testing.expectError(error.InvalidConfig, lockedMountFlags(ms.RELATIME, 1024));
-    try std.testing.expectError(error.InvalidConfig, lockedMountFlags(ms.NOATIME, 0));
+    try std.testing.expectError(error.PermissionDenied, lockedMountFlags(ms.STRICTATIME, 4096));
+    try std.testing.expectError(error.PermissionDenied, lockedMountFlags(ms.RELATIME, 1024));
+    try std.testing.expectError(error.PermissionDenied, lockedMountFlags(ms.NOATIME, 0));
+    // nodiratime is locked too, like runc's mntAtimeFlags.
+    try std.testing.expectError(error.PermissionDenied, lockedMountFlags(ms.STRICTATIME, 2048));
+    try std.testing.expectError(error.PermissionDenied, lockedMountFlags(ms.NODIRATIME, 4096 | 1024));
+    try std.testing.expectEqual(@as(u32, ms.NODIRATIME | ms.RELATIME), try lockedMountFlags(ms.NODIRATIME | ms.RELATIME, 2048 | 4096));
 }
 
 /// Legacy cgroup mounts are expanded during parent-side mount preparation.
@@ -117,6 +125,7 @@ pub fn prepareMounts(allocator: std.mem.Allocator, mounts: []const libcontainer.
             .recursive_attr = mount.recursive_attr,
             .mappings = mount.mappings,
             .copy_up = mount.copy_up,
+            .cleared_flags = mount.cleared_flags,
             .cgroup2_fallback = try cgroup2Fallback(allocator, mount_type, mount.flags, cgroup_path),
         });
     }
@@ -334,6 +343,7 @@ pub const PreparedMount = struct {
     recursive_attr: ?libcontainer.RecursiveAttr = null,
     mappings: ?libcontainer.MountMappings = null,
     copy_up: bool = false,
+    cleared_flags: u32 = 0,
     /// For cgroup2: what to bind when the kernel refuses a new cgroup2
     /// mount (EPERM or EBUSY in a user namespace), as runc does.
     cgroup2_fallback: ?[:0]const u8 = null,
@@ -652,12 +662,31 @@ pub fn remountFlags(target_fd: posix.fd_t, requested: u32) libcontainer.Error!u3
 }
 
 pub fn bindRemount(target_fd: posix.fd_t, target: [*:0]const u8, requested: u32) libcontainer.Error!void {
+    return bindRemountClearing(target_fd, target, requested, 0);
+}
+
+/// Like runc: on EPERM (locked flags in another user namespace) retry with
+/// the mount's locked flags, unless the options asked to clear one of them.
+pub fn bindRemountClearing(target_fd: posix.fd_t, target: [*:0]const u8, requested: u32, cleared: u32) libcontainer.Error!void {
     const result = linux.mount(null, target, null, requested, 0);
     if (linux.errno(result) != .PERM) return checkResult(result);
-    // Retry locked flags on EPERM, including in an inherited user namespace.
-    // Privileged callers may change these flags, so first honor their request.
+    if (lockedClears(target_fd, cleared) != 0) return error.PermissionDenied;
     const flags = try remountFlags(target_fd, requested);
     try checkResult(linux.mount(null, target, null, flags, 0));
+}
+
+/// The locked flags that are set on the mount and that `cleared` asks to
+/// clear. statfs ST_* bits match MS_* for these, except relatime.
+fn lockedClears(target_fd: posix.fd_t, cleared: u32) u32 {
+    const ms = linux.MS;
+    var fs: [32]usize = undefined;
+    if (linux.errno(linux.syscall2(.fstatfs, @intCast(target_fd), @intFromPtr(&fs))) != .SUCCESS) return 0;
+    const st = @import("syscall.zig").statfsFlags(&fs);
+    var set: u32 = @intCast(st & (ms.RDONLY | ms.NOSUID | ms.NODEV | ms.NOEXEC | ms.NOATIME | ms.NODIRATIME));
+    if (st & ST_RELATIME != 0) set |= ms.RELATIME;
+    // statfs has no strictatime bit: it is neither noatime nor relatime.
+    if (st & (ST_NOATIME | ST_RELATIME) == 0) set |= ms.STRICTATIME;
+    return set & cleared;
 }
 
 pub fn applyMount(rootfs: [:0]const u8, root_fd: posix.fd_t, mount: PreparedMount, private_mount_namespace: bool, rootfs_propagation: u32, step: *RootfsStep) libcontainer.Error!void {
@@ -886,10 +915,16 @@ fn isolateBindMount(mount: PreparedMount, target_fd: posix.fd_t, private_mount_n
 fn applyMountAttributes(mount: PreparedMount, target_fd: posix.fd_t, step: *RootfsStep) libcontainer.Error!void {
     const ms = linux.MS;
     var target_buffer: [64]u8 = undefined;
-    if (mount.flags & ms.BIND != 0 and mount.flags & ~@as(u32, ms.BIND | ms.REC) != 0) {
+    // Like runc, also remount when options only clear flags ("bind,dev").
+    if (mount.flags & ms.BIND != 0 and (mount.flags & ~@as(u32, ms.BIND | ms.REC) != 0 or mount.cleared_flags != 0)) {
         step.operation = "bind remount";
         const requested = (mount.flags & ~@as(u32, ms.REC)) | ms.BIND | ms.REMOUNT;
-        try bindRemount(target_fd, fdPath(&target_buffer, target_fd), requested);
+        bindRemountClearing(target_fd, fdPath(&target_buffer, target_fd), requested, mount.cleared_flags) catch |err| {
+            // runc's wording, which its tests match.
+            reportDiagnostic("error mounting \"{s}\" to rootfs at \"{s}\": failed to set user-requested vfs flags on bind-mount: {s}", .{ mount.source orelse "", mount.destination, if (err == error.PermissionDenied) "operation not permitted" else @errorName(err) });
+            step.operation = "";
+            return err;
+        };
     }
     if (mount.recursive_attr) |change| {
         step.operation = "mount_setattr";

@@ -82,21 +82,39 @@ pub fn joinNamespacesWithUser(joins: []const NamespaceJoin, user_fd: ?posix.fd_t
     try joinNamespaceFds(joins, fds[0..joins.len]);
 }
 
+/// Like runc's join_namespaces: first the non-user namespaces we may
+/// already join (EPERM skips one), then the user namespace, then the rest,
+/// which the joined user namespace may now let us join. Mount goes last so
+/// host paths stay reachable until the other joins are done.
 pub fn joinNamespaceFds(joins: []const NamespaceJoin, fds: []const posix.fd_t) libcontainer.Error!void {
-    // User first grants capabilities in the target owner; mount last keeps
-    // host paths reachable until all other namespace operations have finished.
-    for ([_]usize{
-        linux.CLONE.NEWUSER, linux.CLONE.NEWCGROUP, linux.CLONE.NEWIPC,
-        linux.CLONE.NEWUTS,  linux.CLONE.NEWNET,    linux.CLONE.NEWPID,
-        linux.CLONE.NEWTIME, linux.CLONE.NEWNS,
-    }) |flag| {
+    var joined: [8]bool = @splat(false);
+    try joinPass(joins, fds, &joined, false, true);
+    try joinPass(joins, fds, &joined, true, false);
+    try joinPass(joins, fds, &joined, false, false);
+}
+
+const join_order = [_]usize{
+    linux.CLONE.NEWCGROUP, linux.CLONE.NEWIPC,  linux.CLONE.NEWUTS, linux.CLONE.NEWNET,
+    linux.CLONE.NEWPID,    linux.CLONE.NEWTIME, linux.CLONE.NEWNS,
+};
+
+fn joinPass(joins: []const NamespaceJoin, fds: []const posix.fd_t, joined: *[8]bool, user: bool, skip_perm: bool) libcontainer.Error!void {
+    const order: []const usize = if (user) &.{linux.CLONE.NEWUSER} else &join_order;
+    for (order) |flag| {
         for (joins, 0..) |join, i| {
-            if (join.flag == flag and fds[i] >= 0) {
-                checkResult(linux.setns(fds[i], @intCast(flag))) catch |err| {
-                    reportDiagnostic("cannot join namespace {s}: {s}", .{ join.path, @errorName(err) });
-                    return err;
-                };
-            }
+            if (join.flag != flag or fds[i] < 0 or joined[i]) continue;
+            const result = linux.setns(fds[i], @intCast(flag));
+            if (skip_perm and linux.errno(result) == .PERM) continue;
+            checkResult(result) catch |err| {
+                reportDiagnostic("cannot join namespace {s}: {s}", .{ join.path, @errorName(err) });
+                return err;
+            };
+            // Like runc, become root in a joined user namespace.
+            if (flag == linux.CLONE.NEWUSER) checkResult(linux.setresuid(0, 0, 0)) catch |err| {
+                reportDiagnostic("failed to become root in user namespace", .{});
+                return err;
+            };
+            joined[i] = true;
         }
     }
 }

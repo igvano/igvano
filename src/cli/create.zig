@@ -216,6 +216,7 @@ fn prepareCreateMounts(mount_allocator: std.mem.Allocator, bundle: []const u8, r
             .data = options.data,
             .recursive_attr = options.recursive_attr,
             .copy_up = options.copy_up,
+            .cleared_flags = options.cleared,
             .mappings = try oci.mountMappings(mount_allocator, mount, settings),
         };
     }

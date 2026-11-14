@@ -6,14 +6,6 @@
 # Also fail with runc v1.3.3 in the same container (environment, not igvano).
 
 # igvano gaps found by the suite. Delete lines as they pass.
-hooks_so::runc run (hooks library tests)
-mounts_sshfs::runc run [bind mount {no,rel,strict}atime semantics]
-mounts_sshfs::runc run [dev,exec,suid,atime bind mount of a nodev,nosuid,noexec,noatime fuse sshfs mount]
-mounts_sshfs::runc run [explicit-rw bind mount of a ro fuse sshfs mount]
-mounts_sshfs::runc run [mount(8)-unlike behaviour: --bind with clearing flag]
-mounts_sshfs::runc run [ro,symfollow bind mount of a rw,nodev,nosymfollow fuse sshfs mount]
-start_hello::runc run as user with no exec bit but CAP_DAC_OVERRIDE set
-userns::userns join external namespaces [wrong userns owner]
 
 # Host-dependent ("? " prefix): may pass or fail. blkio/bfq need the BFQ scheduler; spec validator needs proxy.golang.org (go mod tidy), blocked on some networks. no_pivot runs unshare -r, which AppArmor-restricted user namespaces (GitHub's Ubuntu 24.04) refuse earlier.
 ? cgroups::runc run (blkio weight)

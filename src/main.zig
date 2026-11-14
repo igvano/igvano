@@ -31,6 +31,7 @@ pub fn main(init: std.process.Init) !u8 {
     oci.clearDiagnostic();
     const allocator = init.arena.allocator();
     const args = try init.minimal.args.toSlice(allocator);
+    if (args.len > 0) program_name = std.fs.path.basename(args[0]);
     if (try helpOrVersion(init.io, args)) |status| return status;
 
     var log: ?[]const u8 = null;
@@ -193,6 +194,10 @@ fn reportError(allocator: std.mem.Allocator, io: std.Io, diagnostic: ?[]const u8
     };
     defer allocator.free(message);
     const detail = diagnostic orelse oci.diagnosticFor(err);
+    if (initFailure(allocator, config, detail)) |line| {
+        defer allocator.free(line);
+        return emitError(allocator, io, config.log, config.log_format, line, null, null);
+    }
     // Like runc run, the process's own exec error is printed alone.
     if (err == error.ProcessExecFailed) if (detail) |text| {
         std.debug.print("{s}\n", .{text});
@@ -200,6 +205,19 @@ fn reportError(allocator: std.mem.Allocator, io: std.Io, diagnostic: ?[]const u8
         return;
     };
     emitError(allocator, io, config.log, config.log_format, message, detail, detail);
+}
+
+/// argv[0]'s basename, as runc's messages name the program.
+var program_name: []const u8 = "igvano";
+
+/// runc's chain for an init mount failure, which its tests match:
+/// "runc run failed: unable to start container process: error during
+/// container init: error mounting ...".
+fn initFailure(allocator: std.mem.Allocator, config: Config, detail: ?[]const u8) ?[]u8 {
+    if (config.subcommand != .create and config.subcommand != .run) return null;
+    const text = detail orelse return null;
+    if (!std.mem.startsWith(u8, text, "error mounting ")) return null;
+    return std.fmt.allocPrint(allocator, "{s} {s} failed: unable to start container process: error during container init: {s}", .{ program_name, @tagName(config.subcommand), text }) catch null;
 }
 
 fn errorMessage(allocator: std.mem.Allocator, config: Config, err: anyerror) ![]u8 {

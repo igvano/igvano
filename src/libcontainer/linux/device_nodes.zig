@@ -101,7 +101,12 @@ pub fn createDevice(root_fd: posix.fd_t, device: PreparedDevice, private_mount_n
 
 pub fn setupDevices(root_fd: posix.fd_t, devices: []const PreparedDevice, symlinks: []const libcontainer.Symlink, private_mount_namespace: bool, step: *RootfsStep) libcontainer.Error!void {
     if (comptime builtin.os.tag == .linux) {
-        for (devices) |device| try createDevice(root_fd, device, private_mount_namespace, step);
+        for (devices) |device| {
+            // Like runc, /dev/ptmx is always the pts/ptmx symlink, even when
+            // listed: a host node there would bypass the container's devpts.
+            if (std.mem.eql(u8, device.path, "/dev/ptmx")) continue;
+            try createDevice(root_fd, device, private_mount_namespace, step);
+        }
         try setupSymlinks(root_fd, symlinks, step);
     } else {
         return error.NotImplemented;
@@ -118,6 +123,13 @@ pub fn setupSymlinks(root_fd: posix.fd_t, symlinks: []const libcontainer.Symlink
             defer closeFd(dir);
             var buffer: [256]u8 = undefined;
             const name = std.fmt.bufPrintZ(&buffer, "{s}", .{std.fs.path.basename(link.path)}) catch return error.InvalidPath;
+            // Like runc's setupPtmx, replace whatever the rootfs has there:
+            // a host node would bypass the container's devpts.
+            if (std.mem.eql(u8, link.path, "/dev/ptmx")) {
+                step.operation = "remove existing ptmx";
+                const removed = linux.unlinkat(dir, name, 0);
+                if (linux.errno(removed) != .NOENT) try checkResult(removed);
+            }
             step.operation = "symlink";
             const result = linux.symlinkat(link.target, dir, name);
             switch (linux.errno(result)) {

@@ -29,7 +29,13 @@ pub const MountOptions = struct {
     recursive_attr: ?libcontainer.RecursiveAttr = null,
     /// runc's tmpcopyup extension: copy the covered directory into a tmpfs.
     copy_up: bool = false,
+    /// runc's ClearedFlags: flags an option such as "dev" or "rw" asked to
+    /// clear. A bind mount is remounted when any are set.
+    cleared: u32 = 0,
 };
+
+/// MS_NOSYMFOLLOW (Linux 5.10); Zig 0.16's MS has no name for it.
+pub const ms_nosymfollow: u32 = 0x100;
 
 /// MOUNT_ATTR_* values from linux/mount.h.
 pub const mount_attr = struct {
@@ -80,6 +86,10 @@ pub const mount_option_table = options: {
         .{ .name = "sync", .set = ms.SYNCHRONOUS },
         .{ .name = "async", .clear = ms.SYNCHRONOUS },
         .{ .name = "dirsync", .set = ms.DIRSYNC },
+        .{ .name = "norelatime", .clear = ms.RELATIME },
+        .{ .name = "nostrictatime", .clear = ms.STRICTATIME },
+        .{ .name = "nosymfollow", .set = ms_nosymfollow },
+        .{ .name = "symfollow", .clear = ms_nosymfollow },
         .{ .name = "private", .propagation = ms.PRIVATE },
         .{ .name = "rprivate", .propagation = ms.PRIVATE | ms.REC },
         .{ .name = "slave", .propagation = ms.SLAVE },
@@ -160,6 +170,8 @@ fn applyMountOption(result: *MountOptions, option: []const u8) bool {
     for (mount_option_table) |entry| {
         if (!std.mem.eql(u8, option, entry.name)) continue;
         result.flags = (result.flags & ~entry.clear) | entry.set;
+        // "bind" and the atime modes clear only to stay exclusive.
+        if (entry.set == 0) result.cleared |= entry.clear else result.cleared &= ~entry.set;
         if (entry.propagation != 0) result.propagation = entry.propagation;
         if (entry.recursive) |recursive| applyRecursiveOption(result, recursive);
         if (entry.copy_up) result.copy_up = true;

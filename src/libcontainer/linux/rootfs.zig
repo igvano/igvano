@@ -354,6 +354,9 @@ pub fn setupRootfs(rootfs: [:0]const u8, mounts: []const PreparedMount, devices:
     try applyRootfsMounts(rootfs, mounts, options, &step);
     closeMountFds(mounts);
     owns_mount_fds = false;
+    // Like runc, createContainer hooks run with the rootfs as cwd.
+    step = .{ .operation = "chdir", .path = rootfs };
+    try checkResult(linux.chdir(rootfs));
     try runCreateHooks(options, &step);
     // runc's fd trick stacks the old root on the new root without a put_old
     // directory. Detach it and close both handles before any container exec.

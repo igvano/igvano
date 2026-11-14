@@ -4,7 +4,6 @@
 # Also expected as root (hack/runc-bats-expected-failures.txt).
 
 # Rootless-only igvano gaps. Delete lines as they pass.
-dev::runc run [redundant default /dev/ptmx]
 
 # Host-dependent ("? " prefix): may pass or fail. blkio needs the BFQ scheduler.
 ? cgroups::runc run (blkio weight)

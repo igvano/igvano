@@ -114,7 +114,7 @@ pub fn runProcess(configured: ?libcontainer.Process, executable: ?[*:0]const u8,
 
 // Runtime syscalls after successful filter installation:
 // - NNP=false init/exec: setgroups, setgid, setuid, capset, prctl (credentials
-//   and capabilities); faccessat, statx (PATH lookup under the configured user).
+//   and capabilities); faccessat2, statx (PATH lookup under the configured user).
 //   On x86/arm these credential calls are setgroups32/setgid32/setuid32.
 // - init: write/close (readiness), openat/close (FIFO), write (acknowledgement),
 //   execve. NNP=true installs after the hooks and FIFO ack, leaving only execve.
@@ -398,12 +398,20 @@ pub fn applyRlimits(rlimits: []const libcontainer.Rlimit) libcontainer.Error!voi
     }
 }
 
+/// Go's exec.LookPath: a regular file, checked with the effective IDs and
+/// capabilities (faccessat2 AT_EACCESS), so CAP_DAC_OVERRIDE counts. When
+/// that call is missing or filtered, any execute bit will do.
 fn isExecutable(path: [*:0]const u8) bool {
-    if (linux.errno(linux.faccessat(linux.AT.FDCWD, path, linux.X_OK, 0)) != .SUCCESS) return false;
     // Zig 0.16 exposes statx rather than fstatat; follow symlinks and check type.
     var stat: linux.Statx = undefined;
-    if (linux.errno(linux.statx(linux.AT.FDCWD, path, 0, .{ .TYPE = true }, &stat)) != .SUCCESS) return false;
-    return stat.mask.TYPE and linux.S.ISREG(stat.mode);
+    if (linux.errno(linux.statx(linux.AT.FDCWD, path, 0, .{ .TYPE = true, .MODE = true }, &stat)) != .SUCCESS) return false;
+    if (!stat.mask.TYPE or !linux.S.ISREG(stat.mode)) return false;
+    const AT_EACCESS = 0x200;
+    return switch (linux.errno(linux.syscall4(.faccessat2, @bitCast(@as(isize, linux.AT.FDCWD)), @intFromPtr(path), linux.X_OK, AT_EACCESS))) {
+        .SUCCESS => true,
+        .NOSYS, .PERM => stat.mode & 0o111 != 0,
+        else => false,
+    };
 }
 
 pub fn resolveExecutable(argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*:0]const u8, buffer: []u8) error{ExecFailed}![*:0]const u8 {
