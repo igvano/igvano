@@ -7,7 +7,6 @@ kill::kill KILL [host pidns]
 mounts::runc run [ro /dev mount]
 personality::runc run personality for i686
 personality::runc run personality with exec for i686
-run::runc run [/proc/self/exe clone]
 seccomp::runc run [seccomp] (SECCOMP_FILTER_FLAG_*)
 seccomp::runc run [seccomp] (startContainer hook)
 

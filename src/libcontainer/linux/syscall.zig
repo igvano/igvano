@@ -18,6 +18,19 @@ pub const OpenHow = extern struct {
 };
 
 /// statfs starts with native words, except s390x's packed u32 type/bsize.
+/// f_flags of the kernel's struct statfs: native words, except s390x's
+/// packed layout (u32 type/bsize, five u64 counts, fsid, u32 namelen,
+/// frsize, flags).
+pub fn statfsFlags(fs: *const [32]usize) usize {
+    if (comptime builtin.cpu.arch == .s390x) {
+        const words: *const [64]u32 = @ptrCast(fs);
+        return words[16];
+    }
+    // type, bsize, blocks, bfree, bavail, files, ffree, fsid (two u32
+    // words on 32-bit, one u64 word on 64-bit), namelen, frsize, flags.
+    return if (@sizeOf(usize) == 8) fs[10] else fs[11];
+}
+
 pub fn statfsType(fs: *const [32]usize) usize {
     if (comptime builtin.cpu.arch == .s390x) {
         const words: *const [64]u32 = @ptrCast(fs);

@@ -2,6 +2,7 @@ const std = @import("std");
 const libcontainer = @import("root.zig");
 
 pub const console = @import("linux/console.zig").console;
+pub const exeseal = @import("linux/exeseal.zig");
 pub const apparmorEnabled = @import("linux/procfs.zig").apparmorEnabled;
 pub const systemdCgroupMatches = @import("linux/systemd.zig").systemdCgroupMatches;
 
@@ -16,6 +17,7 @@ pub const Container = struct {
 
     /// Creates an instance owning state.starttime; all other state fields borrow options.
     /// Call deinit with options.allocator when the instance is no longer needed.
+    /// Callers must seal their binary first (exeseal.ensureSealed; see the README).
     pub fn create(options: libcontainer.CreateOptions) libcontainer.Error!Container {
         return .{ .state = try @import("linux/create.zig").create(options), .owned = true };
     }
@@ -121,6 +123,7 @@ test {
     _ = @import("devicefilter.zig");
     _ = @import("devices.zig");
     _ = @import("linux/netdev.zig");
+    _ = @import("linux/exeseal.zig");
     _ = @import("dbus.zig");
     _ = @import("linux/cgroup.zig");
     _ = @import("linux/cgroup_ops.zig");

@@ -84,6 +84,22 @@ fn setupConfig(allocator: std.mem.Allocator, init: std.process.Init, config: *Co
         std.debug.print("igvano: cannot open log '{s}': {s}\n", .{ config.log orelse "", @errorName(err) });
         return 1;
     };
+    return sealSelf(allocator, init, config.*);
+}
+
+/// Commands whose processes enter a container first re-execute from a
+/// sealed clone of the binary, like runc (see libcontainer exeseal).
+fn sealSelf(allocator: std.mem.Allocator, init: std.process.Init, config: Config) ?u8 {
+    if (comptime builtin.os.tag != .linux) return null;
+    switch (config.subcommand) {
+        .create, .run, .exec => {},
+        else => return null,
+    }
+    const root = allocator.dupeZ(u8, config.root) catch return 1;
+    libcontainer.linux.exeseal.ensureSealed(@ptrCast(init.minimal.args.vector.ptr), init.minimal.environ.block.slice, root, config.debug_log) catch |err| {
+        std.debug.print("igvano: cannot seal /proc/self/exe: {s}\n", .{@errorName(err)});
+        return 1;
+    };
     return null;
 }
 

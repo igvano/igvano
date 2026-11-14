@@ -17,7 +17,6 @@ mounts_sshfs::runc run [mount(8)-unlike behaviour: --bind with clearing flag]
 mounts_sshfs::runc run [ro,symfollow bind mount of a rw,nodev,nosymfollow fuse sshfs mount]
 personality::runc run personality for i686
 personality::runc run personality with exec for i686
-run::runc run [/proc/self/exe clone]
 seccomp::runc run [seccomp] (SECCOMP_FILTER_FLAG_*)
 seccomp::runc run [seccomp] (startContainer hook)
 start_hello::runc run as user with no exec bit but CAP_DAC_OVERRIDE set

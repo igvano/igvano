@@ -154,6 +154,12 @@ the reason available from `linux.diagnostic()`.
 - **Reaping.** `create` double-forks, so init is not your child. It is reparented to the
   nearest subreaper, or to host PID 1. To `waitpid` on init or on `exec`'d processes, set
   `PR_SET_CHILD_SUBREAPER` before the call, as `containerd-shim-runc-v2` does.
+- **Seal your binary (CVE-2019-5736).** `create` and `exec` fork processes that enter the
+  container while `/proc/self/exe` still names your program. A container process could open
+  that file and overwrite it. Call `libcontainer.linux.exeseal.ensureSealed` early in `main`,
+  before you open other descriptors. It re-executes your program once from a read-only
+  overlayfs view of the binary, or from a sealed memfd copy, as runc does for `runc init`.
+  The igvano CLI does this for `create`, `run` and `exec`.
 
 ## Layout
 
