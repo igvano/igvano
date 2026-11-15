@@ -496,6 +496,8 @@ fn runExecChild(context: *const ExecContext) noreturn {
     closeExecFrom(first_closed, fd_dir) catch |err| failCreate(ready[1], err);
     closeExecHostFds(context, fd_dir);
     changeExecCwd(context);
+    // Like runc's nsexec stage-2, the process leads its own session.
+    _ = linux.setsid();
     // Exec shares init's mount namespace; preserve its /dev/console.
     if (options.console_fds) |fds| setupConsole(fds[1], false, options.console_size) catch |err| {
         childError("cannot set up exec console: ", err);

@@ -8,10 +8,9 @@ pub const version = "0.1.0";
 
 const Command = struct { name: []const u8, usage: []const u8, summary: []const u8 };
 
-/// runc's command set. checkpoint and restore are listed so their help
-/// works like runc's, but igvano does not implement them.
+/// runc's command set.
 const commands = [_]Command{
-    .{ .name = "checkpoint", .usage = "<container-id>", .summary = "checkpoint a running container (not supported by igvano)" },
+    .{ .name = "checkpoint", .usage = "[command options] <container-id>", .summary = "checkpoint a running container" },
     .{ .name = "create", .usage = "[command options] <container-id>", .summary = "create a container" },
     .{ .name = "delete", .usage = "[command options] <container-id>", .summary = "delete any resources held by the container often used with detached container" },
     .{ .name = "events", .usage = "[command options] <container-id>", .summary = "display container events such as OOM notifications, cpu, memory, and IO usage statistics" },
@@ -21,7 +20,7 @@ const commands = [_]Command{
     .{ .name = "list", .usage = "[command options]", .summary = "lists containers started by runc with the given root" },
     .{ .name = "pause", .usage = "<container-id>", .summary = "pause suspends all processes inside the container" },
     .{ .name = "ps", .usage = "[command options] <container-id> [ps options]", .summary = "ps displays the processes running inside a container" },
-    .{ .name = "restore", .usage = "<container-id>", .summary = "restore a container from a previous checkpoint (not supported by igvano)" },
+    .{ .name = "restore", .usage = "[command options] <container-id>", .summary = "restore a container from a previous checkpoint" },
     .{ .name = "resume", .usage = "<container-id>", .summary = "resumes all processes that have been previously paused" },
     .{ .name = "run", .usage = "[command options] <container-id>", .summary = "create and run a container" },
     .{ .name = "spec", .usage = "[command options]", .summary = "create a new specification file" },

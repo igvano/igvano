@@ -7,6 +7,8 @@ pub const apparmorEnabled = @import("linux/procfs.zig").apparmorEnabled;
 pub const systemdCgroupMatches = @import("linux/systemd.zig").systemdCgroupMatches;
 pub const systemdUserCgroup = @import("linux/systemd.zig").systemdUserCgroup;
 pub const dbus = @import("dbus.zig");
+/// CRIU checkpoint; restore is CreateOptions.restore.
+pub const checkpoint = @import("linux/criu.zig").checkpoint;
 
 /// Borrowed thread-local failure detail; copy immediately before another operation.
 pub fn diagnostic() ?[]const u8 {
@@ -151,6 +153,7 @@ test {
     _ = @import("linux/rootfs.zig");
     _ = @import("linux/syscall.zig");
     _ = @import("linux/systemd.zig");
+    _ = @import("linux/criu.zig");
     _ = @import("linux/tests/cgroups_v1.zig");
     _ = @import("linux/tests/cgroups_v2.zig");
     _ = @import("linux/tests/console.zig");

@@ -34,6 +34,12 @@ pub fn createContainer(allocator: std.mem.Allocator, io: std.Io, injected: ?Cont
 /// a terminal=true process without --console-socket gets a PTY whose
 /// controller is stored there instead of sent to a socket.
 pub fn createContainerFor(allocator: std.mem.Allocator, io: std.Io, injected: ?ContainerOverride, config: Config, local_console: ?*?std.posix.fd_t) !i32 {
+    return createOrRestore(allocator, io, injected, config, local_console, null);
+}
+
+/// With `restore`, CRIU recreates the checkpointed processes instead of
+/// starting process.args, and the container ends up running.
+pub fn createOrRestore(allocator: std.mem.Allocator, io: std.Io, injected: ?ContainerOverride, config: Config, local_console: ?*?std.posix.fd_t, restore: ?*const libcontainer.Restore) !i32 {
     const cwd = std.Io.Dir.cwd();
     const bundle = try cwd.realPathFileAlloc(io, config.bundle orelse ".", allocator);
     defer allocator.free(bundle);
@@ -43,7 +49,7 @@ pub fn createContainerFor(allocator: std.mem.Allocator, io: std.Io, injected: ?C
     const has_console = createHasConsole(parsed.value, config, local_console != null);
     const process_options = try prepareCreateProcess(allocator, parsed.value.process, has_console);
     defer if (process_options) |options| allocator.free(options.rlimits);
-    const console_fds = if (has_console) try libcontainer.linux.console.socketpair() else null;
+    const console_fds = if (has_console and restore == null) try libcontainer.linux.console.socketpair() else null;
     defer closeConsoleFds(console_fds);
     const rootfs = try oci.resolveRootfs(allocator, bundle, parsed.value.root.path);
     defer allocator.free(rootfs);
@@ -63,14 +69,7 @@ pub fn createContainerFor(allocator: std.mem.Allocator, io: std.Io, injected: ?C
     const readonly_paths = try prepareRestrictionPaths(mount_allocator, settings.readonlyPaths);
     const devices = try oci.prepareDevices(allocator, settings.devices);
     defer oci.freeDevices(allocator, devices);
-    const user_cgroup = if (config.systemd) try libcontainer.linux.systemdUserCgroup(mount_allocator) else null;
-    const systemd_config = if (config.systemd) try oci.parseSystemdCgroupPath(allocator, settings.cgroupsPath, config.id, if (user_cgroup != null) "user.slice" else "system.slice") else null;
-    defer if (systemd_config) |value| value.deinit(allocator);
-    const cgroup_path = if (systemd_config) |value|
-        try std.fs.path.join(allocator, &.{ std.mem.trimStart(u8, user_cgroup orelse "", "/"), value.path })
-    else
-        try oci.resolveCgroupPath(allocator, settings.cgroupsPath, config.id);
-    defer allocator.free(cgroup_path);
+    const cgroup = try selectCgroup(mount_allocator, config, settings);
     const resources = try oci.cgroupResources(allocator, settings.resources);
     defer oci.freeCgroupResources(allocator, resources);
     var options: libcontainer.CreateOptions = .{
@@ -80,14 +79,14 @@ pub fn createContainerFor(allocator: std.mem.Allocator, io: std.Io, injected: ?C
         .exec_fifo = "",
         .console_fds = console_fds,
         .mounts = mounts,
-        .cgroup_path = cgroup_path,
+        .cgroup_path = cgroup.path,
         .cgroup_path_default = settings.cgroupsPath == null,
         .rootless_cgroups = rootlessCgroups(),
         .newuidmap = try mappingTool(mount_allocator, io, config.path_env, "newuidmap"),
         .newgidmap = try mappingTool(mount_allocator, io, config.path_env, "newgidmap"),
         .systemd = config.systemd,
-        .systemd_slice = if (systemd_config) |value| value.slice else "system.slice",
-        .systemd_unit = if (systemd_config) |value| value.unit else "",
+        .systemd_slice = cgroup.slice,
+        .systemd_unit = cgroup.unit,
         .resources = resources,
         .devices = devices,
         .device_symlinks = oci.deviceSymlinks(mounts),
@@ -101,10 +100,23 @@ pub fn createContainerFor(allocator: std.mem.Allocator, io: std.Io, injected: ?C
         .debug = config.debug_log,
         .no_pivot = config.no_pivot,
         .preserve_fds = config.preserve_fds,
+        .restore = restore,
     };
     try applyCreateSpec(mount_allocator, &options, parsed.value);
     applyCreateProcess(&options, process_options, init_env);
     return createPreparedContainer(allocator, mount_allocator, io, injected, config, bundle, parsed.value, options, local_console);
+}
+
+const CgroupSelection = struct { path: []const u8, slice: []const u8 = "system.slice", unit: []const u8 = "" };
+
+/// The cgroup path, and with --systemd-cgroup the slice and scope. A
+/// rootless systemd cgroup nests under the user manager, like runc.
+fn selectCgroup(arena: std.mem.Allocator, config: Config, settings: oci.Spec.Linux) !CgroupSelection {
+    if (!config.systemd) return .{ .path = try oci.resolveCgroupPath(arena, settings.cgroupsPath, config.id) };
+    const user_cgroup = try libcontainer.linux.systemdUserCgroup(arena);
+    const systemd = try oci.parseSystemdCgroupPath(arena, settings.cgroupsPath, config.id, if (user_cgroup != null) "user.slice" else "system.slice");
+    const path = try std.fs.path.join(arena, &.{ std.mem.trimStart(u8, user_cgroup orelse "", "/"), systemd.path });
+    return .{ .path = path, .slice = systemd.slice, .unit = systemd.unit };
 }
 
 /// Like runc, a non-root runtime looks the tools up on PATH before create.
@@ -112,6 +124,11 @@ pub fn createContainerFor(allocator: std.mem.Allocator, io: std.Io, injected: ?C
 fn mappingTool(allocator: std.mem.Allocator, io: std.Io, path_env: ?[]const u8, name: []const u8) !?[]const u8 {
     if (comptime builtin.os.tag != .linux) return null;
     if (std.os.linux.geteuid() == 0) return null;
+    return lookPath(allocator, io, path_env, name);
+}
+
+/// An executable `name` in an absolute $PATH directory, owned by allocator.
+pub fn lookPath(allocator: std.mem.Allocator, io: std.Io, path_env: ?[]const u8, name: []const u8) !?[]const u8 {
     const path = path_env orelse return null;
     var dirs = std.mem.tokenizeScalar(u8, path, ':');
     while (dirs.next()) |dir| {
@@ -175,7 +192,7 @@ fn closeConsoleFds(console_fds: ?[2]std.posix.fd_t) void {
     };
 }
 
-fn prepareCreateNamespaces(allocator: std.mem.Allocator, configured: ?[]const oci.Spec.Namespace) ![]libcontainer.Namespace {
+pub fn prepareCreateNamespaces(allocator: std.mem.Allocator, configured: ?[]const oci.Spec.Namespace) ![]libcontainer.Namespace {
     const namespaces = configured orelse &.{};
     const result = try allocator.alloc(libcontainer.Namespace, namespaces.len);
     for (namespaces, result) |namespace, *prepared| prepared.* = .{
@@ -227,7 +244,7 @@ test "mount labels become a context option on non-bind mounts, like runc" {
     try std.testing.expectEqualStrings("", try labeledMountData(a, &empty, "tmpfs", 0, null));
 }
 
-fn prepareCreateMounts(mount_allocator: std.mem.Allocator, bundle: []const u8, rootfs: []const u8, configured: ?[]const oci.Spec.Mount, settings: oci.Spec.Linux) ![]libcontainer.Mount {
+pub fn prepareCreateMounts(mount_allocator: std.mem.Allocator, bundle: []const u8, rootfs: []const u8, configured: ?[]const oci.Spec.Mount, settings: oci.Spec.Linux) ![]libcontainer.Mount {
     const spec_mounts = configured orelse &.{};
     const mounts = try mount_allocator.alloc(libcontainer.Mount, spec_mounts.len);
     for (spec_mounts, mounts, 0..) |mount, *prepared, i| {
@@ -365,7 +382,7 @@ fn createPreparedContainer(allocator: std.mem.Allocator, mount_allocator: std.me
 
     try reportCreateConsole(options.console_fds, config.console_socket, local_console);
     if (config.pidfd_socket) |path| try sendPidfd(path, handle.pid, "standard");
-    state.status = .created;
+    state.status = if (options.restore != null) .running else .created;
     if (lock) |file| try requireLinkedLock(io, file);
     try oci.saveState(allocator, io, root, state);
     if (config.pid_file) |path| {
@@ -506,7 +523,7 @@ pub const CreateContext = struct {
     }
 };
 
-fn prepareRestrictionPaths(allocator: std.mem.Allocator, configured: ?[]const []const u8) ![]const []const u8 {
+pub fn prepareRestrictionPaths(allocator: std.mem.Allocator, configured: ?[]const []const u8) ![]const []const u8 {
     const paths = configured orelse &.{};
     const prepared = try allocator.alloc([]const u8, paths.len);
     // Like runc, a relative path is taken from /, the cwd after pivot_root.

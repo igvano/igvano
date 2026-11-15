@@ -21,6 +21,8 @@ pub const Subcommand = enum {
     run,
     list,
     events,
+    checkpoint,
+    restore,
 };
 
 const PsFormat = enum { table, json };
@@ -77,6 +79,32 @@ pub const Config = struct {
     /// --preserve-fds: pass fds 3..3+N-1 through to the process.
     preserve_fds: u16 = 0,
     exec_args: []const []const u8 = &.{},
+    criu: CriuFlags = .{},
+};
+
+/// runc checkpoint and restore flags, kept as given; the frontend validates.
+pub const CriuFlags = struct {
+    image_path: ?[]const u8 = null,
+    work_path: ?[]const u8 = null,
+    parent_path: ?[]const u8 = null,
+    page_server: ?[]const u8 = null,
+    manage_cgroups_mode: ?[]const u8 = null,
+    lsm_profile: ?[]const u8 = null,
+    lsm_mount_context: ?[]const u8 = null,
+    status_fd: ?i32 = null,
+    /// --empty-ns network, as CLONE_NEWNET; runc only knows network.
+    empty_ns: u32 = 0,
+    leave_running: bool = false,
+    tcp_established: bool = false,
+    tcp_skip_in_flight: bool = false,
+    link_remap: bool = false,
+    ext_unix_sk: bool = false,
+    shell_job: bool = false,
+    lazy_pages: bool = false,
+    file_locks: bool = false,
+    pre_dump: bool = false,
+    auto_dedup: bool = false,
+    no_subreaper: bool = false,
 };
 
 pub fn parseArgs(args: []const []const u8) !Config {
@@ -125,6 +153,7 @@ fn commandFlagNames(subcommand: Subcommand) []const []const u8 {
     return switch (subcommand) {
         .create => &.{ "bundle", "b", "pid-file", "console-socket", "pidfd-socket", "no-pivot", "preserve-fds" },
         .run => &.{ "bundle", "b", "pid-file", "console-socket", "pidfd-socket", "no-pivot", "preserve-fds", "detach", "d", "keep" },
+        .checkpoint, .restore => &criu_flag_names,
         .spec => &.{ "bundle", "b", "rootless" },
         .list => &.{ "quiet", "q", "format", "f" },
         .events => &.{ "stats", "interval" },
@@ -241,6 +270,7 @@ fn parseCommandOptions(args: []const []const u8, index: *usize, config: *Config)
             config.resource_flags = update.resource_flags;
         },
         .delete => try parseDeleteOptions(args, index, config),
+        .checkpoint, .restore => try parseCriuOptions(args, index, config),
         .ps, .list => try parsePsOptions(args, index, config),
         .events => try parseEventsOptions(args, index, config),
         .kill => {
@@ -378,6 +408,80 @@ fn parseCreateOptions(args: []const []const u8, index: *usize, config: *Config) 
         }
     }
     if (config.bundle == null) config.bundle = ".";
+}
+
+const CriuCommand = enum { checkpoint, restore, both };
+const CriuFlag = struct { name: []const u8, field: []const u8, command: CriuCommand };
+
+/// runc's checkpoint and restore flags, with the Config or CriuFlags field
+/// each sets; bool fields take bare flags or =true/=false.
+const criu_flags = [_]CriuFlag{
+    .{ .name = "image-path", .field = "image_path", .command = .both },
+    .{ .name = "work-path", .field = "work_path", .command = .both },
+    .{ .name = "parent-path", .field = "parent_path", .command = .checkpoint },
+    .{ .name = "leave-running", .field = "leave_running", .command = .checkpoint },
+    .{ .name = "tcp-established", .field = "tcp_established", .command = .both },
+    .{ .name = "tcp-skip-in-flight", .field = "tcp_skip_in_flight", .command = .checkpoint },
+    .{ .name = "link-remap", .field = "link_remap", .command = .checkpoint },
+    .{ .name = "ext-unix-sk", .field = "ext_unix_sk", .command = .both },
+    .{ .name = "shell-job", .field = "shell_job", .command = .both },
+    .{ .name = "lazy-pages", .field = "lazy_pages", .command = .both },
+    .{ .name = "status-fd", .field = "status_fd", .command = .checkpoint },
+    .{ .name = "page-server", .field = "page_server", .command = .checkpoint },
+    .{ .name = "file-locks", .field = "file_locks", .command = .both },
+    .{ .name = "pre-dump", .field = "pre_dump", .command = .checkpoint },
+    .{ .name = "manage-cgroups-mode", .field = "manage_cgroups_mode", .command = .both },
+    .{ .name = "empty-ns", .field = "empty_ns", .command = .both },
+    .{ .name = "auto-dedup", .field = "auto_dedup", .command = .both },
+    .{ .name = "no-subreaper", .field = "no_subreaper", .command = .restore },
+    .{ .name = "lsm-profile", .field = "lsm_profile", .command = .restore },
+    .{ .name = "lsm-mount-context", .field = "lsm_mount_context", .command = .restore },
+    .{ .name = "console-socket", .field = "console_socket", .command = .restore },
+    .{ .name = "bundle", .field = "bundle", .command = .restore },
+    .{ .name = "b", .field = "bundle", .command = .restore },
+    .{ .name = "detach", .field = "detach", .command = .restore },
+    .{ .name = "d", .field = "detach", .command = .restore },
+    .{ .name = "pid-file", .field = "pid_file", .command = .restore },
+    .{ .name = "no-pivot", .field = "no_pivot", .command = .restore },
+};
+
+const criu_flag_names = names: {
+    var names: [criu_flags.len][]const u8 = undefined;
+    for (criu_flags, &names) |flag, *name| name.* = flag.name;
+    break :names names;
+};
+
+fn parseCriuOptions(args: []const []const u8, index: *usize, config: *Config) !void {
+    while (index.* < args.len and std.mem.startsWith(u8, args[index.*], "-") and !std.mem.eql(u8, args[index.*], "--")) : (index.* += 1) {
+        const flag = args[index.*];
+        var name = optionName(flag)[1..];
+        if (std.mem.startsWith(u8, name, "-")) name = name[1..];
+        inline for (criu_flags) |entry| {
+            if (std.mem.eql(u8, name, entry.name) and (entry.command == .both or
+                std.mem.eql(u8, @tagName(entry.command), @tagName(config.subcommand))))
+                break try applyCriuOption(args, index, config, entry.field, flag);
+        } else return oci.validationError(error.UnknownOption, "unknown option '{s}'", .{flag});
+    }
+    if (config.subcommand == .restore and config.bundle == null) config.bundle = ".";
+}
+
+fn applyCriuOption(args: []const []const u8, index: *usize, config: *Config, comptime field: []const u8, flag: []const u8) !void {
+    const target = if (@hasField(CriuFlags, field)) &@field(config.criu, field) else &@field(config, field);
+    switch (@TypeOf(target.*)) {
+        bool => target.* = try boolOption(flag),
+        u32 => {
+            const value = try optionValue(args, index, error.MissingCriuValue);
+            if (!std.mem.eql(u8, value, "network"))
+                return oci.validationError(error.InvalidCriuValue, "namespace \"{s}\" is not supported", .{value});
+            target.* |= std.os.linux.CLONE.NEWNET;
+        },
+        ?i32 => {
+            const value = try optionValue(args, index, error.MissingCriuValue);
+            target.* = std.fmt.parseInt(i32, value, 10) catch
+                return oci.validationError(error.InvalidCriuValue, "{s}: expected a number", .{optionName(flag)});
+        },
+        else => target.* = try optionValue(args, index, error.MissingCriuValue),
+    }
 }
 
 fn parseEventsOptions(args: []const []const u8, index: *usize, config: *Config) !void {
@@ -601,6 +705,7 @@ pub fn optionValue(args: []const []const u8, index: *usize, comptime missing: er
     MissingFormat,
     MissingInterval,
     MissingExecValue,
+    MissingCriuValue,
 }) ![]const u8 {
     const token = args[index.*];
     const flag = token[0 .. std.mem.indexOfScalar(u8, token, '=') orelse token.len];
@@ -1188,3 +1293,22 @@ pub const usage =
     "       igvano [global flags] events [--stats] [--interval <duration>] <id>\n" ++
     "       igvano [global flags] exec [--process <file>] [--detach|-d] [--pid-file <file>] [--console-socket <path>]\n" ++
     "              [--tty|-t] [--cwd <dir>] [--env K=V]... [--user UID[:GID]] <id> [command args...]\n";
+
+test "checkpoint and restore take runc's flags, in any position" {
+    var config = try parseArgs(&.{ "igvano", "checkpoint", "--work-path", "./w", "ctr", "--leave-running", "--empty-ns", "network", "--status-fd=5" });
+    try std.testing.expectEqualStrings("ctr", config.id);
+    try std.testing.expectEqualStrings("./w", config.criu.work_path.?);
+    try std.testing.expect(config.criu.leave_running);
+    try std.testing.expectEqual(std.os.linux.CLONE.NEWNET, config.criu.empty_ns);
+    try std.testing.expectEqual(@as(?i32, 5), config.criu.status_fd);
+    config = try parseArgs(&.{ "igvano", "restore", "-d", "--console-socket", "/s", "-b", "/b", "--pid-file=p", "ctr" });
+    try std.testing.expect(config.detach);
+    try std.testing.expectEqualStrings("/s", config.console_socket.?);
+    try std.testing.expectEqualStrings("/b", config.bundle.?);
+    try std.testing.expectEqualStrings("p", config.pid_file.?);
+    // Restore-only and checkpoint-only flags are rejected by the other command.
+    try std.testing.expectError(error.UnknownOption, parseArgs(&.{ "igvano", "checkpoint", "--detach", "ctr" }));
+    try std.testing.expectError(error.UnknownOption, parseArgs(&.{ "igvano", "restore", "--leave-running", "ctr" }));
+    try std.testing.expectError(error.InvalidCriuValue, parseArgs(&.{ "igvano", "checkpoint", "--empty-ns", "pid", "ctr" }));
+    oci.clearDiagnostic();
+}

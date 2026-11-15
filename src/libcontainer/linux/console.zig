@@ -195,7 +195,9 @@ pub fn setupConsole(socket: posix.fd_t, mount_console: bool, size: ?libcontainer
             try checkResult(linux.mount(replica_path orelse fdPath(&source_buffer, replica), fdPath(&target_buffer, target), null, linux.MS.BIND, 0));
         }
     }
-    try checkResult(linux.setsid());
+    // Init and exec processes may already lead their session.
+    const session = linux.setsid();
+    if (linux.errno(session) != .PERM) try checkResult(session);
     try checkResult(linux.ioctl(replica, linux.T.IOCSCTTY, 0));
     for (0..3) |fd| {
         try checkResult(linux.dup2(replica, @intCast(fd)));

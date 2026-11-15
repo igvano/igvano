@@ -108,6 +108,8 @@ pub const CreateOptions = struct {
     /// maps beyond its own IDs, like runc.
     newuidmap: ?[]const u8 = null,
     newgidmap: ?[]const u8 = null,
+    /// Restore a checkpoint with CRIU instead of starting process.args.
+    restore: ?*const Restore = null,
     debug: ?DebugLog = null,
 };
 
@@ -166,6 +168,65 @@ pub const TimeOffsets = struct {
     boottime: ?TimeOffset = null,
 };
 pub const TimeOffset = struct { secs: i64, nanosecs: u32 };
+
+/// CRIU settings shared by checkpoint and restore, like runc's CriuOpts.
+pub const CriuOptions = struct {
+    /// Absolute path of the criu binary.
+    path: [:0]const u8,
+    /// criu's environment; it runs iptables-restore from PATH.
+    env: []const [:0]const u8 = &.{},
+    image_dir: []const u8,
+    work_dir: ?[]const u8 = null,
+    /// Relative to image_dir: a previous pre-dump.
+    parent_image: ?[]const u8 = null,
+    leave_running: bool = false,
+    tcp_established: bool = false,
+    tcp_skip_in_flight: bool = false,
+    link_remap: bool = false,
+    ext_unix_sk: bool = false,
+    shell_job: bool = false,
+    file_locks: bool = false,
+    pre_dump: bool = false,
+    auto_dedup: bool = false,
+    lazy_pages: bool = false,
+    /// Written with one NUL byte once the lazy-pages server is ready.
+    status_fd: ?std.posix.fd_t = null,
+    page_server: ?PageServer = null,
+    manage_cgroups_mode: CgroupMode = .default,
+    /// CLONE_* namespaces to create empty instead of restoring.
+    empty_ns: u32 = 0x40000000,
+    lsm_profile: ?[]const u8 = null,
+    lsm_mount_context: ?[]const u8 = null,
+    /// A CRIU configuration file; null for none.
+    config_file: ?[]const u8 = "/etc/criu/runc.conf",
+    debug: ?DebugLog = null,
+
+    pub const PageServer = struct { address: []const u8, port: i32 };
+    /// rpc.proto's criu_cg_mode values.
+    pub const CgroupMode = enum(u32) { ignore = 0, soft = 3, full = 4, strict = 5, default = 6 };
+};
+
+/// A running container to checkpoint; everything is borrowed.
+pub const Checkpoint = struct {
+    criu: CriuOptions,
+    pid: i32,
+    rootfs: []const u8,
+    /// Absolute cgroup v2 directory for CRIU's freezer.
+    freeze_cgroup: ?[]const u8 = null,
+    mounts: []const Mount = &.{},
+    masked_paths: []const []const u8 = &.{},
+    devices: []const Device = &.{},
+    namespaces: []const Namespace = &.{},
+};
+
+pub const Restore = struct {
+    criu: CriuOptions,
+    /// A new directory where the rootfs is bind-mounted for CRIU, which
+    /// needs its root to be a mount point.
+    criu_root: []const u8,
+    /// Receives the pseudoterminal controller CRIU recreates.
+    console_socket: ?std.posix.fd_t = null,
+};
 
 pub const Namespace = struct {
     kind: Kind,
@@ -491,6 +552,7 @@ pub const Error = error{
     ConsoleFailed,
     MissingDevpts,
     MissingProcfs,
+    CriuFailed,
 } || std.mem.Allocator.Error;
 
 pub const Container = struct {

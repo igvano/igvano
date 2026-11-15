@@ -46,18 +46,21 @@ Isolation and resources:
   capabilities, `noNewPrivileges`, `oomScoreAdj`, lifecycle hooks.
 - cgroup v2 and cgroup v1, with the cgroupfs driver or the systemd driver
   (`--systemd-cgroup`, `linux.cgroupsPath` = `slice:prefix:name`; transient
-  scopes over a minimal built-in D-Bus client).
+  scopes over a minimal built-in D-Bus client; a rootless runtime uses the
+  per-user manager on the session bus).
 - Device rules on both versions: v1 `devices.*` via a port of runc's devices
   emulator; v2 via a `BPF_CGROUP_DEVICE` program.
 - seccomp: a built-in classic-BPF compiler (native + compat arch, arg
   conditions, runc-compatible ENOSYS handling for newer syscalls).
-- AppArmor profiles for init and `exec`.
+- AppArmor profiles and SELinux labels (`process.selinuxLabel`,
+  `linux.mountLabel`) for init and `exec`.
+- `checkpoint` and `restore` through CRIU's RPC (`criu swrk`), like runc.
 - Idmapped mounts (`uidMappings`/`gidMappings`, `idmap`/`ridmap`).
 - `/proc` writes made inside the container (AppArmor, sysctls) go through a
   private procfs instance, failing closed if it cannot be verified.
 
-Known limitations: no SELinux, no seccomp notify (`SCMP_ACT_NOTIFY`), no
-checkpoint/restore, systemd slice units are not created (scopes only). In
+Known limitations: no seccomp notify (`SCMP_ACT_NOTIFY`), systemd slice
+units are not created (scopes only). In
 joined mount namespaces, bind sources opened by the mount-source helper must
 not contain symlinks.
 

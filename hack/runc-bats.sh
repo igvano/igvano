@@ -32,7 +32,7 @@ if [ "${1-}" = "--inside" ]; then
         done
     fi
     apt-get update -qq
-    apt-get install -y -qq --no-install-recommends jq iproute2 uidmap libseccomp-dev xz-utils sudo >/dev/null
+    apt-get install -y -qq --no-install-recommends jq iproute2 uidmap libseccomp-dev xz-utils sudo criu iptables >/dev/null
     git init -q /tmp/bats-core
     git -C /tmp/bats-core fetch -q --depth 1 https://github.com/bats-core/bats-core.git "$BATS_REF"
     git -C /tmp/bats-core checkout -q --detach FETCH_HEAD

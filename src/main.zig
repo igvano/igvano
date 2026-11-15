@@ -25,6 +25,7 @@ const writeSpec = @import("cli/spec.zig").writeSpec;
 const runContainer = @import("cli/run.zig").runContainer;
 const listContainers = @import("cli/list.zig").listContainers;
 const eventsContainer = @import("cli/events.zig").eventsContainer;
+const criuCommand = @import("cli/checkpoint.zig").criuCommand;
 pub const default_root = @import("cli/args.zig").default_root;
 
 pub fn main(init: std.process.Init) !u8 {
@@ -153,6 +154,8 @@ fn argumentErrorMessage(err: ParseArgsError) []const u8 {
         .{ "MissingInterval", "missing value for --interval" },
         .{ "MissingExecValue", "missing value for an exec option" },
         .{ "InvalidExecValue", "invalid value for an exec option" },
+        .{ "MissingCriuValue", "missing value for a checkpoint or restore option" },
+        .{ "InvalidCriuValue", "invalid value for a checkpoint or restore option" },
         .{ "InvalidDuration", "invalid --interval; expected a positive duration such as 5s" },
         .{ "InvalidFormat", "invalid --format; expected table or json" },
         .{ "InvalidProcess", "invalid process environment; expected K=V" },
@@ -169,20 +172,28 @@ fn argumentErrorMessage(err: ParseArgsError) []const u8 {
     return messages.get(@errorName(err)).?;
 }
 
+/// Commands that exit with a container process's status.
+fn processCommand(allocator: std.mem.Allocator, io: std.Io, config: Config) !u8 {
+    return switch (config.subcommand) {
+        .exec => execContainer(allocator, io, null, config),
+        .run => runContainer(allocator, io, null, config),
+        else => criuCommand(allocator, io, null, config),
+    };
+}
+
 fn dispatchCommand(allocator: std.mem.Allocator, io: std.Io, config: Config) !u8 {
     switch (config.subcommand) {
         .features => try features(allocator, io),
         .state => try stateContainer(allocator, io, null, config),
         .create => try createContainer(allocator, io, null, config),
         .start => try startContainer(allocator, io, null, config),
-        .exec => return execContainer(allocator, io, null, config),
+        .exec, .run, .checkpoint, .restore => return processCommand(allocator, io, config),
         .kill => try killContainer(allocator, io, null, config),
         .update => try updateContainer(allocator, io, null, config),
         .ps => try psContainer(allocator, io, null, config, std.Io.File.stdout()),
         .pause, .@"resume" => try pauseContainer(allocator, io, null, config),
         .delete => try deleteContainer(allocator, io, null, config),
         .spec => try writeSpec(allocator, io, config),
-        .run => return runContainer(allocator, io, null, config),
         .list => try listContainers(allocator, io, null, config),
         .events => try eventsContainer(allocator, io, null, config),
     }
@@ -280,6 +291,7 @@ fn emitError(allocator: std.mem.Allocator, io: std.Io, log: ?[]const u8, log_for
 comptime {
     if (builtin.is_test) {
         _ = @import("cli/args.zig");
+        _ = @import("cli/checkpoint.zig");
         _ = @import("cli/create.zig");
         _ = @import("cli/delete.zig");
         _ = @import("cli/diagnostic.zig");

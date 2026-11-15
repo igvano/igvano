@@ -24,7 +24,7 @@ if [ "${1-}" = "--inside" ]; then
         done
     fi
     apt-get update -qq
-    apt-get install -y -qq --no-install-recommends jq iproute2 libbtrfs-dev btrfs-progs >/dev/null
+    apt-get install -y -qq --no-install-recommends jq iproute2 libbtrfs-dev btrfs-progs criu iptables >/dev/null
     # Copy, not bind-mount: a bind-mounted host binary may not be executable
     # through /proc/self/fd, which runc-style re-exec relies on.
     install -m 0755 /inputs/runtime /usr/local/sbin/runc
@@ -40,9 +40,8 @@ if [ "${1-}" = "--inside" ]; then
     make binaries install >/dev/null
     cd integration/client
     status=0
-    # -no-criu: checkpoint/restore is out of scope (no CRIU in igvano).
     go test -json -timeout "${CONTAINERD_TIMEOUT:-60m}" -parallel 8 ${CONTAINERD_RUN:+-run "$CONTAINERD_RUN"} . \
-        -args -test.root -no-criu > /tmp/test.json 2>&1 || status=$?
+        -args -test.root > /tmp/test.json 2>&1 || status=$?
     jq -r 'select(.Action == "output") | .Output' /tmp/test.json 2>/dev/null | tr -d '\r' || cat /tmp/test.json
     printf '\nExit status: %s\n' "$status"
     echo client > /outputs/groups

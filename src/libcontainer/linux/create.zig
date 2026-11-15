@@ -64,6 +64,8 @@ const RootfsOptions = @import("rootfs.zig").RootfsOptions;
 const setupRootfs = @import("rootfs.zig").setupRootfs;
 const kill = @import("proc.zig").kill;
 const readProcStatAt = @import("proc.zig").readProcStatAt;
+const readProcStat = @import("proc.zig").readProcStat;
+const criu = @import("criu.zig");
 const closeExecFrom = @import("process.zig").closeExecFrom;
 const kernelCapabilities = @import("process.zig").kernelCapabilities;
 const runProcess = @import("process.zig").runProcess;
@@ -223,7 +225,8 @@ fn validateCreateProcess(ctx: *CreateContext) libcontainer.Error!void {
         if (process.args.len == 0) return error.InvalidProcess;
     }
     const terminal = if (ctx.options.process) |process| process.terminal else false;
-    if (terminal != (ctx.options.console_fds != null)) return error.InvalidConfig;
+    // CRIU recreates a restored terminal itself.
+    if (ctx.options.restore == null and terminal != (ctx.options.console_fds != null)) return error.InvalidConfig;
     ctx.init.capabilities = if (ctx.options.capabilities) |caps| try kernelCapabilities(caps) else null;
     for (ctx.options.rlimits) |limit| {
         if (limit.soft > limit.hard) return error.InvalidConfig;
@@ -519,6 +522,7 @@ fn createWithMountSources(ctx: *CreateContext) libcontainer.Error!libcontainer.S
             break;
         }
     }
+    if (ctx.options.restore) |restore| return restoreCreate(ctx, restore);
     const mount_source_helper = if (needs_mount_sources) try startMountSourceHelper(
         ctx.init.mounts,
         // Only a mount namespace igvano unshares itself; one joined by path keeps NO_SYMLINKS.
@@ -532,6 +536,50 @@ fn createWithMountSources(ctx: *CreateContext) libcontainer.Error!libcontainer.S
     };
     return forkCreate(ctx);
 }
+
+/// Restore replaces the init fork: criu takes the place of child1 in the
+/// container's cgroup and recreates the checkpointed processes.
+fn restoreCreate(ctx: *CreateContext, restore: *const libcontainer.Restore) libcontainer.Error!libcontainer.State {
+    var callback: RestoreCallback = .{ .ctx = ctx };
+    const pid = try criu.restore(ctx.allocator, restore, .{
+        .rootfs = ctx.init.rootfs,
+        .mounts = ctx.options.mounts,
+        .masked_paths = ctx.options.masked_paths,
+        .devices = ctx.options.devices,
+        .namespaces = ctx.options.namespaces,
+    }, .{ .ptr = &callback, .started = RestoreCallback.started, .restored = RestoreCallback.restored });
+    errdefer _ = linux.kill(pid, linux.SIG.KILL);
+    const owned_starttime = try ctx.options.allocator.dupe(u8, callback.starttime[0..callback.starttime_len]);
+    return createHandle(ctx, pid, owned_starttime);
+}
+
+const RestoreCallback = struct {
+    ctx: *CreateContext,
+    starttime: [20]u8 = undefined,
+    starttime_len: usize = 0,
+
+    fn started(ptr: *anyopaque, criu_pid: i32) libcontainer.Error!void {
+        const self: *RestoreCallback = @ptrCast(@alignCast(ptr));
+        const ctx = self.ctx;
+        if (ctx.options.systemd) return adoptInitSystemd(ctx, criu_pid);
+        var buffer: [20]u8 = undefined;
+        const pid_text = std.fmt.bufPrint(&buffer, "{d}", .{criu_pid}) catch unreachable;
+        if (ctx.cgroups.cgroup) |fd| return writeCgroupFile(fd, "cgroup.procs", pid_text, ctx.options.cgroup_path);
+        for (ctx.cgroups.hierarchies) |hierarchy| if (hierarchy.leaf) |fd|
+            try writeCgroupFile(fd, "cgroup.procs", pid_text, ctx.options.cgroup_path);
+    }
+
+    /// Like runc's setup-namespaces notification: state and createRuntime hooks.
+    fn restored(ptr: *anyopaque, pid: i32) libcontainer.Error!void {
+        const self: *RestoreCallback = @ptrCast(@alignCast(ptr));
+        var buffer: [512]u8 = undefined;
+        const stat = try readProcStat(pid, &buffer);
+        @memcpy(self.starttime[0..stat.starttime.len], stat.starttime);
+        self.starttime_len = stat.starttime.len;
+        const ctx = self.ctx;
+        if (ctx.options.on_create) |callback| try callback.run(callback.ptr, createHandle(ctx, pid, stat.starttime));
+    }
+};
 
 fn forkCreate(ctx: *CreateContext) libcontainer.Error!libcontainer.State {
     // getpid() in child2 may be 1. Child1 supplies its host PID for
@@ -727,6 +775,9 @@ fn joinInitTime(time_fd: ?posix.fd_t) void {
 }
 
 fn runInitChild(ctx: *const CreateContext, time_fd: ?posix.fd_t) noreturn {
+    // Like runc's nsexec stage-2, init leads its own session; CRIU refuses
+    // to dump a session led from outside the PID namespace.
+    _ = linux.setsid();
     joinInitTime(time_fd);
     closeFd(ctx.sync.pid_pipe[1]);
     var host_pid: i32 = undefined;
