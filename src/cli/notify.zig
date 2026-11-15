@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Portions derived from runc (https://github.com/opencontainers/runc), Copyright The runc Authors, Apache-2.0:
+// notify_socket.go.
+// Translated to Zig and modified. See NOTICE.
 //! systemd's sd_notify from inside the container, like runc's
 //! notify_socket.go: with $NOTIFY_SOCKET set, create and run bind the state
 //! directory's notify/ into the container as /run/notify, and start relays

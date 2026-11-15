@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Portions derived from runc (https://github.com/opencontainers/runc), Copyright The runc Authors, Apache-2.0:
+// libcontainer/nsenter/nsexec.c (join_namespaces).
+// Translated to Zig and modified. See NOTICE.
 const std = @import("std");
 const builtin = @import("builtin");
 const linux = std.os.linux;

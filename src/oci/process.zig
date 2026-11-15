@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Portions derived from youki (https://github.com/youki-dev/youki), Copyright
+// The youki Authors, Apache-2.0: crates/libcontainer/src/process/memory_policy.rs.
+// Translated to Zig and modified. See NOTICE.
 const std = @import("std");
 const libcontainer = @import("libcontainer");
 const validationError = @import("diagnostic.zig").validationError;

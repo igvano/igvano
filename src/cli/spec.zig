@@ -1,3 +1,8 @@
+// SPDX-License-Identifier: Apache-2.0
+// spec.json is the output of `runc spec`, from runc
+// (https://github.com/opencontainers/runc) libcontainer/specconv/example.go,
+// Copyright The runc Authors, Apache-2.0.
+// Translated to Zig and modified. See NOTICE.
 const std = @import("std");
 const oci = @import("igvano").oci;
 const Config = @import("args.zig").Config;

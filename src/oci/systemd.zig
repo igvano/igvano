@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Portions derived from opencontainers/cgroups (https://github.com/opencontainers/cgroups), Copyright The runc Authors, Apache-2.0:
+// systemd/common.go (ExpandSlice).
+// Translated to Zig and modified. See NOTICE.
 const std = @import("std");
 const clearDiagnostic = @import("diagnostic.zig").clearDiagnostic;
 const diagnosticFor = @import("diagnostic.zig").diagnosticFor;

@@ -1,3 +1,8 @@
+// SPDX-License-Identifier: Apache-2.0
+// Portions derived from runc (https://github.com/opencontainers/runc), Copyright The runc Authors, Apache-2.0:
+// libcontainer/rootfs_linux.go (msMoveRoot, pivotRoot, reOpenDevNull,
+// rootfsParentMountPrivate, prepareRoot).
+// Translated to Zig and modified. See NOTICE.
 const std = @import("std");
 const linux = std.os.linux;
 const posix = std.posix;
