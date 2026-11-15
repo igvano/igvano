@@ -47,6 +47,7 @@
             packages = [
               zig-overlay.packages.${system}."0.16.0"
               pkgs.prek
+              pkgs.mdbook
               ccccBin
             ];
           };

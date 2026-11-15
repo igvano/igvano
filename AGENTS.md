@@ -37,6 +37,7 @@ Zig is NOT installed system-wide. The toolchain comes from the Nix flake devShel
 nix develop -c zig build test   # build + run tests
 nix develop -c zig build        # build only
 direnv allow                    # once; then plain `zig build test` works in this dir
+nix develop -c mdbook build docs  # docs; pages in docs/src include README sections by anchor
 # Doubled --dep libcontainer is intentional: one for root, one for igvano.
 nix develop -c zig test --dep igvano --dep libcontainer -Mroot=src/main.zig \
   --dep libcontainer -Migvano=src/lib.zig -Mlibcontainer=src/libcontainer/root.zig   # CLI tests directly

@@ -1,0 +1,15 @@
+[book]
+title = "igvano"
+authors = ["igvano contributors"]
+language = "en"
+src = "src"
+
+[build]
+# Fail on a SUMMARY.md entry with no file instead of creating an empty page.
+create-missing = false
+
+[output.html]
+git-repository-url = "https://github.com/igvano/igvano"
+edit-url-template = "https://github.com/igvano/igvano/edit/main/docs/{path}"
+# The project page path once GitHub Pages is turned on.
+site-url = "/igvano/"
