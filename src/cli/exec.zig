@@ -165,6 +165,7 @@ fn prepareExecOptions(process_allocator: std.mem.Allocator, io: std.Io, state: L
     if (agent.*) |*value| options.on_seccomp_listener = value.callback();
     // Empty means no cgroup to join: a rootless create that had no permission.
     options.cgroup_path = state.container_state.?.cgroup_path orelse "";
+    options.rootless_cgroups = @import("create.zig").rootlessCgroups();
     options.console_fds = if (process.terminal orelse false) try libcontainer.linux.console.socketpair() else null;
     options.debug = config.debug_log;
     options.sub_cgroups = try subCgroups(process_allocator, config.exec_flags);

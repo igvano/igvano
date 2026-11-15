@@ -78,7 +78,8 @@ const Decoder = struct {
     fn next(self: *Decoder) Error!?Field {
         if (self.offset == self.bytes.len) return null;
         const key = try self.varint();
-        var field: Field = .{ .number = @intCast(key >> 3 & 0x1fffffff) };
+        if (key >> 3 == 0 or key >> 3 > 0x1fffffff) return error.CriuFailed;
+        var field: Field = .{ .number = @intCast(key >> 3) };
         switch (key & 7) {
             0 => field.value = try self.varint(),
             1, 5 => {
@@ -157,7 +158,8 @@ const Response = struct {
             4 => parts[2] = item.value,
             else => {},
         };
-        self.version = @truncate(parts[0] * 10000 + parts[1] * 100 + parts[2]);
+        for (parts) |part| if (part > 99) return error.CriuFailed;
+        self.version = @intCast(parts[0] * 10000 + parts[1] * 100 + parts[2]);
     }
 };
 
@@ -199,6 +201,7 @@ const Swrk = struct {
     /// criu's stdio is ours when `inherit_stdio`, otherwise /dev/null, as
     /// runc's exec.Cmd leaves it. `extra` become fds 4, 5, ... in criu.
     fn spawn(allocator: std.mem.Allocator, options: Options, inherit_stdio: bool, extra: []const posix.fd_t) Error!Swrk {
+        if (extra.len > 8) return error.SystemResources;
         var fds: [2]posix.fd_t = undefined;
         try checkResult(linux.socketpair(linux.AF.UNIX, linux.SOCK.SEQPACKET | linux.SOCK.CLOEXEC, 0, &fds));
         defer closeFd(fds[1]);
@@ -214,13 +217,13 @@ const Swrk = struct {
 
     fn execSwrk(path: [:0]const u8, argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*:0]const u8, inherit_stdio: bool, server: posix.fd_t, extra: []const posix.fd_t) noreturn {
         if (!inherit_stdio) {
-            const null_fd = linux.open("/dev/null", .{ .ACCMODE = .RDWR }, 0);
+            const null_fd = linux.open("/dev/null", .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
             if (linux.errno(null_fd) != .SUCCESS) linux.exit(127);
             for (0..3) |target| _ = linux.dup2(@intCast(null_fd), @intCast(target));
         }
         // Move every source above the targets first, so no dup2 clobbers one.
         var sources: [9]posix.fd_t = undefined;
-        const count = @min(extra.len + 1, sources.len);
+        const count = extra.len + 1;
         for (0..count) |i| {
             const fd = if (i == 0) server else extra[i - 1];
             const moved = linux.fcntl(fd, linux.F.DUPFD_CLOEXEC, 64);
@@ -230,6 +233,8 @@ const Swrk = struct {
         for (sources[0..count], 0..) |fd, i| {
             if (linux.errno(linux.dup2(fd, @intCast(3 + i))) != .SUCCESS) linux.exit(127);
         }
+        // Like exec.Cmd, criu gets stdio, its socket and the extras only.
+        _ = linux.syscall3(.close_range, 3 + count, std.math.maxInt(u32), 0);
         _ = linux.execve(path, argv, envp);
         linux.exit(127);
     }
@@ -455,19 +460,22 @@ fn requireExternalNamespace(kind: libcontainer.Namespace.Kind, version: u32, dur
 
 /// The path of `destination` inside `rootfs` after following symlinks, as
 /// runc's securejoin gives it; the literal path when it does not exist.
-fn resolvedDestination(allocator: std.mem.Allocator, root_fd: posix.fd_t, root_path: []const u8, destination: []const u8, is_file: bool, create: bool) Error![]const u8 {
-    const fd = mountDestination(root_fd, destination, is_file, create) catch |err| {
-        if (create) return err;
-        return allocator.dupe(u8, destination);
-    };
+fn resolvedDestination(allocator: std.mem.Allocator, root_fd: posix.fd_t, root_path: []const u8, destination: []const u8, is_file: bool) Error![]const u8 {
+    const fd = mountDestination(root_fd, destination, is_file, false) catch return allocator.dupe(u8, destination);
     defer closeFd(fd);
+    return relativePath(allocator, fd, root_path, destination);
+}
+
+/// Where `fd` is below `root_path`, as an absolute container path.
+fn relativePath(allocator: std.mem.Allocator, fd: posix.fd_t, root_path: []const u8, fallback: []const u8) Error![]const u8 {
     var fd_buffer: [64]u8 = undefined;
     var buffer: [std.fs.max_path_bytes]u8 = undefined;
     const size = linux.readlink(fdPath(&fd_buffer, fd), &buffer, buffer.len);
     try checkResult(size);
     const resolved = buffer[0..size];
-    if (!std.mem.startsWith(u8, resolved, root_path)) return allocator.dupe(u8, destination);
+    if (!std.mem.startsWith(u8, resolved, root_path)) return allocator.dupe(u8, fallback);
     const relative = resolved[root_path.len..];
+    if (relative.len != 0 and relative[0] != '/') return allocator.dupe(u8, fallback);
     return allocator.dupe(u8, if (relative.len == 0) "/" else relative);
 }
 
@@ -513,14 +521,15 @@ fn saveDescriptors(allocator: std.mem.Allocator, pid: i32, image: posix.fd_t) Er
     }
     const json = try std.json.Stringify.valueAlloc(allocator, targets, .{});
     defer allocator.free(json);
-    const fd = linux.openat(image, "descriptors.json", .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true }, 0o600);
+    const fd = linux.openat(image, "descriptors.json", .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .NOFOLLOW = true, .CLOEXEC = true }, 0o600);
     try checkResult(fd);
     defer closeFd(@intCast(fd));
     if (!@import("syscall.zig").writeAll(@intCast(fd), json)) return error.CriuFailed;
 }
 
-/// runc's logCriuErrors: quote the log lines mentioning an error.
-fn logErrors(dir: []const u8, file: []const u8) void {
+/// runc's logCriuErrors: quote the log lines mentioning an error, as
+/// warnings where runc's logrus writes them (--log, else stderr).
+fn logErrors(log: ?libcontainer.DebugLog, dir: []const u8, file: []const u8) void {
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const path = std.fmt.bufPrintZ(&path_buffer, "{s}/{s}", .{ dir, file }) catch return;
     const fd = openPath(linux.AT.FDCWD, path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }) catch return;
@@ -532,13 +541,32 @@ fn logErrors(dir: []const u8, file: []const u8) void {
         if (linux.errno(count) != .SUCCESS or count == 0) break;
         used += count;
     }
-    std.debug.print("igvano: warning: --- Quoting \"{s}\"\n", .{path});
+    var quote_buffer: [std.fs.max_path_bytes + 16]u8 = undefined;
+    warn(log, std.fmt.bufPrint(&quote_buffer, "--- Quoting \"{s}\"", .{path}) catch return);
     var lines = std.mem.splitScalar(u8, buffer[0..used], '\n');
     var number: usize = 0;
+    var line_buffer: [1024]u8 = undefined;
     while (lines.next()) |line| {
         number += 1;
-        if (std.mem.indexOf(u8, line, "Error") != null) std.debug.print("igvano: warning: {d}:{s}\n", .{ number, line });
+        if (std.mem.indexOf(u8, line, "Error") == null) continue;
+        warn(log, std.fmt.bufPrint(&line_buffer, "{d}:{s}", .{ number, line[0..@min(line.len, 1000)] }) catch continue);
     }
+    warn(log, "---");
+}
+
+/// One logrus-style warning line: level=warning msg="..." or JSON.
+fn warn(log: ?libcontainer.DebugLog, message: []const u8) void {
+    const target = log orelse libcontainer.DebugLog{ .fd = 2 };
+    var buffer: [2048]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    if (target.json) {
+        std.json.Stringify.value(.{ .level = "warning", .msg = message }, .{}, &writer) catch return;
+    } else {
+        writer.writeAll("level=warning msg=") catch return;
+        std.json.Stringify.value(message, .{}, &writer) catch return;
+    }
+    writer.writeByte('\n') catch return;
+    _ = @import("syscall.zig").writeAll(target.fd, writer.buffered());
 }
 
 /// runc's Checkpoint. The caller destroys the container afterwards unless
@@ -570,7 +598,7 @@ pub fn checkpoint(allocator: std.mem.Allocator, target: libcontainer.Checkpoint)
     var swrk = try Swrk.spawn(a, options, false, &.{});
     defer swrk.deinit();
     var events: DumpEvents = .{ .status_fd = if (version >= 31500) options.status_fd else null };
-    errdefer logErrors(dirs.log, "dump.log");
+    errdefer logErrors(options.log, dirs.log, "dump.log");
     _ = try swrk.exchange(a, request.bytes.items, &events);
     try swrk.finish(!options.pre_dump);
 }
@@ -629,7 +657,7 @@ fn dumpMounts(a: std.mem.Allocator, opts: *Encoder, target: libcontainer.Checkpo
     defer closeFd(root_fd);
     for (target.mounts) |mount| {
         if (!isBind(mount)) continue;
-        const key = try resolvedDestination(a, root_fd, root_path, mount.destination, sourceIsFile(mount.source), false);
+        const key = try resolvedDestination(a, root_fd, root_path, mount.destination, sourceIsFile(mount.source));
         try opts.pair(23, key, key);
     }
     for (target.masked_paths) |path| {
@@ -640,7 +668,7 @@ fn dumpMounts(a: std.mem.Allocator, opts: *Encoder, target: libcontainer.Checkpo
         try opts.pair(23, path, "/dev/null");
     }
     for (target.devices) |device| {
-        const key = try resolvedDestination(a, root_fd, root_path, device.path, true, false);
+        const key = try resolvedDestination(a, root_fd, root_path, device.path, true);
         try opts.pair(23, key, key);
     }
 }
@@ -688,9 +716,7 @@ pub fn restore(allocator: std.mem.Allocator, settings: *const libcontainer.Resto
     var extra: std.ArrayList(posix.fd_t) = .empty;
     defer for (extra.items) |fd| closeFd(fd);
     try restoreNamespaces(a, &opts, target.namespaces, version, &extra);
-    var mounts: TemporaryMounts = .{};
-    defer mounts.unmount();
-    try prepareRestoreMounts(a, &opts, target, &mounts);
+    try prepareRestoreMounts(a, &opts, target);
     try inheritPipes(a, &opts, dirs.image);
     var swrk = try Swrk.spawn(a, options, true, extra.items);
     defer swrk.deinit();
@@ -700,7 +726,13 @@ pub fn restore(allocator: std.mem.Allocator, settings: *const libcontainer.Resto
     try request.uint(1, @intFromEnum(ReqType.restore));
     try request.string(2, opts.bytes.items);
     var handler: RestoreHandler = .{ .events = events, .console_socket = settings.console_socket };
-    errdefer logErrors(dirs.log, "restore.log");
+    // The restored init is our child (rst_sibling), so its PID stays ours
+    // until reaped; kill it if restore fails after it appeared.
+    errdefer if (handler.pid > 0) {
+        _ = linux.kill(handler.pid, linux.SIG.KILL);
+        _ = waitChild(handler.pid) catch {};
+    };
+    errdefer logErrors(options.log, dirs.log, "restore.log");
     const response = try swrk.exchange(a, request.bytes.items, &handler);
     try swrk.finish(true);
     const pid = if (handler.pid != 0) handler.pid else response.restore_pid;
@@ -708,7 +740,10 @@ pub fn restore(allocator: std.mem.Allocator, settings: *const libcontainer.Resto
         reportDiagnostic("criu did not report the restored process", .{});
         return error.CriuFailed;
     }
-    if (handler.pid == 0) try events.restored(events.ptr, pid);
+    if (handler.pid == 0) {
+        handler.pid = pid;
+        try events.restored(events.ptr, pid);
+    }
     return pid;
 }
 
@@ -748,21 +783,33 @@ const CriuRoot = struct {
     }
 
     fn unmount(self: *CriuRoot) void {
-        _ = linux.umount2(self.path, linux.MNT.DETACH);
+        if (linux.errno(linux.umount2(self.path, linux.MNT.DETACH)) != .SUCCESS) {
+            warn(null, "cannot unmount the rootfs bind for criu");
+            return;
+        }
         _ = linux.rmdir(self.path);
     }
 };
 
 /// Bind mounts made so nested mountpoints can be created, undone after.
+/// Like runc, cleanup resolves each destination again inside the rootfs.
 const TemporaryMounts = struct {
-    paths: [64][:0]const u8 = undefined,
-    len: usize = 0,
+    root_fd: ?posix.fd_t = null,
+    mounts: std.ArrayList(struct { key: []const u8, is_file: bool }) = .empty,
 
     fn unmount(self: *TemporaryMounts) void {
-        var i = self.len;
+        const root_fd = self.root_fd orelse return;
+        defer closeFd(root_fd);
+        var i = self.mounts.items.len;
         while (i > 0) {
             i -= 1;
-            _ = linux.umount2(self.paths[i], linux.MNT.DETACH);
+            const mount = self.mounts.items[i];
+            const fd = mountDestination(root_fd, mount.key, mount.is_file, false) catch continue;
+            defer closeFd(fd);
+            var buffer: [64]u8 = undefined;
+            const result = linux.umount2(fdPath(&buffer, fd), linux.MNT.DETACH);
+            if (linux.errno(result) != .SUCCESS and linux.errno(result) != .INVAL)
+                warn(null, "cannot unmount a temporary restore mount");
         }
     }
 };
@@ -778,24 +825,27 @@ fn onTmpfs(path: []const u8, mounts: []const libcontainer.Mount) bool {
 
 /// runc's prepareCriuRestoreMounts and addCriuRestoreMount: create missing
 /// mountpoints like create does, and map bind mounts to their sources.
-fn prepareRestoreMounts(a: std.mem.Allocator, opts: *Encoder, target: RestoreTarget, temporary: *TemporaryMounts) Error!void {
+fn prepareRestoreMounts(a: std.mem.Allocator, opts: *Encoder, target: RestoreTarget) Error!void {
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root_path = try realPath(&root_buffer, target.rootfs);
     const root_fd = try openPath(linux.AT.FDCWD, try a.dupeZ(u8, root_path), .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true });
-    defer closeFd(root_fd);
+    // Like runc, the temporary binds are gone before criu runs.
+    var temporary: TemporaryMounts = .{ .root_fd = root_fd };
+    defer temporary.unmount();
     for (target.mounts) |mount| {
         // cgroup mountpoints appear with /sys; CRIU restores tmpfs contents.
         if (isCgroup(mount) or onTmpfs(mount.destination, target.mounts)) continue;
         const is_file = isBind(mount) and sourceIsFile(mount.source);
-        const key = try resolvedDestination(a, root_fd, root_path, mount.destination, is_file, true);
+        const fd = try mountDestination(root_fd, mount.destination, is_file, true);
+        defer closeFd(fd);
+        const key = try relativePath(a, fd, root_path, mount.destination);
         if (!isBind(mount)) continue;
         const source = mount.source orelse continue;
         try opts.pair(23, key, source);
-        if (temporary.len == temporary.paths.len) return error.SystemResources;
-        const destination = try std.fmt.allocPrintSentinel(a, "{s}{s}", .{ root_path, key }, 0);
-        try checkResult(linux.mount(try a.dupeZ(u8, source), destination, null, linux.MS.BIND | linux.MS.REC, 0));
-        temporary.paths[temporary.len] = destination;
-        temporary.len += 1;
+        // Mount through the resolved fd, never a path rebuilt from the key.
+        var buffer: [64]u8 = undefined;
+        try checkResult(linux.mount(try a.dupeZ(u8, source), fdPath(&buffer, fd), null, linux.MS.BIND | linux.MS.REC, 0));
+        try temporary.mounts.append(a, .{ .key = key, .is_file = is_file });
     }
     if (target.masked_paths.len != 0) try opts.pair(23, "/dev/null", "/dev/null");
     for (target.devices) |device| try opts.pair(23, device.path, device.path);
@@ -834,7 +884,7 @@ fn restoreNamespaces(a: std.mem.Allocator, opts: *Encoder, namespaces: []const l
 
 /// Pipes from descriptors.json become criu's own stdio in the restored init.
 fn inheritPipes(a: std.mem.Allocator, opts: *Encoder, image: posix.fd_t) Error!void {
-    const fd = linux.openat(image, "descriptors.json", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    const fd = linux.openat(image, "descriptors.json", .{ .ACCMODE = .RDONLY, .NOFOLLOW = true, .CLOEXEC = true }, 0);
     checkResult(fd) catch |err| {
         reportDiagnostic("cannot open descriptors.json in the image directory: {s}", .{@tagName(linux.errno(fd))});
         return err;
@@ -847,7 +897,8 @@ fn inheritPipes(a: std.mem.Allocator, opts: *Encoder, image: posix.fd_t) Error!v
         reportDiagnostic("descriptors.json: invalid JSON", .{});
         return error.CriuFailed;
     };
-    for (parsed, 0..) |target, i| {
+    // Only stdio is inherited; later entries would name criu's own fds.
+    for (parsed[0..@min(parsed.len, 3)], 0..) |target, i| {
         if (std.mem.indexOf(u8, target, "pipe:") == null) continue;
         var inherit: Encoder = .{ .allocator = a };
         try inherit.string(1, target);

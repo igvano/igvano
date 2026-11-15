@@ -269,6 +269,8 @@ pub const RootfsOptions = struct {
     preserve_fds: u32 = 0,
     /// linux.mountLabel and the process's SELinux label (see selinux.zig).
     mount_label: ?[]const u8 = null,
+    /// mount_label as the context= option for masked-path tmpfs mounts.
+    mount_label_data: ?[:0]const u8 = null,
     selinux_label: ?[]const u8 = null,
     /// runc --no-pivot (see moveRoot).
     no_pivot: bool = false,
@@ -276,9 +278,7 @@ pub const RootfsOptions = struct {
 
 /// Paths now resolve entirely inside the container rootfs. Missing targets are
 /// ignored; other mount failures must not silently weaken isolation.
-fn applyPathRestrictions(masked: []const [:0]const u8, readonly: []const [:0]const u8, mount_label: ?[]const u8, step: *RootfsStep) libcontainer.Error!void {
-    var label_buffer: [512]u8 = undefined;
-    const mask_data = selinux.maskData(&label_buffer, mount_label);
+fn applyPathRestrictions(masked: []const [:0]const u8, readonly: []const [:0]const u8, mask_data: ?[:0]const u8, step: *RootfsStep) libcontainer.Error!void {
     const ms = linux.MS;
     for (masked) |path| {
         step.* = .{ .operation = "stat masked path", .path = path };
@@ -292,7 +292,7 @@ fn applyPathRestrictions(masked: []const [:0]const u8, readonly: []const [:0]con
         if (!stat.mask.TYPE) return error.CreateFailed;
         step.operation = "masked path";
         if (stat.mode & linux.S.IFMT == linux.S.IFDIR) {
-            try checkResult(linux.mount("tmpfs", path, "tmpfs", ms.RDONLY | ms.NOSUID | ms.NODEV | ms.NOEXEC, if (mask_data) |data| @intFromPtr(data) else 0));
+            try checkResult(linux.mount("tmpfs", path, "tmpfs", ms.RDONLY | ms.NOSUID | ms.NODEV | ms.NOEXEC, if (mask_data) |data| @intFromPtr(data.ptr) else 0));
         } else {
             try checkResult(linux.mount("/dev/null", path, null, ms.BIND, 0));
         }
@@ -350,6 +350,27 @@ fn makeRootfsParentUnshared(rootfs: [:0]const u8, propagation: u32, step: *Rootf
 /// All paths, hook arguments and state buffers are prepared before fork.
 /// Allocating in child2 risks inherited allocator locks (POSIX only permits
 /// async-signal-safe work after fork). The raw hook runner needs no allocation.
+/// runc's reOpenDevNull: stdio on the host's /dev/null moves to the
+/// container's, so no descriptor refers to a mount outside the container
+/// (CRIU cannot dump one).
+fn reopenDevNull() libcontainer.Error!void {
+    const fd = try openPath(linux.AT.FDCWD, "/dev/null", .{ .ACCMODE = .RDWR, .CLOEXEC = true });
+    defer closeFd(fd);
+    if (!isDevNull(fd)) {
+        reportDiagnostic("can't reopen /dev/null: container's /dev/null is invalid", .{});
+        return error.CreateFailed;
+    }
+    for (0..3) |target| {
+        if (isDevNull(@intCast(target))) try checkResult(linux.dup3(fd, @intCast(target), 0));
+    }
+}
+
+fn isDevNull(fd: posix.fd_t) bool {
+    var stat: linux.Statx = undefined;
+    if (linux.errno(linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .TYPE = true }, &stat)) != .SUCCESS) return false;
+    return stat.mode & linux.S.IFMT == linux.S.IFCHR and stat.rdev_major == 1 and stat.rdev_minor == 3;
+}
+
 pub fn setupRootfs(rootfs: [:0]const u8, mounts: []const PreparedMount, devices: []const PreparedDevice, symlinks: []const libcontainer.Symlink, readonly: bool, options: RootfsOptions) libcontainer.Error!void {
     var owns_mount_fds = true;
     defer if (owns_mount_fds) closeMountFds(mounts);
@@ -381,6 +402,10 @@ pub fn setupRootfs(rootfs: [:0]const u8, mounts: []const PreparedMount, devices:
     // untouched: device nodes and symlinks there would mutate the host source.
     if (needsSetupDev(mounts)) try setupDevices(new_root, devices, symlinks, options.private_mount_namespace, &step);
     try enterRootfs(rootfs, old_root, new_root, options.private_mount_namespace and options.no_pivot, &step);
+    if (needsSetupDev(mounts)) {
+        step = .{ .operation = "reopen /dev/null", .path = "/dev/null" };
+        try reopenDevNull();
+    }
     if (options.console_fd) |socket| {
         defer closeFd(socket);
         setupConsole(socket, true, options.console_size) catch |err| {
@@ -392,7 +417,7 @@ pub fn setupRootfs(rootfs: [:0]const u8, mounts: []const PreparedMount, devices:
     // Sysctls must precede readonlyPaths (typically including /proc/sys).
     step.operation = "";
     try applySysctls(options.sysctls);
-    try applyPathRestrictions(options.masked_paths, options.readonly_paths, options.mount_label, &step);
+    try applyPathRestrictions(options.masked_paths, options.readonly_paths, options.mount_label_data, &step);
     try finishReadonlyMounts(new_root, mounts, &step);
     if (readonly) {
         step = .{ .operation = "remount readonly root", .path = "/" };

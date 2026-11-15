@@ -13,7 +13,7 @@ repo=$(CDPATH='' cd "$(dirname "$0")/.." && pwd)
 cd "$repo" || exit 1
 logs=${CI_LOG_DIR:-"$repo/.zig-cache/ci-local"}
 mkdir -p "$logs"
-jobs=${CI_JOBS:-"lint unit-linux contest runc-bats runc-bats-rootless containerd runtime-tools kind-systemd kind-cgroupfs"}
+jobs=${CI_JOBS:-"lint unit-linux contest runc-bats runc-bats-rootless systemd-user containerd runtime-tools kind-systemd kind-cgroupfs"}
 
 lint() {
     nix develop -c zig fmt --check build.zig src examples &&
@@ -42,6 +42,7 @@ run_job() {
         contest) ./hack/contest.sh ;;
         runc-bats) ./hack/runc-bats.sh ;;
         runc-bats-rootless) RUNC_BATS_ROOTLESS=1 ./hack/runc-bats.sh ;;
+        systemd-user) ./hack/systemd-user.sh ;;
         containerd) ./hack/containerd.sh ;;
         # Report only in CI, like the job there.
         runtime-tools) ./hack/conformance.sh || true ;;

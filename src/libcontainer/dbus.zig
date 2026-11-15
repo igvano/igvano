@@ -1127,16 +1127,7 @@ fn sessionBus(uid: u32) ?UserBus {
         var alternatives = std.mem.tokenizeScalar(u8, addresses, ';');
         while (alternatives.next()) |entry| {
             const params = std.mem.cutPrefix(u8, entry, "unix:") orelse continue;
-            var pairs = std.mem.tokenizeScalar(u8, params, ',');
-            while (pairs.next()) |pair| {
-                const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
-                const key = pair[0..eq];
-                const value = pair[eq + 1 ..];
-                if (!std.mem.eql(u8, key, "path") and !std.mem.eql(u8, key, "abstract")) continue;
-                bus.abstract = std.mem.eql(u8, key, "abstract");
-                bus.len = unescapeAddress(&bus.path, value) orelse continue;
-                return bus;
-            }
+            if (unixAddress(&bus, params)) return bus;
         }
         return null;
     }
@@ -1151,6 +1142,23 @@ fn sessionBus(uid: u32) ?UserBus {
     }
     bus.len = path.len;
     return bus;
+}
+
+/// The path= or abstract= key of one unix: address, into `bus`.
+fn unixAddress(bus: *UserBus, params: []const u8) bool {
+    var pairs = std.mem.tokenizeScalar(u8, params, ',');
+    while (pairs.next()) |pair| {
+        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+        const key = pair[0..eq];
+        if (!std.mem.eql(u8, key, "path") and !std.mem.eql(u8, key, "abstract")) continue;
+        bus.abstract = std.mem.eql(u8, key, "abstract");
+        bus.len = unescapeAddress(&bus.path, pair[eq + 1 ..]) orelse continue;
+        // A NUL would turn a path into an abstract address.
+        if (std.mem.indexOfScalar(u8, bus.address(), 0) != null) continue;
+        if (!bus.abstract and bus.path[0] != '/') continue;
+        return true;
+    }
+    return false;
 }
 
 /// D-Bus address values escape bytes as %xx.
@@ -1181,6 +1189,10 @@ test "user bus addresses and UID maps resolve like go-systemd" {
     try std.testing.expect(sessionBus(1).?.abstract);
     session_bus_address = "tcp:host=x";
     try std.testing.expectEqual(@as(?UserBus, null), sessionBus(1));
+    for ([_][]const u8{ "unix:path=/a%00b", "unix:path=relative" }) |address| {
+        session_bus_address = address;
+        try std.testing.expectEqual(@as(?UserBus, null), sessionBus(1));
+    }
     try std.testing.expectEqual(@as(?u32, 1000), mapUid("         0       1000          1\n         1     100000      65536\n", 0));
     try std.testing.expectEqual(@as(?u32, 100004), mapUid("0 1000 1\n1 100000 65536\n", 5));
     try std.testing.expectEqual(@as(?u32, 0), mapUid("0 0 4294967295\n", 0));

@@ -134,6 +134,7 @@ const CreateInit = struct {
     readonly_paths: []const [:0]const u8 = undefined,
     /// /proc/self/timens_offsets text, written by child1 after unshare.
     time_offsets: []const u8 = "",
+    mount_label_data: ?[:0]const u8 = null,
 };
 
 const CreateCgroups = struct {
@@ -236,6 +237,7 @@ fn validateCreateProcess(ctx: *CreateContext) libcontainer.Error!void {
 fn prepareCreate(ctx: *CreateContext) libcontainer.Error!libcontainer.State {
     ctx.init.apparmor_command = try prepareAppArmor(ctx.allocator, ctx.options.apparmor_profile);
     try selinux.requireLabelSupport(ctx.options.selinux_label);
+    ctx.init.mount_label_data = try selinux.mountLabelOption(ctx.allocator, ctx.options.mount_label);
     ctx.init.seccomp_program = if (ctx.options.seccomp) |config|
         seccomp.compile(ctx.allocator, config, seccomp.Arch.native() orelse return error.Unsupported) catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
@@ -823,6 +825,7 @@ fn initRootfsOptions(ctx: *const CreateContext, create_input: []const u8) Rootfs
         .no_pivot = ctx.options.no_pivot,
         .preserve_fds = ctx.options.preserve_fds,
         .mount_label = ctx.options.mount_label,
+        .mount_label_data = ctx.init.mount_label_data,
         .selinux_label = ctx.options.selinux_label,
         .console_size = if (ctx.options.process) |process| process.console_size else null,
     };

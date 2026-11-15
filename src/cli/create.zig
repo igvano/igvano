@@ -113,7 +113,8 @@ const CgroupSelection = struct { path: []const u8, slice: []const u8 = "system.s
 /// rootless systemd cgroup nests under the user manager, like runc.
 fn selectCgroup(arena: std.mem.Allocator, config: Config, settings: oci.Spec.Linux) !CgroupSelection {
     if (!config.systemd) return .{ .path = try oci.resolveCgroupPath(arena, settings.cgroupsPath, config.id) };
-    const user_cgroup = try libcontainer.linux.systemdUserCgroup(arena);
+    const result = libcontainer.linux.systemdUserCgroup(arena);
+    const user_cgroup = try diagnostics.resultWithDetail(libcontainer.linux.diagnostic(), result);
     const systemd = try oci.parseSystemdCgroupPath(arena, settings.cgroupsPath, config.id, if (user_cgroup != null) "user.slice" else "system.slice");
     const path = try std.fs.path.join(arena, &.{ std.mem.trimStart(u8, user_cgroup orelse "", "/"), systemd.path });
     return .{ .path = path, .slice = systemd.slice, .unit = systemd.unit };
@@ -142,7 +143,7 @@ pub fn lookPath(allocator: std.mem.Allocator, io: std.Io, path_env: ?[]const u8,
 
 /// runc's shouldUseRootlessCgroupManager for cgroupfs: a non-root user, or
 /// root inside a user namespace, may lack permission for cgroups.
-fn rootlessCgroups() bool {
+pub fn rootlessCgroups() bool {
     if (comptime builtin.os.tag != .linux) return false;
     if (std.os.linux.geteuid() != 0) return true;
     // The initial user namespace maps every ID: "0 0 4294967295".
@@ -224,8 +225,10 @@ fn labeledMountData(allocator: std.mem.Allocator, data: [:0]u8, mount_type: ?[]c
     if (mount_type) |kind| for ([_][]const u8{ "mqueue", "proc", "sysfs", "cgroup", "cgroup2" }) |unlabeled| {
         if (std.mem.eql(u8, kind, unlabeled)) return data;
     };
-    if (data.len == 0) return std.fmt.allocPrintSentinel(allocator, "context=\"{s}\"", .{label}, 0);
-    return std.fmt.allocPrintSentinel(allocator, "{s},context=\"{s}\"", .{ data, label }, 0);
+    if (std.mem.indexOfScalar(u8, label, 0) != null) return oci.validationError(error.InvalidConfig, "linux.mountLabel: must not contain NUL", .{});
+    const option = (try libcontainer.linux.mountLabelOption(allocator, label)).?;
+    if (data.len == 0) return option;
+    return std.fmt.allocPrintSentinel(allocator, "{s},{s}", .{ data, option }, 0);
 }
 
 test "mount labels become a context option on non-bind mounts, like runc" {
@@ -242,6 +245,8 @@ test "mount labels become a context option on non-bind mounts, like runc" {
     try std.testing.expectEqualStrings("", try labeledMountData(a, &empty, "bind", ms.BIND, "l"));
     try std.testing.expectEqualStrings("", try labeledMountData(a, &empty, "mqueue", 0, "l"));
     try std.testing.expectEqualStrings("", try labeledMountData(a, &empty, "tmpfs", 0, null));
+    // Quoted like Go's %q, so a label cannot add mount options.
+    try std.testing.expectEqualStrings("context=\"x\\\",nodev\"", try labeledMountData(a, &empty, "tmpfs", 0, "x\",nodev"));
 }
 
 pub fn prepareCreateMounts(mount_allocator: std.mem.Allocator, bundle: []const u8, rootfs: []const u8, configured: ?[]const oci.Spec.Mount, settings: oci.Spec.Linux) ![]libcontainer.Mount {

@@ -200,6 +200,8 @@ pub const CriuOptions = struct {
     /// A CRIU configuration file; null for none.
     config_file: ?[]const u8 = "/etc/criu/runc.conf",
     debug: ?DebugLog = null,
+    /// Where warnings quoting CRIU's log go; null for stderr.
+    log: ?DebugLog = null,
 
     pub const PageServer = struct { address: []const u8, port: i32 };
     /// rpc.proto's criu_cg_mode values.
@@ -254,6 +256,9 @@ pub const ExecOptions = struct {
     oom_score_adj: ?i32 = null,
     console_fds: ?[2]std.posix.fd_t = null,
     cgroup_path: []const u8 = "",
+    /// runc's rootless cgroups: no permission to join the container's cgroup
+    /// (such as a systemd user scope from another session) is not an error.
+    rootless_cgroups: bool = false,
     seccomp: ?seccomp.Config = null,
     /// Required when the seccomp config has notify rules.
     on_seccomp_listener: ?SeccompListenerCallback = null,

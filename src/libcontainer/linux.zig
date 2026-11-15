@@ -7,6 +7,7 @@ pub const apparmorEnabled = @import("linux/procfs.zig").apparmorEnabled;
 pub const systemdCgroupMatches = @import("linux/systemd.zig").systemdCgroupMatches;
 pub const systemdUserCgroup = @import("linux/systemd.zig").systemdUserCgroup;
 pub const dbus = @import("dbus.zig");
+pub const mountLabelOption = @import("linux/selinux.zig").mountLabelOption;
 /// CRIU checkpoint; restore is CreateOptions.restore.
 pub const checkpoint = @import("linux/criu.zig").checkpoint;
 

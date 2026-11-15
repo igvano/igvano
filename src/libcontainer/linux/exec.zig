@@ -439,6 +439,8 @@ fn joinExecCgroups(context: *const ExecContext) void {
             writeCgroupFile(init_fd, "cgroup.procs", "0", options.cgroup_path) catch |err| failCreate(report[1], err)
         else
             cgroupJoinFailed(report[1], options.cgroup_path, "device or resource busy"),
+        // Like runc, a rootless exec without permission stays where it is.
+        .ACCES, .PERM => |errno| if (!options.rootless_cgroups) cgroupJoinFailed(report[1], options.cgroup_path, @tagName(errno)),
         else => |errno| cgroupJoinFailed(report[1], options.cgroup_path, @tagName(errno)),
     };
     for (hierarchies) |hierarchy|

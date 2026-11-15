@@ -60,7 +60,7 @@ pub fn checkpointContainer(allocator: std.mem.Allocator, io: std.Io, injected: ?
     const settings: oci.Spec.Linux = spec.linux orelse .{};
     const rootfs = try oci.resolveRootfs(a, state.parsed.value.bundle, spec.root.path);
     const criu = try criuOptions(a, io, config, spec.annotations);
-    try libcontainer.linux.checkpoint(a, .{
+    const result = libcontainer.linux.checkpoint(a, .{
         .criu = criu,
         .pid = handle.pid,
         .rootfs = rootfs,
@@ -70,6 +70,7 @@ pub fn checkpointContainer(allocator: std.mem.Allocator, io: std.Io, injected: ?
         .devices = handle.device_nodes,
         .namespaces = try create.prepareCreateNamespaces(a, settings.namespaces),
     });
+    try diagnostics.resultWithDetail(libcontainer.linux.diagnostic(), result);
     if (criu.leave_running or criu.pre_dump) return;
     // Like runc, the dumped container is destroyed; its init is gone.
     var instance: ContainerInstance = undefined;
@@ -127,6 +128,7 @@ fn criuOptions(a: std.mem.Allocator, io: std.Io, config: Config, annotations: ?s
         .page_server = try pageServer(flags.page_server),
         .status_fd = try statusFd(flags),
         .debug = config.debug_log,
+        .log = if (config.log != null) try @import("log.zig").openDebugLog(config.log, config.log_format) else null,
     };
     // A container-specific CRIU config; an empty annotation means none.
     if (annotations) |values| if (values.map.get("org.criu.config")) |file| {
@@ -149,7 +151,7 @@ fn pageServer(value: ?[]const u8) !?libcontainer.CriuOptions.PageServer {
     const address = std.mem.trim(u8, text[0..colon], "[]");
     if (address.len == 0 or colon + 1 == text.len)
         return oci.validationError(error.InvalidCriuValue, "Use --page-server ADDRESS:PORT to specify page server", .{});
-    const port = std.fmt.parseInt(i32, text[colon + 1 ..], 10) catch
+    const port = std.fmt.parseInt(u16, text[colon + 1 ..], 10) catch
         return oci.validationError(error.InvalidCriuValue, "Invalid port number", .{});
     return .{ .address = address, .port = port };
 }
@@ -175,7 +177,7 @@ test "criu option values follow runc's parsing" {
     try std.testing.expectEqualStrings("0.0.0.0", server.address);
     try std.testing.expectEqual(@as(i32, 27277), server.port);
     try std.testing.expectEqualStrings("::1", (try pageServer("[::1]:1")).?.address);
-    for ([_][]const u8{ "x", ":1", "x:", "x:y" }) |bad| try std.testing.expectError(error.InvalidCriuValue, pageServer(bad));
+    for ([_][]const u8{ "x", ":1", "x:", "x:y", "x:-1", "x:65536" }) |bad| try std.testing.expectError(error.InvalidCriuValue, pageServer(bad));
     oci.clearDiagnostic();
 }
 

@@ -76,11 +76,45 @@ pub fn labelFile(fd: posix.fd_t, label: ?[]const u8) libcontainer.Error!void {
     };
 }
 
-/// The data for runc's masked-path tmpfs: context="<label>", or none.
-pub fn maskData(buffer: []u8, label: ?[]const u8) ?[*:0]const u8 {
+/// go-selinux's FormatMountLabel option: context= and the label quoted
+/// like Go's %q; null without a label. Owned by `allocator`.
+// ponytail: bytes >= 0x80 pass through; Go also escapes invalid UTF-8 and
+// non-printable runes, which SELinux contexts never contain.
+pub fn mountLabelOption(allocator: std.mem.Allocator, label: ?[]const u8) libcontainer.Error!?[:0]const u8 {
     const value = label orelse return null;
     if (value.len == 0) return null;
-    return (std.fmt.bufPrintZ(buffer, "context=\"{s}\"", .{value}) catch return null).ptr;
+    var text: std.ArrayList(u8) = .empty;
+    errdefer text.deinit(allocator);
+    try text.appendSlice(allocator, "context=\"");
+    for (value) |byte| {
+        if (byte == 0) {
+            reportDiagnostic("linux.mountLabel: must not contain NUL", .{});
+            return error.InvalidConfig;
+        }
+        if (goEscape(byte)) |sequence| {
+            try text.appendSlice(allocator, sequence);
+        } else if (byte < 0x20 or byte == 0x7f) {
+            try text.print(allocator, "\\x{x:0>2}", .{byte});
+        } else try text.append(allocator, byte);
+    }
+    try text.append(allocator, '"');
+    return try text.toOwnedSliceSentinel(allocator, 0);
+}
+
+/// Go's strconv.Quote short escapes.
+fn goEscape(byte: u8) ?[]const u8 {
+    return switch (byte) {
+        '"' => "\\\"",
+        '\\' => "\\\\",
+        0x07 => "\\a",
+        0x08 => "\\b",
+        0x0c => "\\f",
+        '\n' => "\\n",
+        '\r' => "\\r",
+        '\t' => "\\t",
+        0x0b => "\\v",
+        else => null,
+    };
 }
 
 test "a process label without SELinux fails like runc" {
@@ -90,7 +124,9 @@ test "a process label without SELinux fails like runc" {
     try requireLabelSupport("");
     try std.testing.expectError(error.InvalidProcess, requireLabelSupport("a\x00b"));
     if (!enabled()) try std.testing.expectError(error.InvalidConfig, requireLabelSupport("system_u:system_r:container_t:s0"));
-    var buffer: [64]u8 = undefined;
-    try std.testing.expectEqualStrings("context=\"l\"", std.mem.span(maskData(&buffer, "l").?));
-    try std.testing.expect(maskData(&buffer, null) == null);
+    const option = (try mountLabelOption(std.testing.allocator, "a\"b,c\\\n")).?;
+    defer std.testing.allocator.free(option);
+    try std.testing.expectEqualStrings("context=\"a\\\"b,c\\\\\\n\"", option);
+    try std.testing.expect(try mountLabelOption(std.testing.allocator, null) == null);
+    try std.testing.expectError(error.InvalidConfig, mountLabelOption(std.testing.allocator, "a\x00"));
 }
