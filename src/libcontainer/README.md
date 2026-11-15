@@ -179,5 +179,5 @@ nix develop -c zig test src/libcontainer/root.zig --test-no-exec -target x86_64-
   -femit-bin=zig-out/libcontainer-tests-linux   # then run as root on Linux
 ```
 
-See the repository [README](../../README.md#test) for the full Linux matrix: privileged
+See the repository [testing guide](../../docs/src/testing.md) for the full Linux matrix: privileged
 Docker, cgroup v1/v2 VMs, and conformance.

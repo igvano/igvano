@@ -4,6 +4,7 @@
 
 # User guide
 
+- [Features](features.md)
 - [Using it with containerd](containerd.md)
 
 # Developer guide
