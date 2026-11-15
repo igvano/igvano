@@ -10,7 +10,8 @@ Apache License 2.0 (same license as igvano, see LICENSE):
 - runc, https://github.com/opencontainers/runc
   Copyright The runc Authors.
   Used in: src/libcontainer/linux/{criu,exeseal,rootfs,namespaces,process,mount}.zig,
-  src/cli/{notify,checkpoint,process,exec,args}.zig, src/cli/spec.json.
+  src/cli/{notify,checkpoint,process,exec,args}.zig, src/cli/spec.json,
+  src/cli/tests/spec-rootless.json (`runc spec --rootless` output).
 - opencontainers/cgroups, https://github.com/opencontainers/cgroups
   Copyright The runc Authors.
   Copyright (C) 2020 Aleksa Sarai <cyphar@cyphar.com>, Copyright (C) 2020 SUSE LLC
@@ -23,6 +24,14 @@ Apache License 2.0 (same license as igvano, see LICENSE):
 - docker/go-units, https://github.com/docker/go-units
   Copyright The go-units Authors.
   Used in: src/cli/args.zig.
+- moby/profiles, https://github.com/moby/profiles
+  Copyright Docker, Inc. and The Moby Authors.
+  Used in: src/libcontainer/testdata/docker-default.json (trimmed default
+  seccomp profile, test fixture).
+- opencontainers/runtime-tools, https://github.com/opencontainers/runtime-tools
+  Copyright The runtime-tools Authors.
+  Used in: src/libcontainer/testdata/runtime-tools-default.json (default
+  seccomp profile, test fixture).
 
 runc's NOTICE file reads:
 

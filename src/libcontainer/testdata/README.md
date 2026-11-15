@@ -7,3 +7,7 @@ CAP_SYS_CHROOT rule, and x86/Arm architecture rules (377 distinct syscall names)
 Docker-specific capability and architecture selectors have been resolved for
 these four ABIs, and the arch map is expressed as OCI `architectures`. Rules
 requiring additional capabilities and other ABIs are omitted.
+
+`runtime-tools-default.json` is the default seccomp profile that
+opencontainers/runtime-tools generates (`generate/seccomp`,
+https://github.com/opencontainers/runtime-tools), licensed under Apache-2.0.
