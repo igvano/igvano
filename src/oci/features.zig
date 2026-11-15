@@ -14,7 +14,7 @@ const seccomp_ops = @import("seccomp.zig").seccomp_ops;
 const seccomp_flags = @import("seccomp.zig").seccomp_flags;
 
 /// Runtime build capabilities, independent of the host kernel and privileges.
-pub fn featuresJson(allocator: std.mem.Allocator) ![]u8 {
+pub fn featuresJson(allocator: std.mem.Allocator, version: []const u8) ![]u8 {
     const mount_options = comptime names: {
         var names: [mount_option_table.len][]const u8 = undefined;
         for (mount_option_table, 0..) |entry, i| names[i] = entry.name;
@@ -23,6 +23,13 @@ pub fn featuresJson(allocator: std.mem.Allocator) ![]u8 {
     return std.json.Stringify.valueAlloc(allocator, .{
         .ociVersionMin = oci_version_min,
         .ociVersionMax = oci_version_max,
+        // runc's checkpoint key is what callers such as containerd look for.
+        .annotations = .{
+            .@"io.github.igvano.version" = version,
+            .@"org.opencontainers.runc.checkpoint.enabled" = "true",
+        },
+        // Annotations igvano acts on that change how a container runs.
+        .potentiallyUnsafeConfigAnnotations = &[_][]const u8{"org.criu.config"},
         .hooks = std.meta.fieldNames(Spec.Hooks),
         .mountOptions = &mount_options,
         .linux = .{
@@ -47,13 +54,16 @@ pub fn featuresJson(allocator: std.mem.Allocator) ![]u8 {
 
 test "features JSON reports parser tables and supported isolation" {
     const allocator = std.testing.allocator;
-    const json = try featuresJson(allocator);
+    const json = try featuresJson(allocator, "0.0.0-test");
     defer allocator.free(json);
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
     defer parsed.deinit();
     const root = parsed.value.object;
     try std.testing.expectEqualStrings(oci_version_min, root.get("ociVersionMin").?.string);
     try std.testing.expectEqualStrings(oci_version_max, root.get("ociVersionMax").?.string);
+    const annotations = root.get("annotations").?.object;
+    try std.testing.expectEqualStrings("0.0.0-test", annotations.get("io.github.igvano.version").?.string);
+    try std.testing.expectEqualStrings("true", annotations.get("org.opencontainers.runc.checkpoint.enabled").?.string);
     try expectFeatureMounts(allocator, root.get("mountOptions").?.array.items);
     const hooks = root.get("hooks").?.array.items;
     const hook_names = std.meta.fieldNames(Spec.Hooks);

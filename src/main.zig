@@ -72,13 +72,7 @@ fn setupConfig(allocator: std.mem.Allocator, init: std.process.Init, config: *Co
     config.notify_socket = init.minimal.environ.getPosix("NOTIFY_SOCKET");
     libcontainer.linux.dbus.session_bus_address = init.minimal.environ.getPosix("DBUS_SESSION_BUS_ADDRESS");
     libcontainer.linux.dbus.runtime_dir = init.minimal.environ.getPosix("XDG_RUNTIME_DIR");
-    // Before igvano opens any fd of its own, which could take a free slot.
-    if (config.subcommand == .exec or config.subcommand == .create or config.subcommand == .run) for (3..3 + @as(usize, config.preserve_fds)) |fd| {
-        if (std.os.linux.errno(std.os.linux.fcntl(@intCast(fd), std.os.linux.F.GETFD, 0)) != .SUCCESS) {
-            std.debug.print("igvano: --preserve-fds: fd {d} is not open\n", .{fd});
-            return 255;
-        }
-    };
+    if (checkPassedFds(init, config)) |status| return status;
     if (config.root.ptr == default_root.ptr) {
         const root = xdgRoot(allocator, init.minimal.environ.getPosix("XDG_RUNTIME_DIR")) catch |err| {
             std.debug.print("igvano: the path in $XDG_RUNTIME_DIR must be writable by the user: {s}\n", .{@errorName(err)});
@@ -90,7 +84,43 @@ fn setupConfig(allocator: std.mem.Allocator, init: std.process.Init, config: *Co
         std.debug.print("igvano: cannot open log '{s}': {s}\n", .{ config.log orelse "", @errorName(err) });
         return 1;
     };
-    return sealSelf(allocator, init, config.*);
+    if (sealSelf(allocator, init, config.*)) |status| return status;
+    // After the sealing re-exec, which must not close them: like runc's
+    // activation.Files, keep them from hooks and helpers. Init clears
+    // CLOEXEC again for the container process.
+    for (3..3 + @as(usize, config.listen_fds)) |fd| _ = std.os.linux.fcntl(@intCast(fd), std.os.linux.F.SETFD, std.os.linux.FD_CLOEXEC);
+    return null;
+}
+
+/// Fds passed to the container: systemd's LISTEN_FDS, then --preserve-fds.
+/// Checked before igvano opens any fd of its own, which could take a slot.
+fn checkPassedFds(init: std.process.Init, config: *Config) ?u8 {
+    const linux = std.os.linux;
+    if (config.subcommand == .create or config.subcommand == .run)
+        config.listen_fds = listenFds(init.minimal.environ.getPosix("LISTEN_PID"), init.minimal.environ.getPosix("LISTEN_FDS"), linux.getpid());
+    if (config.subcommand != .exec and config.subcommand != .create and config.subcommand != .run) return null;
+    for (3..3 + @as(usize, config.listen_fds) + config.preserve_fds) |fd| {
+        if (linux.errno(linux.fcntl(@intCast(fd), linux.F.GETFD, 0)) != .SUCCESS) {
+            std.debug.print("igvano: {s}: fd {d} is not open\n", .{ if (fd < 3 + config.listen_fds) "LISTEN_FDS" else "--preserve-fds", fd });
+            return 255;
+        }
+    }
+    return null;
+}
+
+/// go-systemd's activation.Files: the fd count when LISTEN_PID names us.
+fn listenFds(listen_pid: ?[]const u8, listen_fds: ?[]const u8, pid: i32) u16 {
+    const owner = std.fmt.parseInt(i32, listen_pid orelse return 0, 10) catch return 0;
+    if (owner != pid) return 0;
+    return std.fmt.parseInt(u16, listen_fds orelse return 0, 10) catch 0;
+}
+
+test "LISTEN_FDS counts only when LISTEN_PID is this process" {
+    try std.testing.expectEqual(@as(u16, 2), listenFds("42", "2", 42));
+    try std.testing.expectEqual(@as(u16, 0), listenFds("41", "2", 42));
+    try std.testing.expectEqual(@as(u16, 0), listenFds(null, "2", 42));
+    try std.testing.expectEqual(@as(u16, 0), listenFds("42", "x", 42));
+    try std.testing.expectEqual(@as(u16, 0), listenFds("42", null, 42));
 }
 
 /// Commands whose processes enter a container first re-execute from a

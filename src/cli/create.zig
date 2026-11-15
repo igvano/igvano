@@ -52,6 +52,7 @@ pub fn createOrRestore(allocator: std.mem.Allocator, io: std.Io, injected: ?Cont
         const root = try cwd.realPathFileAlloc(io, config.root, parsed.arena.allocator());
         try notify.addToSpec(parsed.arena.allocator(), &parsed.value, root, config.id);
     }
+    if (config.listen_fds != 0 and restore == null) try addListenEnv(parsed.arena.allocator(), &parsed.value, config.listen_fds);
     const has_console = createHasConsole(parsed.value, config, local_console != null);
     const process_options = try prepareCreateProcess(allocator, parsed.value.process, has_console);
     defer if (process_options) |options| allocator.free(options.rlimits);
@@ -105,7 +106,7 @@ pub fn createOrRestore(allocator: std.mem.Allocator, io: std.Io, injected: ?Cont
         .seccomp = seccomp_config,
         .debug = config.debug_log,
         .no_pivot = config.no_pivot,
-        .preserve_fds = config.preserve_fds,
+        .preserve_fds = if (restore == null) @as(u32, config.listen_fds) + config.preserve_fds else config.preserve_fds,
         .restore = restore,
     };
     try applyCreateSpec(mount_allocator, &options, parsed.value);
@@ -135,6 +136,17 @@ fn mappingTool(allocator: std.mem.Allocator, io: std.Io, path_env: ?[]const u8, 
 }
 
 /// An executable `name` in an absolute $PATH directory, owned by allocator.
+/// runc passes systemd's sockets as the first fds, with LISTEN_FDS=N and
+/// LISTEN_PID=1 for the container's init.
+fn addListenEnv(arena: std.mem.Allocator, spec: *oci.Spec, count: u16) !void {
+    const process = if (spec.process) |*value| value else return;
+    var env: std.ArrayList([]const u8) = .empty;
+    try env.appendSlice(arena, process.env orelse &.{});
+    try env.append(arena, try std.fmt.allocPrint(arena, "LISTEN_FDS={d}", .{count}));
+    try env.append(arena, "LISTEN_PID=1");
+    process.env = env.items;
+}
+
 pub fn lookPath(allocator: std.mem.Allocator, io: std.Io, path_env: ?[]const u8, name: []const u8) !?[]const u8 {
     const path = path_env orelse return null;
     var dirs = std.mem.tokenizeScalar(u8, path, ':');
