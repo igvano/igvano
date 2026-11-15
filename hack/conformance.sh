@@ -114,6 +114,9 @@ linux_process_apparmor_profile.t: environment limitation: AppArmor is not enable
     mkdir "$work/bundles"
     mount -t tmpfs tmpfs "$work/bundles"
     export TMPDIR="$work/bundles"
+    # Copy, not bind-mount: exeseal's overlayfs sees the directory under a
+    # file bind mount, so a bind-mounted binary cannot run sealed.
+    if [ -f /inputs/igvano ]; then install -m 0755 /inputs/igvano /usr/local/bin/igvano; fi
     export RUNTIME=/usr/local/bin/igvano
     sha256sum "$RUNTIME"
     find validation -type f -name '*.t' | LC_ALL=C sort > /tmp/conformance-tests
@@ -207,7 +210,7 @@ status=0
     cp "$repo/zig-out/bin/igvano" "$snapshot/igvano" || exit "$?"
     cp "$repo/hack/conformance.sh" "$snapshot/conformance.sh" || exit "$?"
     docker run --rm --init --privileged --platform linux/amd64 \
-        --mount "type=bind,src=$snapshot/igvano,dst=/usr/local/bin/igvano,readonly" \
+        --mount "type=bind,src=$snapshot/igvano,dst=/inputs/igvano,readonly" \
         --mount "type=bind,src=$snapshot/conformance.sh,dst=/conformance.sh,readonly" \
         -e "CONFORMANCE_TIMEOUT=${CONFORMANCE_TIMEOUT:-120}" \
         -e "RUNTIME_TOOLS_REF=${RUNTIME_TOOLS_REF:-master}" \
