@@ -11,6 +11,7 @@ const deleteContainer = @import("delete.zig").deleteContainer;
 const reserveStdio = @import("exec.zig").reserveStdio;
 const enableExecSubreaper = @import("exec.zig").enableExecSubreaper;
 const restoreExecSubreaper = @import("exec.zig").restoreExecSubreaper;
+const notify = @import("notify.zig");
 
 /// runc run: create and start. With --detach it returns after start, like
 /// create + start. Otherwise it adopts the init as a subreaper, forwards
@@ -50,10 +51,21 @@ pub fn runContainer(allocator: std.mem.Allocator, io: std.Io, injected: ?Contain
         // Like runc, --keep keeps the state even when run fails after create.
         if (!config.keep) removeContainer(allocator, io, injected, config, true);
     }
+    // runc relays READY= with its own PID as MAINPID while it stays attached.
+    const relay = if (config.notify_socket) |host| try notify.Relay.bind(config.root, config.id, host) else null;
+    errdefer if (relay) |value| value.deinit();
     try startContainer(allocator, io, injected, config);
+    // The thread owns the socket and closes it once init is gone.
+    if (relay) |value| (try std.Thread.spawn(.{}, relayReady, .{ value, pid })).detach();
     const status = try attached.wait(pid, &reaped, &signals, controller, 0, 1);
     if (!config.keep) removeContainer(allocator, io, injected, config, false);
     return status;
+}
+
+fn relayReady(relay: notify.Relay, pid: i32) void {
+    defer relay.deinit();
+    relay.run(pid, std.os.linux.getpid()) catch |err|
+        std.debug.print("igvano: warning: cannot relay sd_notify READY: {s}\n", .{@errorName(err)});
 }
 
 fn removeContainer(allocator: std.mem.Allocator, io: std.Io, injected: ?ContainerOverride, config: Config, force: bool) void {

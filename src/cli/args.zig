@@ -51,6 +51,8 @@ pub const Config = struct {
     rootless: bool = false,
     /// $PATH, for newuidmap/newgidmap lookups by a non-root runtime.
     path_env: ?[]const u8 = null,
+    /// $NOTIFY_SOCKET: relay the container's sd_notify READY= (notify.zig).
+    notify_socket: ?[]const u8 = null,
     /// --debug; main opens debug_log from it.
     debug: bool = false,
     debug_log: ?@import("libcontainer").DebugLog = null,

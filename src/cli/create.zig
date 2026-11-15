@@ -25,6 +25,7 @@ const hookStateTemplate = @import("hooks.zig").hookStateTemplate;
 const runHooks = @import("hooks.zig").runHooks;
 const SeccompAgent = @import("seccomp_agent.zig").Agent;
 const warnHooks = @import("hooks.zig").warnHooks;
+const notify = @import("notify.zig");
 
 pub fn createContainer(allocator: std.mem.Allocator, io: std.Io, injected: ?ContainerOverride, config: Config) !void {
     _ = try createContainerFor(allocator, io, injected, config, null);
@@ -43,9 +44,14 @@ pub fn createOrRestore(allocator: std.mem.Allocator, io: std.Io, injected: ?Cont
     const cwd = std.Io.Dir.cwd();
     const bundle = try cwd.realPathFileAlloc(io, config.bundle orelse ".", allocator);
     defer allocator.free(bundle);
-    const parsed = try oci.loadSpec(allocator, io, bundle);
+    var parsed = try oci.loadSpec(allocator, io, bundle);
     defer parsed.deinit();
     try oci.requireCreate(parsed.value);
+    if (config.notify_socket != null) {
+        _ = try cwd.createDirPathStatus(io, config.root, .fromMode(0o700));
+        const root = try cwd.realPathFileAlloc(io, config.root, parsed.arena.allocator());
+        try notify.addToSpec(parsed.arena.allocator(), &parsed.value, root, config.id);
+    }
     const has_console = createHasConsole(parsed.value, config, local_console != null);
     const process_options = try prepareCreateProcess(allocator, parsed.value.process, has_console);
     defer if (process_options) |options| allocator.free(options.rlimits);
@@ -339,7 +345,7 @@ fn createPreparedContainer(allocator: std.mem.Allocator, mount_allocator: std.me
         .bundle = bundle,
         .annotations = spec.annotations,
     };
-    try createStateDirectory(io, state_dir);
+    try createStateDirectory(io, state_dir, config.notify_socket != null);
     var lock: ?std.Io.File = null;
     defer if (lock) |file| file.close(io);
     var setup_attempted = false;
@@ -396,11 +402,12 @@ fn createPreparedContainer(allocator: std.mem.Allocator, mount_allocator: std.me
     return handle.pid;
 }
 
-fn createStateDirectory(io: std.Io, state_dir: []const u8) !void {
+fn createStateDirectory(io: std.Io, state_dir: []const u8, notify_dir: bool) !void {
     std.Io.Dir.cwd().createDir(io, state_dir, .fromMode(0o700)) catch |err| switch (err) {
         error.PathAlreadyExists => return error.ContainerExists,
         else => return err,
     };
+    if (notify_dir) try notify.makeDir(io, state_dir);
 }
 
 fn createdContainer(detail: ?[]const u8, created: libcontainer.Error!libcontainer.Container, failure: ?anyerror) !libcontainer.Container {

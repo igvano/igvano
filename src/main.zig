@@ -69,6 +69,7 @@ fn helpOrVersion(io: std.Io, args: []const []const u8) !?u8 {
 /// Process-wide setup after parsing; a status means exit with it.
 fn setupConfig(allocator: std.mem.Allocator, init: std.process.Init, config: *Config) ?u8 {
     config.path_env = init.minimal.environ.getPosix("PATH");
+    config.notify_socket = init.minimal.environ.getPosix("NOTIFY_SOCKET");
     libcontainer.linux.dbus.session_bus_address = init.minimal.environ.getPosix("DBUS_SESSION_BUS_ADDRESS");
     libcontainer.linux.dbus.runtime_dir = init.minimal.environ.getPosix("XDG_RUNTIME_DIR");
     // Before igvano opens any fd of its own, which could take a free slot.
@@ -292,6 +293,7 @@ comptime {
     if (builtin.is_test) {
         _ = @import("cli/args.zig");
         _ = @import("cli/checkpoint.zig");
+        _ = @import("cli/notify.zig");
         _ = @import("cli/create.zig");
         _ = @import("cli/delete.zig");
         _ = @import("cli/diagnostic.zig");

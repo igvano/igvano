@@ -16,6 +16,7 @@ const loadHasProcess = @import("state.zig").loadHasProcess;
 const readLiveState = @import("state.zig").readLiveState;
 const runHooks = @import("hooks.zig").runHooks;
 const stopContainer = @import("delete.zig").stopContainer;
+const notify = @import("notify.zig");
 
 pub fn startContainer(allocator: std.mem.Allocator, io: std.Io, injected: ?ContainerOverride, config: Config) !void {
     var lock = try openContainerLock(allocator, config, false);
@@ -35,6 +36,10 @@ pub fn startContainer(allocator: std.mem.Allocator, io: std.Io, injected: ?Conta
     const path = try std.fs.path.join(allocator, &.{ config.root, config.id, oci.exec_fifo_name });
     defer allocator.free(path);
     if (lock) |file| try requireLinkedLock(io, file);
+    // Like runc, start (and a detached run) waits for READY= after start;
+    // an attached run relays it alongside its own wait.
+    const relay = try startRelay(config);
+    defer if (relay) |value| value.deinit();
     try waitForStart(allocator, io, container.?, path);
     state.parsed.value.status = .running;
     if (lock) |file| try requireLinkedLock(io, file);
@@ -53,6 +58,13 @@ pub fn startContainer(allocator: std.mem.Allocator, io: std.Io, injected: ?Conta
             std.debug.print("igvano: warning: cannot stop container after poststart failure: {s}\n", .{@errorName(cleanup_err)});
         return err;
     };
+    if (relay) |value| try value.run(state.parsed.value.pid orelse return, state.parsed.value.pid.?);
+}
+
+fn startRelay(config: Config) !?notify.Relay {
+    const host = config.notify_socket orelse return null;
+    if (config.subcommand == .run and !config.detach) return null;
+    return try notify.Relay.bind(config.root, config.id, host);
 }
 
 /// After acknowledgement, CLOEXEC closes the writer at exec; earlier EOF can
