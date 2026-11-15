@@ -59,7 +59,7 @@ Isolation and resources:
 - `/proc` writes made inside the container (AppArmor, sysctls) go through a
   private procfs instance, failing closed if it cannot be verified.
 
-Known limitations: no seccomp notify (`SCMP_ACT_NOTIFY`), systemd slice
+Known limitations: no Intel RDT and no RDMA cgroup, systemd slice
 units are not created (scopes only). In
 joined mount namespaces, bind sources opened by the mount-source helper must
 not contain symlinks.

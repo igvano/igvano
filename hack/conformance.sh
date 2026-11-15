@@ -3,6 +3,7 @@
 # CONFORMANCE_LOG defaults to .zig-cache/conformance.log.
 # CONFORMANCE_IMAGE and CONFORMANCE_TIMEOUT override the Go image and seconds/test.
 # RUNTIME_TOOLS_REF overrides the runtime-tools branch, tag, or commit.
+# CONFORMANCE_RUNTIME=<static binary> runs the suite against e.g. runc instead.
 set -eu
 
 KNOWN_UPSTREAM='linux_cgroups_*.t: cgroups/cgroups.go is v1-only ("cgroupv2 is not supported yet").
@@ -12,7 +13,10 @@ hooks.t: upstream compares against a string its own hooks never write.
 misc_props.t: annotation case execs /runtimetest, which PrepareBundle never installs; runc fails it at create.
 pidfile.t: expects kill of a stopped container to succeed, contradicting the spec and kill.t.
 process_rlimits.t: soft-NOFILE; Go >= 1.21 runtimetest raises its own soft limit to hard-1.
-start.t: step 7 asserts start succeeds for a container without process, inverting the spec'\''s MUST-error; step 8 then times out.'
+start.t: step 7 asserts start succeeds for a container without process, inverting the spec'\''s MUST-error; step 8 then times out.
+hooks_stdin.t, prestart.t: like runc, prestart runs at create (status creating), not after start.
+poststart_fail.t, poststop_fail.t: like runc, a failing poststart fails start and a failing poststop fails delete.
+process_capabilities_fail.t: like runc, unknown capabilities are ignored with a warning.'
 
 if [ "${1-}" = "--inside" ]; then
     timeout_seconds=${CONFORMANCE_TIMEOUT:-120}
@@ -207,7 +211,7 @@ status=0
     # running validation container or reuse a previously mounted binary inode.
     snapshot=$(mktemp -d "$repo/.zig-cache/conformance.XXXXXX") || exit "$?"
     trap 'rm -rf "$snapshot"' 0
-    cp "$repo/zig-out/bin/igvano" "$snapshot/igvano" || exit "$?"
+    cp "${CONFORMANCE_RUNTIME:-$repo/zig-out/bin/igvano}" "$snapshot/igvano" || exit "$?"
     cp "$repo/hack/conformance.sh" "$snapshot/conformance.sh" || exit "$?"
     docker run --rm --init --privileged --platform linux/amd64 \
         --mount "type=bind,src=$snapshot/igvano,dst=/inputs/igvano,readonly" \
