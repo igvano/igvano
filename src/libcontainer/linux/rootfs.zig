@@ -354,7 +354,12 @@ fn makeRootfsParentUnshared(rootfs: [:0]const u8, propagation: u32, step: *Rootf
 /// container's, so no descriptor refers to a mount outside the container
 /// (CRIU cannot dump one).
 fn reopenDevNull() libcontainer.Error!void {
-    const fd = try openPath(linux.AT.FDCWD, "/dev/null", .{ .ACCMODE = .RDWR, .CLOEXEC = true });
+    if (!isDevNull(0) and !isDevNull(1) and !isDevNull(2)) return;
+    const opened = linux.open("/dev/null", .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
+    // Library callers may provide no /dev/null; runc always creates one.
+    if (linux.errno(opened) == .NOENT) return;
+    try checkResult(opened);
+    const fd: posix.fd_t = @intCast(opened);
     defer closeFd(fd);
     if (!isDevNull(fd)) {
         reportDiagnostic("can't reopen /dev/null: container's /dev/null is invalid", .{});
