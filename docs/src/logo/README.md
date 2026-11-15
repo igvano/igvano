@@ -24,4 +24,4 @@ converted to outlines, so no font is needed to render it.
   [SIL Open Font License 1.1](https://openfontlicense.org/).
 
 The container drawing, layout, and wordmark arrangement are part of igvano
-and are covered by the repository [LICENSE](../../LICENSE).
+and are covered by the repository [LICENSE](../../../LICENSE).

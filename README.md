@@ -1,10 +1,11 @@
 # igvano
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/logo/igvano-horizontal-dark.svg">
-  <img alt="igvano logo: Ziggy the Ziguana standing on a shipping container" src="docs/logo/igvano-horizontal.svg" width="480">
+  <source media="(prefers-color-scheme: dark)" srcset="docs/src/logo/igvano-horizontal-dark.svg">
+  <img alt="igvano logo: Ziggy the Ziguana standing on a shipping container" src="docs/src/logo/igvano-horizontal.svg" width="480">
 </picture>
 
+<!-- ANCHOR: intro -->
 A toy OCI container runtime written in Zig. It started as an exercise in
 conformance with the [OCI runtime spec](https://github.com/opencontainers/runtime-spec),
 measured with [opencontainers/runtime-tools](https://github.com/opencontainers/runtime-tools),
@@ -14,8 +15,11 @@ Linux only at runtime; the code builds and unit-tests on macOS (Linux-specific
 paths are comptime-guarded). It is a single static binary with no C
 dependencies (no libseccomp, no libsystemd).
 
+<!-- ANCHOR_END: intro -->
+
 ## Features
 
+<!-- ANCHOR: features -->
 runc-compatible CLI:
 
 ```
@@ -64,8 +68,11 @@ units are not created (scopes only). In
 joined mount namespaces, bind sources opened by the mount-source helper must
 not contain symlinks.
 
+<!-- ANCHOR_END: features -->
+
 ## Using it with containerd
 
+<!-- ANCHOR: containerd -->
 igvano runs under the stock `containerd-shim-runc-v2`; no shim of its own:
 
 ```toml
@@ -79,8 +86,11 @@ igvano runs under the stock `containerd-shim-runc-v2`; no shim of its own:
 `ctr run --runc-binary /usr/local/bin/igvano ...` and
 `nerdctl run --runtime /usr/local/bin/igvano ...` work too.
 
+<!-- ANCHOR_END: containerd -->
+
 ## Build
 
+<!-- ANCHOR: build -->
 The Zig toolchain is pinned (ghostty-style): `minimum_zig_version` in
 `build.zig.zon` is the single declared version, and the Nix flake devShell
 provides exactly that compiler via [zig-overlay](https://github.com/mitchellh/zig-overlay).
@@ -107,11 +117,14 @@ Note: Nix flakes only see files tracked by git — `git add` new files before
 Other Zig projects can depend on the standalone `libcontainer` module:
 fetch with `zig fetch --save git+https://github.com/igvano/igvano`, then import
 `b.dependency("igvano", .{ .target = target, .optimize = optimize }).module("libcontainer")`.
-See [src/libcontainer/README.md](src/libcontainer/README.md) for the API and caller contract,
-and [examples/consumer](examples/consumer) for a complete build and usage example.
+See [src/libcontainer/README.md](https://github.com/igvano/igvano/blob/main/src/libcontainer/README.md) for the API and caller contract,
+and [examples/consumer](https://github.com/igvano/igvano/tree/main/examples/consumer) for a complete build and usage example.
+
+<!-- ANCHOR_END: build -->
 
 ## Test
 
+<!-- ANCHOR: test -->
 Pre-commit hooks run through [prek](https://github.com/j178/prek): `zig fmt --check`, and `cccc` enforcing the `cccc.toml` complexity limits (cognitive 25, cyclomatic 15 per function; `tests/` and `test/` exempt) on the staged files and on all of `src/`. Both tools come from the devShell. With a global `core.hooksPath` (e.g. a corporate hook that chains to local hooks), put `exec nix develop -c prek run --hook-stage pre-commit` in `.git/hooks/pre-commit` instead of `prek install`.
 
 ```sh
@@ -253,8 +266,11 @@ diagnostics. The cluster and built node image are deleted on exit; set
 `KEEP_CLUSTER=1` to retain them and use `kind export kubeconfig --name <cluster>`
 to inspect it.
 
+<!-- ANCHOR_END: test -->
+
 ## Layout
 
+<!-- ANCHOR: layout -->
 - `src/main.zig` — CLI entry point: dispatch and error reporting (stderr, `--log`)
 - `src/cli/` — the runc-compatible commands: argument parsing (`args.zig`),
   `--log` writing, the state directory and locks (`state.zig`), one file per
@@ -278,12 +294,16 @@ to inspect it.
 - `src/libcontainer/dbus.zig` — minimal D-Bus client for the systemd driver
 - `src/libcontainer/hooks.zig` — hook execution
 - `hack/conformance.sh` — runtime-tools conformance harness
+- `docs/` — the mdBook documentation; its pages include sections of this
+  README. Preview with `nix develop -c mdbook serve docs`
 
 Small unit tests sit next to the code they test; tests that run real
 containers live in the `tests/` directories and are pulled into the test
 binaries with `test { _ = @import(...); }` blocks.
 
-See `AGENTS.md` for architecture rules and development conventions.
+See [AGENTS.md](https://github.com/igvano/igvano/blob/main/AGENTS.md) for architecture rules and development conventions.
+
+<!-- ANCHOR_END: layout -->
 
 ## License
 
@@ -292,4 +312,4 @@ See [LICENSE](LICENSE).
 The logo uses [Ziggy the Ziguana](https://codeberg.org/ziglang/logo#official-mascots)
 by the Zig project, licensed under
 [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). See
-[docs/logo](docs/logo/README.md) for details and changes.
+[docs/logo](docs/src/logo/README.md) for details and changes.
