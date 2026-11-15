@@ -138,7 +138,7 @@ fn mappingTool(allocator: std.mem.Allocator, io: std.Io, path_env: ?[]const u8, 
 /// An executable `name` in an absolute $PATH directory, owned by allocator.
 /// runc passes systemd's sockets as the first fds, with LISTEN_FDS=N and
 /// LISTEN_PID=1 for the container's init.
-fn addListenEnv(arena: std.mem.Allocator, spec: *oci.Spec, count: u16) !void {
+fn addListenEnv(arena: std.mem.Allocator, spec: *oci.Spec, count: u32) !void {
     const process = if (spec.process) |*value| value else return;
     var env: std.ArrayList([]const u8) = .empty;
     try env.appendSlice(arena, process.env orelse &.{});

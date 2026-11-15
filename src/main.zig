@@ -109,18 +109,19 @@ fn checkPassedFds(init: std.process.Init, config: *Config) ?u8 {
 }
 
 /// go-systemd's activation.Files: the fd count when LISTEN_PID names us.
-fn listenFds(listen_pid: ?[]const u8, listen_fds: ?[]const u8, pid: i32) u16 {
+fn listenFds(listen_pid: ?[]const u8, listen_fds: ?[]const u8, pid: i32) u32 {
     const owner = std.fmt.parseInt(i32, listen_pid orelse return 0, 10) catch return 0;
     if (owner != pid) return 0;
-    return std.fmt.parseInt(u16, listen_fds orelse return 0, 10) catch 0;
+    return std.fmt.parseInt(u32, listen_fds orelse return 0, 10) catch 0;
 }
 
 test "LISTEN_FDS counts only when LISTEN_PID is this process" {
-    try std.testing.expectEqual(@as(u16, 2), listenFds("42", "2", 42));
-    try std.testing.expectEqual(@as(u16, 0), listenFds("41", "2", 42));
-    try std.testing.expectEqual(@as(u16, 0), listenFds(null, "2", 42));
-    try std.testing.expectEqual(@as(u16, 0), listenFds("42", "x", 42));
-    try std.testing.expectEqual(@as(u16, 0), listenFds("42", null, 42));
+    try std.testing.expectEqual(@as(u32, 2), listenFds("42", "2", 42));
+    try std.testing.expectEqual(@as(u32, 0), listenFds("41", "2", 42));
+    try std.testing.expectEqual(@as(u32, 0), listenFds(null, "2", 42));
+    try std.testing.expectEqual(@as(u32, 0), listenFds("42", "x", 42));
+    try std.testing.expectEqual(@as(u32, 0), listenFds("42", null, 42));
+    try std.testing.expectEqual(@as(u32, 70000), listenFds("42", "70000", 42));
 }
 
 /// Commands whose processes enter a container first re-execute from a

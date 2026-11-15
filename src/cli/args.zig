@@ -55,7 +55,7 @@ pub const Config = struct {
     notify_socket: ?[]const u8 = null,
     /// systemd socket activation: fds 3..3+N-1 passed on to the container
     /// ahead of --preserve-fds, like runc (see listenFds).
-    listen_fds: u16 = 0,
+    listen_fds: u32 = 0,
     /// --debug; main opens debug_log from it.
     debug: bool = false,
     debug_log: ?@import("libcontainer").DebugLog = null,
