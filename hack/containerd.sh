@@ -82,7 +82,7 @@ status=0
         -e "CONTAINERD_RUN=${CONTAINERD_RUN:-}" \
         -e "CONTAINERD_TIMEOUT=${CONTAINERD_TIMEOUT:-60m}" \
         -e "HOST_UID=$(id -u)" -e "HOST_GID=$(id -g)" \
-        golang:1.25-bookworm@sha256:3b4a11519ad929d1e1d261a12cff056f0c85b735253d7d861346b9c6f8b36437 sh /containerd.sh --inside || exit "$?"
+        golang:1.25-trixie@sha256:2c4c60ef415fbfa5e90300722293bef36c5e63fae17570ce18f580af933dbd73 sh /containerd.sh --inside || exit "$?"
     expected="$repo/hack/containerd-expected-failures.txt"
     if [ -n "${CONTAINERD_RUN:-}" ]; then
         # A -run subset only checks listed tests that actually ran.

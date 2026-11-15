@@ -143,7 +143,7 @@ status=0
         -e "RUNC_BATS_FILES=${RUNC_BATS_FILES:-}" \
         -e "RUNC_BATS_TIMEOUT=${RUNC_BATS_TIMEOUT:-600}" \
         -e "RUNC_BATS_ROOTLESS=${RUNC_BATS_ROOTLESS:-}" \
-        golang:1.25-bookworm@sha256:3b4a11519ad929d1e1d261a12cff056f0c85b735253d7d861346b9c6f8b36437 sh /runc-bats.sh --inside || exit "$?"
+        golang:1.25-trixie@sha256:2c4c60ef415fbfa5e90300722293bef36c5e63fae17570ce18f580af933dbd73 sh /runc-bats.sh --inside || exit "$?"
     sh "$repo/hack/gate.sh" "$snapshot/outputs/results" "$snapshot/outputs/groups" "$repo/hack/runc-bats$suffix-expected-failures.txt"
 ) > "$log" 2>&1 || status=$?
 cat "$log"

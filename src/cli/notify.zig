@@ -90,7 +90,7 @@ pub const Relay = struct {
             // Checked every round, so a flood of datagrams cannot hide an
             // exited container.
             if (!alive(watched)) return null;
-            var poll = [_]posix.pollfd{.{ .fd = self.fd, .events = posix.POLL.IN, .revents = 0 }};
+            var poll = [_]linux.pollfd{.{ .fd = self.fd, .events = linux.POLL.IN, .revents = 0 }};
             const ready = linux.poll(&poll, 1, 100);
             if (linux.errno(ready) == .INTR) continue;
             if (linux.errno(ready) != .SUCCESS) return error.SocketFailed;
@@ -153,7 +153,7 @@ fn barrier(fd: posix.fd_t) !void {
     const sent = linux.sendmsg(fd, &message, 0);
     _ = linux.close(pipe[1]);
     if (linux.errno(sent) != .SUCCESS) return error.SocketFailed;
-    var poll = [_]posix.pollfd{.{ .fd = pipe[0], .events = posix.POLL.IN, .revents = 0 }};
+    var poll = [_]linux.pollfd{.{ .fd = pipe[0], .events = linux.POLL.IN, .revents = 0 }};
     while (true) {
         const ready = linux.poll(&poll, 1, 30_000);
         if (linux.errno(ready) == .INTR) continue;
