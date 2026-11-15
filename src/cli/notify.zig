@@ -239,9 +239,15 @@ test "a flood of non-READY datagrams does not hide an exited container" {
     defer relay.deinit();
     var address: linux.sockaddr.un = .{ .path = @splat(0) };
     _ = try std.fmt.bufPrint(&address.path, "{s}/c/notify/notify.sock", .{root});
-    const sender: posix.fd_t = @intCast(linux.socket(linux.AF.UNIX, linux.SOCK.DGRAM | linux.SOCK.CLOEXEC, 0));
+    const sender: posix.fd_t = @intCast(linux.socket(linux.AF.UNIX, linux.SOCK.DGRAM | linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK, 0));
     defer _ = linux.close(sender);
-    for (0..64) |_| _ = linux.sendto(sender, "STATUS=x", 8, 0, @ptrCast(&address), @sizeOf(linux.sockaddr.un));
+    // Fill the queue without blocking: net.unix.max_dgram_qlen is 10 by
+    // default (systemd raises it on many hosts), so a blocking send hangs.
+    var sent: usize = 0;
+    for (0..64) |_| {
+        if (linux.errno(linux.sendto(sender, "STATUS=x", 8, 0, @ptrCast(&address), @sizeOf(linux.sockaddr.un))) == .SUCCESS) sent += 1;
+    }
+    try std.testing.expect(sent > 0);
     // A reaped child's PID is gone, as an exited container's init is.
     const child: i32 = @intCast(linux.fork());
     if (child == 0) linux.exit(0);
