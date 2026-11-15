@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Portions derived from runc (https://github.com/opencontainers/runc), Copyright The runc Authors, Apache-2.0:
+// libcontainer/criu_linux.go (Checkpoint, Restore and their helpers).
+// Translated to Zig and modified. See NOTICE.
 //! Checkpoint and restore through CRIU's RPC (`criu swrk`), like runc's
 //! libcontainer/criu_linux.go. Messages follow CRIU's rpc.proto; only the
 //! fields igvano sends or reads are encoded here.

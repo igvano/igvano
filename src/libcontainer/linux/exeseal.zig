@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Portions derived from runc (https://github.com/opencontainers/runc), Copyright The runc Authors, Apache-2.0:
+// libcontainer/exeseal (sealedOverlayfs, escapeOverlayLowerDir, CloneSelfExe).
+// Translated to Zig and modified. See NOTICE.
 //! runc's exeseal (CVE-2019-5736): processes that enter a container must
 //! not have /proc/self/exe point at the writable host binary, or the
 //! container could reopen and overwrite it. igvano forks rather than

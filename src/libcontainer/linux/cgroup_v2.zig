@@ -1,3 +1,8 @@
+// SPDX-License-Identifier: Apache-2.0
+// Portions derived from opencontainers/cgroups (https://github.com/opencontainers/cgroups), Copyright The runc Authors, Apache-2.0:
+// utils.go (ConvertCPUSharesToCgroupV2Value, ConvertMemorySwapToCgroupV2Value)
+// and fs2/create.go (CreateCgroupPath).
+// Translated to Zig and modified. See NOTICE.
 const std = @import("std");
 const linux = std.os.linux;
 const posix = std.posix;

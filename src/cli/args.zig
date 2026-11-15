@@ -1,3 +1,10 @@
+// SPDX-License-Identifier: Apache-2.0 AND MIT
+// Portions derived from runc (https://github.com/opencontainers/runc), Copyright The runc Authors, Apache-2.0: checkpoint.go (criu flags).
+// Portions derived from docker/go-units (https://github.com/docker/go-units),
+// Copyright The go-units Authors, Apache-2.0: size.go (RAMInBytes).
+// reorderArgs is derived from urfave/cli v1 (https://github.com/urfave/cli),
+// Copyright (c) 2023 Jeremy Saenz & Contributors, MIT; see NOTICE.
+// Translated to Zig and modified. See NOTICE.
 const std = @import("std");
 const oci = @import("igvano").oci;
 const LogFormat = @import("log.zig").LogFormat;

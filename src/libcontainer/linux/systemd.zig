@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Portions derived from opencontainers/cgroups (https://github.com/opencontainers/cgroups), Copyright The runc Authors, Apache-2.0:
+// devices/systemd.go (systemdProperties).
+// Translated to Zig and modified. See NOTICE.
 const std = @import("std");
 const libcontainer = @import("../root.zig");
 const Resources = libcontainer.Resources;

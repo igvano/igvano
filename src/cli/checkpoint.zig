@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Portions derived from runc (https://github.com/opencontainers/runc), Copyright The runc Authors, Apache-2.0:
+// checkpoint.go (prepareImagePaths, criuOptions).
+// Translated to Zig and modified. See NOTICE.
 //! runc checkpoint and restore, through CRIU (see libcontainer criu.zig).
 const std = @import("std");
 const builtin = @import("builtin");

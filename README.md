@@ -33,7 +33,8 @@ See [AGENTS.md](AGENTS.md) for architecture rules and conventions.
 
 ## License
 
-See [LICENSE](LICENSE).
+See [LICENSE](LICENSE). Code translated from runc, opencontainers/cgroups,
+youki, docker/go-units, urfave/cli and Go is listed in [NOTICE](NOTICE).
 
 The logo uses [Ziggy the Ziguana](https://codeberg.org/ziglang/logo#official-mascots)
 by the Zig project, licensed under
