@@ -71,6 +71,7 @@ pub const Config = struct {
     exec_flags: []const []const u8 = &.{},
     exec_no_new_privs: ?bool = null,
     exec_apparmor: ?[]const u8 = null,
+    exec_process_label: ?[]const u8 = null,
     /// --cgroup: a sub-cgroup of the container's to join.
     ignore_paused: bool = false,
     /// --preserve-fds: pass fds 3..3+N-1 through to the process.
@@ -330,7 +331,8 @@ fn applyExecOption(args: []const []const u8, index: *usize, config: *Config, opt
         .env => try oci.validateEnv(try optionValue(args, index, error.MissingEnv)),
         .additional_gids => _ = try numericId(try optionValue(args, index, error.MissingExecValue)),
         // --cgroup is parsed later from exec_flags (see exec.subCgroups).
-        .cap, .process_label, .cgroup => _ = try optionValue(args, index, error.MissingExecValue),
+        .cap, .cgroup => _ = try optionValue(args, index, error.MissingExecValue),
+        .process_label => config.exec_process_label = try optionValue(args, index, error.MissingExecValue),
         .apparmor => config.exec_apparmor = try optionValue(args, index, error.MissingExecValue),
         .preserve_fds => config.preserve_fds = try preserveFds(try optionValue(args, index, error.MissingExecValue)),
     }

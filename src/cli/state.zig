@@ -304,7 +304,7 @@ fn systemdUnitMatchesContainer(allocator: std.mem.Allocator, unit: []const u8, i
     const suffix = try std.fmt.allocPrint(allocator, "-{s}.scope", .{id});
     defer allocator.free(suffix);
     if (!std.mem.endsWith(u8, unit, suffix)) return false;
-    const expected = oci.parseSystemdCgroupPath(allocator, configured, id) catch |err| {
+    const expected = oci.parseSystemdCgroupPath(allocator, configured, id, "system.slice") catch |err| {
         if (err == error.OutOfMemory) return err;
         oci.clearDiagnostic();
         return false;

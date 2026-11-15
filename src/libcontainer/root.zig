@@ -84,6 +84,8 @@ pub const CreateOptions = struct {
     sysctls: []const Sysctl = &.{},
     /// runc --preserve-fds: fds 3..3+N-1 reach the container process.
     preserve_fds: u32 = 0,
+    /// linux.mountLabel: SELinux context for the container's mounts.
+    mount_label: ?[]const u8 = null,
     /// runc --no-pivot: move the rootfs onto / and chroot, not pivot_root.
     no_pivot: bool = false,
     /// Host interfaces to move into the container's network namespace.
@@ -91,6 +93,8 @@ pub const CreateOptions = struct {
     /// Null means runc's default, rslave, in a private mount namespace.
     rootfs_propagation: ?u32 = null,
     apparmor_profile: ?[]const u8 = null,
+    /// SELinux label for the process (runc's ProcessLabel).
+    selinux_label: ?[]const u8 = null,
     seccomp: ?seccomp.Config = null,
     /// Required when the seccomp config has notify rules.
     on_seccomp_listener: ?SeccompListenerCallback = null,
@@ -184,6 +188,8 @@ pub const ExecOptions = struct {
     rlimits: []const Rlimit = &.{},
     no_new_privileges: bool = false,
     apparmor_profile: ?[]const u8 = null,
+    /// SELinux label for the process (runc's ProcessLabel).
+    selinux_label: ?[]const u8 = null,
     oom_score_adj: ?i32 = null,
     console_fds: ?[2]std.posix.fd_t = null,
     cgroup_path: []const u8 = "",

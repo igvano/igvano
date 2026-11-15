@@ -48,8 +48,9 @@ fn systemdUnitCharacters(name: []const u8) bool {
 }
 
 /// OCI's slice:prefix:name syntax is interpreted only by the frontend.
-pub fn parseSystemdCgroupPath(allocator: std.mem.Allocator, configured: ?[]const u8, id: []const u8) !SystemdCgroup {
-    var slice: []const u8 = "system.slice";
+/// The default slice is runc's: system.slice, or user.slice when rootless.
+pub fn parseSystemdCgroupPath(allocator: std.mem.Allocator, configured: ?[]const u8, id: []const u8, default_slice: []const u8) !SystemdCgroup {
+    var slice = default_slice;
     var prefix: []const u8 = "igvano";
     var name = id;
     if (configured) |path| {
@@ -102,15 +103,18 @@ test "systemd cgroupsPath resolves defaults scope names and nested slices" {
         .{ .configured = "a-b.slice:test:abc", .slice = "a-b.slice", .unit = "test-abc.scope", .path = "a.slice/a-b.slice/test-abc.scope" },
         .{ .configured = "-.slice:test:abc", .slice = "-.slice", .unit = "test-abc.scope", .path = "test-abc.scope" },
     }) |case| {
-        const result = try parseSystemdCgroupPath(std.testing.allocator, case.configured, "id");
+        const result = try parseSystemdCgroupPath(std.testing.allocator, case.configured, "id", "system.slice");
         defer result.deinit(std.testing.allocator);
         try std.testing.expectEqualStrings(case.slice, result.slice);
         try std.testing.expectEqualStrings(case.unit, result.unit);
         try std.testing.expectEqualStrings(case.path, result.path);
     }
     for ([_][]const u8{ "/x", "x:y", "a.slice:p:n:extra", "bad:p:n", "a.slice:p:../escape", "a.slice:p:n\x00" }) |configured|
-        try std.testing.expectError(error.InvalidConfig, parseSystemdCgroupPath(std.testing.allocator, configured, "id"));
-    try std.testing.expectError(error.Unsupported, parseSystemdCgroupPath(std.testing.allocator, "system.slice:test:foo.slice", "id"));
+        try std.testing.expectError(error.InvalidConfig, parseSystemdCgroupPath(std.testing.allocator, configured, "id", "system.slice"));
+    try std.testing.expectError(error.Unsupported, parseSystemdCgroupPath(std.testing.allocator, "system.slice:test:foo.slice", "id", "system.slice"));
+    const rootless = try parseSystemdCgroupPath(std.testing.allocator, null, "id", "user.slice");
+    defer rootless.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("user.slice/igvano-id.scope", rootless.path);
 }
 
 test "systemd cgroupsPath validates component characters and unit length limits" {
@@ -124,18 +128,18 @@ test "systemd cgroupsPath validates component characters and unit length limits"
         "system.slice:p:n%",
     }) |configured| {
         clearDiagnostic();
-        try std.testing.expectError(error.InvalidConfig, parseSystemdCgroupPath(allocator, configured, "id"));
+        try std.testing.expectError(error.InvalidConfig, parseSystemdCgroupPath(allocator, configured, "id", "system.slice"));
         try std.testing.expect(diagnosticFor(error.InvalidConfig) != null);
     }
-    const valid = try parseSystemdCgroupPath(allocator, "test_A.0\\x40.slice:prefix_1:Name.2@x\\x2d", "id");
+    const valid = try parseSystemdCgroupPath(allocator, "test_A.0\\x40.slice:prefix_1:Name.2@x\\x2d", "id", "system.slice");
     defer valid.deinit(allocator);
     try std.testing.expectEqualStrings("prefix_1-Name.2@x\\x2d.scope", valid.unit);
-    const scope = try parseSystemdCgroupPath(allocator, "system.slice:p:" ++ "n" ** 247, "id");
+    const scope = try parseSystemdCgroupPath(allocator, "system.slice:p:" ++ "n" ** 247, "id", "system.slice");
     defer scope.deinit(allocator);
     try std.testing.expectEqual(@as(usize, 255), scope.unit.len);
-    try std.testing.expectError(error.InvalidConfig, parseSystemdCgroupPath(allocator, "system.slice:p:" ++ "n" ** 248, "id"));
+    try std.testing.expectError(error.InvalidConfig, parseSystemdCgroupPath(allocator, "system.slice:p:" ++ "n" ** 248, "id", "system.slice"));
     const slice = try expandSystemdSlice(allocator, "s" ** 249 ++ ".slice");
     defer allocator.free(slice);
     try std.testing.expectError(error.InvalidConfig, expandSystemdSlice(allocator, "s" ** 250 ++ ".slice"));
-    try std.testing.expectError(error.InvalidConfig, parseSystemdCgroupPath(allocator, null, "bad id"));
+    try std.testing.expectError(error.InvalidConfig, parseSystemdCgroupPath(allocator, null, "bad id", "system.slice"));
 }

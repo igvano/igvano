@@ -694,6 +694,8 @@ pub const Client = struct {
     bus_owner: ?[]u8 = null,
     unit_started: bool = false,
     auth_barrier: bool = false,
+    /// Connected to a per-user manager (see userBus).
+    user_bus: bool = false,
     jobs: std.ArrayList(struct { path: []u8, result: []u8 }) = .empty,
 
     pub fn init(allocator: std.mem.Allocator) Client {
@@ -730,8 +732,16 @@ pub const Client = struct {
     pub fn connect(self: *Client) Error!void {
         if (comptime builtin.os.tag != .linux) return error.NotAvailable;
         self.deadline = (try now()) + timeout_ms;
-        self.fd = openSocket("/run/systemd/private") catch |private_err| fallback: {
-            const fd = openSocket("/run/dbus/system_bus_socket") catch |bus_err| {
+        if (try self.userBus()) |bus| {
+            self.fd = openSocket(bus.address(), bus.abstract) catch |err| {
+                self.note("cannot connect to the user D-Bus {s}: {s}", .{ bus.address(), @errorName(err) });
+                return err;
+            };
+            self.user_bus = true;
+            return self.joinBus(bus.uid);
+        }
+        self.fd = openSocket("/run/systemd/private", false) catch |private_err| fallback: {
+            const fd = openSocket("/run/dbus/system_bus_socket", false) catch |bus_err| {
                 if (private_err == error.NotAvailable and bus_err == error.NotAvailable) {
                     self.note("systemd cgroup driver requested but systemd is not available", .{});
                     return error.NotAvailable;
@@ -740,25 +750,55 @@ pub const Client = struct {
                 return bus_err;
             };
             self.fd = fd;
-            try self.authenticate();
-            const hello = try self.callAt(bus_path, bus_interface, bus_interface, "Hello", &.{});
-            self.allocator.free(hello);
-            const owner_reply = try self.callAt(bus_path, bus_interface, bus_interface, "GetNameOwner", &.{.{ .string = manager_destination }});
-            defer self.allocator.free(owner_reply);
-            try self.pinBusOwner(try Message.parse(owner_reply));
-            // Register interest before Subscribe, otherwise the bus will not
-            // forward systemd's broadcast JobRemoved signals to this client.
-            const rule = "type='signal',sender='org.freedesktop.systemd1',interface='org.freedesktop.systemd1.Manager',member='JobRemoved',path='/org/freedesktop/systemd1'";
-            const matched = try self.callAt(bus_path, bus_interface, bus_interface, "AddMatch", &.{.{ .string = rule }});
-            self.allocator.free(matched);
+            try self.joinBus(linux.geteuid());
             break :fallback fd;
         };
-        // The fallback authenticated and issued Hello inside its branch.
+        // joinBus authenticated and issued Hello for the bus.
         // Private connections need AUTH but must not issue Hello.
         if (self.serial == 0) {
-            try self.authenticate();
+            try self.authenticate(linux.geteuid());
             self.auth_barrier = true;
         }
+    }
+
+    /// Authenticates on a message bus and subscribes to systemd's signals.
+    fn joinBus(self: *Client, uid: u32) Error!void {
+        try self.authenticate(uid);
+        const hello = try self.callAt(bus_path, bus_interface, bus_interface, "Hello", &.{});
+        self.allocator.free(hello);
+        const owner_reply = try self.callAt(bus_path, bus_interface, bus_interface, "GetNameOwner", &.{.{ .string = manager_destination }});
+        defer self.allocator.free(owner_reply);
+        try self.pinBusOwner(try Message.parse(owner_reply));
+        // Register interest before Subscribe, otherwise the bus will not
+        // forward systemd's broadcast JobRemoved signals to this client.
+        const rule = "type='signal',sender='org.freedesktop.systemd1',interface='org.freedesktop.systemd1.Manager',member='JobRemoved',path='/org/freedesktop/systemd1'";
+        const matched = try self.callAt(bus_path, bus_interface, bus_interface, "AddMatch", &.{.{ .string = rule }});
+        self.allocator.free(matched);
+    }
+
+    /// runc's rootless systemd driver uses the per-user manager on the
+    /// session bus; null selects the system manager.
+    fn userBus(self: *Client) Error!?UserBus {
+        const uid = userBusOwner() orelse return null;
+        if (sessionBus(uid)) |bus| return bus;
+        // Root in a user namespace without a session bus is treated as root,
+        // as runc does when busctl --user cannot answer.
+        if (linux.geteuid() == 0) return null;
+        self.note("could not detect DBUS_SESSION_BUS_ADDRESS from the environment; make sure you have installed the dbus-user-session or dbus-daemon package; note you may need to re-login", .{});
+        return error.NotAvailable;
+    }
+
+    /// The absolute cgroup of the connected manager, owned by the caller.
+    pub fn managerControlGroup(self: *Client) Error![]u8 {
+        self.deadline = (try now()) + timeout_ms;
+        const reply = try self.callAt(manager_path, "org.freedesktop.DBus.Properties", manager_destination, "Get", &.{
+            .{ .string = manager_interface },
+            .{ .string = "ControlGroup" },
+        });
+        defer self.allocator.free(reply);
+        const control_group = try stringVariant(try Message.parse(reply));
+        if (control_group.len == 0 or control_group[0] != '/') return error.InvalidMessage;
+        return self.allocator.dupe(u8, control_group);
     }
 
     fn pinBusOwner(self: *Client, message: Message) Error!void {
@@ -769,10 +809,10 @@ pub const Client = struct {
         self.bus_owner = try self.allocator.dupe(u8, owner);
     }
 
-    fn authenticate(self: *Client) Error!void {
+    fn authenticate(self: *Client, owner: u32) Error!void {
         if (comptime builtin.os.tag != .linux) return error.NotAvailable;
         var uid_buf: [20]u8 = undefined;
-        const uid = std.fmt.bufPrint(&uid_buf, "{d}", .{linux.geteuid()}) catch unreachable;
+        const uid = std.fmt.bufPrint(&uid_buf, "{d}", .{owner}) catch unreachable;
         var auth: [80]u8 = undefined;
         const prefix = "\x00AUTH EXTERNAL ";
         @memcpy(auth[0..prefix.len], prefix);
@@ -910,12 +950,7 @@ pub const Client = struct {
             .{ .string = "ControlGroup" },
         });
         defer self.allocator.free(reply);
-        const message = try Message.parse(reply);
-        if (!std.mem.eql(u8, message.signature, "v")) return error.InvalidMessage;
-        var reader: Reader = .{ .bytes = message.body };
-        if (!std.mem.eql(u8, try reader.signature(), "s")) return error.InvalidMessage;
-        const control_group = try reader.text();
-        if (reader.offset != message.body.len) return error.InvalidMessage;
+        const control_group = try stringVariant(try Message.parse(reply));
         return control_group.len != 0 and control_group[0] == '/' and
             std.mem.eql(u8, control_group[1..], cgroup_path);
     }
@@ -1031,16 +1066,139 @@ fn now() Error!i64 {
     return @as(i64, @intCast(ts.sec)) * 1000 + @divTrunc(ts.nsec, 1_000_000);
 }
 
-fn openSocket(path: []const u8) Error!i32 {
+/// A Properties.Get reply holding a string.
+fn stringVariant(message: Message) Error![]const u8 {
+    if (!std.mem.eql(u8, message.signature, "v")) return error.InvalidMessage;
+    var reader: Reader = .{ .bytes = message.body };
+    if (!std.mem.eql(u8, try reader.signature(), "s")) return error.InvalidMessage;
+    const text = try reader.text();
+    if (reader.offset != message.body.len) return error.InvalidMessage;
+    return text;
+}
+
+/// The frontend's $DBUS_SESSION_BUS_ADDRESS and $XDG_RUNTIME_DIR, which
+/// locate the user bus as go-systemd does.
+pub var session_bus_address: ?[]const u8 = null;
+pub var runtime_dir: ?[]const u8 = null;
+
+const UserBus = struct {
+    path: [108]u8 = undefined,
+    len: usize = 0,
+    abstract: bool = false,
+    uid: u32,
+
+    fn address(self: *const UserBus) []const u8 {
+        return self.path[0..self.len];
+    }
+};
+
+/// The UID this process has outside its user namespace, when non-zero.
+/// runc asks `busctl --user` for the bus OwnerUID instead.
+// ponytail: only the parent user namespace is consulted; nested
+// namespaces would need the bus owner from the bus itself.
+pub fn userBusOwner() ?u32 {
+    if (comptime builtin.os.tag != .linux) return null;
+    const euid = linux.geteuid();
+    var buffer: [1024]u8 = undefined;
+    const fd = std.posix.openat(std.posix.AT.FDCWD, "/proc/self/uid_map", .{ .CLOEXEC = true }, 0) catch
+        return if (euid == 0) null else euid;
+    defer _ = linux.close(fd);
+    const count = std.posix.read(fd, &buffer) catch return if (euid == 0) null else euid;
+    const outer = mapUid(buffer[0..count], euid) orelse return null;
+    return if (outer == 0) null else outer;
+}
+
+fn mapUid(map: []const u8, uid: u32) ?u32 {
+    var lines = std.mem.tokenizeScalar(u8, map, '\n');
+    while (lines.next()) |line| {
+        var fields = std.mem.tokenizeScalar(u8, line, ' ');
+        const inside = std.fmt.parseInt(u32, fields.next() orelse continue, 10) catch continue;
+        const outside = std.fmt.parseInt(u32, fields.next() orelse continue, 10) catch continue;
+        const length = std.fmt.parseInt(u32, fields.next() orelse continue, 10) catch continue;
+        if (uid >= inside and uid - inside < length) return outside +% (uid - inside);
+    }
+    return null;
+}
+
+/// The first unix:path= or unix:abstract= address, else $XDG_RUNTIME_DIR/bus.
+fn sessionBus(uid: u32) ?UserBus {
+    var bus: UserBus = .{ .uid = uid };
+    if (session_bus_address) |addresses| {
+        var alternatives = std.mem.tokenizeScalar(u8, addresses, ';');
+        while (alternatives.next()) |entry| {
+            const params = std.mem.cutPrefix(u8, entry, "unix:") orelse continue;
+            var pairs = std.mem.tokenizeScalar(u8, params, ',');
+            while (pairs.next()) |pair| {
+                const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+                const key = pair[0..eq];
+                const value = pair[eq + 1 ..];
+                if (!std.mem.eql(u8, key, "path") and !std.mem.eql(u8, key, "abstract")) continue;
+                bus.abstract = std.mem.eql(u8, key, "abstract");
+                bus.len = unescapeAddress(&bus.path, value) orelse continue;
+                return bus;
+            }
+        }
+        return null;
+    }
+    const dir = runtime_dir orelse return null;
+    const path = std.fmt.bufPrint(&bus.path, "{s}/bus", .{dir}) catch return null;
+    if (comptime builtin.os.tag == .linux) {
+        var z: [109]u8 = undefined;
+        if (path.len >= z.len) return null;
+        @memcpy(z[0..path.len], path);
+        z[path.len] = 0;
+        if (linux.errno(linux.access(z[0..path.len :0], linux.F_OK)) != .SUCCESS) return null;
+    }
+    bus.len = path.len;
+    return bus;
+}
+
+/// D-Bus address values escape bytes as %xx.
+fn unescapeAddress(out: []u8, value: []const u8) ?usize {
+    var len: usize = 0;
+    var i: usize = 0;
+    while (i < value.len) : (len += 1) {
+        if (len >= out.len - 1) return null;
+        if (value[i] == '%') {
+            if (i + 3 > value.len) return null;
+            out[len] = std.fmt.parseInt(u8, value[i + 1 .. i + 3], 16) catch return null;
+            i += 3;
+        } else {
+            out[len] = value[i];
+            i += 1;
+        }
+    }
+    return if (len == 0) null else len;
+}
+
+test "user bus addresses and UID maps resolve like go-systemd" {
+    defer session_bus_address = null;
+    session_bus_address = "tcp:host=x;unix:guid=1,path=/run/user/1000/b%2cus";
+    const bus = sessionBus(1000).?;
+    try std.testing.expectEqualStrings("/run/user/1000/b,us", bus.address());
+    try std.testing.expect(!bus.abstract);
+    session_bus_address = "unix:abstract=/tmp/dbus-x";
+    try std.testing.expect(sessionBus(1).?.abstract);
+    session_bus_address = "tcp:host=x";
+    try std.testing.expectEqual(@as(?UserBus, null), sessionBus(1));
+    try std.testing.expectEqual(@as(?u32, 1000), mapUid("         0       1000          1\n         1     100000      65536\n", 0));
+    try std.testing.expectEqual(@as(?u32, 100004), mapUid("0 1000 1\n1 100000 65536\n", 5));
+    try std.testing.expectEqual(@as(?u32, 0), mapUid("0 0 4294967295\n", 0));
+    try std.testing.expectEqual(@as(?u32, null), mapUid("0 1000 1\n", 7));
+}
+
+fn openSocket(path: []const u8, abstract: bool) Error!i32 {
     if (comptime builtin.os.tag != .linux) return error.NotAvailable;
     const opened = linux.socket(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK, 0);
     if (linux.errno(opened) != .SUCCESS) return error.SocketFailed;
     const fd: i32 = @intCast(opened);
     errdefer _ = linux.close(fd);
     var addr: linux.sockaddr.un = .{ .family = linux.AF.UNIX, .path = @splat(0) };
-    if (path.len >= addr.path.len) return error.SocketFailed;
-    @memcpy(addr.path[0..path.len], path);
-    switch (linux.errno(linux.connect(fd, &addr, @intCast(@offsetOf(linux.sockaddr.un, "path") + path.len + 1)))) {
+    // An abstract address starts with NUL and has no terminator.
+    const start: usize = @intFromBool(abstract);
+    if (start + path.len >= addr.path.len) return error.SocketFailed;
+    @memcpy(addr.path[start..][0..path.len], path);
+    switch (linux.errno(linux.connect(fd, &addr, @intCast(@offsetOf(linux.sockaddr.un, "path") + start + path.len + @intFromBool(!abstract))))) {
         .SUCCESS => return fd,
         .NOENT, .CONNREFUSED => return error.NotAvailable,
         else => return error.SocketFailed,

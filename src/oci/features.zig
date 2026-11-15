@@ -28,7 +28,7 @@ pub fn featuresJson(allocator: std.mem.Allocator) ![]u8 {
         .linux = .{
             .namespaces = std.meta.fieldNames(@FieldType(Spec.Namespace, "type")),
             .capabilities = &capability_names,
-            .cgroup = .{ .v1 = true, .v2 = true, .systemd = true, .systemdUser = false, .rdma = false },
+            .cgroup = .{ .v1 = true, .v2 = true, .systemd = true, .systemdUser = true, .rdma = false },
             .seccomp = .{
                 .enabled = true,
                 .actions = seccomp_actions.keys(),
@@ -38,7 +38,7 @@ pub fn featuresJson(allocator: std.mem.Allocator) ![]u8 {
                 .supportedFlags = seccomp_flags.keys(),
             },
             .apparmor = .{ .enabled = true },
-            .selinux = .{ .enabled = false },
+            .selinux = .{ .enabled = true },
             .intelRdt = .{ .enabled = false },
             .mountExtensions = .{ .idmap = .{ .enabled = true } },
         },
@@ -79,12 +79,12 @@ test "features JSON reports parser tables and supported isolation" {
     try std.testing.expect(cgroup.get("v1").?.bool);
     try std.testing.expect(cgroup.get("v2").?.bool);
     try std.testing.expect(cgroup.get("systemd").?.bool);
-    for ([_][]const u8{ "systemdUser", "rdma" }) |name|
-        try std.testing.expect(!cgroup.get(name).?.bool);
+    try std.testing.expect(cgroup.get("systemdUser").?.bool);
+    try std.testing.expect(!cgroup.get("rdma").?.bool);
     try expectFeatureSeccomp(allocator, linux.get("seccomp").?.object);
     try std.testing.expect(linux.get("apparmor").?.object.get("enabled").?.bool);
-    for ([_][]const u8{ "selinux", "intelRdt" }) |name|
-        try std.testing.expect(!linux.get(name).?.object.get("enabled").?.bool);
+    try std.testing.expect(linux.get("selinux").?.object.get("enabled").?.bool);
+    try std.testing.expect(!linux.get("intelRdt").?.object.get("enabled").?.bool);
     try std.testing.expect(linux.get("mountExtensions").?.object.get("idmap").?.object.get("enabled").?.bool);
 }
 

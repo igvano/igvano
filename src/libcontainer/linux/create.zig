@@ -5,6 +5,7 @@ const posix = std.posix;
 const libcontainer = @import("../root.zig");
 const hooks = @import("../hooks.zig");
 const seccomp = @import("../seccomp.zig");
+const selinux = @import("selinux.zig");
 const dbus = @import("../dbus.zig");
 const diagnostics = @import("diagnostic.zig");
 const v2DeviceRules = @import("devices.zig").v2DeviceRules;
@@ -231,6 +232,7 @@ fn validateCreateProcess(ctx: *CreateContext) libcontainer.Error!void {
 
 fn prepareCreate(ctx: *CreateContext) libcontainer.Error!libcontainer.State {
     ctx.init.apparmor_command = try prepareAppArmor(ctx.allocator, ctx.options.apparmor_profile);
+    try selinux.requireLabelSupport(ctx.options.selinux_label);
     ctx.init.seccomp_program = if (ctx.options.seccomp) |config|
         seccomp.compile(ctx.allocator, config, seccomp.Arch.native() orelse return error.Unsupported) catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
@@ -769,6 +771,8 @@ fn initRootfsOptions(ctx: *const CreateContext, create_input: []const u8) Rootfs
         .cpuset = if (ctx.options.resources.cpu) |cpu| cpu.cpus != null else false,
         .no_pivot = ctx.options.no_pivot,
         .preserve_fds = ctx.options.preserve_fds,
+        .mount_label = ctx.options.mount_label,
+        .selinux_label = ctx.options.selinux_label,
         .console_size = if (ctx.options.process) |process| process.console_size else null,
     };
 }
@@ -1185,6 +1189,7 @@ fn runPreparedInit(init: *const InitContext) noreturn {
     const retry_cwd = linux.errno(cwd_result) == .ACCES;
     if (!retry_cwd) checkResult(cwd_result) catch |err| failCreate(init.ready_fd, err);
     applyAppArmor(init.apparmor_command) catch |err| failCreate(init.ready_fd, err);
+    selinux.applyExecLabel(init.rootfs_options.selinux_label) catch |err| failCreate(init.ready_fd, err);
     // Like runc's ExtraFiles, preserved fds reach the process without CLOEXEC.
     const first_closed: u32 = 3 + init.rootfs_options.preserve_fds;
     for (3..first_closed) |fd| _ = linux.fcntl(@intCast(fd), linux.F.SETFD, 0);

@@ -37,6 +37,7 @@ pub const Spec = struct {
         consoleSize: ?struct { height: u16 = 0, width: u16 = 0 } = null,
         noNewPrivileges: bool = false,
         apparmorProfile: ?[]const u8 = null,
+        selinuxLabel: ?[]const u8 = null,
         oomScoreAdj: ?i32 = null,
         /// Optional, as in runc: an omitted user is root.
         user: User = .{ .uid = 0, .gid = 0 },
@@ -113,6 +114,7 @@ pub const Spec = struct {
         timeOffsets: ?TimeOffsets = null,
         netDevices: ?std.json.ArrayHashMap(NetDevice) = null,
         memoryPolicy: ?MemoryPolicy = null,
+        mountLabel: ?[]const u8 = null,
         personality: ?Personality = null,
     };
 

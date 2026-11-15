@@ -63,9 +63,13 @@ pub fn createContainerFor(allocator: std.mem.Allocator, io: std.Io, injected: ?C
     const readonly_paths = try prepareRestrictionPaths(mount_allocator, settings.readonlyPaths);
     const devices = try oci.prepareDevices(allocator, settings.devices);
     defer oci.freeDevices(allocator, devices);
-    const systemd_config = if (config.systemd) try oci.parseSystemdCgroupPath(allocator, settings.cgroupsPath, config.id) else null;
+    const user_cgroup = if (config.systemd) try libcontainer.linux.systemdUserCgroup(mount_allocator) else null;
+    const systemd_config = if (config.systemd) try oci.parseSystemdCgroupPath(allocator, settings.cgroupsPath, config.id, if (user_cgroup != null) "user.slice" else "system.slice") else null;
     defer if (systemd_config) |value| value.deinit(allocator);
-    const cgroup_path = if (systemd_config) |value| try allocator.dupe(u8, value.path) else try oci.resolveCgroupPath(allocator, settings.cgroupsPath, config.id);
+    const cgroup_path = if (systemd_config) |value|
+        try std.fs.path.join(allocator, &.{ std.mem.trimStart(u8, user_cgroup orelse "", "/"), value.path })
+    else
+        try oci.resolveCgroupPath(allocator, settings.cgroupsPath, config.id);
     defer allocator.free(cgroup_path);
     const resources = try oci.cgroupResources(allocator, settings.resources);
     defer oci.freeCgroupResources(allocator, resources);
@@ -194,6 +198,35 @@ fn namespaceKind(kind: @FieldType(oci.Spec.Namespace, "type")) libcontainer.Name
     };
 }
 
+/// runc's FormatMountLabel: a mount gets context="<mountLabel>", except bind
+/// mounts (no data), proc, sysfs and cgroup (runc passes no label), and mqueue
+/// (labeled after mounting instead).
+fn labeledMountData(allocator: std.mem.Allocator, data: [:0]u8, mount_type: ?[]const u8, flags: u32, mount_label: ?[]const u8) ![:0]const u8 {
+    const label = mount_label orelse return data;
+    if (label.len == 0 or flags & std.os.linux.MS.BIND != 0) return data;
+    if (mount_type) |kind| for ([_][]const u8{ "mqueue", "proc", "sysfs", "cgroup", "cgroup2" }) |unlabeled| {
+        if (std.mem.eql(u8, kind, unlabeled)) return data;
+    };
+    if (data.len == 0) return std.fmt.allocPrintSentinel(allocator, "context=\"{s}\"", .{label}, 0);
+    return std.fmt.allocPrintSentinel(allocator, "{s},context=\"{s}\"", .{ data, label }, 0);
+}
+
+test "mount labels become a context option on non-bind mounts, like runc" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const ms = std.os.linux.MS;
+    var mode = "mode=755".*;
+    try std.testing.expectEqualStrings("mode=755,context=\"system_u:object_r:container_file_t:s0\"", try labeledMountData(a, &mode, "tmpfs", 0, "system_u:object_r:container_file_t:s0"));
+    var empty = "".*;
+    try std.testing.expectEqualStrings("context=\"l\"", try labeledMountData(a, &empty, "devpts", 0, "l"));
+    try std.testing.expectEqualStrings("", try labeledMountData(a, &empty, "proc", 0, "l"));
+    try std.testing.expectEqualStrings("", try labeledMountData(a, &empty, "cgroup", 0, "l"));
+    try std.testing.expectEqualStrings("", try labeledMountData(a, &empty, "bind", ms.BIND, "l"));
+    try std.testing.expectEqualStrings("", try labeledMountData(a, &empty, "mqueue", 0, "l"));
+    try std.testing.expectEqualStrings("", try labeledMountData(a, &empty, "tmpfs", 0, null));
+}
+
 fn prepareCreateMounts(mount_allocator: std.mem.Allocator, bundle: []const u8, rootfs: []const u8, configured: ?[]const oci.Spec.Mount, settings: oci.Spec.Linux) ![]libcontainer.Mount {
     const spec_mounts = configured orelse &.{};
     const mounts = try mount_allocator.alloc(libcontainer.Mount, spec_mounts.len);
@@ -213,7 +246,7 @@ fn prepareCreateMounts(mount_allocator: std.mem.Allocator, bundle: []const u8, r
             .type = mount.type,
             .flags = options.flags,
             .propagation = options.propagation,
-            .data = options.data,
+            .data = try labeledMountData(mount_allocator, options.data, mount.type, options.flags, settings.mountLabel),
             .recursive_attr = options.recursive_attr,
             .copy_up = options.copy_up,
             .cleared_flags = options.cleared,
@@ -242,6 +275,7 @@ fn applyCreateSpec(allocator: std.mem.Allocator, options: *libcontainer.CreateOp
         .boottime = if (offsets.boottime) |value| .{ .secs = value.secs, .nanosecs = value.nanosecs } else null,
     };
     options.readonly_rootfs = spec.root.readonly;
+    options.mount_label = settings.mountLabel;
     options.net_devices = try netDevices(allocator, settings.netDevices);
 }
 
@@ -259,6 +293,7 @@ fn applyCreateProcess(options: *libcontainer.CreateOptions, process: ?libcontain
         options.rlimits = value.rlimits;
         options.oom_score_adj = value.oom_score_adj;
         options.apparmor_profile = value.apparmor_profile;
+        options.selinux_label = value.selinux_label;
         if (options.process) |*init| {
             init.scheduler = value.scheduler;
             init.io_priority = value.io_priority;

@@ -19,6 +19,7 @@ pub fn prepareProcess(allocator: std.mem.Allocator, process: oci.Spec.Process, h
         .no_new_privileges = config.no_new_privileges,
         .console_size = config.console_size,
         .apparmor_profile = process.apparmorProfile,
+        .selinux_label = process.selinuxLabel,
         .oom_score_adj = process.oomScoreAdj,
         .cpu_affinity = try oci.cpuAffinity(process.execCPUAffinity),
         .scheduler = try oci.processScheduler(process.scheduler),

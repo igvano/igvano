@@ -33,6 +33,7 @@ fn execProcessConfig(allocator: std.mem.Allocator, inherited: oci.Spec.Process, 
     }
     if (config.exec_no_new_privs) |value| process.noNewPrivileges = value;
     if (config.exec_apparmor) |value| process.apparmorProfile = value;
+    if (config.exec_process_label) |value| process.selinuxLabel = value;
     var env: std.ArrayList([]const u8) = .empty;
     errdefer env.deinit(allocator);
     try env.appendSlice(allocator, process.env orelse &.{});
@@ -230,6 +231,8 @@ fn inheritExecProfile(process: *oci.Spec.Process, saved_spec: ?std.json.Parsed(o
     // Like runc, an omitted or empty exec profile inherits the container default.
     if (process.apparmorProfile == null or process.apparmorProfile.?.len == 0)
         process.apparmorProfile = inherited.apparmorProfile;
+    if (process.selinuxLabel == null or process.selinuxLabel.?.len == 0)
+        process.selinuxLabel = inherited.selinuxLabel;
     // config.json's execCPUAffinity is the default for every exec.
     if (process.execCPUAffinity == null) process.execCPUAffinity = inherited.execCPUAffinity;
     // So are the scheduler and I/O priority, as in runc.

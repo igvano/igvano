@@ -396,6 +396,17 @@ pub fn stopSystemdScope(allocator: std.mem.Allocator, unit: []const u8) libconta
     client.stop(unit) catch |err| return systemdFailure(&client, "stop systemd scope", err);
 }
 
+/// runc's rootless systemd driver nests slices under the user manager's own
+/// cgroup, such as /user.slice/user-1000.slice/user@1000.service. Null for
+/// the system manager; otherwise owned by the caller.
+pub fn systemdUserCgroup(allocator: std.mem.Allocator) libcontainer.Error!?[]u8 {
+    var client = dbus.Client.init(allocator);
+    defer client.deinit();
+    client.connect() catch |err| return systemdFailure(&client, "connect to systemd", err);
+    if (!client.user_bus) return null;
+    return client.managerControlGroup() catch |err| systemdFailure(&client, "get systemd manager cgroup", err);
+}
+
 pub fn systemdCgroupMatches(allocator: std.mem.Allocator, unit: []const u8, path: []const u8) dbus.Error!bool {
     var client = dbus.Client.init(allocator);
     defer client.deinit();

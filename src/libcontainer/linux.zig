@@ -5,6 +5,8 @@ pub const console = @import("linux/console.zig").console;
 pub const exeseal = @import("linux/exeseal.zig");
 pub const apparmorEnabled = @import("linux/procfs.zig").apparmorEnabled;
 pub const systemdCgroupMatches = @import("linux/systemd.zig").systemdCgroupMatches;
+pub const systemdUserCgroup = @import("linux/systemd.zig").systemdUserCgroup;
+pub const dbus = @import("dbus.zig");
 
 /// Borrowed thread-local failure detail; copy immediately before another operation.
 pub fn diagnostic() ?[]const u8 {
@@ -124,6 +126,7 @@ test {
     _ = @import("devices.zig");
     _ = @import("linux/netdev.zig");
     _ = @import("linux/exeseal.zig");
+    _ = @import("linux/selinux.zig");
     _ = @import("dbus.zig");
     _ = @import("linux/cgroup.zig");
     _ = @import("linux/cgroup_ops.zig");

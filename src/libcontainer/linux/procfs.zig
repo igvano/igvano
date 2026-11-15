@@ -220,24 +220,28 @@ pub fn applyAppArmor(command: ?[]const u8) libcontainer.Error!void {
         });
     const proc = try Procfs.open(true);
     defer closeFd(proc.fd);
-    for ([_][:0]const u8{ "thread-self/attr/apparmor/exec", "self/attr/apparmor/exec", "self/attr/exec" }, 0..) |fallback_path, i| {
-        var buffer: [96]u8 = undefined;
-        // A private subset mount need not expose thread-self. Numeric IDs
-        // refer to this child in the PID namespace that created the mount.
-        // The visible fallback may use an ancestor PID namespace, so use its
-        // verified self links rather than interpreting getpid() there.
-        const path = if (proc.mount_id != null)
-            fallback_path
-        else
-            std.fmt.bufPrintZ(&buffer, "{d}/task/{d}/attr/{s}exec", .{
-                linux.getpid(), linux.gettid(), if (i < 2) "apparmor/" else "",
-            }) catch unreachable;
-        const fd = (try proc.openWrite(path)) orelse continue;
+    const attrs = [_]struct { []const u8, bool }{ .{ "apparmor/exec", true }, .{ "apparmor/exec", false }, .{ "exec", false } };
+    for (attrs) |attr| {
+        const fd = (try openAttr(proc, attr[0], attr[1])) orelse continue;
         defer closeFd(fd);
         return writeAppArmorCommand(fd, text, &unknown_profile);
     }
     reportDiagnostic("no apparmor exec attr in procfs", .{});
     return error.MissingProcfs;
+}
+
+/// Opens this thread's (or process's) attr/<name> for writing.
+pub fn openAttr(proc: Procfs, name: []const u8, thread: bool) libcontainer.Error!?posix.fd_t {
+    var buffer: [96]u8 = undefined;
+    // A private subset mount need not expose thread-self. Numeric IDs
+    // refer to this child in the PID namespace that created the mount.
+    // The visible fallback may use an ancestor PID namespace, so use its
+    // verified self links rather than interpreting getpid() there.
+    const path = if (proc.mount_id != null)
+        std.fmt.bufPrintZ(&buffer, "{s}/attr/{s}", .{ if (thread) "thread-self" else "self", name }) catch unreachable
+    else
+        std.fmt.bufPrintZ(&buffer, "{d}/task/{d}/attr/{s}", .{ linux.getpid(), linux.gettid(), name }) catch unreachable;
+    return proc.openWrite(path);
 }
 
 fn writeAppArmorCommand(fd: posix.fd_t, text: []const u8, unknown_profile: *bool) libcontainer.Error!void {

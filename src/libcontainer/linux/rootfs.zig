@@ -7,6 +7,8 @@ const needsSetupDev = @import("mount.zig").needsSetupDev;
 const PreparedMount = @import("mount.zig").PreparedMount;
 const bindRemount = @import("mount.zig").bindRemount;
 const applyMount = @import("mount.zig").applyMount;
+const mountDestination = @import("mount.zig").mountDestination;
+const selinux = @import("selinux.zig");
 const finishReadonlyMounts = @import("mount.zig").finishReadonlyMounts;
 const checkResult = @import("syscall.zig").checkResult;
 const closeFd = @import("syscall.zig").closeFd;
@@ -265,13 +267,18 @@ pub const RootfsOptions = struct {
     cpuset: bool = false,
     console_size: ?libcontainer.ConsoleSize = null,
     preserve_fds: u32 = 0,
+    /// linux.mountLabel and the process's SELinux label (see selinux.zig).
+    mount_label: ?[]const u8 = null,
+    selinux_label: ?[]const u8 = null,
     /// runc --no-pivot (see moveRoot).
     no_pivot: bool = false,
 };
 
 /// Paths now resolve entirely inside the container rootfs. Missing targets are
 /// ignored; other mount failures must not silently weaken isolation.
-fn applyPathRestrictions(masked: []const [:0]const u8, readonly: []const [:0]const u8, step: *RootfsStep) libcontainer.Error!void {
+fn applyPathRestrictions(masked: []const [:0]const u8, readonly: []const [:0]const u8, mount_label: ?[]const u8, step: *RootfsStep) libcontainer.Error!void {
+    var label_buffer: [512]u8 = undefined;
+    const mask_data = selinux.maskData(&label_buffer, mount_label);
     const ms = linux.MS;
     for (masked) |path| {
         step.* = .{ .operation = "stat masked path", .path = path };
@@ -285,7 +292,7 @@ fn applyPathRestrictions(masked: []const [:0]const u8, readonly: []const [:0]con
         if (!stat.mask.TYPE) return error.CreateFailed;
         step.operation = "masked path";
         if (stat.mode & linux.S.IFMT == linux.S.IFDIR) {
-            try checkResult(linux.mount("tmpfs", path, "tmpfs", ms.RDONLY | ms.NOSUID | ms.NODEV | ms.NOEXEC, 0));
+            try checkResult(linux.mount("tmpfs", path, "tmpfs", ms.RDONLY | ms.NOSUID | ms.NODEV | ms.NOEXEC, if (mask_data) |data| @intFromPtr(data) else 0));
         } else {
             try checkResult(linux.mount("/dev/null", path, null, ms.BIND, 0));
         }
@@ -385,7 +392,7 @@ pub fn setupRootfs(rootfs: [:0]const u8, mounts: []const PreparedMount, devices:
     // Sysctls must precede readonlyPaths (typically including /proc/sys).
     step.operation = "";
     try applySysctls(options.sysctls);
-    try applyPathRestrictions(options.masked_paths, options.readonly_paths, &step);
+    try applyPathRestrictions(options.masked_paths, options.readonly_paths, options.mount_label, &step);
     try finishReadonlyMounts(new_root, mounts, &step);
     if (readonly) {
         step = .{ .operation = "remount readonly root", .path = "/" };
@@ -442,6 +449,13 @@ fn applyRootfsMounts(rootfs: [:0]const u8, mounts: []const PreparedMount, option
         const root_fd = try openPath(linux.AT.FDCWD, rootfs, .{ .PATH = true, .DIRECTORY = true, .CLOEXEC = true });
         defer closeFd(root_fd);
         try applyMount(rootfs, root_fd, mount, options.private_mount_namespace, options.propagation, step);
+        // Like runc, mqueue takes the mount label as an xattr.
+        if (options.mount_label != null and mount.type != null and std.mem.eql(u8, mount.type.?, "mqueue")) {
+            step.* = .{ .operation = "label mqueue", .path = mount.destination };
+            const fd = try mountDestination(root_fd, mount.destination, false, false);
+            defer closeFd(fd);
+            try selinux.labelFile(fd, options.mount_label);
+        }
         try setupSymlinks(root_fd, mount.symlinks, step);
     }
 }

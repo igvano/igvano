@@ -94,6 +94,9 @@ pub fn validateProcess(process: Spec.Process) !void {
         if (std.mem.indexOfScalar(u8, arg, 0) != null) return validationError(error.InvalidProcess, "process.args: must not contain NUL", .{});
     }
     for (process.env orelse &.{}) |entry| try validateEnv(entry);
+    if (process.selinuxLabel) |label| {
+        if (std.mem.indexOfScalar(u8, label, 0) != null) return validationError(error.InvalidProcess, "process.selinuxLabel: must not contain NUL", .{});
+    }
     if (process.apparmorProfile) |profile| {
         if (std.mem.indexOfScalar(u8, profile, 0) != null) return validationError(error.InvalidProcess, "process.apparmorProfile: must not contain NUL", .{});
     }

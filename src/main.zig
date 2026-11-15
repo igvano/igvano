@@ -68,6 +68,8 @@ fn helpOrVersion(io: std.Io, args: []const []const u8) !?u8 {
 /// Process-wide setup after parsing; a status means exit with it.
 fn setupConfig(allocator: std.mem.Allocator, init: std.process.Init, config: *Config) ?u8 {
     config.path_env = init.minimal.environ.getPosix("PATH");
+    libcontainer.linux.dbus.session_bus_address = init.minimal.environ.getPosix("DBUS_SESSION_BUS_ADDRESS");
+    libcontainer.linux.dbus.runtime_dir = init.minimal.environ.getPosix("XDG_RUNTIME_DIR");
     // Before igvano opens any fd of its own, which could take a free slot.
     if (config.subcommand == .exec or config.subcommand == .create or config.subcommand == .run) for (3..3 + @as(usize, config.preserve_fds)) |fd| {
         if (std.os.linux.errno(std.os.linux.fcntl(@intCast(fd), std.os.linux.F.GETFD, 0)) != .SUCCESS) {

@@ -4,6 +4,7 @@ const linux = std.os.linux;
 const posix = std.posix;
 const libcontainer = @import("../root.zig");
 const seccomp = @import("../seccomp.zig");
+const selinux = @import("selinux.zig");
 const diagnostics = @import("diagnostic.zig");
 const processString = @import("syscall.zig").processString;
 const pathString = @import("syscall.zig").pathString;
@@ -109,6 +110,7 @@ pub fn exec(handle: libcontainer.State, options: libcontainer.ExecOptions) libco
 
 fn prepareExecProcess(allocator: std.mem.Allocator, options: libcontainer.ExecOptions) libcontainer.Error!ExecProcess {
     const apparmor_command = try prepareAppArmor(allocator, options.apparmor_profile);
+    try selinux.requireLabelSupport(options.selinux_label);
     const seccomp_program = if (options.seccomp) |config|
         seccomp.compile(allocator, config, seccomp.Arch.native() orelse return error.Unsupported) catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
@@ -501,6 +503,7 @@ fn runExecChild(context: *const ExecContext) noreturn {
     };
     if (options.pidfd_socket) |socket| sendOwnPidfd(socket) catch |err| failCreate(ready[1], err);
     applyAppArmor(apparmor_command) catch |err| failCreate(ready[1], err);
+    selinux.applyExecLabel(options.selinux_label) catch |err| failCreate(ready[1], err);
     applyRlimits(process.rlimits) catch |err| failCreate(ready[1], err);
     finishExecProcess(context);
 }
