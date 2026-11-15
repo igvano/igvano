@@ -1,18 +1,12 @@
 name: docs
 
-# Builds docs/ with mdBook and publishes it to GitHub Pages.
-#
-# Off for now: it only runs when started by hand, and the deploy job also
-# needs Pages turned on (Settings > Pages > Source: GitHub Actions). Pages
-# on a free plan needs a public repo, and the site is public. To turn it on,
-# replace `on:` with:
-#
-#   on:
-#     push:
-#       branches: [main]
-#       paths: [docs/**]
-#     workflow_dispatch:
+# Builds docs/ with mdBook and publishes it to GitHub Pages. Deploying
+# needs Pages turned on (Settings > Pages > Source: GitHub Actions); until
+# then the run fails at configure-pages. The published site is public.
 on:
+  push:
+    branches: [main]
+    paths: [docs/**, .github/workflows/docs.yml]
   workflow_dispatch:
 
 permissions:
