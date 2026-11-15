@@ -52,11 +52,14 @@ pub fn runContainer(allocator: std.mem.Allocator, io: std.Io, injected: ?Contain
         if (!config.keep) removeContainer(allocator, io, injected, config, true);
     }
     // runc relays READY= with its own PID as MAINPID while it stays attached.
-    const relay = if (config.notify_socket) |host| try notify.Relay.bind(config.root, config.id, host) else null;
+    var relay = if (config.notify_socket) |host| try notify.Relay.bind(config.root, config.id, host) else null;
     errdefer if (relay) |value| value.deinit();
     try startContainer(allocator, io, injected, config);
-    // The thread owns the socket and closes it once init is gone.
-    if (relay) |value| (try std.Thread.spawn(.{}, relayReady, .{ value, pid })).detach();
+    // The thread owns the socket from here and closes it once init is gone.
+    if (relay) |value| {
+        (try std.Thread.spawn(.{}, relayReady, .{ value, pid })).detach();
+        relay = null;
+    }
     const status = try attached.wait(pid, &reaped, &signals, controller, 0, 1);
     if (!config.keep) removeContainer(allocator, io, injected, config, false);
     return status;

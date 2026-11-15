@@ -83,14 +83,14 @@ pub const Relay = struct {
     /// `watched` is gone.
     fn waitReady(self: Relay, watched: i32, buffer: []u8) !?[]const u8 {
         while (true) {
+            // Checked every round, so a flood of datagrams cannot hide an
+            // exited container.
+            if (!alive(watched)) return null;
             var poll = [_]posix.pollfd{.{ .fd = self.fd, .events = posix.POLL.IN, .revents = 0 }};
             const ready = linux.poll(&poll, 1, 100);
             if (linux.errno(ready) == .INTR) continue;
             if (linux.errno(ready) != .SUCCESS) return error.SocketFailed;
-            if (ready == 0) {
-                if (!alive(watched)) return null;
-                continue;
-            }
+            if (ready == 0) continue;
             const count = linux.recvfrom(self.fd, buffer.ptr, buffer.len, linux.MSG.DONTWAIT, null, null);
             if (linux.errno(count) != .SUCCESS) continue;
             if (readyLine(buffer[0..count])) |line| return line;
@@ -222,4 +222,27 @@ test "a relay forwards READY, MAINPID and the barrier to the host socket" {
     try std.testing.expectEqualStrings("BARRIER=1", buffer[0..count]);
     _ = linux.close(rights.fd);
     thread.join();
+}
+
+test "a flood of non-READY datagrams does not hide an exited container" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    try tmp.dir.createDirPath(std.testing.io, "c/notify");
+    const relay = try Relay.bind(root, "c", "unused");
+    defer relay.deinit();
+    var address: linux.sockaddr.un = .{ .path = @splat(0) };
+    _ = try std.fmt.bufPrint(&address.path, "{s}/c/notify/notify.sock", .{root});
+    const sender: posix.fd_t = @intCast(linux.socket(linux.AF.UNIX, linux.SOCK.DGRAM | linux.SOCK.CLOEXEC, 0));
+    defer _ = linux.close(sender);
+    for (0..64) |_| _ = linux.sendto(sender, "STATUS=x", 8, 0, @ptrCast(&address), @sizeOf(linux.sockaddr.un));
+    // A reaped child's PID is gone, as an exited container's init is.
+    const child: i32 = @intCast(linux.fork());
+    if (child == 0) linux.exit(0);
+    var status: u32 = undefined;
+    _ = linux.waitpid(child, &status, 0);
+    var buffer: [64]u8 = undefined;
+    try std.testing.expectEqual(@as(?[]const u8, null), try relay.waitReady(child, &buffer));
 }
