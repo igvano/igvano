@@ -37,7 +37,7 @@ Zig is NOT installed system-wide. The toolchain comes from the Nix flake devShel
 nix develop -c zig build test   # build + run tests
 nix develop -c zig build        # build only
 direnv allow                    # once; then plain `zig build test` works in this dir
-nix develop -c mdbook build docs  # docs; pages in docs/src include README sections by anchor
+nix develop -c mdbook build docs  # docs (user and developer guide in docs/src)
 # Doubled --dep libcontainer is intentional: one for root, one for igvano.
 nix develop -c zig test --dep igvano --dep libcontainer -Mroot=src/main.zig \
   --dep libcontainer -Migvano=src/lib.zig -Mlibcontainer=src/libcontainer/root.zig   # CLI tests directly
@@ -48,7 +48,7 @@ independent `examples/consumer` project:
 `cd examples/consumer && nix develop ../.. -c zig build`, then
 `nix develop ../.. -c zig build -Dtarget=x86_64-linux-musl` for the Linux check.
 
-macOS skips every Linux-gated test, so a passing `zig build test` is not enough for Linux implementation changes. Linux checks (see README "Test"):
+macOS skips every Linux-gated test, so a passing `zig build test` is not enough for Linux implementation changes. Linux checks (see docs/src/testing.md):
 - x86_64 cgroup v2: cross-compile the libcontainer/lib/main test binaries for `x86_64-linux-musl` (`--test-no-exec`) and run them as root in privileged `debian:bookworm-slim` (install `procps`) from a container-local directory. The main tests need `IGVANO_SECCOMP_PROBE` pointing at `src/test/seccomp-probe.zig` built for the same target.
 - arm64 cgroup v1 and v2, systemd, AppArmor: the same binaries built for `aarch64-linux-musl`, run as root in the Lima VMs (one pure cgroup v1, one cgroup v2).
 - Conformance: `hack/conformance.sh` (cgroup v2, Colima) and `CONFORMANCE_VM=<vm> hack/conformance.sh` (cgroup v1), from a checkout under `$HOME`. Gate per suite: no previously clean suite may gain failures; known runtime-tools/kernel failures are labelled.

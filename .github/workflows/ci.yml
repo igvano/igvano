@@ -32,7 +32,7 @@ jobs:
       - run: nix develop -c zig build test
 
   unit-linux:
-    # Same as README "Test": cross-compile, then run as root in a privileged container.
+    # Same as docs/src/testing.md: cross-compile, then run as root in a privileged container.
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -136,7 +136,7 @@ jobs:
           path: .zig-cache/containerd.log
 
   runtime-tools:
-    # Report only: the PASS/FAIL table is the tracking metric (README "OCI conformance").
+    # Report only: the PASS/FAIL table is the tracking metric (docs/src/testing.md "OCI conformance").
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
